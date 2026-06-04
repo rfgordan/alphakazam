@@ -1196,6 +1196,45 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         return vec![b];
     }
 
+    // Rest: cures status, falls asleep, and heals to full. Implemented as an onHit callback
+    // in PS (no static fields). Fails at full HP. The sleep counter is excluded from the
+    // comparison and re-projected each turn, so we only set the status + heal.
+    if md.id.to_id() == "rest" {
+        let mut b = b;
+        let (hp, maxhp, status) = { let p = b.state.side(side).active(); (p.hp, p.max_hp, p.status) };
+        if hp < maxhp {
+            let slot = b.state.side(side).active_index;
+            if status != Status::Sleep {
+                push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::Sleep });
+            }
+            push(&mut b, Instruction::Heal { side, slot, amount: maxhp - hp });
+        }
+        return vec![b];
+    }
+
+    // Strength Sap: heal the user by the target's (boost-adjusted) Attack stat, then lower
+    // the target's Attack by 1 (an opponent-induced drop, so Defiant/Competitive can react).
+    if md.id.to_id() == "strengthsap" {
+        let mut b = b;
+        if b.state.side(foe).active().is_alive() {
+            let atk_val = {
+                let t = b.state.side(foe).active();
+                let boost = b.state.side(foe).boost(BoostIndex::Attack);
+                (t.stat(crate::ids::StatIndex::Attack) as f32 * boost_multiplier(boost)) as i16
+            };
+            let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
+            let amount = atk_val.min(maxhp - hp);
+            if amount > 0 {
+                let slot = b.state.side(side).active_index;
+                push(&mut b, Instruction::Heal { side, slot, amount });
+            }
+            if apply_boost_clamped(&mut b, foe, BoostIndex::Attack, -1) < 0 {
+                react_to_stat_drop(&mut b, foe);
+            }
+        }
+        return vec![b];
+    }
+
     // Weather-dependent recovery (Moonlight / Synthesis / Morning Sun: 1/2 normally, 0.667 in
     // sun, 1/4 in any other weather; Shore Up: 1/2, 0.667 in sand). PS implements these as
     // `onHit` callbacks, so they carry no static `heal` field for the codegen to read. The
