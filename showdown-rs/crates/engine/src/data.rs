@@ -55,6 +55,14 @@ pub struct MoveData {
     pub target_volatile: Option<VolatileStatus>,
     /// Weather this move sets (Sunny Day, Sandstorm, ...).
     pub weather: crate::ids::Weather,
+    // Move flags relevant to abilities/items.
+    pub flag_contact: bool,
+    pub flag_sound: bool,
+    pub flag_punch: bool,
+    pub flag_bite: bool,
+    pub flag_slicing: bool,
+    pub flag_bullet: bool,
+    pub flag_pulse: bool,
 }
 
 impl MoveData {
@@ -83,6 +91,13 @@ impl MoveData {
             drain: (0, 1),
             target_volatile: None,
             weather: crate::ids::Weather::None,
+            flag_contact: false,
+            flag_sound: false,
+            flag_punch: false,
+            flag_bite: false,
+            flag_slicing: false,
+            flag_bullet: false,
+            flag_pulse: false,
         }
     }
 }

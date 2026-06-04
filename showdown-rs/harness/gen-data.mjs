@@ -100,6 +100,13 @@ moves.forEach((m, i) => {
 		`drain: ${drain}`,
 		`target_volatile: ${volatileRs(targetVol)}`,
 		`weather: ${weatherRs(m.weather)}`,
+		`flag_contact: ${!!(m.flags && m.flags.contact)}`,
+		`flag_sound: ${!!(m.flags && m.flags.sound)}`,
+		`flag_punch: ${!!(m.flags && m.flags.punch)}`,
+		`flag_bite: ${!!(m.flags && m.flags.bite)}`,
+		`flag_slicing: ${!!(m.flags && m.flags.slicing)}`,
+		`flag_bullet: ${!!(m.flags && m.flags.bullet)}`,
+		`flag_pulse: ${!!(m.flags && m.flags.pulse)}`,
 	];
 	moveRows.push(`    MoveData { ${fields.join(', ')} },`);
 });

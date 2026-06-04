@@ -157,6 +157,16 @@ id_map!(Ability {
     Defeatist => "defeatist",
     MarvelScale => "marvelscale",
     FurCoat => "furcoat",
+    ToughClaws => "toughclaws",
+    IronFist => "ironfist",
+    StrongJaw => "strongjaw",
+    Sharpness => "sharpness",
+    MegaLauncher => "megalauncher",
+    PunkRock => "punkrock",
+    RoughSkin => "roughskin",
+    IronBarbs => "ironbarbs",
+    Soundproof => "soundproof",
+    Bulletproof => "bulletproof",
 });
 
 id_map!(Item {

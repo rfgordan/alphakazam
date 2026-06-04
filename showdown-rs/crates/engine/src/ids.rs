@@ -192,6 +192,18 @@ pub enum Ability {
     // Defensive
     MarvelScale,
     FurCoat,
+    // Flag-keyed offensive
+    ToughClaws,
+    IronFist,
+    StrongJaw,
+    Sharpness,
+    MegaLauncher,
+    PunkRock,
+    // Contact punishers / move-flag immunities
+    RoughSkin,
+    IronBarbs,
+    Soundproof,
+    Bulletproof,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

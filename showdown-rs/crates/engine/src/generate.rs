@@ -434,8 +434,11 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // A type-immune move (e.g. Close Combat vs a Ghost, or Ground vs Levitate) deals no
     // damage and skips its self-stat secondary — PS only applies `self` boosts on a hit.
     let defender = b.state.side(foe).active();
+    let flag_immune = (md.flag_sound && defender.ability == crate::ids::Ability::Soundproof)
+        || (md.flag_bullet && defender.ability == crate::ids::Ability::Bulletproof);
     let connects = crate::damage::type_multiplier(md.typ, defender.types) != 0.0
-        && !ability_immune(md.typ, defender.ability);
+        && !ability_immune(md.typ, defender.ability)
+        && !flag_immune;
     if !connects {
         out.push(scaled(&b, hit_prob));
         return out;
@@ -596,6 +599,12 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
         Ab::SheerForce if md.secondary_chance > 0 => atk_stat = crate::damage::modify(atk_stat, 5325, 4096),
         Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
         Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
+        Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+        Ab::IronFist if md.flag_punch => atk_stat = crate::damage::modify(atk_stat, 4915, 4096), // ×1.2
+        Ab::StrongJaw if md.flag_bite => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
         _ => {}
     }
     // Thick Fat (defender) halves the attack of Fire/Ice moves.
@@ -626,6 +635,10 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     if defender.ability == Ab::IceScales && md.category == MoveCategory::Special {
         fden *= 2;
     }
+    // Punk Rock halves sound-move damage taken.
+    if defender.ability == Ab::PunkRock && md.flag_sound {
+        fden *= 2;
+    }
     // Attacker final-damage modifiers keyed on effectiveness / item.
     if attacker.ability == Ab::TintedLens && type_mult < 1.0 {
         fnum *= 2;
@@ -648,6 +661,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     }
     let adaptability = attacker.ability == Ab::Adaptability;
     let def_ability = defender.ability;
+    let def_item = defender.item;
     let def_maxhp = defender.max_hp;
     let life_orb = attacker.item == Item::LifeOrb;
 
@@ -760,6 +774,23 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             if atk.is_alive() {
                 let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
                 push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
+            }
+        }
+        // Contact punishers: Rocky Helmet (1/6) and Rough Skin / Iron Barbs (1/8).
+        if md.flag_contact && !hit_sub {
+            let frac = if def_item == Item::RockyHelmet {
+                Some(6)
+            } else if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
+                Some(8)
+            } else {
+                None
+            };
+            if let Some(d) = frac {
+                let atk = b.state.side(side).active();
+                if atk.is_alive() {
+                    let dmg = (atk.max_hp / d).max(1).min(atk.hp);
+                    push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+                }
             }
         }
     }
