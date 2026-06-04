@@ -1783,6 +1783,25 @@ fn apply_end_of_turn(b: &mut Branch) {
             push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
         }
 
+        // Leech Seed: the seeded active loses 1/8 max HP and the opposing active heals that
+        // amount (Magic Guard prevents the drain entirely).
+        let p = b.state.side(side).active();
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
+            let drain = (maxhp / 8).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: drain });
+            let other = side.other();
+            let (f_alive, f_room, fslot) = {
+                let f = b.state.side(other).active();
+                (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
+            };
+            if f_alive {
+                let heal = drain.min(f_room);
+                if heal > 0 {
+                    push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
+                }
+            }
+        }
+
         // Salt Cure.
         let p = b.state.side(side).active();
         if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::SaltCure) {
