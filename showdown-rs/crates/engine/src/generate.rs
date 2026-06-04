@@ -856,10 +856,24 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         final_num: fnum,
         final_den: fden,
     };
-    let rolls_nocrit = damage_rolls(&input);
+    // Crit rolls are computed from the screen-free modifiers (a crit ignores screens).
+    let mut input = input;
     let mut input_crit = input;
     input_crit.is_crit = true;
     let rolls_crit = damage_rolls(&input_crit);
+    // Screens halve non-crit damage in singles (Reflect: physical, Light Screen: special,
+    // Aurora Veil: both), unless the attacker has Infiltrator. ×0.5 = modifier 2048/4096.
+    let sc = &b.state.side(foe).side_conditions;
+    let screened = attacker.ability != Ab::Infiltrator
+        && match md.category {
+            MoveCategory::Physical => sc.reflect > 0 || sc.aurora_veil > 0,
+            MoveCategory::Special => sc.light_screen > 0 || sc.aurora_veil > 0,
+            MoveCategory::Status => false,
+        };
+    if screened {
+        input.final_den *= 2;
+    }
+    let rolls_nocrit = damage_rolls(&input);
 
     DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb }
 }

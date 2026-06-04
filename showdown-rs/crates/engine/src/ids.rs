@@ -231,6 +231,8 @@ pub enum Ability {
     // End-of-turn residual modifiers
     PoisonHeal,
     MagicGuard,
+    // Bypasses screens / Substitute when attacking
+    Infiltrator,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
