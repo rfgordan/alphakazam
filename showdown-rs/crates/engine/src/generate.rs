@@ -620,6 +620,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
+        // Protect blocks a status move that targets the foe (Thunder Wave, Will-O-Wisp,
+        // Toxic, Taunt, Parting Shot, Roar, ...) — but not self/field moves (Swords Dance,
+        // recovery, weather, hazards).
+        let targets_foe = md.status != Status::None
+            || md.target_boosts.iter().any(|&x| x != 0)
+            || md.target_volatile.is_some()
+            || md.force_switch;
+        if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
+            return vec![b];
+        }
         let mut branches = execute_status_move(b, side, &md);
         // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
         if let Some(t) = pivot {
