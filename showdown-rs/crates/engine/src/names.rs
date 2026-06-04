@@ -192,6 +192,7 @@ id_map!(Item {
     MuscleBand => "muscleband",
     WiseGlasses => "wiseglasses",
     FocusSash => "focussash",
+    Eviolite => "eviolite",
     Other => "other",
 });
 

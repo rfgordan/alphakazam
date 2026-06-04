@@ -144,3 +144,9 @@ pub fn species_types(species: Species) -> [Type; 2] {
 pub fn species_weight_hg(species: Species) -> u32 {
     crate::gen::SPECIES_WEIGHT_HG.get(species.0 as usize).copied().unwrap_or(0)
 }
+
+/// Whether the species is not-fully-evolved (can still evolve) — Eviolite raises the
+/// defenses of such Pokémon.
+pub fn species_is_nfe(species: Species) -> bool {
+    crate::gen::SPECIES_NFE.get(species.0 as usize).copied().unwrap_or(false)
+}

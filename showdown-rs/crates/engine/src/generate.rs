@@ -594,6 +594,10 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
         def_stat = crate::damage::modify(def_stat, 3, 2);
     }
+    // Eviolite: ×1.5 to the defensive stat (Def and SpD) of a not-fully-evolved Pokémon.
+    if defender.item == Item::Eviolite && crate::data::species_is_nfe(defender.species) {
+        def_stat = crate::damage::modify(def_stat, 3, 2);
+    }
     // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
     // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
     if defender.ability == crate::ids::Ability::PurifyingSalt && md.typ == Type::Ghost {

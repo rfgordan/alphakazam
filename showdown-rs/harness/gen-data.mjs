@@ -122,6 +122,7 @@ species.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 const specTypes = ['    [Type::None, Type::None],'];
 const specStats = ['    [0, 0, 0, 0, 0, 0],'];
 const specWeight = ['    0,'];
+const specNfe = ['    false,']; // not-fully-evolved (can still evolve) — Eviolite applies
 const specNames = ['""'];
 const specByName = [];
 species.forEach((s, i) => {
@@ -135,6 +136,7 @@ species.forEach((s, i) => {
 	const bs = s.baseStats;
 	specStats.push(`    [${bs.hp}, ${bs.atk}, ${bs.def}, ${bs.spa}, ${bs.spd}, ${bs.spe}],`);
 	specWeight.push(`    ${Math.round((s.weightkg || 0) * 10)},`); // hectograms (kg*10)
+	specNfe.push(`    ${!!(s.evos && s.evos.length > 0)},`); // has further evolutions
 });
 
 const byNameRs = (pairs) => pairs.slice().sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([n, i]) => `    ("${esc(n)}", ${i}),`).join('\n');
@@ -161,6 +163,10 @@ ${specStats.join('\n')}
 /// Weight in hectograms (kg × 10).
 pub static SPECIES_WEIGHT_HG: &[u32] = &[
 ${specWeight.join('\n')}
+];
+/// Not-fully-evolved: the species can still evolve (Eviolite boosts its defenses).
+pub static SPECIES_NFE: &[bool] = &[
+${specNfe.join('\n')}
 ];
 pub static SPECIES_BY_NAME: &[(&str, u16)] = &[
 ${byNameRs(specByName)}
