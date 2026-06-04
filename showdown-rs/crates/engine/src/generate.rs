@@ -1811,6 +1811,20 @@ fn apply_end_of_turn(b: &mut Branch) {
             push(b, Instruction::Damage { side, slot, amount: dmg });
         }
 
+        // Partially-trapped (Fire Spin / Whirlpool / Magma Storm / Infestation / ...): 1/8.
+        let p = b.state.side(side).active();
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::PartiallyTrapped) {
+            let dmg = (maxhp / 8).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+
+        // Curse (Ghost): the cursed mon loses 1/4 max HP each turn.
+        let p = b.state.side(side).active();
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::Curse) {
+            let dmg = (maxhp / 4).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+
         // Sitrus Berry can also fire here if end-of-turn chip drops the holder to ≤ 1/2.
         apply_pinch_berry(b, side);
 
