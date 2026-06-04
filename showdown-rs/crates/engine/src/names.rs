@@ -191,6 +191,11 @@ id_map!(Ability {
     LiquidOoze => "liquidooze",
     NaturalCure => "naturalcure",
     MoldBreaker => "moldbreaker",
+    WaterBubble => "waterbubble",
+    Transistor => "transistor",
+    DragonsMaw => "dragonsmaw",
+    RockyPayload => "rockypayload",
+    Steelworker => "steelworker",
 });
 
 id_map!(Item {

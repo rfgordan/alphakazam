@@ -758,10 +758,20 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
         Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        // Type-boosting abilities (applied to the offensive stat like the others above).
+        Ab::WaterBubble if md.typ == Type::Water => atk_stat = crate::damage::modify(atk_stat, 2, 1),
+        Ab::Transistor if md.typ == Type::Electric => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+        Ab::DragonsMaw if md.typ == Type::Dragon => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::RockyPayload if md.typ == Type::Rock => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Steelworker if md.typ == Type::Steel => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         _ => {}
     }
-    // Thick Fat (defender) halves the attack of Fire/Ice moves.
+    // Thick Fat (defender) halves the attack of Fire/Ice moves; Water Bubble (defender)
+    // halves Fire-move attack.
     if def_ab == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
+        atk_stat = crate::damage::modify(atk_stat, 1, 2);
+    }
+    if def_ab == Ab::WaterBubble && md.typ == Type::Fire {
         atk_stat = crate::damage::modify(atk_stat, 1, 2);
     }
     // Marvel Scale / Fur Coat (defender) raise physical Defense.

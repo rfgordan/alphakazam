@@ -241,6 +241,12 @@ pub enum Ability {
     NaturalCure,
     // Ignores the defender's damage-affecting abilities when attacking
     MoldBreaker,
+    // Type-boosting offensive abilities
+    WaterBubble,
+    Transistor,
+    DragonsMaw,
+    RockyPayload,
+    Steelworker,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
