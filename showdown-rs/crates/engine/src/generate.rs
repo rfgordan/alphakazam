@@ -347,9 +347,21 @@ enum Order {
     Tie,
 }
 
+/// A move's effective priority, including Prankster (+1 to the user's status moves).
+fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
+    let md = move_data(state.side(side).active().moves[move_idx as usize].id);
+    let mut pri = md.priority;
+    if md.category == MoveCategory::Status
+        && state.side(side).active().ability == crate::ids::Ability::Prankster
+    {
+        pri += 1;
+    }
+    pri
+}
+
 fn move_order(state: &State, sa: SideId, ma: u8, sb: SideId, mb: u8) -> Order {
-    let pa = move_data(state.side(sa).active().moves[ma as usize].id).priority;
-    let pb = move_data(state.side(sb).active().moves[mb as usize].id).priority;
+    let pa = effective_priority(state, sa, ma);
+    let pb = effective_priority(state, sb, mb);
     if pa != pb {
         return Order::First(if pa > pb { sa } else { sb });
     }

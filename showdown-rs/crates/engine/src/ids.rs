@@ -218,6 +218,8 @@ pub enum Ability {
     Competitive,
     // +1 Atk on KO
     Moxie,
+    // +1 priority to status moves
+    Prankster,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

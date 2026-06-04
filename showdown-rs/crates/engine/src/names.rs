@@ -178,6 +178,7 @@ id_map!(Ability {
     Defiant => "defiant",
     Competitive => "competitive",
     Moxie => "moxie",
+    Prankster => "prankster",
 });
 
 id_map!(Item {
