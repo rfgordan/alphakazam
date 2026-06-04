@@ -239,6 +239,8 @@ pub enum Ability {
     LiquidOoze,
     // Cures status on switch-out
     NaturalCure,
+    // Ignores the defender's damage-affecting abilities when attacking
+    MoldBreaker,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

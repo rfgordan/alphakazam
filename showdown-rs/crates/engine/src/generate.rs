@@ -223,11 +223,20 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             push(b, Instruction::RemoveVolatile { side, volatile: *v });
         }
     }
-    // Natural Cure heals the outgoing Pokémon's non-volatile status as it switches out.
-    let outgoing = b.state.side(side).active();
-    if outgoing.ability == crate::ids::Ability::NaturalCure && outgoing.status != Status::None {
-        let prev = outgoing.status;
-        push(b, Instruction::ChangeStatus { side, slot: previous, previous: prev, new: Status::None });
+    // Natural Cure heals the outgoing Pokémon's non-volatile status as it switches out;
+    // Regenerator restores 1/3 of its max HP. Both act on the mon before it leaves.
+    let (out_ability, out_status, out_hp, out_max) = {
+        let o = b.state.side(side).active();
+        (o.ability, o.status, o.hp, o.max_hp)
+    };
+    if out_ability == crate::ids::Ability::NaturalCure && out_status != Status::None {
+        push(b, Instruction::ChangeStatus { side, slot: previous, previous: out_status, new: Status::None });
+    }
+    if out_ability == crate::ids::Ability::Regenerator && out_hp > 0 && out_hp < out_max {
+        let heal = (out_max / 3).min(out_max - out_hp);
+        if heal > 0 {
+            push(b, Instruction::Heal { side, slot: previous, amount: heal });
+        }
     }
     push(b, Instruction::Switch { side, previous, next: target });
 

@@ -190,6 +190,7 @@ id_map!(Ability {
     Justified => "justified",
     LiquidOoze => "liquidooze",
     NaturalCure => "naturalcure",
+    MoldBreaker => "moldbreaker",
 });
 
 id_map!(Item {
