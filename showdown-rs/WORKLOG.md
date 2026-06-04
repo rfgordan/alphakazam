@@ -135,7 +135,19 @@ about which mechanics touch a turn every time they're up.
 | Eviolite, Defiant/Competitive/Moxie, Justified, Liquid Ooze, Natural Cure, Lum Berry, Mold Breaker, type-boost abilities (Water Bubble/Transistor/…), Regenerator | 74.5–74.8% |
 | **Forced-switch drag fan-out** (replay enumerates random drag targets — harness never logged them) | 74.8% |
 | **Flinch** (Iron Head/Rock Slide/Fake Out/…, sequence-skip) + Inner Focus | 75.3% |
-| **Leech Seed** EoT drain | **76.0%** |
+| **Leech Seed** EoT drain | 76.0% |
+| Partially-trapped + Ghost Curse residuals; Speed Boost (EoT +1 Spe, switch-aware) | 76.7% |
+| **Conditional base power** (Facade/Hex/Venoshock/Brine/Acrobatics ×2; Eruption/Water Spout = HP-scaled) | 77.2% |
+| **Heavy-Duty Boots negate hazards** + Toxic Spikes/Sticky Web on entry + Magic Guard | **78.5%** |
+| Rock Head/Scrappy/Unnerve; exact integer boost math; HJK crash; **confusion self-hit** | **78.8%** |
+
+> Biggest single wins this stretch: **Heavy-Duty Boots** (ubiquitous — every HDB switch-in
+> was over-damaged, +94 turns), **flinch** (+41), **Leech Seed** (+53), **Speed Boost** (+50),
+> **Poison Heal + Magic Guard** (+94 over two metrics). Pattern holds: common *every-turn*
+> residuals, *move-execution* volatiles (flinch/confusion), and *switch-in* effects (HDB,
+> hazards, Regenerator) dominate; pure damage-modifier abilities are a thinner tail. Move-
+> execution volatiles (flinch, confusion) and forced drags are *safe to add* — they only
+> expand the candidate set, so the common path can't regress.
 
 Methodology that worked: (1) **callback-implemented moves** carry no static data fields
 (weather recovery, Rest, Strength Sap, fixed-damage) → hand-code by move id; (2)
