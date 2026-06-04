@@ -1,0 +1,228 @@
+//! Integer-backed identifier enums for the engine.
+//!
+//! Everything in the hot path is keyed by these small `#[repr]` enums rather than
+//! strings, so a `State` stays flat and cheap to copy. The Species / Move / Ability /
+//! Item sets below are an intentionally small starter slice — they are meant to be
+//! regenerated from Pokémon Showdown's data files (see `data.rs`) as coverage grows.
+
+/// Elemental type. `None` is the "second type" of a mono-type Pokémon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Type {
+    None = 0,
+    Normal,
+    Fire,
+    Water,
+    Electric,
+    Grass,
+    Ice,
+    Fighting,
+    Poison,
+    Ground,
+    Flying,
+    Psychic,
+    Bug,
+    Rock,
+    Ghost,
+    Dragon,
+    Dark,
+    Steel,
+    Fairy,
+    Stellar,
+}
+
+impl Type {
+    /// Total number of "real" elemental types (excludes `None`/`Stellar` bookkeeping).
+    pub const COUNT: usize = 18;
+}
+
+/// Non-volatile status. Stored on the Pokémon; only one at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Status {
+    None = 0,
+    Burn,
+    Paralysis,
+    Sleep,
+    Freeze,
+    Poison,
+    Toxic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Weather {
+    None = 0,
+    Sun,
+    Rain,
+    Sand,
+    Snow,
+    HarshSun,
+    HeavyRain,
+    StrongWinds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Terrain {
+    None = 0,
+    Electric,
+    Grassy,
+    Misty,
+    Psychic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MoveCategory {
+    Physical = 0,
+    Special,
+    Status,
+}
+
+/// Index into the boost / stat-stage array on a `Side`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum BoostIndex {
+    Attack = 0,
+    Defense,
+    SpecialAttack,
+    SpecialDefense,
+    Speed,
+    Accuracy,
+    Evasion,
+}
+
+impl BoostIndex {
+    pub const COUNT: usize = 7;
+}
+
+/// Permanent stat slots (no accuracy/evasion — those only exist as boosts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum StatIndex {
+    Hp = 0,
+    Attack,
+    Defense,
+    SpecialAttack,
+    SpecialDefense,
+    Speed,
+}
+
+impl StatIndex {
+    pub const COUNT: usize = 6;
+}
+
+/// A species, addressed by a dense u16 id into the generated tables (`gen.rs`).
+/// `Species::None` is the empty sentinel (id 0). Look up data via `data::base_stats`,
+/// names via `from_id`/`to_id` (see `names.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Species(pub u16);
+
+impl Species {
+    #[allow(non_upper_case_globals)]
+    pub const None: Species = Species(0);
+}
+
+/// A move, addressed by a dense u16 id into the generated tables (`gen.rs`). Look up the
+/// full record via `data::move_data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MoveId(pub u16);
+
+impl MoveId {
+    #[allow(non_upper_case_globals)]
+    pub const None: MoveId = MoveId(0);
+}
+
+/// Starter ability slice. Regenerate from PS `data/abilities.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum Ability {
+    None = 0,
+    Protosynthesis,
+    GoodAsGold,
+    ClearBody,
+    PurifyingSalt,
+    SupremeOverlord,
+    IntimidateAbility,
+    ToxicDebris,
+    Pressure,
+    Regenerator,
+    QuarkDrive,
+    Drought,
+    Drizzle,
+    SandStream,
+    SnowWarning,
+    Levitate,
+    // Offensive multipliers
+    HugePower,
+    PurePower,
+    Guts,
+    Technician,
+    Adaptability,
+    // Defensive multipliers
+    ThickFat,
+    Multiscale,
+    ShadowShield,
+    IceScales,
+    Filter,
+    SolidRock,
+    PrismArmor,
+    Sturdy,
+    // Type-immunity (absorbing) abilities
+    FlashFire,
+    WaterAbsorb,
+    DrySkin,
+    VoltAbsorb,
+    LightningRod,
+    MotorDrive,
+    StormDrain,
+    SapSipper,
+}
+
+/// Starter item slice. Regenerate from PS `data/items.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum Item {
+    None = 0,
+    Leftovers,
+    ChoiceBand,
+    ChoiceScarf,
+    ChoiceSpecs,
+    HeavyDutyBoots,
+    AssaultVest,
+    LifeOrb,
+    RockyHelmet,
+    BoosterEnergy,
+}
+
+/// All 25 natures. Each nudges one stat +10% and another -10% (Serious-type = neutral).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Nature {
+    Hardy = 0,
+    Lonely,
+    Brave,
+    Adamant,
+    Naughty,
+    Bold,
+    Docile,
+    Relaxed,
+    Impish,
+    Lax,
+    Timid,
+    Hasty,
+    Serious,
+    Jolly,
+    Naive,
+    Modest,
+    Mild,
+    Quiet,
+    Bashful,
+    Rash,
+    Calm,
+    Gentle,
+    Sassy,
+    Careful,
+    Quirky,
+}

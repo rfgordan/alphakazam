@@ -1,0 +1,13 @@
+# Third-party reference clones — clone separately, see README (each has its own history)
+/engines/
+
+# Rust build artifacts
+target/
+
+# Generated battle traces (reproducible via harness/gen-trace.mjs)
+/showdown-rs/harness/traces/
+/showdown-rs/harness/traces-rand/
+
+# OS / editor cruft
+.DS_Store
+*.swp

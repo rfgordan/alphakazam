@@ -1,0 +1,892 @@
+//! Turn resolution: `generate_instructions` produces the set of weighted outcome
+//! branches for a pair of chosen actions.
+//!
+//! Because `State` is `Copy`, each branch simply carries its own state — enumerating
+//! the probability tree is a fold over `Branch`es, no mutate/undo bookkeeping needed
+//! (the apply/reverse engine in `instruction.rs` is the separate, allocation-free path
+//! intended for search/RL rollouts). For *verification* we want the full enumeration so
+//! that PS's actual result is guaranteed to be one of the branches we produce.
+//!
+//! Coverage is the current slice: switching with entry hazards, damaging moves (with
+//! accuracy / crit / damage-roll branching and 100%-chance self-stat secondaries),
+//! a few status moves, and common end-of-turn residuals. Unmodeled mechanics are listed
+//! at each site; the differential runner measures what fraction of real turns this
+//! already reproduces.
+
+use crate::damage::{damage_rolls, type_multiplier, DamageInput};
+use crate::data::move_data;
+use crate::ids::{BoostIndex, Item, MoveCategory, Status, Type, Weather};
+use crate::instruction::{Instruction, SideConditionId, StateInstructions};
+use crate::state::{SideId, State};
+use crate::volatile::VolatileStatus;
+
+/// A chosen action for one side this turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveChoice {
+    Move(u8),   // move slot index 0..=3
+    Switch(u8), // party index 0..=5
+}
+
+/// One node of the outcome tree: a probability, the resulting state, and the
+/// instructions that produced it (relative to the input state).
+#[derive(Clone)]
+struct Branch {
+    prob: f32,
+    state: State,
+    ins: Vec<Instruction>,
+}
+
+/// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
+fn round_div(n: i32, d: i32) -> i32 {
+    (n + d / 2) / d
+}
+
+/// True if the defender's ability grants immunity to `move_type` (absorbing abilities).
+fn ability_immune(move_type: Type, ability: crate::ids::Ability) -> bool {
+    use crate::ids::Ability::*;
+    match (move_type, ability) {
+        (Type::Ground, Levitate) => true,
+        (Type::Fire, FlashFire) => true,
+        (Type::Water, WaterAbsorb | DrySkin | StormDrain) => true,
+        (Type::Electric, VoltAbsorb | LightningRod | MotorDrive) => true,
+        (Type::Grass, SapSipper) => true,
+        _ => false,
+    }
+}
+
+/// Multiplier for a stat stage (-6..=6), the standard gen formula.
+pub fn boost_multiplier(stage: i8) -> f32 {
+    if stage >= 0 {
+        (2 + stage as i32) as f32 / 2.0
+    } else {
+        2.0 / (2 - stage as i32) as f32
+    }
+}
+
+/// Effective speed including boost, paralysis, Choice Scarf, Tailwind and a Speed-based
+/// Protosynthesis / Quark Drive boost.
+fn effective_speed(state: &State, side: SideId) -> i32 {
+    let s = state.side(side);
+    let p = s.active();
+    let mut spe = p.stat(crate::ids::StatIndex::Speed) as f32;
+    spe *= boost_multiplier(s.boost(BoostIndex::Speed));
+    if p.status == Status::Paralysis {
+        spe *= 0.5;
+    }
+    if p.item == Item::ChoiceScarf {
+        spe *= 1.5;
+    }
+    if s.side_conditions.tailwind > 0 {
+        spe *= 2.0;
+    }
+    if has_proto(s) && proto_stat(p) == crate::ids::StatIndex::Speed {
+        spe *= 1.5;
+    }
+    spe as i32
+}
+
+/// Whether the active Pokémon has a Protosynthesis / Quark Drive boost active.
+fn has_proto(s: &crate::state::Side) -> bool {
+    s.volatiles.contains(VolatileStatus::Protosynthesis) || s.volatiles.contains(VolatileStatus::QuarkDrive)
+}
+
+/// The stat Protosynthesis / Quark Drive boosts: the highest of atk/def/spa/spd/spe,
+/// matching PS's `bestStat` (first max in that order).
+fn proto_stat(p: &crate::state::Pokemon) -> crate::ids::StatIndex {
+    use crate::ids::StatIndex::*;
+    let candidates = [Attack, Defense, SpecialAttack, SpecialDefense, Speed];
+    let mut best = Attack;
+    let mut best_val = i16::MIN;
+    for c in candidates {
+        let v = p.stat(c);
+        if v > best_val {
+            best_val = v;
+            best = c;
+        }
+    }
+    best
+}
+
+/// The battle is over once either side has no living Pokémon; PS then stops the turn
+/// before end-of-turn residuals.
+fn battle_over(state: &State) -> bool {
+    [SideId::One, SideId::Two].into_iter().any(|side| {
+        !state.side(side).pokemon.iter().any(|p| p.species != crate::ids::Species::None && p.is_alive())
+    })
+}
+
+/// Is the active Pokémon grounded (subject to Spikes / Toxic Spikes / Sticky Web)?
+fn is_grounded(state: &State, side: SideId) -> bool {
+    let p = state.side(side).active();
+    !(p.types.contains(&Type::Flying))
+}
+
+/// Public entry point. `s1`/`s2` are side one's and side two's chosen actions.
+pub fn generate_instructions(state: &State, s1: MoveChoice, s2: MoveChoice) -> Vec<StateInstructions> {
+    generate_instructions_ex(state, s1, s2, [None, None])
+}
+
+/// Like [`generate_instructions`], but `pivot` gives each side's switch-in target for a
+/// pivot move (U-turn): when that move connects and the user survives, it switches out
+/// mid-turn — so a faster pivot's switch happens *before* the opponent's move. Used by
+/// the differential harness, which knows the recorded replacement target.
+pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2]) -> Vec<StateInstructions> {
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    let mut branches = vec![start];
+
+    // 1) Switches resolve before moves (deterministic).
+    for (side, choice) in [(SideId::One, s1), (SideId::Two, s2)] {
+        if let MoveChoice::Switch(target) = choice {
+            for b in &mut branches {
+                apply_switch(b, side, target);
+            }
+        }
+    }
+
+    // 2) Moves, ordered by priority then effective speed (speed ties branch 50/50).
+    let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0]), (SideId::Two, s2, pivot[1])]
+        .into_iter()
+        .filter_map(|(side, c, pv)| match c {
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv }),
+            MoveChoice::Switch(_) => None,
+        })
+        .collect();
+
+    branches = resolve_moves(branches, &move_actions);
+
+    // 3) End-of-turn residuals (deterministic) — skipped if the battle has ended (a side
+    //    has no living Pokémon), matching PS, which stops the turn on a win.
+    for b in &mut branches {
+        if !battle_over(&b.state) {
+            apply_end_of_turn(b);
+        }
+    }
+
+    branches
+        .into_iter()
+        .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
+        .collect()
+}
+
+/// Apply a (forced) switch-in directly to `state`: reset the outgoing active's boosts
+/// and volatiles, change the active slot, and apply entry hazards. Used by the
+/// differential harness to apply post-faint replacement switches.
+pub fn switch_into(state: &mut State, side: SideId, target: u8) {
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    apply_switch(&mut b, side, target);
+    *state = b.state;
+}
+
+/// Push an instruction onto a branch and apply it to that branch's state.
+fn push(b: &mut Branch, ins: Instruction) {
+    b.state.apply_one(ins);
+    b.ins.push(ins);
+}
+
+// --- switching ---------------------------------------------------------------
+
+fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
+    let s = b.state.side(side);
+    let previous = s.active_index;
+    if previous == target {
+        return;
+    }
+    // Reset the outgoing active's boosts and volatiles (emit explicit deltas so the
+    // instruction list stays exactly reversible).
+    for stat in [
+        BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+        BoostIndex::SpecialDefense, BoostIndex::Speed, BoostIndex::Accuracy, BoostIndex::Evasion,
+    ] {
+        let cur = b.state.side(side).boost(stat);
+        if cur != 0 {
+            push(b, Instruction::Boost { side, stat, amount: -cur });
+        }
+    }
+    let vols = b.state.side(side).volatiles;
+    for v in ALL_VOLATILES {
+        if vols.contains(*v) {
+            push(b, Instruction::RemoveVolatile { side, volatile: *v });
+        }
+    }
+    push(b, Instruction::Switch { side, previous, next: target });
+
+    apply_entry_hazards(b, side);
+    apply_switch_in_ability(b, side);
+}
+
+/// On-switch-in ability effects (weather setters and Intimidate).
+fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
+    use crate::ids::Ability::*;
+    let ability = b.state.side(side).active().ability;
+    let weather = match ability {
+        Drought => Weather::Sun,
+        Drizzle => Weather::Rain,
+        SandStream => Weather::Sand,
+        SnowWarning => Weather::Snow,
+        _ => Weather::None,
+    };
+    if weather != Weather::None && b.state.weather != weather {
+        set_weather(b, weather, 5);
+    }
+    // Intimidate: lower the opposing active's Attack by 1 on switch-in.
+    if ability == IntimidateAbility {
+        let foe = side.other();
+        if b.state.side(foe).active().is_alive() {
+            apply_boost_clamped(b, foe, BoostIndex::Attack, -1);
+        }
+    }
+}
+
+/// Apply the switching side's own hazards to the incoming Pokémon.
+fn apply_entry_hazards(b: &mut Branch, side: SideId) {
+    let s = b.state.side(side);
+    let p = s.active();
+    let slot = s.active_index;
+    let maxhp = p.max_hp;
+    let grounded = is_grounded(&b.state, side);
+
+    // Stealth Rock — hits everything, scaled by Rock effectiveness.
+    if s.side_conditions.stealth_rock {
+        let mult = type_multiplier(Type::Rock, p.types);
+        let dmg = ((maxhp as f32 / 8.0) * mult).floor() as i16;
+        let dmg = dmg.max(1).min(p.hp);
+        if dmg > 0 {
+            push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+    }
+    // Spikes — grounded only.
+    let layers = b.state.side(side).side_conditions.spikes;
+    if grounded && layers > 0 {
+        let frac = match layers { 1 => 8, 2 => 6, _ => 4 };
+        let p = b.state.side(side).active();
+        let dmg = (p.max_hp / frac).max(1).min(p.hp);
+        if dmg > 0 {
+            push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+    }
+}
+
+// --- moves -------------------------------------------------------------------
+
+/// A move action: which side, which move slot, and (for a pivot move) the switch-in
+/// target to use after it connects.
+#[derive(Clone, Copy)]
+struct Action {
+    side: SideId,
+    move_idx: u8,
+    pivot: Option<u8>,
+}
+
+fn resolve_moves(branches: Vec<Branch>, actions: &[Action]) -> Vec<Branch> {
+    let mut out = Vec::new();
+    for b in branches {
+        out.extend(resolve_moves_for_branch(b, actions));
+    }
+    out
+}
+
+fn resolve_moves_for_branch(b: Branch, actions: &[Action]) -> Vec<Branch> {
+    match actions.len() {
+        0 => vec![b],
+        1 => execute_move(b, actions[0]),
+        _ => {
+            let (a, b_act) = (actions[0], actions[1]);
+            let order = move_order(&b.state, a.side, a.move_idx, b_act.side, b_act.move_idx);
+            match order {
+                Order::First(first) => {
+                    let (f, s) = if first == a.side { (a, b_act) } else { (b_act, a) };
+                    sequence_two_moves(b, f, s)
+                }
+                Order::Tie => {
+                    // 50/50 over the two orderings.
+                    let mut res = sequence_two_moves(scaled(&b, 0.5), a, b_act);
+                    res.extend(sequence_two_moves(scaled(&b, 0.5), b_act, a));
+                    res
+                }
+            }
+        }
+    }
+}
+
+fn scaled(b: &Branch, f: f32) -> Branch {
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone() }
+}
+
+fn sequence_two_moves(b: Branch, first: Action, second: Action) -> Vec<Branch> {
+    let mut out = Vec::new();
+    for fb in execute_move(b, first) {
+        // Second mover only acts if its active is still alive.
+        if fb.state.side(second.side).active().is_alive() {
+            out.extend(execute_move(fb, second));
+        } else {
+            out.push(fb);
+        }
+    }
+    out
+}
+
+enum Order {
+    First(SideId),
+    Tie,
+}
+
+fn move_order(state: &State, sa: SideId, ma: u8, sb: SideId, mb: u8) -> Order {
+    let pa = move_data(state.side(sa).active().moves[ma as usize].id).priority;
+    let pb = move_data(state.side(sb).active().moves[mb as usize].id).priority;
+    if pa != pb {
+        return Order::First(if pa > pb { sa } else { sb });
+    }
+    let va = effective_speed(state, sa);
+    let vb = effective_speed(state, sb);
+    let faster_is_higher = !state.trick_room;
+    if va == vb {
+        Order::Tie
+    } else if (va > vb) == faster_is_higher {
+        Order::First(sa)
+    } else {
+        Order::First(sb)
+    }
+}
+
+const ALL_VOLATILES: &[VolatileStatus] = &[
+    VolatileStatus::Confusion, VolatileStatus::Substitute, VolatileStatus::LeechSeed,
+    VolatileStatus::Taunt, VolatileStatus::Encore, VolatileStatus::Disable,
+    VolatileStatus::Protect, VolatileStatus::Endure, VolatileStatus::Flinch,
+    VolatileStatus::Roost, VolatileStatus::Charge, VolatileStatus::Yawn,
+    VolatileStatus::PerishSong, VolatileStatus::DestinyBond, VolatileStatus::Curse,
+    VolatileStatus::Nightmare, VolatileStatus::Attract, VolatileStatus::Torment,
+    VolatileStatus::SaltCure, VolatileStatus::GlaiveRush, VolatileStatus::LockedMove,
+    VolatileStatus::MustRecharge, VolatileStatus::PartiallyTrapped, VolatileStatus::Roosted,
+    // Note: ChoiceLock / Protosynthesis / QuarkDrive intentionally persist through our
+    // switch reset model is N/A — they are not in this list so a switch won't clear
+    // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
+];
+
+/// Execute one move from `action.side`, returning the resulting branches.
+fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
+    let Action { side, move_idx, pivot } = action;
+    let attacker = b.state.side(side).active();
+    if !attacker.is_alive() {
+        return vec![b];
+    }
+    let move_id = attacker.moves[move_idx as usize].id;
+    let md = move_data(move_id);
+    let foe = side.other();
+
+    let mut b = b;
+    // PP decrement (every used move).
+    let slot = b.state.side(side).active_index;
+    if b.state.side(side).active().moves[move_idx as usize].pp > 0 {
+        push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount: 1 });
+    }
+
+    // Status moves handled specially.
+    if md.category == MoveCategory::Status {
+        return execute_status_move(b, side, &md);
+    }
+
+    // Damaging move: branch on accuracy (hit/miss), then crit, then the 16 rolls.
+    let mut out = Vec::new();
+    let acc = md.accuracy;
+    let (hit_prob, miss_prob) = if acc == 0 || acc >= 100 { (1.0, 0.0) } else { (acc as f32 / 100.0, 1.0 - acc as f32 / 100.0) };
+
+    if miss_prob > 0.0 {
+        out.push(scaled(&b, miss_prob)); // miss: nothing further happens
+    }
+
+    let foe_alive = b.state.side(foe).active().is_alive();
+    if !foe_alive {
+        out.push(scaled(&b, hit_prob));
+        return out;
+    }
+
+    // A type-immune move (e.g. Close Combat vs a Ghost, or Ground vs Levitate) deals no
+    // damage and skips its self-stat secondary — PS only applies `self` boosts on a hit.
+    let defender = b.state.side(foe).active();
+    let connects = crate::damage::type_multiplier(md.typ, defender.types) != 0.0
+        && !ability_immune(md.typ, defender.ability);
+    if !connects {
+        out.push(scaled(&b, hit_prob));
+        return out;
+    }
+
+    const CRIT: f32 = 1.0 / 24.0;
+    // Each hit rolls damage (16) and crit (independently) on its own. Enumerate the full
+    // product across hits so every mixed crit/roll outcome PS could produce is present.
+    let hits = md.hits.max(1) as usize;
+    for combo in HitCombos::new(hits) {
+        let mut prob = hit_prob;
+        for &(_, crit) in &combo {
+            prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
+        }
+        let mut hb = scaled(&b, prob);
+        apply_damage_hit(&mut hb, side, &md, &combo);
+        apply_damage_secondaries(&mut hb, side, &md);
+        for mut sb in apply_target_secondary(hb, side, &md) {
+            // Pivot move (U-turn): switch the user out now that it connected.
+            if let Some(t) = pivot {
+                if sb.state.side(side).active().is_alive() {
+                    apply_switch(&mut sb, side, t);
+                }
+            }
+            out.push(sb);
+        }
+    }
+    out
+}
+
+/// Iterator over all per-hit (roll 0..16, crit bool) combinations for `hits` hits.
+struct HitCombos {
+    hits: usize,
+    idx: u64,
+    total: u64,
+}
+impl HitCombos {
+    fn new(hits: usize) -> Self {
+        HitCombos { hits, idx: 0, total: 32u64.pow(hits as u32) }
+    }
+}
+impl Iterator for HitCombos {
+    type Item = Vec<(u8, bool)>;
+    fn next(&mut self) -> Option<Vec<(u8, bool)>> {
+        if self.idx >= self.total {
+            return None;
+        }
+        let mut n = self.idx;
+        let mut combo = Vec::with_capacity(self.hits);
+        for _ in 0..self.hits {
+            let per = (n % 32) as u8; // 0..32: low 4 bits = roll, bit 5 = crit
+            combo.push((per & 0x0F, per & 0x10 != 0));
+            n /= 32;
+        }
+        self.idx += 1;
+        Some(combo)
+    }
+}
+
+fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) {
+    let foe = side.other();
+    let attacker = b.state.side(side).active();
+    let defender = b.state.side(foe).active();
+
+    // Choose offensive / defensive stats (Body Press uses Defense to attack).
+    let atk_idx = if md.uses_defense_as_attack {
+        crate::ids::StatIndex::Defense
+    } else if md.category == MoveCategory::Physical {
+        crate::ids::StatIndex::Attack
+    } else {
+        crate::ids::StatIndex::SpecialAttack
+    };
+    let atk_boost_idx = match atk_idx {
+        crate::ids::StatIndex::Defense => BoostIndex::Defense,
+        crate::ids::StatIndex::SpecialAttack => BoostIndex::SpecialAttack,
+        _ => BoostIndex::Attack,
+    };
+    let (def_idx, def_boost_idx) = if md.category == MoveCategory::Physical {
+        (crate::ids::StatIndex::Defense, BoostIndex::Defense)
+    } else {
+        (crate::ids::StatIndex::SpecialDefense, BoostIndex::SpecialDefense)
+    };
+
+    let mut atk_stat = (attacker.stat(atk_idx) as f32 * boost_multiplier(b.state.side(side).boost(atk_boost_idx))) as i64;
+    let mut def_stat = (defender.stat(def_idx) as f32 * boost_multiplier(b.state.side(foe).boost(def_boost_idx))) as i64;
+
+    // Item stat modifiers (PS applies these via `modify`, round-half-up).
+    match (attacker.item, md.category) {
+        (Item::ChoiceBand, MoveCategory::Physical) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        (Item::ChoiceSpecs, MoveCategory::Special) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        _ => {}
+    }
+    if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
+        def_stat = crate::damage::modify(def_stat, 3, 2);
+    }
+    // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
+    // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
+    if defender.ability == crate::ids::Ability::PurifyingSalt && md.typ == Type::Ghost {
+        atk_stat = crate::damage::modify(atk_stat, 1, 2);
+    }
+    // Supreme Overlord: +10% to the offensive stat per fallen ally (max 5).
+    if attacker.ability == crate::ids::Ability::SupremeOverlord {
+        let fallen = b.state.side(side).pokemon.iter()
+            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
+            .count()
+            .min(5) as i64;
+        if fallen > 0 {
+            atk_stat = crate::damage::modify(atk_stat, 10 + fallen, 10);
+        }
+    }
+    // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
+    // chainModify([5325, 4096]) — modifier 5325, NOT 13/10 (which rounds to 5324).
+    //
+    // Offensive modifiers run on the *category* stat event (ModifyAtk for physical,
+    // ModifySpA for special) regardless of `overrideOffensiveStat` — so Body Press
+    // (physical, reads Defense) is boosted by an 'atk' best-stat. We therefore compare
+    // proto_stat to the category offensive stat, not the stat actually read.
+    let category_off_stat = if md.category == MoveCategory::Physical {
+        crate::ids::StatIndex::Attack
+    } else {
+        crate::ids::StatIndex::SpecialAttack
+    };
+    if has_proto(b.state.side(side)) && proto_stat(attacker) == category_off_stat {
+        atk_stat = crate::damage::modify(atk_stat, 5325, 4096);
+    }
+    if has_proto(b.state.side(foe)) && proto_stat(defender) == def_idx {
+        def_stat = crate::damage::modify(def_stat, 5325, 4096);
+    }
+    // Weather defensive boosts: Sandstorm ×1.5 SpD for Rock types, Snow ×1.5 Def for Ice.
+    if b.state.weather == Weather::Sand
+        && def_idx == crate::ids::StatIndex::SpecialDefense
+        && defender.types.contains(&Type::Rock)
+    {
+        def_stat = crate::damage::modify(def_stat, 3, 2);
+    }
+    if b.state.weather == Weather::Snow
+        && def_idx == crate::ids::StatIndex::Defense
+        && defender.types.contains(&Type::Ice)
+    {
+        def_stat = crate::damage::modify(def_stat, 3, 2);
+    }
+    // Offensive ability multipliers.
+    use crate::ids::Ability as Ab;
+    match attacker.ability {
+        Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
+        Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Technician if md.base_power <= 60 => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        _ => {}
+    }
+    // Thick Fat (defender) halves the attack of Fire/Ice moves.
+    if defender.ability == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
+        atk_stat = crate::damage::modify(atk_stat, 1, 2);
+    }
+    // Guts ignores the burn attack drop.
+    let burned = attacker.status == Status::Burn && attacker.ability != Ab::Guts;
+
+    // Final defender-side damage modifiers (stack multiplicatively).
+    let (mut fnum, mut fden) = (1i64, 1i64);
+    if matches!(defender.ability, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
+        fden *= 2;
+    }
+    let type_mult = crate::damage::type_multiplier(md.typ, defender.types);
+    if matches!(defender.ability, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
+        fnum *= 3072;
+        fden *= 4096;
+    }
+    if defender.ability == Ab::IceScales && md.category == MoveCategory::Special {
+        fden *= 2;
+    }
+    let adaptability = attacker.ability == Ab::Adaptability;
+    let def_ability = defender.ability;
+    let def_maxhp = defender.max_hp;
+    let life_orb = attacker.item == Item::LifeOrb;
+
+    let input = DamageInput {
+        level: attacker.level,
+        base_power: md.base_power,
+        category: md.category,
+        move_type: md.typ,
+        attacker_types: attacker.types,
+        defender_types: defender.types,
+        attack_stat: atk_stat as i16,
+        defense_stat: def_stat.max(1) as i16,
+        is_crit: false,
+        attacker_burned: burned,
+        weather: b.state.weather,
+        terastallized: attacker.terastallized,
+        tera_type: attacker.tera_type,
+        life_orb,
+        adaptability,
+        final_num: fnum,
+        final_den: fden,
+    };
+    let rolls_nocrit = damage_rolls(&input);
+    let mut input_crit = input;
+    input_crit.is_crit = true;
+    let rolls_crit = damage_rolls(&input_crit);
+
+    // Apply each hit's damage independently (own roll and crit), clamped to current HP
+    // (a hit that faints the target ends the sequence; remaining hits add nothing).
+    let mut any_damage = false;
+    let mut total_dealt: i32 = 0;
+    for &(roll, crit) in hits {
+        let target_hp = b.state.side(foe).active().hp;
+        if target_hp <= 0 {
+            break;
+        }
+        let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
+        let mut dmg = (rolls[roll as usize]).min(target_hp);
+        // Sturdy: survive a would-be KO from full HP at 1 HP.
+        if def_ability == Ab::Sturdy && target_hp == def_maxhp && dmg >= target_hp {
+            dmg = target_hp - 1;
+        }
+        if dmg > 0 {
+            let slot = b.state.side(foe).active_index;
+            push(b, Instruction::Damage { side: foe, slot, amount: dmg });
+            any_damage = true;
+            total_dealt += dmg as i32;
+        }
+    }
+    if any_damage {
+        let aslot = b.state.side(side).active_index;
+        // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt.
+        if md.drain.0 > 0 {
+            let atk = b.state.side(side).active();
+            let heal = round_div(total_dealt * md.drain.0 as i32, md.drain.1 as i32) as i16;
+            let heal = heal.min(atk.max_hp - atk.hp);
+            if heal > 0 && atk.is_alive() {
+                push(b, Instruction::Heal { side, slot: aslot, amount: heal });
+            }
+        }
+        // Move recoil (Brave Bird, Flare Blitz): self-damage a fraction of damage dealt.
+        if md.recoil.0 > 0 {
+            let atk = b.state.side(side).active();
+            if atk.is_alive() {
+                let rec = (round_div(total_dealt * md.recoil.0 as i32, md.recoil.1 as i32) as i16).max(1).min(atk.hp);
+                push(b, Instruction::Damage { side, slot: aslot, amount: rec });
+            }
+        }
+        // Life Orb recoil: 10% of the attacker's max HP, once after a damaging move.
+        if life_orb {
+            let atk = b.state.side(side).active();
+            if atk.is_alive() {
+                let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
+                push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
+            }
+        }
+    }
+
+    // Toxic Debris: a physical hit on the holder scatters a Toxic Spikes layer onto the
+    // attacker's side (up to 2).
+    if md.category == MoveCategory::Physical
+        && b.state.side(foe).active().ability == crate::ids::Ability::ToxicDebris
+    {
+        let cur = b.state.side(side).side_conditions.toxic_spikes;
+        if cur < 2 {
+            push(b, Instruction::SetSideCondition {
+                side,
+                condition: SideConditionId::ToxicSpikes,
+                previous: cur,
+                new: cur + 1,
+            });
+        }
+    }
+}
+
+/// Stat indices in `BoostIndex` order, for iterating a `[i8; 7]` boost array.
+const BOOST_ORDER: [BoostIndex; BoostIndex::COUNT] = [
+    BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+    BoostIndex::SpecialDefense, BoostIndex::Speed, BoostIndex::Accuracy, BoostIndex::Evasion,
+];
+
+/// Whether `status` can be inflicted on `p` right now (status-free + type immunity).
+fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
+    if p.status != Status::None || !p.is_alive() {
+        return false;
+    }
+    match status {
+        Status::Burn => !p.types.contains(&Type::Fire),
+        Status::Paralysis => !p.types.contains(&Type::Electric),
+        Status::Poison | Status::Toxic => !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel)),
+        _ => true,
+    }
+}
+
+/// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
+/// the ±6 clamp.
+fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) {
+    if delta < 0 && b.state.side(target).active().ability == crate::ids::Ability::ClearBody {
+        return;
+    }
+    let cur = b.state.side(target).boost(stat);
+    let eff = (cur + delta).clamp(-6, 6) - cur;
+    if eff != 0 {
+        push(b, Instruction::Boost { side: target, stat, amount: eff });
+    }
+}
+
+/// Split a hit branch on a move's chance-based target secondary (proc vs no-proc).
+fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    if md.secondary_chance == 0 {
+        return vec![b];
+    }
+    let foe = side.other();
+    if !b.state.side(foe).active().is_alive() {
+        return vec![b];
+    }
+    let chance = md.secondary_chance as f32 / 100.0;
+    let mut proc = scaled(&b, chance);
+    let noproc = scaled(&b, 1.0 - chance);
+    for (i, &delta) in md.secondary_boosts.iter().enumerate() {
+        if delta != 0 {
+            apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta);
+        }
+    }
+    if md.secondary_status != Status::None && status_applies(proc.state.side(foe).active(), md.secondary_status) {
+        let slot = proc.state.side(foe).active_index;
+        push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
+    }
+    vec![proc, noproc]
+}
+
+/// A damaging move's deterministic on-hit effects: user self-boosts and any target
+/// volatile (Salt Cure, etc.).
+fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    for (i, &delta) in md.self_boosts.iter().enumerate() {
+        if delta != 0 {
+            // Self-boosts ignore Clear Body (which only blocks foe-induced drops).
+            let cur = b.state.side(side).boost(BOOST_ORDER[i]);
+            let eff = (cur + delta).clamp(-6, 6) - cur;
+            if eff != 0 {
+                push(b, Instruction::Boost { side, stat: BOOST_ORDER[i], amount: eff });
+            }
+        }
+    }
+    if let Some(v) = md.target_volatile {
+        let foe = side.other();
+        if !b.state.side(foe).volatiles.contains(v) {
+            push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
+        }
+    }
+}
+
+/// Execute a status move from its data: self-heal, hazard, and/or target status, with an
+/// accuracy hit/miss branch when the move can miss.
+fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    let foe = side.other();
+    let (hit_prob, miss_prob) = if md.accuracy == 0 || md.accuracy >= 100 {
+        (1.0, 0.0)
+    } else {
+        (md.accuracy as f32 / 100.0, 1.0 - md.accuracy as f32 / 100.0)
+    };
+    let mut hit = scaled(&b, hit_prob);
+
+    if md.heal.0 > 0 {
+        let p = hit.state.side(side).active();
+        let amount = ((p.max_hp as i32 * md.heal.0 as i32 / md.heal.1 as i32) as i16).min(p.max_hp - p.hp);
+        if amount > 0 {
+            let slot = hit.state.side(side).active_index;
+            push(&mut hit, Instruction::Heal { side, slot, amount });
+        }
+    }
+    // Self-boosts (Swords Dance, Dragon Dance, ...).
+    for (i, &delta) in md.self_boosts.iter().enumerate() {
+        if delta != 0 {
+            let cur = hit.state.side(side).boost(BOOST_ORDER[i]);
+            let eff = (cur + delta).clamp(-6, 6) - cur;
+            if eff != 0 {
+                push(&mut hit, Instruction::Boost { side, stat: BOOST_ORDER[i], amount: eff });
+            }
+        }
+    }
+    // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
+    if hit.state.side(foe).active().is_alive() {
+        for (i, &delta) in md.target_boosts.iter().enumerate() {
+            if delta != 0 {
+                apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta);
+            }
+        }
+    }
+    if let Some(sc) = md.side_condition {
+        apply_hazard(&mut hit, foe, sc);
+    }
+    if md.weather != Weather::None && hit.state.weather != md.weather {
+        set_weather(&mut hit, md.weather, 5);
+    }
+    if md.status != Status::None && status_applies(hit.state.side(foe).active(), md.status) {
+        let slot = hit.state.side(foe).active_index;
+        push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
+    }
+
+    if miss_prob > 0.0 {
+        vec![hit, scaled(&b, miss_prob)]
+    } else {
+        vec![hit]
+    }
+}
+
+/// Set the field weather (and its duration).
+fn set_weather(b: &mut Branch, weather: Weather, turns: i8) {
+    push(b, Instruction::ChangeWeather {
+        previous: b.state.weather,
+        previous_turns: b.state.weather_turns,
+        new: weather,
+        new_turns: turns,
+    });
+}
+
+/// Set or increment a hazard on `target`'s side (capped at its max layers).
+fn apply_hazard(b: &mut Branch, target: SideId, sc: SideConditionId) {
+    let conds = &b.state.side(target).side_conditions;
+    let (cur, max) = match sc {
+        SideConditionId::StealthRock => (conds.stealth_rock as u8, 1),
+        SideConditionId::Spikes => (conds.spikes, 3),
+        SideConditionId::ToxicSpikes => (conds.toxic_spikes, 2),
+        SideConditionId::StickyWeb => (conds.sticky_web as u8, 1),
+        _ => (1, 1),
+    };
+    if cur < max {
+        push(b, Instruction::SetSideCondition { side: target, condition: sc, previous: cur, new: cur + 1 });
+    }
+}
+
+// --- end of turn -------------------------------------------------------------
+
+fn apply_end_of_turn(b: &mut Branch) {
+    // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
+    // (PS uses a finer speed-ordered residual queue; this covers the common cases.)
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let maxhp = p.max_hp;
+
+        // Sandstorm chip.
+        if b.state.weather == Weather::Sand {
+            let immune = p.types.contains(&Type::Rock)
+                || p.types.contains(&Type::Ground)
+                || p.types.contains(&Type::Steel);
+            if !immune {
+                let dmg = (maxhp / 16).max(1).min(b.state.side(side).active().hp);
+                if dmg > 0 {
+                    push(b, Instruction::Damage { side, slot, amount: dmg });
+                }
+            }
+        }
+
+        // Leftovers.
+        let p = b.state.side(side).active();
+        if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() {
+            let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+            push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+
+        // Status residual.
+        let p = b.state.side(side).active();
+        if p.is_alive() {
+            match p.status {
+                Status::Burn | Status::Poison => {
+                    let frac = if p.status == Status::Burn { 16 } else { 8 };
+                    let dmg = (maxhp / frac).max(1).min(p.hp);
+                    push(b, Instruction::Damage { side, slot, amount: dmg });
+                }
+                Status::Toxic => {
+                    let stage = (b.state.side(side).active().status_counter as i16 + 1).max(1);
+                    let dmg = ((maxhp / 16) * stage).max(1).min(b.state.side(side).active().hp);
+                    push(b, Instruction::Damage { side, slot, amount: dmg });
+                    push(b, Instruction::ChangeStatusCounter { side, slot, previous: stage as u8 - 1, new: stage as u8 });
+                }
+                _ => {}
+            }
+        }
+
+        // Salt Cure.
+        let p = b.state.side(side).active();
+        if p.is_alive() && b.state.side(side).volatiles.contains(VolatileStatus::SaltCure) {
+            let heavy = p.types.contains(&Type::Water) || p.types.contains(&Type::Steel);
+            let frac = if heavy { 4 } else { 8 };
+            let dmg = (maxhp / frac).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+    }
+}
