@@ -63,6 +63,14 @@ pub fn boost_multiplier(stage: i8) -> f32 {
     }
 }
 
+/// Apply a stat-stage boost to a stat with PS-exact integer math: `floor(stat · num / den)`,
+/// where a positive stage is `(2+n)/2` and a negative stage is `2/(2−n)`. Avoids the ±1
+/// errors a float multiply-then-truncate can introduce at negative stages.
+pub fn boosted_stat(stat: i64, stage: i8) -> i64 {
+    let (num, den) = if stage >= 0 { (2 + stage as i64, 2) } else { (2, 2 - stage as i64) };
+    stat * num / den
+}
+
 /// Effective speed including boost, paralysis, Choice Scarf, Tailwind and a Speed-based
 /// Protosynthesis / Quark Drive boost.
 fn effective_speed(state: &State, side: SideId) -> i32 {
@@ -725,8 +733,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Unaware ignores the attacker's offensive boosts.
     let atk_boost = if def_ab == Ab::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
     let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
-    let mut atk_stat = (attacker.stat(atk_idx) as f32 * boost_multiplier(atk_boost)) as i64;
-    let mut def_stat = (defender.stat(def_idx) as f32 * boost_multiplier(def_boost)) as i64;
+    let mut atk_stat = boosted_stat(attacker.stat(atk_idx) as i64, atk_boost);
+    let mut def_stat = boosted_stat(defender.stat(def_idx) as i64, def_boost);
 
     // Item stat modifiers (PS applies these via `modify`, round-half-up).
     match (attacker.item, md.category) {
