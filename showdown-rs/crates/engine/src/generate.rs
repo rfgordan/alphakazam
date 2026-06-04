@@ -517,10 +517,17 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // A type-immune move (e.g. Close Combat vs a Ghost, or Ground vs Levitate) deals no
     // damage and skips its self-stat secondary — PS only applies `self` boosts on a hit.
     let defender = b.state.side(foe).active();
-    let flag_immune = (md.flag_sound && defender.ability == crate::ids::Ability::Soundproof)
-        || (md.flag_bullet && defender.ability == crate::ids::Ability::Bulletproof);
+    // Mold Breaker also bypasses the defender's immunity abilities (Levitate, absorbs,
+    // Soundproof, Bulletproof) — treat the ability as None for the immunity check.
+    let def_ab = if b.state.side(side).active().ability == crate::ids::Ability::MoldBreaker {
+        crate::ids::Ability::None
+    } else {
+        defender.ability
+    };
+    let flag_immune = (md.flag_sound && def_ab == crate::ids::Ability::Soundproof)
+        || (md.flag_bullet && def_ab == crate::ids::Ability::Bulletproof);
     let connects = crate::damage::type_multiplier(md.typ, defender.types) != 0.0
-        && !ability_immune(md.typ, defender.ability)
+        && !ability_immune(md.typ, def_ab)
         && !flag_immune;
     if !connects {
         out.push(scaled(&b, hit_prob));
@@ -636,9 +643,14 @@ impl Iterator for HitCombos {
 /// after application. Pure with respect to `b` (reads state, mutates nothing) so both the
 /// exact per-hit path and the sumset-DP path can call it once and share the result.
 fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> DamageCalc {
+    use crate::ids::Ability as Ab;
     let foe = side.other();
     let attacker = b.state.side(side).active();
     let defender = b.state.side(foe).active();
+    // Mold Breaker suppresses the defender's damage-affecting ability for this move; `def_ab`
+    // is the defender's ability as the damage calc should see it (None when suppressed).
+    let mb = attacker.ability == Ab::MoldBreaker;
+    let def_ab = if mb { Ab::None } else { defender.ability };
 
     // Choose offensive / defensive stats (Body Press uses Defense to attack).
     let atk_idx = if md.uses_defense_as_attack {
@@ -661,7 +673,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 
     // Unaware: the attacker ignores the defender's defensive boosts, and a defender with
     // Unaware ignores the attacker's offensive boosts.
-    let atk_boost = if defender.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
+    let atk_boost = if def_ab == Ab::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
     let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
     let mut atk_stat = (attacker.stat(atk_idx) as f32 * boost_multiplier(atk_boost)) as i64;
     let mut def_stat = (defender.stat(def_idx) as f32 * boost_multiplier(def_boost)) as i64;
@@ -681,7 +693,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     }
     // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
     // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
-    if defender.ability == crate::ids::Ability::PurifyingSalt && md.typ == Type::Ghost {
+    if def_ab == Ab::PurifyingSalt && md.typ == Type::Ghost {
         atk_stat = crate::damage::modify(atk_stat, 1, 2);
     }
     // Supreme Overlord: +10% to the offensive stat per fallen ally (max 5).
@@ -726,7 +738,6 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         def_stat = crate::damage::modify(def_stat, 3, 2);
     }
     // Offensive ability multipliers.
-    use crate::ids::Ability as Ab;
     let pinch = (attacker.hp as i32) * 3 <= attacker.max_hp as i32; // HP ≤ 1/3
     match attacker.ability {
         Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
@@ -750,14 +761,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         _ => {}
     }
     // Thick Fat (defender) halves the attack of Fire/Ice moves.
-    if defender.ability == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
+    if def_ab == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
         atk_stat = crate::damage::modify(atk_stat, 1, 2);
     }
     // Marvel Scale / Fur Coat (defender) raise physical Defense.
     if md.category == MoveCategory::Physical && def_idx == crate::ids::StatIndex::Defense {
-        if defender.ability == Ab::FurCoat {
+        if def_ab == Ab::FurCoat {
             def_stat = crate::damage::modify(def_stat, 2, 1);
-        } else if defender.ability == Ab::MarvelScale && defender.status != Status::None {
+        } else if def_ab == Ab::MarvelScale && defender.status != Status::None {
             def_stat = crate::damage::modify(def_stat, 3, 2);
         }
     }
@@ -766,19 +777,19 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 
     // Final defender-side damage modifiers (stack multiplicatively).
     let (mut fnum, mut fden) = (1i64, 1i64);
-    if matches!(defender.ability, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
+    if matches!(def_ab, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
         fden *= 2;
     }
     let type_mult = crate::damage::type_multiplier(md.typ, defender.types);
-    if matches!(defender.ability, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
+    if matches!(def_ab, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
         fnum *= 3072;
         fden *= 4096;
     }
-    if defender.ability == Ab::IceScales && md.category == MoveCategory::Special {
+    if def_ab == Ab::IceScales && md.category == MoveCategory::Special {
         fden *= 2;
     }
     // Punk Rock halves sound-move damage taken.
-    if defender.ability == Ab::PunkRock && md.flag_sound {
+    if def_ab == Ab::PunkRock && md.flag_sound {
         fden *= 2;
     }
     // Attacker final-damage modifiers keyed on effectiveness / item.
@@ -802,7 +813,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         fden *= 4096;
     }
     let adaptability = attacker.ability == Ab::Adaptability;
-    let def_ability = defender.ability;
+    // Returned for post-damage (contact punishers); also suppressed under Mold Breaker.
+    let def_ability = def_ab;
     let def_item = defender.item;
     let def_maxhp = defender.max_hp;
     let life_orb = attacker.item == Item::LifeOrb;
