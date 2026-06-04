@@ -205,6 +205,9 @@ id_map!(Item {
     SitrusBerry => "sitrusberry",
     WhiteHerb => "whiteherb",
     WeaknessPolicy => "weaknesspolicy",
+    ToxicOrb => "toxicorb",
+    FlameOrb => "flameorb",
+    ChestoBerry => "chestoberry",
     Other => "other",
 });
 

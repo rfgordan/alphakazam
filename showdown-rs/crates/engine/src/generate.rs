@@ -1326,11 +1326,18 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     // comparison and re-projected each turn, so we only set the status + heal.
     if md.id.to_id() == "rest" {
         let mut b = b;
-        let (hp, maxhp, status) = { let p = b.state.side(side).active(); (p.hp, p.max_hp, p.status) };
+        let (hp, maxhp, status, item) = {
+            let p = b.state.side(side).active();
+            (p.hp, p.max_hp, p.status, p.item)
+        };
         if hp < maxhp {
             let slot = b.state.side(side).active_index;
-            if status != Status::Sleep {
+            // Chesto Berry immediately cures the Rest sleep, so the user stays awake.
+            if status != Status::Sleep && item != Item::ChestoBerry {
                 push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::Sleep });
+            } else if status != Status::None && item == Item::ChestoBerry {
+                // Rest first cures the prior status; Chesto then prevents the new sleep.
+                push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
             }
             push(&mut b, Instruction::Heal { side, slot, amount: maxhp - hp });
         }
@@ -1552,5 +1559,19 @@ fn apply_end_of_turn(b: &mut Branch) {
 
         // Sitrus Berry can also fire here if end-of-turn chip drops the holder to ≤ 1/2.
         apply_pinch_berry(b, side);
+
+        // Status orbs poison/burn the holder at end of turn (Toxic Orb → Toxic, Flame Orb →
+        // Burn) if it has no status yet. The status damage starts next turn.
+        let p = b.state.side(side).active();
+        if p.is_alive() {
+            let orb_status = match p.item {
+                Item::ToxicOrb => Status::Toxic,
+                Item::FlameOrb => Status::Burn,
+                _ => Status::None,
+            };
+            if orb_status != Status::None && status_applies(p, orb_status) {
+                push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
+            }
+        }
     }
 }
