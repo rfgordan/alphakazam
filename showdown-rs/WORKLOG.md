@@ -116,7 +116,33 @@ Progression (40 random games, 1105 turns), each a broad data-driven addition:
 | **Weather recovery** (Moonlight/Synthesis/Morning Sun/Shore Up) + **Rest** + **Strength Sap** — onHit-callback moves with no static `heal` field | 69.6% |
 | Prankster (+1 priority to status moves) | 69.7% |
 | **Fixed-damage moves** (Night Shade/Seismic Toss=level, Dragon Rage=40, Sonic Boom=20, Super Fang=½HP, Endeavor) | 70.0% |
-| Contrary (inverts stat changes) | **70.2%** |
+| Contrary (inverts stat changes) | **70.2%** (120-trace set) |
+
+### Goal: 100% random parity, prioritizing high-usage competitive mons
+
+Trace set widened to **220** here (seeds 1–220) for a denser signal. The big remaining
+gains came from *common end-of-turn residuals and move-execution volatiles* — not damage
+modifiers — found by diagnosis (worst-trace / first-mismatch surveys) and by reasoning
+about which mechanics touch a turn every time they're up.
+
+| Added | Random match rate (220-trace set) |
+|---|---|
+| White Herb / Weakness Policy; contact-status (Flame Body/Static/Poison Point/Poison Touch) | 70.6% |
+| Toxic Orb/Flame Orb (EoT self-status) + Chesto Berry | 71.1% |
+| **Poison Heal + Magic Guard** (EoT residual; Gliscor/Clefable) | 73.6% |
+| **Terrain** damage ×1.3 + Grassy Terrain EoT heal | 74.0% |
+| **Screens** (Reflect/Light Screen/Aurora Veil, non-crit ½) + Infiltrator | 74.3% |
+| Eviolite, Defiant/Competitive/Moxie, Justified, Liquid Ooze, Natural Cure, Lum Berry, Mold Breaker, type-boost abilities (Water Bubble/Transistor/…), Regenerator | 74.5–74.8% |
+| **Forced-switch drag fan-out** (replay enumerates random drag targets — harness never logged them) | 74.8% |
+| **Flinch** (Iron Head/Rock Slide/Fake Out/…, sequence-skip) + Inner Focus | 75.3% |
+| **Leech Seed** EoT drain | **76.0%** |
+
+Methodology that worked: (1) **callback-implemented moves** carry no static data fields
+(weather recovery, Rest, Strength Sap, fixed-damage) → hand-code by move id; (2)
+**every-turn residuals** (Poison Heal, Leech Seed, Magic Guard, terrain/Grassy heal) and
+**move-execution volatiles** (flinch) each touch many turns → high leverage; (3) the
+**worst-trace survey** finds a single mechanic dominating one battle (e.g. Gliscor Poison
+Heal); (4) some gaps are **harness-side** (forced drags weren't logged → enumerate them).
 
 > **Crash fix** this stretch: Population Bomb (`multihit: 10`) drove the per-hit outcome
 > enumeration to 32¹⁰ branches (~1 EB) and OOM-froze the machine. Multi-hit now uses a
