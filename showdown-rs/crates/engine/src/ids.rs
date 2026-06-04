@@ -271,6 +271,12 @@ pub enum Ability {
     Scrappy,
     // Suppresses the opponent's berries
     Unnerve,
+    // Switch-in boosts
+    IntrepidSword,
+    DauntlessShield,
+    Download,
+    // KO boosts highest stat
+    BeastBoost,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

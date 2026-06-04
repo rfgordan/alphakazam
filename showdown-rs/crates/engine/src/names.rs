@@ -211,6 +211,10 @@ id_map!(Ability {
     RockHead => "rockhead",
     Scrappy => "scrappy",
     Unnerve => "unnerve",
+    IntrepidSword => "intrepidsword",
+    DauntlessShield => "dauntlessshield",
+    Download => "download",
+    BeastBoost => "beastboost",
 });
 
 id_map!(Item {

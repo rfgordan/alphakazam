@@ -282,6 +282,23 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             }
         }
     }
+    // Intrepid Sword (Zacian) / Dauntless Shield (Zamazenta): +1 Atk / +1 Def on switch-in.
+    if ability == IntrepidSword {
+        raise_boost(b, side, BoostIndex::Attack, 1);
+    }
+    if ability == DauntlessShield {
+        raise_boost(b, side, BoostIndex::Defense, 1);
+    }
+    // Download: +1 Atk if the foe's Defense ≤ Special Defense, else +1 SpA.
+    if ability == Download {
+        let foe = side.other();
+        if b.state.side(foe).active().is_alive() {
+            let f = b.state.side(foe).active();
+            let (def, spd) = (f.stat(crate::ids::StatIndex::Defense), f.stat(crate::ids::StatIndex::SpecialDefense));
+            let stat = if def <= spd { BoostIndex::Attack } else { BoostIndex::SpecialAttack };
+            raise_boost(b, side, stat, 1);
+        }
+    }
 }
 
 /// Apply the switching side's own hazards to the incoming Pokémon.
@@ -1175,6 +1192,22 @@ fn apply_post_damage(
         && b.state.side(side).active().is_alive()
     {
         raise_boost(b, side, BoostIndex::Attack, 1);
+    }
+
+    // Beast Boost: a KO raises the attacker's highest stat by 1.
+    if any_damage
+        && !b.state.side(foe).active().is_alive()
+        && b.state.side(side).active().ability == Ab::BeastBoost
+        && b.state.side(side).active().is_alive()
+    {
+        let stat = match proto_stat(b.state.side(side).active()) {
+            crate::ids::StatIndex::Attack => BoostIndex::Attack,
+            crate::ids::StatIndex::Defense => BoostIndex::Defense,
+            crate::ids::StatIndex::SpecialAttack => BoostIndex::SpecialAttack,
+            crate::ids::StatIndex::SpecialDefense => BoostIndex::SpecialDefense,
+            _ => BoostIndex::Speed,
+        };
+        raise_boost(b, side, stat, 1);
     }
 
     // Aftermath: if a contact move knocks out the holder, the attacker loses 1/4 max HP.
