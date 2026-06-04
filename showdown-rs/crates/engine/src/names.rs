@@ -180,6 +180,10 @@ id_map!(Ability {
     Moxie => "moxie",
     Prankster => "prankster",
     Contrary => "contrary",
+    FlameBody => "flamebody",
+    Static => "static",
+    PoisonPoint => "poisonpoint",
+    PoisonTouch => "poisontouch",
 });
 
 id_map!(Item {

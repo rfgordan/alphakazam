@@ -564,8 +564,16 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
         apply_pinch_berry(&mut hb, foe);
         apply_pinch_berry(&mut hb, side);
-        // A Substitute blocks the target's own secondaries (boosts/status).
-        let branches = if hit_sub { vec![hb] } else { apply_target_secondary(hb, side, &md) };
+        // A Substitute blocks the target's own secondaries (boosts/status) and contact
+        // abilities; otherwise split on the move's secondary, then the contact-status ability.
+        let branches = if hit_sub {
+            vec![hb]
+        } else {
+            apply_target_secondary(hb, side, &md)
+                .into_iter()
+                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .collect::<Vec<_>>()
+        };
         for mut sb in branches {
             // Pivot move (U-turn): switch the user out now that it connected.
             if let Some(t) = pivot {
@@ -1158,6 +1166,34 @@ fn react_to_stat_drop(b: &mut Branch, target: SideId) {
         Ab::Competitive => raise_boost(b, target, BoostIndex::SpecialAttack, 2),
         _ => {}
     }
+}
+
+/// Split a contact hit on a contact-triggered status ability (30%): the defender's Flame
+/// Body / Static / Poison Point statuses the attacker, or the attacker's Poison Touch
+/// poisons the target. Only one (the first applicable) is modeled; no-op off contact.
+fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    use crate::ids::Ability as Ab;
+    if !md.flag_contact {
+        return vec![b];
+    }
+    let foe = side.other();
+    let def_ab = b.state.side(foe).active().ability;
+    let (target, status) = match def_ab {
+        Ab::FlameBody => (side, Status::Burn),
+        Ab::Static => (side, Status::Paralysis),
+        Ab::PoisonPoint => (side, Status::Poison),
+        _ if b.state.side(side).active().ability == Ab::PoisonTouch => (foe, Status::Poison),
+        _ => return vec![b],
+    };
+    if !status_applies(b.state.side(target).active(), status) {
+        return vec![b];
+    }
+    let chance = 0.30;
+    let mut proc = scaled(&b, chance);
+    let noproc = scaled(&b, 1.0 - chance);
+    let slot = proc.state.side(target).active_index;
+    push(&mut proc, Instruction::ChangeStatus { side: target, slot, previous: Status::None, new: status });
+    vec![proc, noproc]
 }
 
 /// Split a hit branch on a move's chance-based target secondary (proc vs no-proc).

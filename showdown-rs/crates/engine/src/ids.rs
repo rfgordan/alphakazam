@@ -222,6 +222,12 @@ pub enum Ability {
     Prankster,
     // Inverts stat-stage changes on the holder
     Contrary,
+    // Contact-triggered status (30%): defender burns/paralyzes/poisons the attacker
+    FlameBody,
+    Static,
+    PoisonPoint,
+    // Attacker poisons the target on contact (30%)
+    PoisonTouch,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
