@@ -519,7 +519,10 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let defender = b.state.side(foe).active();
     // Mold Breaker also bypasses the defender's immunity abilities (Levitate, absorbs,
     // Soundproof, Bulletproof) — treat the ability as None for the immunity check.
-    let def_ab = if b.state.side(side).active().ability == crate::ids::Ability::MoldBreaker {
+    let def_ab = if matches!(
+        b.state.side(side).active().ability,
+        crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+    ) {
         crate::ids::Ability::None
     } else {
         defender.ability
@@ -583,6 +586,8 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
         apply_weakness_policy(&mut hb, foe, &md);
         apply_justified(&mut hb, foe, &md);
+        apply_weak_armor(&mut hb, foe, &md);
+        apply_throat_spray(&mut hb, side, &md);
         apply_white_herb(&mut hb, side);
         // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
         apply_pinch_berry(&mut hb, foe);
@@ -649,7 +654,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let defender = b.state.side(foe).active();
     // Mold Breaker suppresses the defender's damage-affecting ability for this move; `def_ab`
     // is the defender's ability as the damage calc should see it (None when suppressed).
-    let mb = attacker.ability == Ab::MoldBreaker;
+    let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
     let def_ab = if mb { Ab::None } else { defender.ability };
 
     // Choose offensive / defensive stats (Body Press uses Defense to attack).
@@ -1046,6 +1051,20 @@ fn apply_post_damage(
         raise_boost(b, side, BoostIndex::Attack, 1);
     }
 
+    // Aftermath: if a contact move knocks out the holder, the attacker loses 1/4 max HP.
+    if any_damage
+        && !hit_sub
+        && md.flag_contact
+        && def_ability == Ab::Aftermath
+        && !b.state.side(foe).active().is_alive()
+        && b.state.side(side).active().is_alive()
+    {
+        let aslot = b.state.side(side).active_index;
+        let atk = b.state.side(side).active();
+        let dmg = (atk.max_hp / 4).max(1).min(atk.hp);
+        push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+    }
+
     // Toxic Debris: a physical hit on the holder scatters a Toxic Spikes layer onto the
     // attacker's side (up to 2).
     if md.category == MoveCategory::Physical
@@ -1101,6 +1120,22 @@ fn apply_justified(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
         && md.category != MoveCategory::Status
     {
         raise_boost(b, foe, BoostIndex::Attack, 1);
+    }
+}
+
+/// Weak Armor: when the holder is hit by a physical move, −1 Def and +2 Spe.
+fn apply_weak_armor(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    let d = b.state.side(foe).active();
+    if d.is_alive() && d.ability == crate::ids::Ability::WeakArmor && md.category == MoveCategory::Physical {
+        raise_boost(b, foe, BoostIndex::Defense, -1);
+        raise_boost(b, foe, BoostIndex::Speed, 2);
+    }
+}
+
+/// Throat Spray: the user gains +1 SpA after using a sound move.
+fn apply_throat_spray(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if md.flag_sound && b.state.side(side).active().item == Item::ThroatSpray {
+        raise_boost(b, side, BoostIndex::SpecialAttack, 1);
     }
 }
 
@@ -1211,10 +1246,13 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
     if p.item == crate::ids::Item::LumBerry {
         return false;
     }
+    use crate::ids::Ability as Ab;
     match status {
         Status::Burn => !p.types.contains(&Type::Fire),
         Status::Paralysis => !p.types.contains(&Type::Electric),
         Status::Poison | Status::Toxic => !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel)),
+        // Insomnia / Vital Spirit / Sweet Veil grant immunity to sleep.
+        Status::Sleep => !matches!(p.ability, Ab::Insomnia | Ab::VitalSpirit | Ab::SweetVeil),
         _ => true,
     }
 }

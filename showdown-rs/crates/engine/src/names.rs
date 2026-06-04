@@ -196,6 +196,13 @@ id_map!(Ability {
     DragonsMaw => "dragonsmaw",
     RockyPayload => "rockypayload",
     Steelworker => "steelworker",
+    Teravolt => "teravolt",
+    Turboblaze => "turboblaze",
+    WeakArmor => "weakarmor",
+    Aftermath => "aftermath",
+    Insomnia => "insomnia",
+    VitalSpirit => "vitalspirit",
+    SweetVeil => "sweetveil",
 });
 
 id_map!(Item {
@@ -221,6 +228,7 @@ id_map!(Item {
     FlameOrb => "flameorb",
     ChestoBerry => "chestoberry",
     LumBerry => "lumberry",
+    ThroatSpray => "throatspray",
     Other => "other",
 });
 

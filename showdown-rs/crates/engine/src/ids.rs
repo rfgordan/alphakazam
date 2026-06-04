@@ -247,6 +247,16 @@ pub enum Ability {
     DragonsMaw,
     RockyPayload,
     Steelworker,
+    // Mold Breaker variants (ignore defender abilities)
+    Teravolt,
+    Turboblaze,
+    // On-hit reaction abilities
+    WeakArmor,
+    Aftermath,
+    // Sleep-immunity abilities
+    Insomnia,
+    VitalSpirit,
+    SweetVeil,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
@@ -275,6 +285,7 @@ pub enum Item {
     FlameOrb,
     ChestoBerry,
     LumBerry,
+    ThroatSpray,
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,
