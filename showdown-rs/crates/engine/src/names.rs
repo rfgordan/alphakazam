@@ -199,6 +199,8 @@ id_map!(Item {
     FocusSash => "focussash",
     Eviolite => "eviolite",
     SitrusBerry => "sitrusberry",
+    WhiteHerb => "whiteherb",
+    WeaknessPolicy => "weaknesspolicy",
     Other => "other",
 });
 

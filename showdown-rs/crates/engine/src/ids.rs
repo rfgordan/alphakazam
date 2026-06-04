@@ -244,6 +244,8 @@ pub enum Item {
     FocusSash,
     Eviolite,
     SitrusBerry,
+    WhiteHerb,
+    WeaknessPolicy,
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,

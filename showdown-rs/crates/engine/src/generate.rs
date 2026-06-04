@@ -557,6 +557,10 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     };
     for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
+        // Weakness Policy on the target (super-effective hit), then White Herb if the user's
+        // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
+        apply_weakness_policy(&mut hb, foe, &md);
+        apply_white_herb(&mut hb, side);
         // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
         apply_pinch_berry(&mut hb, foe);
         apply_pinch_berry(&mut hb, side);
@@ -982,6 +986,34 @@ fn apply_pinch_berry(b: &mut Branch, side: SideId) {
     }
 }
 
+/// White Herb: once any of the holder's stats is below 0, it restores every negative stage
+/// to 0. Consumption isn't compared (item excluded + re-projected), so we only emit the
+/// restoring boosts. Triggers regardless of who caused the drop (self-drops included).
+fn apply_white_herb(b: &mut Branch, side: SideId) {
+    if b.state.side(side).active().item != Item::WhiteHerb {
+        return;
+    }
+    for stat in BOOST_ORDER {
+        let cur = b.state.side(side).boost(stat);
+        if cur < 0 {
+            push(b, Instruction::Boost { side, stat, amount: -cur });
+        }
+    }
+}
+
+/// Weakness Policy: when the holder survives a super-effective damaging hit, +2 Atk / +2 SpA.
+fn apply_weakness_policy(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    let d = b.state.side(foe).active();
+    if d.is_alive()
+        && d.item == Item::WeaknessPolicy
+        && md.category != MoveCategory::Status
+        && crate::damage::type_multiplier(md.typ, d.types) > 1.0
+    {
+        raise_boost(b, foe, BoostIndex::Attack, 2);
+        raise_boost(b, foe, BoostIndex::SpecialAttack, 2);
+    }
+}
+
 /// The per-hit-count probabilities for a multi-hit move spanning `min..=max` hits. Fixed
 /// moves return a single certain count; the variable [2,5] case uses gen5+'s weighted
 /// sample [2,2,3,3,4,5]; any other range is treated as uniform.
@@ -1340,6 +1372,8 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
             apply_self_boost(&mut hit, side, BOOST_ORDER[i], delta);
         }
     }
+    // White Herb restores the user's own drops (Shell Smash's −Def/−SpD).
+    apply_white_herb(&mut hit, side);
     // Good as Gold blocks status moves that target the holder (boosts/status against it).
     let foe_immune = hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold;
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
@@ -1352,6 +1386,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         }
         if lowered {
             react_to_stat_drop(&mut hit, foe);
+            apply_white_herb(&mut hit, foe);
         }
     }
     if let Some(sc) = md.side_condition {
