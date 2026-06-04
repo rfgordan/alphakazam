@@ -257,6 +257,10 @@ pub enum Ability {
     Insomnia,
     VitalSpirit,
     SweetVeil,
+    // Status-related
+    ToxicChain,
+    Hydration,
+    Synchronize,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

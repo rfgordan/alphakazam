@@ -1111,6 +1111,23 @@ fn apply_white_herb(b: &mut Branch, side: SideId) {
     }
 }
 
+/// Synchronize: when the holder is given a burn/paralysis/poison/toxic by the opponent, the
+/// opponent receives the same status (if it can be statused). `statused` is the side that
+/// just got the status; the source is its opponent.
+fn apply_synchronize(b: &mut Branch, statused: SideId, status: Status) {
+    if b.state.side(statused).active().ability != crate::ids::Ability::Synchronize {
+        return;
+    }
+    if !matches!(status, Status::Burn | Status::Paralysis | Status::Poison | Status::Toxic) {
+        return;
+    }
+    let source = statused.other();
+    if status_applies(b.state.side(source).active(), status) {
+        let slot = b.state.side(source).active_index;
+        push(b, Instruction::ChangeStatus { side: source, slot, previous: Status::None, new: status });
+    }
+}
+
 /// Justified: +1 Atk when the holder is hit by a damaging Dark-type move.
 fn apply_justified(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
     let d = b.state.side(foe).active();
@@ -1311,17 +1328,24 @@ fn react_to_stat_drop(b: &mut Branch, target: SideId) {
 /// poisons the target. Only one (the first applicable) is modeled; no-op off contact.
 fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     use crate::ids::Ability as Ab;
-    if !md.flag_contact {
-        return vec![b];
-    }
     let foe = side.other();
+    let atk_ab = b.state.side(side).active().ability;
     let def_ab = b.state.side(foe).active().ability;
-    let (target, status) = match def_ab {
-        Ab::FlameBody => (side, Status::Burn),
-        Ab::Static => (side, Status::Paralysis),
-        Ab::PoisonPoint => (side, Status::Poison),
-        _ if b.state.side(side).active().ability == Ab::PoisonTouch => (foe, Status::Poison),
-        _ => return vec![b],
+    // Toxic Chain (attacker) badly-poisons the target on any damaging hit (30%, not contact-
+    // gated). Otherwise a contact hit can trigger the defender's status ability or the
+    // attacker's Poison Touch.
+    let (target, status) = if atk_ab == Ab::ToxicChain {
+        (foe, Status::Toxic)
+    } else if !md.flag_contact {
+        return vec![b];
+    } else {
+        match def_ab {
+            Ab::FlameBody => (side, Status::Burn),
+            Ab::Static => (side, Status::Paralysis),
+            Ab::PoisonPoint => (side, Status::Poison),
+            _ if atk_ab == Ab::PoisonTouch => (foe, Status::Poison),
+            _ => return vec![b],
+        }
     };
     if !status_applies(b.state.side(target).active(), status) {
         return vec![b];
@@ -1368,6 +1392,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if md.secondary_status != Status::None && status_applies(proc.state.side(foe).active(), md.secondary_status) {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
+        apply_synchronize(&mut proc, foe, md.secondary_status);
     }
     vec![proc, noproc]
 }
@@ -1579,6 +1604,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     if md.status != Status::None && !foe_immune && status_applies(hit.state.side(foe).active(), md.status) {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
+        apply_synchronize(&mut hit, foe, md.status);
     }
 
     if miss_prob > 0.0 {
@@ -1714,6 +1740,18 @@ fn apply_end_of_turn(b: &mut Branch) {
                     _ => {}
                 }
             }
+        }
+
+        // Hydration cures any non-volatile status at end of turn while it's raining (after
+        // that turn's status damage has already been dealt).
+        let p = b.state.side(side).active();
+        if ability == Ab::Hydration
+            && matches!(b.state.weather, Weather::Rain | Weather::HeavyRain)
+            && p.status != Status::None
+            && p.is_alive()
+        {
+            let prev = p.status;
+            push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
         }
 
         // Salt Cure.

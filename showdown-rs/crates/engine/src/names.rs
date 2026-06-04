@@ -203,6 +203,9 @@ id_map!(Ability {
     Insomnia => "insomnia",
     VitalSpirit => "vitalspirit",
     SweetVeil => "sweetveil",
+    ToxicChain => "toxicchain",
+    Hydration => "hydration",
+    Synchronize => "synchronize",
 });
 
 id_map!(Item {
