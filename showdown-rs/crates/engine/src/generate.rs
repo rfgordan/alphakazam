@@ -555,7 +555,17 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let (hit_prob, miss_prob) = if acc == 0 || acc >= 100 { (1.0, 0.0) } else { (acc as f32 / 100.0, 1.0 - acc as f32 / 100.0) };
 
     if miss_prob > 0.0 {
-        out.push(scaled(&b, miss_prob)); // miss: nothing further happens
+        let mut mb = scaled(&b, miss_prob);
+        // High Jump Kick / Jump Kick: missing costs the user 1/2 of its max HP (crash).
+        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick") {
+            let (hp, maxhp) = { let p = mb.state.side(side).active(); (p.hp, p.max_hp) };
+            let crash = (maxhp / 2).min(hp);
+            if crash > 0 {
+                let slot = mb.state.side(side).active_index;
+                push(&mut mb, Instruction::Damage { side, slot, amount: crash });
+            }
+        }
+        out.push(mb);
     }
 
     let foe_alive = b.state.side(foe).active().is_alive();
