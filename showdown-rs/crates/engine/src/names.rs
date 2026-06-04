@@ -184,6 +184,8 @@ id_map!(Ability {
     Static => "static",
     PoisonPoint => "poisonpoint",
     PoisonTouch => "poisontouch",
+    PoisonHeal => "poisonheal",
+    MagicGuard => "magicguard",
 });
 
 id_map!(Item {

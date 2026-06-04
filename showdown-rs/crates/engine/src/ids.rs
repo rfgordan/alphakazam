@@ -228,6 +228,9 @@ pub enum Ability {
     PoisonPoint,
     // Attacker poisons the target on contact (30%)
     PoisonTouch,
+    // End-of-turn residual modifiers
+    PoisonHeal,
+    MagicGuard,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

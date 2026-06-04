@@ -1509,8 +1509,13 @@ fn apply_end_of_turn(b: &mut Branch) {
         let slot = b.state.side(side).active_index;
         let maxhp = p.max_hp;
 
+        use crate::ids::Ability as Ab;
+        let ability = p.ability;
+        // Magic Guard cancels all indirect (residual) damage but not healing.
+        let magic_guard = ability == Ab::MagicGuard;
+
         // Sandstorm chip.
-        if b.state.weather == Weather::Sand {
+        if b.state.weather == Weather::Sand && !magic_guard {
             let immune = p.types.contains(&Type::Rock)
                 || p.types.contains(&Type::Ground)
                 || p.types.contains(&Type::Steel);
@@ -1529,28 +1534,45 @@ fn apply_end_of_turn(b: &mut Branch) {
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
 
-        // Status residual.
-        let p = b.state.side(side).active();
-        if p.is_alive() {
-            match p.status {
-                Status::Burn | Status::Poison => {
-                    let frac = if p.status == Status::Burn { 16 } else { 8 };
-                    let dmg = (maxhp / frac).max(1).min(p.hp);
-                    push(b, Instruction::Damage { side, slot, amount: dmg });
+        // Status residual. Poison Heal *heals* 1/8 instead of taking poison/toxic damage;
+        // Magic Guard cancels the damage entirely.
+        let (palive, pstatus, php) = {
+            let p = b.state.side(side).active();
+            (p.is_alive(), p.status, p.hp)
+        };
+        if palive {
+            let poisoned = matches!(pstatus, Status::Poison | Status::Toxic);
+            if ability == Ab::PoisonHeal && poisoned {
+                let heal = (maxhp / 8).max(1).min(maxhp - php);
+                if heal > 0 {
+                    push(b, Instruction::Heal { side, slot, amount: heal });
                 }
-                Status::Toxic => {
-                    let stage = (b.state.side(side).active().status_counter as i16 + 1).max(1);
-                    let dmg = ((maxhp / 16) * stage).max(1).min(b.state.side(side).active().hp);
-                    push(b, Instruction::Damage { side, slot, amount: dmg });
-                    push(b, Instruction::ChangeStatusCounter { side, slot, previous: stage as u8 - 1, new: stage as u8 });
+                // Toxic still advances its counter even under Poison Heal.
+                if pstatus == Status::Toxic {
+                    let cur = b.state.side(side).active().status_counter;
+                    push(b, Instruction::ChangeStatusCounter { side, slot, previous: cur, new: cur + 1 });
                 }
-                _ => {}
+            } else if !magic_guard {
+                match pstatus {
+                    Status::Burn | Status::Poison => {
+                        let frac = if pstatus == Status::Burn { 16 } else { 8 };
+                        let dmg = (maxhp / frac).max(1).min(php);
+                        push(b, Instruction::Damage { side, slot, amount: dmg });
+                    }
+                    Status::Toxic => {
+                        let stage = (b.state.side(side).active().status_counter as i16 + 1).max(1);
+                        let dmg = ((maxhp / 16) * stage).max(1).min(b.state.side(side).active().hp);
+                        push(b, Instruction::Damage { side, slot, amount: dmg });
+                        push(b, Instruction::ChangeStatusCounter { side, slot, previous: stage as u8 - 1, new: stage as u8 });
+                    }
+                    _ => {}
+                }
             }
         }
 
         // Salt Cure.
         let p = b.state.side(side).active();
-        if p.is_alive() && b.state.side(side).volatiles.contains(VolatileStatus::SaltCure) {
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::SaltCure) {
             let heavy = p.types.contains(&Type::Water) || p.types.contains(&Type::Steel);
             let frac = if heavy { 4 } else { 8 };
             let dmg = (maxhp / frac).max(1).min(p.hp);
