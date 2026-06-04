@@ -124,6 +124,9 @@ pub struct DamageInput {
     pub category: MoveCategory,
     pub move_type: Type,
     pub attacker_types: [Type; 2],
+    /// The attacker's *original* (pre-Tera) types — needed to detect a Tera into one of its
+    /// own types (which upgrades STAB to ×2). Equals `attacker_types` when not Terastallized.
+    pub attacker_base_types: [Type; 2],
     pub defender_types: [Type; 2],
     pub attack_stat: i16,
     pub defense_stat: i16,
@@ -150,17 +153,26 @@ pub fn base_damage(level: u8, base_power: u16, attack: i16, defense: i16) -> i32
     (numerator / 50) + 2
 }
 
-/// STAB multiplier: 1.5 if the move shares a type with the attacker (2.0 with Adaptability,
-/// not modeled yet). Tera adds STAB for the tera type.
-fn stab(input: &DamageInput) -> f32 {
-    let mut matches = input.attacker_types.contains(&input.move_type);
-    if input.terastallized && input.tera_type == input.move_type {
-        matches = true;
-    }
-    if matches {
-        1.5
+/// The STAB modifier as a 4096-friendly ratio. Base STAB is ×1.5 (×2 with Adaptability).
+/// Terastallizing into one of the attacker's *original* types upgrades STAB to ×2 (×2.25
+/// with Adaptability); Tera into a new type keeps the move STAB-able for both the tera type
+/// and any matching original type at the normal rate.
+fn stab_mod(input: &DamageInput) -> (i64, i64) {
+    let mt = input.move_type;
+    let (from_orig, from_tera) = if input.terastallized {
+        (input.attacker_base_types.contains(&mt), input.tera_type == mt)
     } else {
-        1.0
+        (input.attacker_types.contains(&mt), false)
+    };
+    if !from_orig && !from_tera {
+        return (1, 1);
+    }
+    let double = from_orig && from_tera; // Tera into an original type
+    match (double, input.adaptability) {
+        (true, true) => (9216, 4096), // ×2.25
+        (true, false) => (2, 1),      // ×2
+        (false, true) => (2, 1),      // ×2
+        (false, false) => (3, 2),     // ×1.5
     }
 }
 
@@ -188,7 +200,7 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
     }
 
     let base = base_damage(input.level, input.base_power, input.attack_stat, input.defense_stat) as i64;
-    let is_stab = stab(input) > 1.0;
+    let (stab_num, stab_den) = stab_mod(input);
     let burn = input.attacker_burned && input.category == MoveCategory::Physical;
     let weather = weather_mult(input.move_type, input.weather);
 
@@ -207,13 +219,9 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         }
         // Random factor: trunc(d * (100 - roll) / 100).
         d = d * (100 - roll as i64) / 100;
-        // STAB (×1.5, or ×2 with Adaptability).
-        if is_stab {
-            if input.adaptability {
-                d = modify(d, 2, 1);
-            } else {
-                d = modify(d, 3, 2);
-            }
+        // STAB (×1.5 base, ×2 Adaptability or Tera-into-own-type, ×2.25 both).
+        if (stab_num, stab_den) != (1, 1) {
+            d = modify(d, stab_num, stab_den);
         }
         // Type effectiveness: ×2 for super, floor(÷2) for resist, applied per type.
         d = apply_type_step(d, e0);
@@ -301,6 +309,7 @@ mod tests {
             category: MoveCategory::Physical,
             move_type: Ground,
             attacker_types: [Ground, Fighting],
+            attacker_base_types: [Ground, Fighting],
             defender_types: [Normal, None],
             attack_stat: 300,
             defense_stat: 200,

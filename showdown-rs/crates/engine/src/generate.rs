@@ -1062,6 +1062,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         category: md.category,
         move_type: md.typ,
         attacker_types: attacker.types,
+        attacker_base_types: crate::data::species_types(attacker.species),
         defender_types: def_types_eff,
         attack_stat: atk_stat as i16,
         defense_stat: def_stat.max(1) as i16,
