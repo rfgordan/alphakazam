@@ -592,7 +592,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return vec![b];
     }
     let move_id = attacker.moves[move_idx as usize].id;
-    let md = move_data(move_id);
+    let mut md = move_data(move_id);
+    // Tera Blast: when the user is Terastallized it becomes the tera type and uses whichever
+    // of Atk/SpA is higher (so the category can flip to physical).
+    if md.id.to_id() == "terablast" && attacker.terastallized {
+        md.typ = attacker.tera_type;
+        if attacker.stat(crate::ids::StatIndex::Attack) > attacker.stat(crate::ids::StatIndex::SpecialAttack) {
+            md.category = MoveCategory::Physical;
+        }
+    }
     let foe = side.other();
 
     let mut b = b;
