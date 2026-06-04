@@ -1629,6 +1629,16 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
                 push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
             }
         }
+        // Clear Smog resets the target's stat stages to 0 on hit.
+        if md.id.to_id() == "clearsmog" {
+            let foe = side.other();
+            for stat in BOOST_ORDER {
+                let cur = b.state.side(foe).boost(stat);
+                if cur != 0 {
+                    push(b, Instruction::Boost { side: foe, stat, amount: -cur });
+                }
+            }
+        }
     }
 }
 
