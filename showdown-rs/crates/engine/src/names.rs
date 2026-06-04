@@ -146,6 +146,17 @@ id_map!(Ability {
     MotorDrive => "motordrive",
     StormDrain => "stormdrain",
     SapSipper => "sapsipper",
+    Overgrow => "overgrow",
+    Blaze => "blaze",
+    Torrent => "torrent",
+    Swarm => "swarm",
+    SheerForce => "sheerforce",
+    TintedLens => "tintedlens",
+    Neuroforce => "neuroforce",
+    Reckless => "reckless",
+    Defeatist => "defeatist",
+    MarvelScale => "marvelscale",
+    FurCoat => "furcoat",
 });
 
 id_map!(Item {
@@ -159,6 +170,10 @@ id_map!(Item {
     LifeOrb => "lifeorb",
     RockyHelmet => "rockyhelmet",
     BoosterEnergy => "boosterenergy",
+    ExpertBelt => "expertbelt",
+    MuscleBand => "muscleband",
+    WiseGlasses => "wiseglasses",
+    Other => "other",
 });
 
 id_map!(VolatileStatus {

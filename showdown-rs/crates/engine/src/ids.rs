@@ -178,6 +178,20 @@ pub enum Ability {
     MotorDrive,
     StormDrain,
     SapSipper,
+    // Pinch (low-HP) STAB boosters
+    Overgrow,
+    Blaze,
+    Torrent,
+    Swarm,
+    // Other offensive
+    SheerForce,
+    TintedLens,
+    Neuroforce,
+    Reckless,
+    Defeatist,
+    // Defensive
+    MarvelScale,
+    FurCoat,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
@@ -194,6 +208,12 @@ pub enum Item {
     LifeOrb,
     RockyHelmet,
     BoosterEnergy,
+    ExpertBelt,
+    MuscleBand,
+    WiseGlasses,
+    /// Catch-all for a held item the engine doesn't model — preserves "has an item"
+    /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
+    Other,
 }
 
 /// All 25 natures. Each nudges one stat +10% and another -10% (Serious-type = neutral).

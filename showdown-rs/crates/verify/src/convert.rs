@@ -61,7 +61,8 @@ fn parse_pokemon(tp: &TPokemon, unmapped: &mut Unmapped) -> Pokemon {
     p.base_ability = p.ability;
     p.item = Item::from_id(&tp.item).unwrap_or_else(|| {
         unmapped.note("item", &tp.item);
-        Item::None
+        // Preserve "holds an item" for unmodeled items (Knock Off, Acrobatics, ...).
+        if tp.item.is_empty() || tp.item == "none" { Item::None } else { Item::Other }
     });
     p.stats[StatIndex::Hp as usize] = tp.max_hp;
     p.stats[StatIndex::Attack as usize] = tp.stats.atk;

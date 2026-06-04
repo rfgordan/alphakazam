@@ -120,6 +120,22 @@ pub fn analyze_turn(prev: &TState, choices: &Choices, replacements: &Replacement
     (r, best.map(|(_, c)| c))
 }
 
+/// Compact, tally-able context line for a mismatching turn (move/ability/item per side).
+pub fn dump_context(prev: &TState, choices: &Choices, cause: &str) -> String {
+    let mut unmapped = Unmapped::default();
+    let st = parse_state(prev, &mut unmapped);
+    let part = |side: SideId, choice: &Option<String>| -> String {
+        let p = st.side(side).active();
+        let mv = match choice.as_deref().and_then(parse_choice) {
+            Some(MoveChoice::Move(i)) => p.moves[i as usize].id.to_id().to_string(),
+            Some(MoveChoice::Switch(_)) => "switch".to_string(),
+            None => "?".to_string(),
+        };
+        format!("m={mv} a={:?} i={:?}", p.ability, p.item)
+    };
+    format!("MM {cause} | p1 {} | p2 {}", part(SideId::One, &choices.p1), part(SideId::Two, &choices.p2))
+}
+
 /// Bucket a diff message into a coarse cause for aggregation.
 fn categorize(diff: &str) -> String {
     if diff.contains("hp") { "hp".into() }

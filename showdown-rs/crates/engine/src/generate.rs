@@ -548,15 +548,32 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     }
     // Offensive ability multipliers.
     use crate::ids::Ability as Ab;
+    let pinch = (attacker.hp as i32) * 3 <= attacker.max_hp as i32; // HP ≤ 1/3
     match attacker.ability {
         Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
         Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         Ab::Technician if md.base_power <= 60 => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Overgrow if md.typ == Type::Grass && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Blaze if md.typ == Type::Fire && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        Ab::Swarm if md.typ == Type::Bug && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+        // Sheer Force: ×1.3 when the move has a secondary (the secondary is then removed).
+        Ab::SheerForce if md.secondary_chance > 0 => atk_stat = crate::damage::modify(atk_stat, 5325, 4096),
+        Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
+        Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
         _ => {}
     }
     // Thick Fat (defender) halves the attack of Fire/Ice moves.
     if defender.ability == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
         atk_stat = crate::damage::modify(atk_stat, 1, 2);
+    }
+    // Marvel Scale / Fur Coat (defender) raise physical Defense.
+    if md.category == MoveCategory::Physical && def_idx == crate::ids::StatIndex::Defense {
+        if defender.ability == Ab::FurCoat {
+            def_stat = crate::damage::modify(def_stat, 2, 1);
+        } else if defender.ability == Ab::MarvelScale && defender.status != Status::None {
+            def_stat = crate::damage::modify(def_stat, 3, 2);
+        }
     }
     // Guts ignores the burn attack drop.
     let burned = attacker.status == Status::Burn && attacker.ability != Ab::Guts;
@@ -574,14 +591,41 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     if defender.ability == Ab::IceScales && md.category == MoveCategory::Special {
         fden *= 2;
     }
+    // Attacker final-damage modifiers keyed on effectiveness / item.
+    if attacker.ability == Ab::TintedLens && type_mult < 1.0 {
+        fnum *= 2;
+    }
+    if attacker.ability == Ab::Neuroforce && type_mult > 1.0 {
+        fnum *= 5120;
+        fden *= 4096;
+    }
+    if attacker.item == Item::ExpertBelt && type_mult > 1.0 {
+        fnum *= 4915;
+        fden *= 4096;
+    }
+    if attacker.item == Item::MuscleBand && md.category == MoveCategory::Physical {
+        fnum *= 4505;
+        fden *= 4096;
+    }
+    if attacker.item == Item::WiseGlasses && md.category == MoveCategory::Special {
+        fnum *= 4505;
+        fden *= 4096;
+    }
     let adaptability = attacker.ability == Ab::Adaptability;
     let def_ability = defender.ability;
     let def_maxhp = defender.max_hp;
     let life_orb = attacker.item == Item::LifeOrb;
 
+    // Knock Off: ×1.5 base power when the target is holding a (removable) item.
+    let base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
+        crate::damage::modify(md.base_power as i64, 3, 2) as u16
+    } else {
+        md.base_power
+    };
+
     let input = DamageInput {
         level: attacker.level,
-        base_power: md.base_power,
+        base_power,
         category: md.category,
         move_type: md.typ,
         attacker_types: attacker.types,
@@ -708,6 +752,10 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if md.secondary_chance == 0 {
         return vec![b];
     }
+    // Sheer Force removes secondary effects entirely (in exchange for the ×1.3 above).
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return vec![b];
+    }
     let foe = side.other();
     if !b.state.side(foe).active().is_alive() {
         return vec![b];
@@ -752,6 +800,20 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 /// accuracy hit/miss branch when the move can miss.
 fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let foe = side.other();
+
+    // Pain Split: average the two actives' current HP.
+    if md.id.to_id() == "painsplit" {
+        let mut b = b;
+        if b.state.side(foe).active().is_alive() {
+            let (a_hp, a_max) = { let a = b.state.side(side).active(); (a.hp, a.max_hp) };
+            let (f_hp, f_max) = { let f = b.state.side(foe).active(); (f.hp, f.max_hp) };
+            let avg = (a_hp + f_hp) / 2;
+            set_hp(&mut b, side, avg.min(a_max));
+            set_hp(&mut b, foe, avg.min(f_max));
+        }
+        return vec![b];
+    }
+
     let (hit_prob, miss_prob) = if md.accuracy == 0 || md.accuracy >= 100 {
         (1.0, 0.0)
     } else {
@@ -800,6 +862,18 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         vec![hit, scaled(&b, miss_prob)]
     } else {
         vec![hit]
+    }
+}
+
+/// Move the active Pokémon's HP to `target_hp` via a Heal or Damage instruction.
+fn set_hp(b: &mut Branch, side: SideId, target_hp: i16) {
+    let p = b.state.side(side).active();
+    let slot = b.state.side(side).active_index;
+    let delta = target_hp - p.hp;
+    if delta > 0 {
+        push(b, Instruction::Heal { side, slot, amount: delta });
+    } else if delta < 0 {
+        push(b, Instruction::Damage { side, slot, amount: -delta });
     }
 }
 

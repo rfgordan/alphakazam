@@ -159,6 +159,9 @@ fn run_trace(path: &str, totals: &mut Totals) -> bool {
             TurnResult::Mismatch => {
                 mm += 1;
                 totals.mismatched += 1;
+                if std::env::var("VERIFY_DUMP").is_ok() {
+                    println!("{}", replay::dump_context(prev, &snap.choices, reason.as_deref().unwrap_or("?")));
+                }
                 if let Some(c) = reason {
                     *totals.reasons.entry(c).or_insert(0) += 1;
                 }
