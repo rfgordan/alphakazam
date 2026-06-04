@@ -627,11 +627,27 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let life_orb = attacker.item == Item::LifeOrb;
 
     // Knock Off: ×1.5 base power when the target is holding a (removable) item.
-    let base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
+    let mut base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
         crate::damage::modify(md.base_power as i64, 3, 2) as u16
     } else {
         md.base_power
     };
+    // Weight-based moves compute their base power dynamically.
+    match md.id.to_id() {
+        "grassknot" | "lowkick" => {
+            let w = crate::data::species_weight_hg(defender.species);
+            base_power = if w >= 2000 { 120 } else if w >= 1000 { 100 } else if w >= 500 { 80 }
+                else if w >= 250 { 60 } else if w >= 100 { 40 } else { 20 };
+        }
+        "heavyslam" | "heatcrash" => {
+            let wu = crate::data::species_weight_hg(attacker.species).max(1);
+            let wt = crate::data::species_weight_hg(defender.species).max(1);
+            let ratio = wu / wt;
+            base_power = if ratio >= 5 { 120 } else if ratio >= 4 { 100 } else if ratio >= 3 { 80 }
+                else if ratio >= 2 { 60 } else { 40 };
+        }
+        _ => {}
+    }
 
     let input = DamageInput {
         level: attacker.level,

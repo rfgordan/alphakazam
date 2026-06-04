@@ -116,3 +116,8 @@ pub fn base_stats(species: Species) -> [u16; 6] {
 pub fn species_types(species: Species) -> [Type; 2] {
     crate::gen::SPECIES_TYPES.get(species.0 as usize).copied().unwrap_or([Type::None, Type::None])
 }
+
+/// Species weight in hectograms (kg × 10), from the generated table.
+pub fn species_weight_hg(species: Species) -> u32 {
+    crate::gen::SPECIES_WEIGHT_HG.get(species.0 as usize).copied().unwrap_or(0)
+}
