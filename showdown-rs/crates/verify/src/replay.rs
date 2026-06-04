@@ -69,6 +69,10 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
     for si in generate_instructions_ex(prev_state, m1, m2, pivots) {
         let mut cand: State = *prev_state; // Copy
         cand.apply_instructions(&si.instructions);
+        // Sides whose alive active was force-switched (Roar/Whirlwind/Dragon Tail) but for
+        // which no replacement target is recorded — PS's drag is a *random* benched mon, so
+        // the harness never logs it. Fan out over every legal target instead.
+        let mut drag_unknown: Vec<SideId> = Vec::new();
         for (i, side) in [SideId::One, SideId::Two].into_iter().enumerate() {
             if !cand.side(side).active().is_alive() {
                 // Faint replacement: index 1 if this side already pivoted, else index 0.
@@ -77,13 +81,43 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
                     switch_into(&mut cand, side, target);
                 }
             } else if pivots[i].is_none() && forced[i] {
-                // Forced out by the opponent's move (it goes last, so end-of-turn timing).
                 if let Some(&target) = lists[i].first() {
                     switch_into(&mut cand, side, target);
+                } else {
+                    drag_unknown.push(side);
                 }
             }
         }
-        out.push(cand);
+        if drag_unknown.is_empty() {
+            out.push(cand);
+            continue;
+        }
+        // Expand each unknown drag into one candidate per alive benched target.
+        let mut variants = vec![cand];
+        for side in drag_unknown {
+            let mut next = Vec::new();
+            for v in &variants {
+                let active = v.side(side).active_index;
+                let targets: Vec<u8> = (0..v.side(side).pokemon.len())
+                    .filter(|&j| {
+                        let p = &v.side(side).pokemon[j];
+                        j as u8 != active && p.species != engine::ids::Species::None && p.hp > 0
+                    })
+                    .map(|j| j as u8)
+                    .collect();
+                if targets.is_empty() {
+                    next.push(*v);
+                } else {
+                    for t in targets {
+                        let mut c = *v;
+                        switch_into(&mut c, side, t);
+                        next.push(c);
+                    }
+                }
+            }
+            variants = next;
+        }
+        out.extend(variants);
     }
     out
 }
