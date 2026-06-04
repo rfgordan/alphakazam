@@ -167,6 +167,11 @@ id_map!(Ability {
     IronBarbs => "ironbarbs",
     Soundproof => "soundproof",
     Bulletproof => "bulletproof",
+    Chlorophyll => "chlorophyll",
+    SwiftSwim => "swiftswim",
+    SandRush => "sandrush",
+    SlushRush => "slushrush",
+    QuickFeet => "quickfeet",
 });
 
 id_map!(Item {

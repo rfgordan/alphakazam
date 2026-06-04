@@ -204,6 +204,12 @@ pub enum Ability {
     IronBarbs,
     Soundproof,
     Bulletproof,
+    // Speed (affect turn order)
+    Chlorophyll,
+    SwiftSwim,
+    SandRush,
+    SlushRush,
+    QuickFeet,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

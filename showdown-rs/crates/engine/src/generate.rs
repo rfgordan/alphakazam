@@ -82,6 +82,21 @@ fn effective_speed(state: &State, side: SideId) -> i32 {
     if has_proto(s) && proto_stat(p) == crate::ids::StatIndex::Speed {
         spe *= 1.5;
     }
+    // Speed abilities (affect turn order).
+    use crate::ids::Ability::*;
+    let weather_double = matches!(
+        (p.ability, state.weather),
+        (Chlorophyll, crate::ids::Weather::Sun)
+            | (SwiftSwim, crate::ids::Weather::Rain)
+            | (SandRush, crate::ids::Weather::Sand)
+            | (SlushRush, crate::ids::Weather::Snow)
+    );
+    if weather_double {
+        spe *= 2.0;
+    }
+    if p.ability == QuickFeet && p.status != Status::None {
+        spe *= 1.5;
+    }
     spe as i32
 }
 
