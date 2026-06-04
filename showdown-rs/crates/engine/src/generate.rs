@@ -525,8 +525,17 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // confusion self-hit (1/3) and full paralysis (1/4 of the remainder) — both branches where
     // the move doesn't execute. The remaining "acts normally" branch equals prior behavior, so
     // these only *add* outcomes (no regression on the common path).
-    if !alive || status == Status::Sleep || status == Status::Freeze {
+    if !alive || status == Status::Sleep {
         return execute_move_inner(b, action);
+    }
+    // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
+    if status == Status::Freeze {
+        let mut out = vec![scaled(&b, 0.80)];
+        let mut thawed = scaled(&b, 0.20);
+        let slot = thawed.state.side(side).active_index;
+        push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
+        out.extend(execute_move_inner(thawed, action));
+        return out;
     }
     let mut out = Vec::new();
     let mut act = 1.0f32;
