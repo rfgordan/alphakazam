@@ -1646,6 +1646,20 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         return vec![b];
     }
 
+    // Haze: reset every stat stage on both actives to 0.
+    if md.id.to_id() == "haze" {
+        let mut b = b;
+        for s in [SideId::One, SideId::Two] {
+            for stat in BOOST_ORDER {
+                let cur = b.state.side(s).boost(stat);
+                if cur != 0 {
+                    push(&mut b, Instruction::Boost { side: s, stat, amount: -cur });
+                }
+            }
+        }
+        return vec![b];
+    }
+
     // Curse: Ghost users pay 1/2 HP and curse the foe; others get +Atk/+Def/-Spe.
     if md.id.to_id() == "curse" {
         let mut b = b;
