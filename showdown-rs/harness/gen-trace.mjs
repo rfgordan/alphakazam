@@ -235,13 +235,19 @@ function chooseFor(request) {
 		return `switch ${options[choiceRand(options.length)]}`;
 	}
 	if (request.active) {
-		const moves = request.active[0].moves;
+		const act = request.active[0];
+		const moves = act.moves;
 		const legal = [];
 		for (let i = 0; i < moves.length; i++) {
 			if (!moves[i].disabled && (moves[i].pp === undefined || moves[i].pp > 0)) legal.push(i + 1);
 		}
 		if (!legal.length) return 'move 1'; // Struggle fallback
-		return `move ${legal[choiceRand(legal.length)]}`;
+		const mv = legal[choiceRand(legal.length)];
+		// Terastallize when available (~50%) for Tera coverage — the defining gen9 mechanic.
+		if (act.canTerastallize && choiceRand(2) === 0) {
+			return `move ${mv} terastallize`;
+		}
+		return `move ${mv}`;
 	}
 	return 'default';
 }
