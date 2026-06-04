@@ -193,6 +193,7 @@ id_map!(Item {
     WiseGlasses => "wiseglasses",
     FocusSash => "focussash",
     Eviolite => "eviolite",
+    SitrusBerry => "sitrusberry",
     Other => "other",
 });
 

@@ -234,6 +234,7 @@ pub enum Item {
     WiseGlasses,
     FocusSash,
     Eviolite,
+    SitrusBerry,
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,

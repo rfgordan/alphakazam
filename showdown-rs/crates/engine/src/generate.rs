@@ -507,6 +507,9 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     };
     for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
+        // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
+        apply_pinch_berry(&mut hb, foe);
+        apply_pinch_berry(&mut hb, side);
         // A Substitute blocks the target's own secondaries (boosts/status).
         let branches = if hit_sub { vec![hb] } else { apply_target_secondary(hb, side, &md) };
         for mut sb in branches {
@@ -906,6 +909,20 @@ fn apply_post_damage(
     }
 }
 
+/// Sitrus Berry: when the holder's HP is at or below 1/2, it eats the berry and heals 1/4
+/// of max HP. The berry's *consumption* isn't compared (item is excluded from `relaxed_eq`,
+/// and the harness re-projects PS's pre-turn item each turn), so we only emit the heal.
+fn apply_pinch_berry(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if p.is_alive() && p.item == Item::SitrusBerry && p.hp * 2 <= p.max_hp {
+        let heal = (p.max_hp / 4).min(p.max_hp - p.hp);
+        if heal > 0 {
+            let slot = b.state.side(side).active_index;
+            push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+    }
+}
+
 /// The per-hit-count probabilities for a multi-hit move spanning `min..=max` hits. Fixed
 /// moves return a single certain count; the variable [2,5] case uses gen5+'s weighted
 /// sample [2,2,3,3,4,5]; any other range is treated as uniform.
@@ -1301,5 +1318,8 @@ fn apply_end_of_turn(b: &mut Branch) {
             let dmg = (maxhp / frac).max(1).min(p.hp);
             push(b, Instruction::Damage { side, slot, amount: dmg });
         }
+
+        // Sitrus Berry can also fire here if end-of-turn chip drops the holder to ≤ 1/2.
+        apply_pinch_berry(b, side);
     }
 }
