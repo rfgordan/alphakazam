@@ -142,7 +142,15 @@ about which mechanics touch a turn every time they're up.
 | Rock Head/Scrappy/Unnerve; exact integer boost math; HJK crash; **confusion self-hit** | 78.8% |
 | Switch-in/KO boosts (Intrepid Sword/Download/Beast Boost); sand-immunity + weather-heal abilities | 78.9% |
 | **Full paralysis** (25% can't move) + **freeze thaw** (20%) | 80.8% |
-| **Haze** + **Clear Smog** (reset stat stages) | **81.1%** |
+| **Haze** + **Clear Smog** (reset stat stages) | 81.1% |
+| Scale Shot self-boost (codegen reads `selfBoost`); Protect blocks foe status moves; exact Tera STAB (×2 into own type) | 81.2% |
+
+**Tera coverage enabled.** The trace generator never chose to Terastallize, so Tera — the
+defining gen9 competitive mechanic — was untested (0/220 traces). The harness now Teras
+~50% when offered (218/220 traces exercise it). This is a harder, more honest set: the
+measured rate drops **81.2% → 78.8%** as Tera turns surface real gaps, then **Tera Blast**
+(tera type + higher attacking stat) recovers to **78.9%** (5734/7266). Remaining Tera tail:
+Stellar tera, defensive-type effectiveness edges, STAB precision. Slice stays 100%.
 
 > The move-execution volatiles/statuses were the richest vein: **full paralysis** alone was
 > +137 turns (paralysis is everywhere), on top of flinch (+41) and confusion (+10). All are
