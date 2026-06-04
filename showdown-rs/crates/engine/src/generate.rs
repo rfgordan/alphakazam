@@ -169,11 +169,18 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
 
     branches = resolve_moves(branches, &move_actions);
 
+    // A side's active was switched in this turn (chose to switch, or used a pivot move) — it
+    // hasn't earned an end-of-turn Speed Boost yet.
+    let switched = [
+        matches!(s1, MoveChoice::Switch(_)) || pivot[0].is_some(),
+        matches!(s2, MoveChoice::Switch(_)) || pivot[1].is_some(),
+    ];
+
     // 3) End-of-turn residuals (deterministic) — skipped if the battle has ended (a side
     //    has no living Pokémon), matching PS, which stops the turn on a win.
     for b in &mut branches {
         if !battle_over(&b.state) {
-            apply_end_of_turn(b);
+            apply_end_of_turn(b, switched);
         }
     }
 
@@ -1691,7 +1698,7 @@ fn apply_hazard(b: &mut Branch, target: SideId, sc: SideConditionId) {
 
 // --- end of turn -------------------------------------------------------------
 
-fn apply_end_of_turn(b: &mut Branch) {
+fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
     // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
     // (PS uses a finer speed-ordered residual queue; this covers the common cases.)
     for side in [SideId::One, SideId::Two] {
@@ -1840,6 +1847,12 @@ fn apply_end_of_turn(b: &mut Branch) {
             if orb_status != Status::None && status_applies(p, orb_status) {
                 push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
             }
+        }
+
+        // Speed Boost: +1 Spe at end of turn, but not the turn the mon switched in.
+        let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
+        if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
+            raise_boost(b, side, BoostIndex::Speed, 1);
         }
     }
 }

@@ -207,6 +207,7 @@ id_map!(Ability {
     Hydration => "hydration",
     Synchronize => "synchronize",
     InnerFocus => "innerfocus",
+    SpeedBoost => "speedboost",
 });
 
 id_map!(Item {

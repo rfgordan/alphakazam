@@ -263,6 +263,8 @@ pub enum Ability {
     Synchronize,
     // Prevents flinching
     InnerFocus,
+    // +1 Speed at end of each turn
+    SpeedBoost,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
