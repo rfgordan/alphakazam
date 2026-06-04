@@ -29,6 +29,11 @@ pub fn parse_choice(s: &str) -> Option<MoveChoice> {
     }
 }
 
+/// Whether a choice string requested Terastallization (`"move 3 terastallize"`).
+fn used_tera(s: &str) -> bool {
+    s.contains("terastallize")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TurnResult {
     /// PS's next state matched one of the engine's branches.
@@ -52,7 +57,7 @@ fn switch_list(strs: &[String]) -> Vec<u8> {
 /// Generate every candidate resulting state for a turn. Replacements happen in order: a
 /// U-turn pivot (mid-turn, inside the engine), then a faint replacement (post-turn) if
 /// the side's active ends up fainted.
-fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacements: &ReplacementList) -> Vec<State> {
+fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacements: &ReplacementList, tera: [bool; 2]) -> Vec<State> {
     let lists = [switch_list(&replacements.p1), switch_list(&replacements.p2)];
     // The first replacement is the U-turn pivot target if the side used a pivot move.
     let pivots = [
@@ -66,7 +71,7 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
     ];
 
     let mut out = Vec::new();
-    for si in generate_instructions_ex(prev_state, m1, m2, pivots) {
+    for si in generate_instructions_ex(prev_state, m1, m2, pivots, tera) {
         let mut cand: State = *prev_state; // Copy
         cand.apply_instructions(&si.instructions);
         // Sides whose alive active was force-switched (Roar/Whirlwind/Dragon Tail) but for
@@ -161,7 +166,7 @@ pub fn analyze_turn(prev: &TState, choices: &Choices, replacements: &Replacement
     let target_proj = project_state(&parse_state(target, &mut unmapped));
     // Closest candidate by active-HP distance, then categorize its first relaxed diff.
     let mut best: Option<(i32, String)> = None;
-    for cand in candidate_states(&prev_state, m1, m2, replacements) {
+    for cand in candidate_states(&prev_state, m1, m2, replacements, [used_tera(c1), used_tera(c2)]) {
         let proj = project_state(&cand);
         let dist = active_hp_distance(&proj, &target_proj);
         let reason = relaxed_diff(&proj, &target_proj).map(|d| categorize(&d)).unwrap_or_else(|| "match".into());
@@ -214,7 +219,7 @@ pub fn check_turn(prev: &TState, choices: &Choices, replacements: &ReplacementLi
     let prev_state = parse_state(prev, &mut unmapped);
     let target_proj = project_state(&parse_state(target, &mut unmapped));
 
-    for cand in candidate_states(&prev_state, m1, m2, replacements) {
+    for cand in candidate_states(&prev_state, m1, m2, replacements, [used_tera(c1), used_tera(c2)]) {
         if relaxed_eq(&project_state(&cand), &target_proj) {
             return TurnResult::Match;
         }
@@ -252,7 +257,7 @@ pub fn diagnose(prev: &TState, choices: &Choices, replacements: &ReplacementList
     // Find the engine candidate closest to PS (min summed |hp diff| over actives), and
     // print the first relaxed field difference against it.
     let mut best: Option<(i32, TState)> = None;
-    for cand in candidate_states(&prev_state, m1, m2, replacements) {
+    for cand in candidate_states(&prev_state, m1, m2, replacements, [used_tera(&c1), used_tera(&c2)]) {
         let proj = project_state(&cand);
         let dist = active_hp_distance(&proj, &target_proj);
         if best.as_ref().map_or(true, |(d, _)| dist < *d) {

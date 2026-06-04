@@ -146,14 +146,32 @@ fn is_grounded(state: &State, side: SideId) -> bool {
 
 /// Public entry point. `s1`/`s2` are side one's and side two's chosen actions.
 pub fn generate_instructions(state: &State, s1: MoveChoice, s2: MoveChoice) -> Vec<StateInstructions> {
-    generate_instructions_ex(state, s1, s2, [None, None])
+    generate_instructions_ex(state, s1, s2, [None, None], [false, false])
+}
+
+/// Apply Terastallization to a side's active at turn start: its types become its tera type
+/// (Stellar keeps the original types) and the terastallized flag flips. Done before moves so
+/// the new typing affects both its own STAB and the damage it takes this turn.
+fn apply_tera(b: &mut Branch, side: SideId) {
+    let (already, tera_type, prev, slot) = {
+        let s = b.state.side(side);
+        let p = s.active();
+        (p.terastallized, p.tera_type, p.types, s.active_index)
+    };
+    if already {
+        return;
+    }
+    if tera_type != Type::None && tera_type != Type::Stellar {
+        push(b, Instruction::ChangeTypes { side, slot, previous: prev, new: [tera_type, Type::None] });
+    }
+    push(b, Instruction::ToggleTerastallized { side, slot });
 }
 
 /// Like [`generate_instructions`], but `pivot` gives each side's switch-in target for a
 /// pivot move (U-turn): when that move connects and the user survives, it switches out
 /// mid-turn — so a faster pivot's switch happens *before* the opponent's move. Used by
 /// the differential harness, which knows the recorded replacement target.
-pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2]) -> Vec<StateInstructions> {
+pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2]) -> Vec<StateInstructions> {
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     let mut branches = vec![start];
 
@@ -162,6 +180,15 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
         if let MoveChoice::Switch(target) = choice {
             for b in &mut branches {
                 apply_switch(b, side, target);
+            }
+        }
+    }
+
+    // 1.5) Terastallization happens at turn start (gen9), before moves, for staying mons.
+    for (i, side) in [SideId::One, SideId::Two].into_iter().enumerate() {
+        if tera[i] && matches!([s1, s2][i], MoveChoice::Move(_)) {
+            for b in &mut branches {
+                apply_tera(b, side);
             }
         }
     }
