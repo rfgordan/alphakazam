@@ -894,6 +894,15 @@ fn apply_post_damage(
         }
     }
 
+    // Moxie: +1 Atk when the move knocks out the target.
+    if any_damage
+        && !b.state.side(foe).active().is_alive()
+        && b.state.side(side).active().ability == Ab::Moxie
+        && b.state.side(side).active().is_alive()
+    {
+        raise_boost(b, side, BoostIndex::Attack, 1);
+    }
+
     // Toxic Debris: a physical hit on the holder scatters a Toxic Spikes layer onto the
     // attacker's side (up to 2).
     if md.category == MoveCategory::Physical

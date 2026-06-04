@@ -216,6 +216,8 @@ pub enum Ability {
     // React to an opponent lowering a stat
     Defiant,
     Competitive,
+    // +1 Atk on KO
+    Moxie,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
