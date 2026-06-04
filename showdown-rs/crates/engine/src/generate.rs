@@ -738,8 +738,10 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             break;
         }
         let mut dmg = raw.min(target_hp);
-        // Sturdy: survive a would-be KO from full HP at 1 HP.
-        if def_ability == Ab::Sturdy && target_hp == def_maxhp && dmg >= target_hp {
+        // Sturdy / Focus Sash: survive a would-be KO from full HP at 1 HP.
+        if (def_ability == Ab::Sturdy || def_item == Item::FocusSash)
+            && target_hp == def_maxhp && dmg >= target_hp
+        {
             dmg = target_hp - 1;
         }
         if dmg > 0 {
@@ -819,9 +821,13 @@ const BOOST_ORDER: [BoostIndex; BoostIndex::COUNT] = [
     BoostIndex::SpecialDefense, BoostIndex::Speed, BoostIndex::Accuracy, BoostIndex::Evasion,
 ];
 
-/// Whether `status` can be inflicted on `p` right now (status-free + type immunity).
+/// Whether `status` can be inflicted on `p` right now (status-free + type + Purifying Salt).
 fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
     if p.status != Status::None || !p.is_alive() {
+        return false;
+    }
+    // Purifying Salt grants blanket status immunity (to both moves and secondaries).
+    if p.ability == crate::ids::Ability::PurifyingSalt {
         return false;
     }
     match status {
@@ -990,8 +996,10 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
             }
         }
     }
+    // Good as Gold blocks status moves that target the holder (boosts/status against it).
+    let foe_immune = hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold;
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
-    if hit.state.side(foe).active().is_alive() {
+    if hit.state.side(foe).active().is_alive() && !foe_immune {
         for (i, &delta) in md.target_boosts.iter().enumerate() {
             if delta != 0 {
                 apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta);
@@ -1004,7 +1012,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     if md.weather != Weather::None && hit.state.weather != md.weather {
         set_weather(&mut hit, md.weather, 5);
     }
-    if md.status != Status::None && status_applies(hit.state.side(foe).active(), md.status) {
+    if md.status != Status::None && !foe_immune && status_applies(hit.state.side(foe).active(), md.status) {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
     }

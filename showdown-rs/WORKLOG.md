@@ -94,7 +94,24 @@ Progression (40 random games, 1105 turns), each a broad data-driven addition:
 | Intimidate (switch-in −1 atk), Levitate (Ground immunity) | 49.7% |
 | Self-boosting status moves (Swords Dance, Dragon Dance, Calm Mind, ...) | (folded in) |
 | Move recoil + drain (Brave Bird, Giga Drain, ...) | 53.8% |
-| Ability batch: immunities (Flash Fire, Water/Volt Absorb, Sap Sipper, ...), offensive (Huge Power, Guts, Technician, Adaptability), defensive (Multiscale, Thick Fat, Ice Scales, Filter), Sturdy | **55.3%** |
+| Ability batch: immunities (Flash Fire, Water/Volt Absorb, Sap Sipper, ...), offensive (Huge Power, Guts, Technician, Adaptability), defensive (Multiscale, Thick Fat, Ice Scales, Filter), Sturdy | 55.3% |
+| Knock Off (item-conditional power), Pain Split, `Item::Other` (held-item presence) | 56.2% |
+| Protect (blocks foe's move), Substitute (HP cost + damage routing) | 57.8% |
+| Fold `secondary.self` boosts (Rapid Spin, Trailblaze, ...), Curse | 59.8% |
+| Weight-based moves (Grass Knot, Low Kick, Heavy Slam, Heat Crash) | 61.0% |
+| Forced-switch moves (Roar/Whirlwind/Dragon Tail) + self-switch status (Teleport/Chilly Reception/Parting Shot) | 61.1% |
+| Sleep (fixed-counter wake) + Freeze can't-move | 62.3% |
+| Move flags + flag-keyed abilities (Tough Claws/Sharpness/Iron Fist/Strong Jaw/Mega Launcher/Punk Rock), Soundproof/Bulletproof, contact recoil (Rocky Helmet/Rough Skin/Iron Barbs) | 62.7% |
+| Focus Sash; status-immunity (Purifying Salt blanket, Good as Gold vs status moves) | **62.8%** |
+
+The grind plateaus into the genuine Pokémon long tail: by ~63% the mismatch buckets are
+noise-dominated (common moves co-occur with any failing turn), and each remaining mechanic
+is individually rare (~0.1–0.5%). Known larger remaining items: variable multi-hit
+(Icicle Spear/Bullet Seed 2–5 hits — exact membership needs a sumset-of-totals approach,
+not per-hit-combo enumeration, which blows up past 3 hits); Wish/Future Sight (delayed,
+and not captured in the trace projection); the ~100-ability/item logic tail. The
+representation check is relaxed to modeled fields (hp/stats/status/types/boosts/hazards/
+weather); ability/item/volatiles/tera are excluded.
 
 The 2-team slice stays at **100%** throughout (regression gate). Remaining random-battle
 gap is the classic Pokémon long tail, each diagnosable via `VERIFY_DEBUG=1`:

@@ -183,6 +183,7 @@ id_map!(Item {
     ExpertBelt => "expertbelt",
     MuscleBand => "muscleband",
     WiseGlasses => "wiseglasses",
+    FocusSash => "focussash",
     Other => "other",
 });
 
