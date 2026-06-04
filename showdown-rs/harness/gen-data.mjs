@@ -56,7 +56,11 @@ moves.forEach((m, i) => {
 	moveByName.push([m.id, idx]);
 	const cat = m.category === 'Physical' ? 'Physical' : m.category === 'Special' ? 'Special' : 'Status';
 	const acc = m.accuracy === true ? 0 : (m.accuracy || 0);
-	const hits = typeof m.multihit === 'number' ? m.multihit : 1;
+	// Fixed multihit is a number (Dragon Darts = 2, Population Bomb = 10); variable is a
+		// [min, max] pair (Bullet Seed / Rock Blast / Icicle Spear = [2, 5]). `hits` is the
+		// guaranteed minimum; `hits_max` the maximum (== hits when fixed).
+		const hits = typeof m.multihit === 'number' ? m.multihit : (Array.isArray(m.multihit) ? m.multihit[0] : 1);
+		const hitsMax = typeof m.multihit === 'number' ? m.multihit : (Array.isArray(m.multihit) ? m.multihit[1] : 1);
 	const sec = m.secondary || (m.secondaries && m.secondaries[0]) || null;
 	const heal = Array.isArray(m.heal) ? `(${m.heal[0]},${m.heal[1]})` : '(0,1)';
 	const recoil = Array.isArray(m.recoil) ? `(${m.recoil[0]},${m.recoil[1]})` : '(0,1)';
@@ -85,6 +89,7 @@ moves.forEach((m, i) => {
 		`accuracy: ${acc}`,
 		`priority: ${m.priority || 0}`,
 		`hits: ${hits}`,
+			`hits_max: ${hitsMax}`,
 		`uses_defense_as_attack: ${m.overrideOffensiveStat === 'def'}`,
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,

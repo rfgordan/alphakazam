@@ -20,8 +20,12 @@ pub struct MoveData {
     /// Accuracy in percent; `0` means "never misses" (bypasses the accuracy check).
     pub accuracy: u8,
     pub priority: i8,
-    /// Number of hits (1 for most; e.g. Dragon Darts = 2).
+    /// Number of hits (1 for most; e.g. Dragon Darts = 2). For a variable multi-hit move
+    /// (Bullet Seed, Rock Blast, ...) this is the guaranteed *minimum*; `hits_max` the max.
     pub hits: u8,
+    /// Maximum number of hits; equals `hits` for fixed-count moves. `hits_max > hits` marks
+    /// a variable multi-hit move ([min, max], almost always [2, 5] in gen9).
+    pub hits_max: u8,
     /// Body Press and similar use the user's Defense as the attacking stat.
     pub uses_defense_as_attack: bool,
     /// Pivot move (U-turn): the user switches out after it connects.
@@ -76,6 +80,7 @@ impl MoveData {
             accuracy,
             priority,
             hits: 1,
+            hits_max: 1,
             uses_defense_as_attack: false,
             self_switch: false,
             force_switch: false,

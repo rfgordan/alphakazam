@@ -485,10 +485,14 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // large counts (Population Bomb's 10 hits → 32¹⁰ branches) that explodes the allocator
     // and crashes the machine, so we instead enumerate the distinct *total* damage via a
     // sumset DP — same set of observable result states, bounded memory.
-    let hits = md.hits.max(1) as usize;
-    let damaged: Vec<(Branch, bool)> = if hits <= MAX_EXACT_HITS {
+    let hits_min = md.hits.max(1) as usize;
+    let hits_max = (md.hits_max as usize).max(hits_min);
+    // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
+    // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
+    // take the sumset-DP path, which also folds in the distribution over the hit count.
+    let damaged: Vec<(Branch, bool)> = if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
-        for combo in HitCombos::new(hits) {
+        for combo in HitCombos::new(hits_min) {
             let mut prob = hit_prob;
             for &(_, crit) in &combo {
                 prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
@@ -499,7 +503,7 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         }
         v
     } else {
-        apply_multihit_dp(&b, side, &md, hits, hit_prob)
+        apply_multihit_dp(&b, side, &md, hits_min, hits_max, hit_prob)
     };
     for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
@@ -898,20 +902,36 @@ fn apply_post_damage(
     }
 }
 
-/// The sumset-DP multi-hit path: enumerate the distinct *total* damage a fixed multi-hit
-/// move can deal (instead of the 32ʰⁱᵗˢ per-hit product) and emit one branch per total.
+/// The per-hit-count probabilities for a multi-hit move spanning `min..=max` hits. Fixed
+/// moves return a single certain count; the variable [2,5] case uses gen5+'s weighted
+/// sample [2,2,3,3,4,5]; any other range is treated as uniform.
+fn hit_count_probs(min: usize, max: usize) -> Vec<(usize, f32)> {
+    if min == max {
+        vec![(min, 1.0)]
+    } else if (min, max) == (2, 5) {
+        vec![(2, 2.0 / 6.0), (3, 2.0 / 6.0), (4, 1.0 / 6.0), (5, 1.0 / 6.0)]
+    } else {
+        let n = (max - min + 1) as f32;
+        (min..=max).map(|k| (k, 1.0 / n)).collect()
+    }
+}
+
+/// The sumset-DP multi-hit path: enumerate the distinct *total* damage a multi-hit move can
+/// deal (instead of the 32ʰⁱᵗˢ per-hit product) and emit one branch per total.
 ///
 /// Each hit independently draws from the 16 non-crit rolls (each w.p. (1/16)·(1−CRIT)) or
-/// the 16 crit rolls (each w.p. (1/16)·CRIT). We convolve that per-hit distribution `hits`
-/// times, clamping every running total at the target's current HP (overkill collapses to a
-/// single "faint" outcome), which yields the exact set of reachable totals in O(hits · HP ·
-/// 32) time and O(HP) branches. Substitute routing and Sturdy/Focus Sash are not modeled on
-/// this path: both are one-hit effects (a Sash/Sturdy is broken by the second hit) that do
-/// not apply to the fixed ≥4-hit moves (Population Bomb) that reach here.
-fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, hits: usize, hit_prob: f32) -> Vec<(Branch, bool)> {
+/// the 16 crit rolls (each w.p. (1/16)·CRIT). We convolve that per-hit distribution up to
+/// `max` times, clamping every running total at the target's current HP (overkill collapses
+/// to a single "faint" outcome), and after the kᵗʰ convolution fold in `P(hit count = k)` —
+/// so a variable [2,5] move's full range of totals is covered. Runs in O(max · HP · 32) time
+/// and O(HP) branches. Substitute routing and Sturdy/Focus Sash are not modeled on this path:
+/// both are one-hit effects (a Sash/Sturdy is broken by the second hit) and don't apply to
+/// the ≥2-hit moves that reach here.
+fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: usize, max: usize, hit_prob: f32) -> Vec<(Branch, bool)> {
     use std::collections::HashMap;
     let foe = side.other();
     let calc = compute_damage(b, side, md);
+    let counts = hit_count_probs(min, max);
 
     // Per-hit damage value → probability (32 entries: 16 non-crit + 16 crit).
     let mut per_hit: Vec<(i32, f32)> = Vec::with_capacity(32);
@@ -920,19 +940,26 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, hits:
         per_hit.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * CRIT));
     }
 
-    // Convolve the per-hit distribution `hits` times, clamping cumulative damage at the
-    // target's HP so all overkill collapses to one faint outcome (bounds the support size).
+    // Convolve the per-hit distribution up to `max` times, clamping cumulative damage at the
+    // target's HP (all overkill collapses to one faint outcome, bounding the support size).
+    // After the kᵗʰ convolution, mix in the branch for "exactly k hits" weighted by P(k).
     let cap = b.state.side(foe).active().hp.max(0) as i32;
+    let mut conv: HashMap<i32, f32> = HashMap::new();
+    conv.insert(0, 1.0);
     let mut dist: HashMap<i32, f32> = HashMap::new();
-    dist.insert(0, 1.0);
-    for _ in 0..hits {
-        let mut next: HashMap<i32, f32> = HashMap::with_capacity(dist.len() + 32);
-        for (&t, &pt) in &dist {
+    for k in 1..=max {
+        let mut next: HashMap<i32, f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&t, &pt) in &conv {
             for &(v, pv) in &per_hit {
                 *next.entry((t + v).min(cap)).or_insert(0.0) += pt * pv;
             }
         }
-        dist = next;
+        conv = next;
+        if let Some(&(_, pk)) = counts.iter().find(|(c, _)| *c == k) {
+            for (&t, &p) in &conv {
+                *dist.entry(t).or_insert(0.0) += pk * p;
+            }
+        }
     }
 
     // One branch per distinct total damage.
