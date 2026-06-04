@@ -385,6 +385,12 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         return execute_status_move(b, side, &md);
     }
 
+    // Protect: a protected target blocks the incoming damaging move (Protect moves +4
+    // priority, so the protector has already set the volatile this turn).
+    if b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
+        return vec![b];
+    }
+
     // Damaging move: branch on accuracy (hit/miss), then crit, then the 16 rolls.
     let mut out = Vec::new();
     let acc = md.accuracy;
@@ -420,9 +426,11 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
             prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
         }
         let mut hb = scaled(&b, prob);
-        apply_damage_hit(&mut hb, side, &md, &combo);
-        apply_damage_secondaries(&mut hb, side, &md);
-        for mut sb in apply_target_secondary(hb, side, &md) {
+        let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
+        apply_damage_secondaries(&mut hb, side, &md, hit_sub);
+        // A Substitute blocks the target's own secondaries (boosts/status).
+        let branches = if hit_sub { vec![hb] } else { apply_target_secondary(hb, side, &md) };
+        for mut sb in branches {
             // Pivot move (U-turn): switch the user out now that it connected.
             if let Some(t) = pivot {
                 if sb.state.side(side).active().is_alive() {
@@ -464,7 +472,9 @@ impl Iterator for HitCombos {
     }
 }
 
-fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) {
+/// Applies a damaging move's hits; returns true if a Substitute absorbed the damage
+/// (so the target's own secondaries/volatiles are blocked).
+fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) -> bool {
     let foe = side.other();
     let attacker = b.state.side(side).active();
     let defender = b.state.side(foe).active();
@@ -650,14 +660,29 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     // Apply each hit's damage independently (own roll and crit), clamped to current HP
     // (a hit that faints the target ends the sequence; remaining hits add nothing).
     let mut any_damage = false;
+    let mut hit_sub = false;
     let mut total_dealt: i32 = 0;
     for &(roll, crit) in hits {
+        let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
+        let raw = rolls[roll as usize];
+        // Route to the Substitute if the target has one up (it absorbs the whole hit).
+        let sub_hp = b.state.side(foe).substitute_hp;
+        if sub_hp > 0 && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
+            let sub_dmg = raw.min(sub_hp);
+            push(b, Instruction::DamageSubstitute { side: foe, amount: sub_dmg });
+            if raw >= sub_hp {
+                push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
+            }
+            total_dealt += sub_dmg as i32;
+            any_damage = true;
+            hit_sub = true;
+            continue;
+        }
         let target_hp = b.state.side(foe).active().hp;
         if target_hp <= 0 {
             break;
         }
-        let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
-        let mut dmg = (rolls[roll as usize]).min(target_hp);
+        let mut dmg = raw.min(target_hp);
         // Sturdy: survive a would-be KO from full HP at 1 HP.
         if def_ability == Ab::Sturdy && target_hp == def_maxhp && dmg >= target_hp {
             dmg = target_hp - 1;
@@ -713,6 +738,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             });
         }
     }
+    hit_sub
 }
 
 /// Stat indices in `BoostIndex` order, for iterating a `[i8; 7]` boost array.
@@ -777,7 +803,8 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
 
 /// A damaging move's deterministic on-hit effects: user self-boosts and any target
 /// volatile (Salt Cure, etc.).
-fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
+    // Self-boosts apply even through a Substitute (they affect the attacker).
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
             // Self-boosts ignore Clear Body (which only blocks foe-induced drops).
@@ -788,10 +815,13 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
             }
         }
     }
-    if let Some(v) = md.target_volatile {
-        let foe = side.other();
-        if !b.state.side(foe).volatiles.contains(v) {
-            push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
+    // A target volatile (Salt Cure, ...) is blocked by a Substitute.
+    if !hit_sub {
+        if let Some(v) = md.target_volatile {
+            let foe = side.other();
+            if !b.state.side(foe).volatiles.contains(v) {
+                push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            }
         }
     }
 }
@@ -800,6 +830,29 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 /// accuracy hit/miss branch when the move can miss.
 fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let foe = side.other();
+
+    // Protect family: set the Protect volatile on the user (blocks the foe's move).
+    if is_protect_move(md.id) {
+        let mut b = b;
+        if !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protect });
+        }
+        return vec![b];
+    }
+
+    // Substitute: pay 1/4 max HP to put up a substitute with that much HP.
+    if md.id.to_id() == "substitute" {
+        let mut b = b;
+        let p = b.state.side(side).active();
+        let cost = p.max_hp / 4;
+        if p.hp > cost && !b.state.side(side).volatiles.contains(VolatileStatus::Substitute) {
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::Damage { side, slot, amount: cost });
+            push(&mut b, Instruction::ChangeSubstituteHp { side, amount: cost });
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Substitute });
+        }
+        return vec![b];
+    }
 
     // Pain Split: average the two actives' current HP.
     if md.id.to_id() == "painsplit" {
@@ -863,6 +916,15 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     } else {
         vec![hit]
     }
+}
+
+/// Protect-family moves that block the opponent's move for the turn.
+fn is_protect_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "protect" | "detect" | "spikyshield" | "kingsshield" | "banefulbunker"
+            | "silktrap" | "burningbulwark" | "obstruct" | "maxguard"
+    )
 }
 
 /// Move the active Pokémon's HP to `target_hp` via a Heal or Damage instruction.
