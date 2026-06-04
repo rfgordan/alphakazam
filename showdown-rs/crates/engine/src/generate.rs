@@ -1082,6 +1082,9 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
 /// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
 /// the ±6 clamp. Returns the effective change actually applied (0 if blocked/clamped out).
 fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+    // Contrary inverts the change before anything else (so a "drop" becomes a raise and is no
+    // longer blocked by Clear Body / counted as a drop by Defiant).
+    let delta = if b.state.side(target).active().ability == crate::ids::Ability::Contrary { -delta } else { delta };
     if delta < 0 && b.state.side(target).active().ability == crate::ids::Ability::ClearBody {
         return 0;
     }
@@ -1091,6 +1094,17 @@ fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: 
         push(b, Instruction::Boost { side: target, stat, amount: eff });
     }
     eff
+}
+
+/// Apply a *self*-boost (Swords Dance, Leaf Storm's −2 SpA, ...). Self-boosts ignore Clear
+/// Body but are inverted by Contrary. Returns nothing; clamps to ±6.
+fn apply_self_boost(b: &mut Branch, side: SideId, stat: BoostIndex, delta: i8) {
+    let delta = if b.state.side(side).active().ability == crate::ids::Ability::Contrary { -delta } else { delta };
+    let cur = b.state.side(side).boost(stat);
+    let eff = (cur + delta).clamp(-6, 6) - cur;
+    if eff != 0 {
+        push(b, Instruction::Boost { side, stat, amount: eff });
+    }
 }
 
 /// Raise a stat by `amount` on `side` (positive only; respects the +6 clamp). Used for the
@@ -1158,12 +1172,7 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     // Self-boosts apply even through a Substitute (they affect the attacker).
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
-            // Self-boosts ignore Clear Body (which only blocks foe-induced drops).
-            let cur = b.state.side(side).boost(BOOST_ORDER[i]);
-            let eff = (cur + delta).clamp(-6, 6) - cur;
-            if eff != 0 {
-                push(b, Instruction::Boost { side, stat: BOOST_ORDER[i], amount: eff });
-            }
+            apply_self_boost(b, side, BOOST_ORDER[i], delta);
         }
     }
     // A target volatile (Salt Cure, ...) is blocked by a Substitute.
@@ -1328,11 +1337,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     // Self-boosts (Swords Dance, Dragon Dance, ...).
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
-            let cur = hit.state.side(side).boost(BOOST_ORDER[i]);
-            let eff = (cur + delta).clamp(-6, 6) - cur;
-            if eff != 0 {
-                push(&mut hit, Instruction::Boost { side, stat: BOOST_ORDER[i], amount: eff });
-            }
+            apply_self_boost(&mut hit, side, BOOST_ORDER[i], delta);
         }
     }
     // Good as Gold blocks status moves that target the holder (boosts/status against it).

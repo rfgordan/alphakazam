@@ -111,6 +111,20 @@ Progression (40 random games, 1105 turns), each a broad data-driven addition:
 > The exact per-hit product is kept for ≤3 hits (`MAX_EXACT_HITS`), so Substitute/Sturdy
 > interleaving on common 2–3-hit moves is unchanged; only fixed ≥4-hit moves take the DP path.
 
+| Eviolite (×1.5 Def/SpD for not-fully-evolved; new SPECIES_NFE table) | 67.6% |
+| Sitrus Berry (heal 1/4 at ≤1/2 HP); Defiant/Competitive (+2 on opponent drop); Moxie (+1 Atk on KO) | 67.9% |
+| **Weather recovery** (Moonlight/Synthesis/Morning Sun/Shore Up) + **Rest** + **Strength Sap** — onHit-callback moves with no static `heal` field | 69.6% |
+| Prankster (+1 priority to status moves) | 69.7% |
+| **Fixed-damage moves** (Night Shade/Seismic Toss=level, Dragon Rage=40, Sonic Boom=20, Super Fang=½HP, Endeavor) | 70.0% |
+| Contrary (inverts stat changes) | **70.2%** |
+
+> **Crash fix** this stretch: Population Bomb (`multihit: 10`) drove the per-hit outcome
+> enumeration to 32¹⁰ branches (~1 EB) and OOM-froze the machine. Multi-hit now uses a
+> sumset-of-totals DP for >3 hits (and all variable [2,5] moves), enumerating distinct total
+> damage instead of the per-hit product. The biggest parity gains came from *callback-
+> implemented* moves (weather recovery, Rest, Strength Sap, fixed-damage) — these carry no
+> static data fields, so the codegen can't see them; they must be hand-coded by move id.
+
 The grind plateaus into the genuine Pokémon long tail: by ~63% the mismatch buckets are
 noise-dominated (common moves co-occur with any failing turn), and each remaining mechanic
 is individually rare (~0.1–0.5%). Known larger remaining items: variable multi-hit

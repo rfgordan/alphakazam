@@ -220,6 +220,8 @@ pub enum Ability {
     Moxie,
     // +1 priority to status moves
     Prankster,
+    // Inverts stat-stage changes on the holder
+    Contrary,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
