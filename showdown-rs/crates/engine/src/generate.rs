@@ -813,6 +813,29 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         }
         _ => {}
     }
+    // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
+    // The terrain is part of the projected state, so terrain-setting abilities/moves needn't
+    // be modeled here. Grounded ≈ not Flying and not Levitate (Air Balloon etc. unmodeled).
+    use crate::ids::Terrain;
+    let atk_grounded = !attacker.types.contains(&Type::Flying) && attacker.ability != Ab::Levitate;
+    let def_grounded = !defender.types.contains(&Type::Flying) && defender.ability != Ab::Levitate;
+    let terrain_boost = atk_grounded
+        && matches!(
+            (b.state.terrain, md.typ),
+            (Terrain::Electric, Type::Electric) | (Terrain::Grassy, Type::Grass) | (Terrain::Psychic, Type::Psychic)
+        );
+    if terrain_boost {
+        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
+    }
+    // Grassy Terrain halves the ground-shaking moves vs grounded targets; Misty Terrain
+    // halves Dragon moves vs grounded targets.
+    let terrain_halve = (b.state.terrain == Terrain::Grassy
+        && def_grounded
+        && matches!(md.id.to_id(), "earthquake" | "bulldoze" | "magnitude"))
+        || (b.state.terrain == Terrain::Misty && def_grounded && md.typ == Type::Dragon);
+    if terrain_halve {
+        base_power = crate::damage::modify(base_power as i64, 2048, 4096) as u16;
+    }
 
     let input = DamageInput {
         level: attacker.level,
@@ -1530,6 +1553,14 @@ fn apply_end_of_turn(b: &mut Branch) {
         // Leftovers.
         let p = b.state.side(side).active();
         if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() {
+            let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+            push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+
+        // Grassy Terrain heals grounded actives 1/16 max HP at end of turn.
+        let p = b.state.side(side).active();
+        let grounded = !p.types.contains(&Type::Flying) && p.ability != crate::ids::Ability::Levitate;
+        if b.state.terrain == crate::ids::Terrain::Grassy && grounded && p.hp < p.max_hp && p.is_alive() {
             let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
