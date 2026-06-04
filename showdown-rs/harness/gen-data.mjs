@@ -69,8 +69,12 @@ moves.forEach((m, i) => {
 	// Cure: 100% volatileStatus) is folded into `target_volatile` instead.
 	const secHasBoostOrStatus = !!(sec && (sec.boosts || sec.status));
 	const secChance = secHasBoostOrStatus ? (sec.chance || 0) : 0;
-	let targetVol = m.volatileStatus;
-	if (!targetVol && sec && sec.volatileStatus && (sec.chance === 100 || sec.chance === undefined)) {
+	// Flinch is its own chance-based secondary (Iron Head 30%, Fake Out 100%), handled
+	// separately so it can interrupt a not-yet-moved target rather than being a plain volatile.
+	const flinchChance = (sec && sec.volatileStatus === 'flinch') ? (sec.chance || 100)
+		: (m.volatileStatus === 'flinch' ? 100 : 0);
+	let targetVol = m.volatileStatus === 'flinch' ? undefined : m.volatileStatus;
+	if (!targetVol && sec && sec.volatileStatus && sec.volatileStatus !== 'flinch' && (sec.chance === 100 || sec.chance === undefined)) {
 		targetVol = sec.volatileStatus;
 	}
 	// Top-level `boosts` apply to the user when target is 'self' (Swords Dance, Dragon
@@ -90,6 +94,7 @@ moves.forEach((m, i) => {
 		`priority: ${m.priority || 0}`,
 		`hits: ${hits}`,
 			`hits_max: ${hitsMax}`,
+			`flinch_chance: ${flinchChance}`,
 		`uses_defense_as_attack: ${m.overrideOffensiveStat === 'def'}`,
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,

@@ -261,6 +261,8 @@ pub enum Ability {
     ToxicChain,
     Hydration,
     Synchronize,
+    // Prevents flinching
+    InnerFocus,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

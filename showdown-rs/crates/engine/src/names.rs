@@ -206,6 +206,7 @@ id_map!(Ability {
     ToxicChain => "toxicchain",
     Hydration => "hydration",
     Synchronize => "synchronize",
+    InnerFocus => "innerfocus",
 });
 
 id_map!(Item {

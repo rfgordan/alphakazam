@@ -347,8 +347,9 @@ fn scaled(b: &Branch, f: f32) -> Branch {
 fn sequence_two_moves(b: Branch, first: Action, second: Action) -> Vec<Branch> {
     let mut out = Vec::new();
     for fb in execute_move(b, first) {
-        // Second mover only acts if its active is still alive.
-        if fb.state.side(second.side).active().is_alive() {
+        // The second mover acts only if its active is alive and wasn't flinched by the first.
+        let flinched = fb.state.side(second.side).volatiles.contains(VolatileStatus::Flinch);
+        if fb.state.side(second.side).active().is_alive() && !flinched {
             out.extend(execute_move(fb, second));
         } else {
             out.push(fb);
@@ -600,6 +601,7 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
             apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .flat_map(|sb| apply_flinch_split(sb, side, &md))
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -1355,6 +1357,33 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
     let noproc = scaled(&b, 1.0 - chance);
     let slot = proc.state.side(target).active_index;
     push(&mut proc, Instruction::ChangeStatus { side: target, slot, previous: Status::None, new: status });
+    vec![proc, noproc]
+}
+
+/// Split a hit on the move's flinch chance (×2 under Serene Grace): the proc branch applies
+/// the Flinch volatile to the target, which `sequence_two_moves` uses to skip a target that
+/// hasn't moved yet. Inner Focus and an already-flinched target are immune.
+fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    if md.flinch_chance == 0 {
+        return vec![b];
+    }
+    let foe = side.other();
+    let d = b.state.side(foe).active();
+    if !d.is_alive()
+        || d.ability == crate::ids::Ability::InnerFocus
+        || b.state.side(foe).volatiles.contains(VolatileStatus::Flinch)
+    {
+        return vec![b];
+    }
+    let pct = if b.state.side(side).active().ability == crate::ids::Ability::SereneGrace {
+        (md.flinch_chance as u16 * 2).min(100) as u8
+    } else {
+        md.flinch_chance
+    };
+    let chance = pct as f32 / 100.0;
+    let mut proc = scaled(&b, chance);
+    let noproc = scaled(&b, 1.0 - chance);
+    push(&mut proc, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Flinch });
     vec![proc, noproc]
 }
 

@@ -38,6 +38,8 @@ pub struct MoveData {
     /// Stat-stage changes a status move applies to the *target* (Growl, Charm, ...).
     pub target_boosts: [i8; BoostIndex::COUNT],
 
+    /// Chance (percent) the move flinches the target (Iron Head 30%, Fake Out 100%).
+    pub flinch_chance: u8,
     /// Chance (percent) of the target secondary; `0` = no secondary.
     pub secondary_chance: u8,
     /// Stat-stage changes applied to the *target* when the secondary procs.
@@ -81,6 +83,7 @@ impl MoveData {
             priority,
             hits: 1,
             hits_max: 1,
+            flinch_chance: 0,
             uses_defense_as_attack: false,
             self_switch: false,
             force_switch: false,
