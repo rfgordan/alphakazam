@@ -215,6 +215,11 @@ id_map!(Ability {
     DauntlessShield => "dauntlessshield",
     Download => "download",
     BeastBoost => "beastboost",
+    SandVeil => "sandveil",
+    SandForce => "sandforce",
+    Overcoat => "overcoat",
+    RainDish => "raindish",
+    IceBody => "icebody",
 });
 
 id_map!(Item {

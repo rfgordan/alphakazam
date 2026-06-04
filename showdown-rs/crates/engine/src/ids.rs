@@ -277,6 +277,13 @@ pub enum Ability {
     Download,
     // KO boosts highest stat
     BeastBoost,
+    // Sandstorm-immunity (besides Rock/Ground/Steel typing)
+    SandVeil,
+    SandForce,
+    Overcoat,
+    // Weather healing
+    RainDish,
+    IceBody,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

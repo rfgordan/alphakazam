@@ -1868,14 +1868,31 @@ fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
         // Magic Guard cancels all indirect (residual) damage but not healing.
         let magic_guard = ability == Ab::MagicGuard;
 
-        // Sandstorm chip.
+        // Sandstorm chip — skipped for Rock/Ground/Steel types and sand-immune abilities.
         if b.state.weather == Weather::Sand && !magic_guard {
             let immune = p.types.contains(&Type::Rock)
                 || p.types.contains(&Type::Ground)
-                || p.types.contains(&Type::Steel);
+                || p.types.contains(&Type::Steel)
+                || matches!(ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat | Ab::SandStream);
             if !immune {
                 let dmg = (maxhp / 16).max(1).min(b.state.side(side).active().hp);
                 if dmg > 0 {
+                    push(b, Instruction::Damage { side, slot, amount: dmg });
+                }
+            }
+        }
+        // Weather healing abilities: Rain Dish (rain) / Ice Body (snow) / Dry Skin (rain)
+        // restore 1/16; Dry Skin loses 1/8 in sun.
+        {
+            let p = b.state.side(side).active();
+            if p.is_alive() {
+                let heal16 = (matches!(ability, Ab::RainDish | Ab::DrySkin) && matches!(b.state.weather, Weather::Rain | Weather::HeavyRain))
+                    || (ability == Ab::IceBody && b.state.weather == Weather::Snow);
+                if heal16 && p.hp < p.max_hp {
+                    let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+                    push(b, Instruction::Heal { side, slot, amount: heal });
+                } else if ability == Ab::DrySkin && matches!(b.state.weather, Weather::Sun | Weather::HarshSun) && !magic_guard {
+                    let dmg = (maxhp / 8).max(1).min(p.hp);
                     push(b, Instruction::Damage { side, slot, amount: dmg });
                 }
             }
