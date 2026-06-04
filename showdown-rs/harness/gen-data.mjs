@@ -87,6 +87,7 @@ moves.forEach((m, i) => {
 		`hits: ${hits}`,
 		`uses_defense_as_attack: ${m.overrideOffensiveStat === 'def'}`,
 		`self_switch: ${!!m.selfSwitch}`,
+		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
 		`target_boosts: ${boostsRs(targetBoostsObj)}`,
 		`secondary_chance: ${secChance}`,

@@ -26,6 +26,8 @@ pub struct MoveData {
     pub uses_defense_as_attack: bool,
     /// Pivot move (U-turn): the user switches out after it connects.
     pub self_switch: bool,
+    /// Forces the *target* to switch out (Roar, Whirlwind, Dragon Tail, ...).
+    pub force_switch: bool,
 
     /// Stat-stage changes applied to the *user* (Close Combat self-drop, Swords Dance).
     pub self_boosts: [i8; BoostIndex::COUNT],
@@ -68,6 +70,7 @@ impl MoveData {
             hits: 1,
             uses_defense_as_attack: false,
             self_switch: false,
+            force_switch: false,
             self_boosts: [0; BoostIndex::COUNT],
             target_boosts: [0; BoostIndex::COUNT],
             secondary_chance: 0,

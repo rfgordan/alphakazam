@@ -382,7 +382,16 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
-        return execute_status_move(b, side, &md);
+        let mut branches = execute_status_move(b, side, &md);
+        // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
+        if let Some(t) = pivot {
+            for sb in &mut branches {
+                if sb.state.side(side).active().is_alive() {
+                    apply_switch(sb, side, t);
+                }
+            }
+        }
+        return branches;
     }
 
     // Protect: a protected target blocks the incoming damaging move (Protect moves +4

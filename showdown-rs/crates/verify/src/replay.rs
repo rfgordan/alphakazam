@@ -59,17 +59,26 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
         if used_pivot_move(prev_state, SideId::One, m1) { lists[0].first().copied() } else { None },
         if used_pivot_move(prev_state, SideId::Two, m2) { lists[1].first().copied() } else { None },
     ];
+    // Whether each side was force-switched by the *other* side's move (Roar, Dragon Tail).
+    let forced = [
+        used_force_move(prev_state, SideId::Two, m2),
+        used_force_move(prev_state, SideId::One, m1),
+    ];
 
     let mut out = Vec::new();
     for si in generate_instructions_ex(prev_state, m1, m2, pivots) {
         let mut cand: State = *prev_state; // Copy
         cand.apply_instructions(&si.instructions);
-        // Faint replacement: index 1 if this side already used its first switch as a
-        // pivot, else index 0.
         for (i, side) in [SideId::One, SideId::Two].into_iter().enumerate() {
             if !cand.side(side).active().is_alive() {
+                // Faint replacement: index 1 if this side already pivoted, else index 0.
                 let idx = if pivots[i].is_some() { 1 } else { 0 };
                 if let Some(&target) = lists[i].get(idx) {
+                    switch_into(&mut cand, side, target);
+                }
+            } else if pivots[i].is_none() && forced[i] {
+                // Forced out by the opponent's move (it goes last, so end-of-turn timing).
+                if let Some(&target) = lists[i].first() {
                     switch_into(&mut cand, side, target);
                 }
             }
@@ -77,6 +86,15 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
         out.push(cand);
     }
     out
+}
+
+/// True if the side's chosen action is a force-switch move (Roar, Whirlwind, Dragon Tail).
+fn used_force_move(state: &State, side: SideId, mc: MoveChoice) -> bool {
+    if let MoveChoice::Move(idx) = mc {
+        engine::data::move_data(state.side(side).active().moves[idx as usize].id).force_switch
+    } else {
+        false
+    }
 }
 
 /// True if the side's chosen action is a pivot move (U-turn) that triggers a switch-out.
