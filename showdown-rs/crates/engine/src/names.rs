@@ -175,6 +175,8 @@ id_map!(Ability {
     Hustle => "hustle",
     Unaware => "unaware",
     SereneGrace => "serenegrace",
+    Defiant => "defiant",
+    Competitive => "competitive",
 });
 
 id_map!(Item {

@@ -247,7 +247,9 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     if ability == IntimidateAbility {
         let foe = side.other();
         if b.state.side(foe).active().is_alive() {
-            apply_boost_clamped(b, foe, BoostIndex::Attack, -1);
+            if apply_boost_clamped(b, foe, BoostIndex::Attack, -1) < 0 {
+                react_to_stat_drop(b, foe);
+            }
         }
     }
 }
@@ -1021,15 +1023,37 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
 }
 
 /// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
-/// the ±6 clamp.
-fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) {
+/// the ±6 clamp. Returns the effective change actually applied (0 if blocked/clamped out).
+fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
     if delta < 0 && b.state.side(target).active().ability == crate::ids::Ability::ClearBody {
-        return;
+        return 0;
     }
     let cur = b.state.side(target).boost(stat);
     let eff = (cur + delta).clamp(-6, 6) - cur;
     if eff != 0 {
         push(b, Instruction::Boost { side: target, stat, amount: eff });
+    }
+    eff
+}
+
+/// Raise a stat by `amount` on `side` (positive only; respects the +6 clamp). Used for the
+/// reaction abilities, so it bypasses the Clear-Body / re-trigger paths of a normal drop.
+fn raise_boost(b: &mut Branch, side: SideId, stat: BoostIndex, amount: i8) {
+    let cur = b.state.side(side).boost(stat);
+    let eff = (cur + amount).clamp(-6, 6) - cur;
+    if eff != 0 {
+        push(b, Instruction::Boost { side, stat, amount: eff });
+    }
+}
+
+/// Defiant (+2 Atk) / Competitive (+2 SpA) fire once when an *opponent* lowers a stat. Call
+/// after a foe-induced boost event in which at least one stat was actually reduced.
+fn react_to_stat_drop(b: &mut Branch, target: SideId) {
+    use crate::ids::Ability as Ab;
+    match b.state.side(target).active().ability {
+        Ab::Defiant => raise_boost(b, target, BoostIndex::Attack, 2),
+        Ab::Competitive => raise_boost(b, target, BoostIndex::SpecialAttack, 2),
+        _ => {}
     }
 }
 
@@ -1055,10 +1079,14 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     let chance = pct as f32 / 100.0;
     let mut proc = scaled(&b, chance);
     let noproc = scaled(&b, 1.0 - chance);
+    let mut lowered = false;
     for (i, &delta) in md.secondary_boosts.iter().enumerate() {
         if delta != 0 {
-            apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta);
+            lowered |= apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0;
         }
+    }
+    if lowered {
+        react_to_stat_drop(&mut proc, foe);
     }
     if md.secondary_status != Status::None && status_applies(proc.state.side(foe).active(), md.secondary_status) {
         let slot = proc.state.side(foe).active_index;
@@ -1188,10 +1216,14 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     let foe_immune = hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold;
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
     if hit.state.side(foe).active().is_alive() && !foe_immune {
+        let mut lowered = false;
         for (i, &delta) in md.target_boosts.iter().enumerate() {
             if delta != 0 {
-                apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta);
+                lowered |= apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta) < 0;
             }
+        }
+        if lowered {
+            react_to_stat_drop(&mut hit, foe);
         }
     }
     if let Some(sc) = md.side_condition {

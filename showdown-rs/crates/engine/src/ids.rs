@@ -213,6 +213,9 @@ pub enum Ability {
     Hustle,
     Unaware,
     SereneGrace,
+    // React to an opponent lowering a stat
+    Defiant,
+    Competitive,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
