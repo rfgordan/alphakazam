@@ -265,6 +265,12 @@ pub enum Ability {
     InnerFocus,
     // +1 Speed at end of each turn
     SpeedBoost,
+    // No recoil damage
+    RockHead,
+    // Normal/Fighting moves hit Ghost types
+    Scrappy,
+    // Suppresses the opponent's berries
+    Unnerve,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.

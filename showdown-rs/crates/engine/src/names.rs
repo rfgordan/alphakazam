@@ -208,6 +208,9 @@ id_map!(Ability {
     Synchronize => "synchronize",
     InnerFocus => "innerfocus",
     SpeedBoost => "speedboost",
+    RockHead => "rockhead",
+    Scrappy => "scrappy",
+    Unnerve => "unnerve",
 });
 
 id_map!(Item {

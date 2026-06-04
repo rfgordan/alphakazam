@@ -393,6 +393,17 @@ enum Order {
     Tie,
 }
 
+/// The defender's types as the type chart should see them: a Scrappy attacker's Normal /
+/// Fighting moves treat the target's Ghost type as neutral (immunity removed).
+fn effective_def_types(scrappy: bool, move_type: Type, types: [Type; 2]) -> [Type; 2] {
+    if scrappy && matches!(move_type, Type::Normal | Type::Fighting) {
+        let unghost = |t: Type| if t == Type::Ghost { Type::None } else { t };
+        [unghost(types[0]), unghost(types[1])]
+    } else {
+        types
+    }
+}
+
 /// Fixed-damage moves bypass the damage formula (PS implements them via a `damage` field or
 /// callback). Returns the HP to remove, or `None` if `md` isn't one of them. Type immunity
 /// is handled separately by the caller's `connects` check.
@@ -560,7 +571,9 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     };
     let flag_immune = (md.flag_sound && def_ab == crate::ids::Ability::Soundproof)
         || (md.flag_bullet && def_ab == crate::ids::Ability::Bulletproof);
-    let connects = crate::damage::type_multiplier(md.typ, defender.types) != 0.0
+    let scrappy = b.state.side(side).active().ability == crate::ids::Ability::Scrappy;
+    let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
+    let connects = crate::damage::type_multiplier(md.typ, def_types_eff) != 0.0
         && !ability_immune(md.typ, def_ab)
         && !flag_immune;
     if !connects {
@@ -827,7 +840,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if matches!(def_ab, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
         fden *= 2;
     }
-    let type_mult = crate::damage::type_multiplier(md.typ, defender.types);
+    let scrappy = attacker.ability == Ab::Scrappy;
+    let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
+    let type_mult = crate::damage::type_multiplier(md.typ, def_types_eff);
     if matches!(def_ab, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
         fnum *= 3072;
         fden *= 4096;
@@ -930,7 +945,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         category: md.category,
         move_type: md.typ,
         attacker_types: attacker.types,
-        defender_types: defender.types,
+        defender_types: def_types_eff,
         attack_stat: atk_stat as i16,
         defense_stat: def_stat.max(1) as i16,
         is_crit: false,
@@ -1052,7 +1067,9 @@ fn apply_post_damage(
             }
         }
         // Move recoil (Brave Bird, Flare Blitz): self-damage a fraction of damage dealt.
-        if md.recoil.0 > 0 {
+        // Rock Head and Magic Guard prevent recoil.
+        let recoil_immune = matches!(b.state.side(side).active().ability, Ab::RockHead | Ab::MagicGuard);
+        if md.recoil.0 > 0 && !recoil_immune {
             let atk = b.state.side(side).active();
             if atk.is_alive() {
                 let rec = (round_div(total_dealt * md.recoil.0 as i32, md.recoil.1 as i32) as i16).max(1).min(atk.hp);
@@ -1130,6 +1147,10 @@ fn apply_post_damage(
 /// of max HP. The berry's *consumption* isn't compared (item is excluded from `relaxed_eq`,
 /// and the harness re-projects PS's pre-turn item each turn), so we only emit the heal.
 fn apply_pinch_berry(b: &mut Branch, side: SideId) {
+    // Unnerve on the opponent's active suppresses this side's berries.
+    if b.state.side(side.other()).active().ability == crate::ids::Ability::Unnerve {
+        return;
+    }
     let p = b.state.side(side).active();
     if p.is_alive() && p.item == Item::SitrusBerry && p.hp * 2 <= p.max_hp {
         let heal = (p.max_hp / 4).min(p.max_hp - p.hp);
