@@ -863,6 +863,18 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             base_power = if ratio >= 5 { 120 } else if ratio >= 4 { 100 } else if ratio >= 3 { 80 }
                 else if ratio >= 2 { 60 } else { 40 };
         }
+        // Status / HP / item-conditional doublers.
+        "facade" if attacker.status != Status::None => base_power = base_power.saturating_mul(2),
+        "hex" | "infernalparade" if defender.status != Status::None => base_power = base_power.saturating_mul(2),
+        "venoshock" | "barbbarrage" if matches!(defender.status, Status::Poison | Status::Toxic) => base_power = base_power.saturating_mul(2),
+        "brine" if defender.hp * 2 <= defender.max_hp => base_power = base_power.saturating_mul(2),
+        "acrobatics" if attacker.item == Item::None => base_power = base_power.saturating_mul(2),
+        // HP-proportional spread moves: BP = floor(150 · userHP / userMaxHP), min 1.
+        "eruption" | "waterspout" | "dragonenergy" => {
+            let hp = attacker.hp.max(0) as u32;
+            let max = attacker.max_hp.max(1) as u32;
+            base_power = ((150 * hp / max).max(1)) as u16;
+        }
         _ => {}
     }
     // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
