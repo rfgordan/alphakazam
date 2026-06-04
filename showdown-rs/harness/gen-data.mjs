@@ -72,7 +72,10 @@ moves.forEach((m, i) => {
 	// Top-level `boosts` apply to the user when target is 'self' (Swords Dance, Dragon
 	// Dance, ...) or to the foe otherwise (Growl, Charm, ...). Also fold in `self.boosts`.
 	const selfTarget = m.target === 'self';
-	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, selfTarget ? m.boosts : null);
+	// Some moves boost the user via a 100%-chance self-secondary (Rapid Spin, Trailblaze,
+	// Meteor Mash, ...) — fold those into the deterministic self-boosts too.
+	const secSelfBoosts = sec && sec.self && (sec.chance === 100 || sec.chance === undefined) ? sec.self.boosts : null;
+	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, selfTarget ? m.boosts : null, secSelfBoosts);
 	const targetBoostsObj = !selfTarget ? m.boosts : null;
 	const fields = [
 		`id: MoveId(${idx})`,

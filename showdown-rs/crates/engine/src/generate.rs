@@ -840,6 +840,32 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         return vec![b];
     }
 
+    // Curse: Ghost users pay 1/2 HP and curse the foe; others get +Atk/+Def/-Spe.
+    if md.id.to_id() == "curse" {
+        let mut b = b;
+        let is_ghost = b.state.side(side).active().types.contains(&Type::Ghost);
+        if is_ghost {
+            let p = b.state.side(side).active();
+            let cost = (p.max_hp / 2).min(p.hp);
+            let slot = b.state.side(side).active_index;
+            if cost > 0 {
+                push(&mut b, Instruction::Damage { side, slot, amount: cost });
+            }
+            if b.state.side(foe).active().is_alive() && !b.state.side(foe).volatiles.contains(VolatileStatus::Curse) {
+                push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Curse });
+            }
+        } else {
+            for (stat, delta) in [(BoostIndex::Attack, 1), (BoostIndex::Defense, 1), (BoostIndex::Speed, -1)] {
+                let cur = b.state.side(side).boost(stat);
+                let eff = (cur + delta).clamp(-6, 6) - cur;
+                if eff != 0 {
+                    push(&mut b, Instruction::Boost { side, stat, amount: eff });
+                }
+            }
+        }
+        return vec![b];
+    }
+
     // Substitute: pay 1/4 max HP to put up a substitute with that much HP.
     if md.id.to_id() == "substitute" {
         let mut b = b;
