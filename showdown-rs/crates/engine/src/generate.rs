@@ -374,8 +374,24 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let foe = side.other();
 
     let mut b = b;
-    // PP decrement (every used move).
     let slot = b.state.side(side).active_index;
+
+    // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
+    // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
+    let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
+    if status == Status::Sleep {
+        if counter > 1 {
+            push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - 1 });
+            return vec![b];
+        }
+        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+    }
+    // Freeze: a frozen mon can't move (the 20% thaw + act is left unmodeled for now).
+    if b.state.side(side).active().status == Status::Freeze {
+        return vec![b];
+    }
+
+    // PP decrement (every used move).
     if b.state.side(side).active().moves[move_idx as usize].pp > 0 {
         push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount: 1 });
     }
