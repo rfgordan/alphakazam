@@ -521,12 +521,28 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         let p = b.state.side(side).active();
         (p.is_alive(), p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
     };
-    if alive && confused && status != Status::Sleep && status != Status::Freeze {
-        let mut out = confusion_self_hit(scaled(&b, 1.0 / 3.0), side);
-        out.extend(execute_move_inner(scaled(&b, 2.0 / 3.0), action));
-        out
-    } else {
+    // Sleep/freeze are handled inside (the mon can't act anyway). For an awake mon, split off
+    // confusion self-hit (1/3) and full paralysis (1/4 of the remainder) — both branches where
+    // the move doesn't execute. The remaining "acts normally" branch equals prior behavior, so
+    // these only *add* outcomes (no regression on the common path).
+    if !alive || status == Status::Sleep || status == Status::Freeze {
+        return execute_move_inner(b, action);
+    }
+    let mut out = Vec::new();
+    let mut act = 1.0f32;
+    if confused {
+        out.extend(confusion_self_hit(scaled(&b, act * (1.0 / 3.0)), side));
+        act *= 2.0 / 3.0;
+    }
+    if status == Status::Paralysis {
+        out.push(scaled(&b, act * 0.25)); // fully paralyzed: no move
+        act *= 0.75;
+    }
+    if out.is_empty() {
         execute_move_inner(b, action)
+    } else {
+        out.extend(execute_move_inner(scaled(&b, act), action));
+        out
     }
 }
 
