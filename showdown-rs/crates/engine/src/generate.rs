@@ -284,8 +284,14 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
     let maxhp = p.max_hp;
     let grounded = is_grounded(&b.state, side);
 
-    // Stealth Rock — hits everything, scaled by Rock effectiveness.
-    if s.side_conditions.stealth_rock {
+    // Heavy-Duty Boots negate *all* entry hazards for the holder.
+    if p.item == Item::HeavyDutyBoots {
+        return;
+    }
+    let magic_guard = p.ability == crate::ids::Ability::MagicGuard;
+
+    // Stealth Rock — hits everything, scaled by Rock effectiveness (Magic Guard blocks it).
+    if s.side_conditions.stealth_rock && !magic_guard {
         let mult = type_multiplier(Type::Rock, p.types);
         let dmg = ((maxhp as f32 / 8.0) * mult).floor() as i16;
         let dmg = dmg.max(1).min(p.hp);
@@ -293,14 +299,31 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
             push(b, Instruction::Damage { side, slot, amount: dmg });
         }
     }
-    // Spikes — grounded only.
+    // Spikes — grounded only (Magic Guard blocks it).
     let layers = b.state.side(side).side_conditions.spikes;
-    if grounded && layers > 0 {
+    if grounded && layers > 0 && !magic_guard {
         let frac = match layers { 1 => 8, 2 => 6, _ => 4 };
         let p = b.state.side(side).active();
         let dmg = (p.max_hp / frac).max(1).min(p.hp);
         if dmg > 0 {
             push(b, Instruction::Damage { side, slot, amount: dmg });
+        }
+    }
+    // Toxic Spikes — grounded; 1 layer poisons, 2 layers badly-poisons; Poison types absorb
+    // them (handled as immunity here: a grounded Poison type would remove them, but we only
+    // model the status). Steel/immune types and non-grounded skip.
+    let tspikes = b.state.side(side).side_conditions.toxic_spikes;
+    if grounded && tspikes > 0 {
+        let p = b.state.side(side).active();
+        let status = if tspikes >= 2 { Status::Toxic } else { Status::Poison };
+        if !p.types.contains(&Type::Poison) && status_applies(p, status) {
+            push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
+        }
+    }
+    // Sticky Web — grounded: −1 Speed on entry.
+    if grounded && b.state.side(side).side_conditions.sticky_web {
+        if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
+            react_to_stat_drop(b, side);
         }
     }
 }
