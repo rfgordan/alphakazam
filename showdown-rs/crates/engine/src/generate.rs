@@ -1196,6 +1196,33 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         return vec![b];
     }
 
+    // Weather-dependent recovery (Moonlight / Synthesis / Morning Sun: 1/2 normally, 0.667 in
+    // sun, 1/4 in any other weather; Shore Up: 1/2, 0.667 in sand). PS implements these as
+    // `onHit` callbacks, so they carry no static `heal` field for the codegen to read. The
+    // sun/sand factor is PS's literal 0.667 → modifier tr(0.667·4096)=2732, not exactly 2/3.
+    let weather_heal: Option<(i64, i64)> = match md.id.to_id() {
+        "moonlight" | "synthesis" | "morningsun" => Some(match b.state.weather {
+            Weather::None => (1, 2),
+            Weather::Sun | Weather::HarshSun => (2732, 4096),
+            _ => (1, 4),
+        }),
+        "shoreup" => Some(match b.state.weather {
+            Weather::Sand => (2732, 4096),
+            _ => (1, 2),
+        }),
+        _ => None,
+    };
+    if let Some((num, den)) = weather_heal {
+        let mut b = b;
+        let p = b.state.side(side).active();
+        let amount = (crate::damage::modify(p.max_hp as i64, num, den) as i16).min(p.max_hp - p.hp);
+        if amount > 0 {
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::Heal { side, slot, amount });
+        }
+        return vec![b];
+    }
+
     let (hit_prob, miss_prob) = if md.accuracy == 0 || md.accuracy >= 100 {
         (1.0, 0.0)
     } else {
