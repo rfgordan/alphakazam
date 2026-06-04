@@ -149,8 +149,11 @@ about which mechanics touch a turn every time they're up.
 defining gen9 competitive mechanic — was untested (0/220 traces). The harness now Teras
 ~50% when offered (218/220 traces exercise it). This is a harder, more honest set: the
 measured rate drops **81.2% → 78.8%** as Tera turns surface real gaps, then **Tera Blast**
-(tera type + higher attacking stat) recovers to **78.9%** (5734/7266). Remaining Tera tail:
-Stellar tera, defensive-type effectiveness edges, STAB precision. Slice stays 100%.
+(tera type + higher attacking stat) recovers to 78.9% (5734/7266), and **mid-turn Tera**
+(applying the type change at turn start, so STAB + defensive typing are right for the rest
+of the turn — a mon Teraing into a Fighting-resist no longer eats a full Body Press) brings
+it to **80.3%** (5831/7266). Remaining Tera tail: Stellar Tera, a few STAB-precision edges.
+Slice stays 100%. The Tera-enabled set is the honest competitive baseline going forward.
 
 > The move-execution volatiles/statuses were the richest vein: **full paralysis** alone was
 > +137 turns (paralysis is everywhere), on top of flinch (+41) and confusion (+10). All are
