@@ -187,6 +187,9 @@ id_map!(Ability {
     PoisonHeal => "poisonheal",
     MagicGuard => "magicguard",
     Infiltrator => "infiltrator",
+    Justified => "justified",
+    LiquidOoze => "liquidooze",
+    NaturalCure => "naturalcure",
 });
 
 id_map!(Item {
@@ -211,6 +214,7 @@ id_map!(Item {
     ToxicOrb => "toxicorb",
     FlameOrb => "flameorb",
     ChestoBerry => "chestoberry",
+    LumBerry => "lumberry",
     Other => "other",
 });
 

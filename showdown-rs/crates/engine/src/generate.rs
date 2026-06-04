@@ -223,6 +223,12 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             push(b, Instruction::RemoveVolatile { side, volatile: *v });
         }
     }
+    // Natural Cure heals the outgoing Pokémon's non-volatile status as it switches out.
+    let outgoing = b.state.side(side).active();
+    if outgoing.ability == crate::ids::Ability::NaturalCure && outgoing.status != Status::None {
+        let prev = outgoing.status;
+        push(b, Instruction::ChangeStatus { side, slot: previous, previous: prev, new: Status::None });
+    }
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
@@ -560,6 +566,7 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         // Weakness Policy on the target (super-effective hit), then White Herb if the user's
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
         apply_weakness_policy(&mut hb, foe, &md);
+        apply_justified(&mut hb, foe, &md);
         apply_white_herb(&mut hb, side);
         // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
         apply_pinch_berry(&mut hb, foe);
@@ -947,13 +954,21 @@ fn apply_post_damage(
     let foe = side.other();
     if any_damage {
         let aslot = b.state.side(side).active_index;
-        // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt.
+        // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt — unless the
+        // target has Liquid Ooze, which damages the drainer for that amount instead.
         if md.drain.0 > 0 {
             let atk = b.state.side(side).active();
-            let heal = round_div(total_dealt * md.drain.0 as i32, md.drain.1 as i32) as i16;
-            let heal = heal.min(atk.max_hp - atk.hp);
-            if heal > 0 && atk.is_alive() {
-                push(b, Instruction::Heal { side, slot: aslot, amount: heal });
+            let amount = round_div(total_dealt * md.drain.0 as i32, md.drain.1 as i32) as i16;
+            if def_ability == Ab::LiquidOoze {
+                let dmg = amount.min(atk.hp);
+                if dmg > 0 && atk.is_alive() {
+                    push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+                }
+            } else {
+                let heal = amount.min(atk.max_hp - atk.hp);
+                if heal > 0 && atk.is_alive() {
+                    push(b, Instruction::Heal { side, slot: aslot, amount: heal });
+                }
             }
         }
         // Move recoil (Brave Bird, Flare Blitz): self-damage a fraction of damage dealt.
@@ -1043,6 +1058,18 @@ fn apply_white_herb(b: &mut Branch, side: SideId) {
         if cur < 0 {
             push(b, Instruction::Boost { side, stat, amount: -cur });
         }
+    }
+}
+
+/// Justified: +1 Atk when the holder is hit by a damaging Dark-type move.
+fn apply_justified(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    let d = b.state.side(foe).active();
+    if d.is_alive()
+        && d.ability == crate::ids::Ability::Justified
+        && md.typ == Type::Dark
+        && md.category != MoveCategory::Status
+    {
+        raise_boost(b, foe, BoostIndex::Attack, 1);
     }
 }
 
@@ -1146,6 +1173,11 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
     }
     // Purifying Salt grants blanket status immunity (to both moves and secondaries).
     if p.ability == crate::ids::Ability::PurifyingSalt {
+        return false;
+    }
+    // A Lum Berry holder immediately cures any inflicted status, so it never sticks (the
+    // berry's consumption isn't compared, and the holder's item is re-projected each turn).
+    if p.item == crate::ids::Item::LumBerry {
         return false;
     }
     match status {

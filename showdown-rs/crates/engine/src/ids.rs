@@ -233,6 +233,12 @@ pub enum Ability {
     MagicGuard,
     // Bypasses screens / Substitute when attacking
     Infiltrator,
+    // +1 Atk when hit by a Dark move
+    Justified,
+    // Drain moves damage the holder's attacker instead of healing
+    LiquidOoze,
+    // Cures status on switch-out
+    NaturalCure,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
@@ -260,6 +266,7 @@ pub enum Item {
     ToxicOrb,
     FlameOrb,
     ChestoBerry,
+    LumBerry,
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,
