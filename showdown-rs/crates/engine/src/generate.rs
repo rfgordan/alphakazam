@@ -347,6 +347,24 @@ enum Order {
     Tie,
 }
 
+/// Fixed-damage moves bypass the damage formula (PS implements them via a `damage` field or
+/// callback). Returns the HP to remove, or `None` if `md` isn't one of them. Type immunity
+/// is handled separately by the caller's `connects` check.
+fn fixed_damage_amount(md: &crate::data::MoveData, state: &State, side: SideId) -> Option<i16> {
+    let attacker = state.side(side).active();
+    let defender = state.side(side.other()).active();
+    Some(match md.id.to_id() {
+        "seismictoss" | "nightshade" => attacker.level as i16,
+        "dragonrage" => 40,
+        "sonicboom" => 20,
+        // Super Fang halves the target's *current* HP (min 1); Endeavor brings it down to the
+        // attacker's current HP (0 if the target is already at or below it).
+        "superfang" => (defender.hp / 2).max(1),
+        "endeavor" => (defender.hp - attacker.hp).max(0),
+        _ => return None,
+    })
+}
+
 /// A move's effective priority, including Prankster (+1 to the user's status moves).
 fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     let md = move_data(state.side(side).active().moves[move_idx as usize].id);
@@ -504,7 +522,25 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
     // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
     // take the sumset-DP path, which also folds in the distribution over the hit count.
-    let damaged: Vec<(Branch, bool)> = if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
+    let damaged: Vec<(Branch, bool)> = if let Some(fixed) = fixed_damage_amount(&md, &b.state, side) {
+        // Fixed-damage moves (Night Shade / Seismic Toss = level, Dragon Rage = 40, ...) skip
+        // the damage formula entirely: one deterministic outcome, no rolls or crit.
+        let mut hb = scaled(&b, hit_prob);
+        let calc = compute_damage(&hb, side, &md);
+        let target_hp = hb.state.side(foe).active().hp;
+        let mut dealt = fixed.min(target_hp);
+        if (calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash)
+            && target_hp == calc.def_maxhp && dealt >= target_hp
+        {
+            dealt = target_hp - 1;
+        }
+        if dealt > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: dealt });
+        }
+        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, calc.life_orb, calc.def_item, calc.def_ability);
+        vec![(hb, false)]
+    } else if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
         for combo in HitCombos::new(hits_min) {
             let mut prob = hit_prob;
