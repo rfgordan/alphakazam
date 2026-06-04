@@ -495,8 +495,55 @@ struct DamageCalc {
     life_orb: bool,
 }
 
-/// Execute one move from `action.side`, returning the resulting branches.
+/// Execute one move, first splitting on confusion: a confused, awake mon has a 1/3 chance to
+/// hit itself instead of acting. The 2/3 "acts normally" branch is identical to no-confusion
+/// behavior, so this only *adds* the self-hit outcomes (no regression on the common path).
 fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
+    let side = action.side;
+    let (alive, status, confused) = {
+        let p = b.state.side(side).active();
+        (p.is_alive(), p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
+    };
+    if alive && confused && status != Status::Sleep && status != Status::Freeze {
+        let mut out = confusion_self_hit(scaled(&b, 1.0 / 3.0), side);
+        out.extend(execute_move_inner(scaled(&b, 2.0 / 3.0), action));
+        out
+    } else {
+        execute_move_inner(b, action)
+    }
+}
+
+/// The confusion self-hit: a 40-BP typeless physical attack the mon lands on itself, using
+/// its own (boosted) Attack and Defense, halved by burn. Enumerates the 16 damage rolls.
+fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
+    let (level, atk, def, burned, hp) = {
+        let s = b.state.side(side);
+        let p = s.active();
+        let atk = boosted_stat(p.stat(crate::ids::StatIndex::Attack) as i64, s.boost(BoostIndex::Attack));
+        let def = boosted_stat(p.stat(crate::ids::StatIndex::Defense) as i64, s.boost(BoostIndex::Defense)).max(1);
+        (p.level as i64, atk, def, p.status == Status::Burn, p.hp)
+    };
+    let lvl_factor = 2 * level / 5 + 2;
+    let bd = (lvl_factor * 40 * atk) / def / 50 + 2;
+    let mut out = Vec::with_capacity(16);
+    for i in 0..16i64 {
+        let mut dmg = bd * (85 + i) / 100;
+        if burned {
+            dmg /= 2;
+        }
+        let dmg = (dmg.max(1) as i16).min(hp);
+        let mut sb = scaled(&b, 1.0 / 16.0);
+        if dmg > 0 {
+            let slot = sb.state.side(side).active_index;
+            push(&mut sb, Instruction::Damage { side, slot, amount: dmg });
+        }
+        out.push(sb);
+    }
+    out
+}
+
+/// Execute one move from `action.side`, returning the resulting branches.
+fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let Action { side, move_idx, pivot } = action;
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
