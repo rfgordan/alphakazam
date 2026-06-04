@@ -139,7 +139,18 @@ about which mechanics touch a turn every time they're up.
 | Partially-trapped + Ghost Curse residuals; Speed Boost (EoT +1 Spe, switch-aware) | 76.7% |
 | **Conditional base power** (Facade/Hex/Venoshock/Brine/Acrobatics ×2; Eruption/Water Spout = HP-scaled) | 77.2% |
 | **Heavy-Duty Boots negate hazards** + Toxic Spikes/Sticky Web on entry + Magic Guard | **78.5%** |
-| Rock Head/Scrappy/Unnerve; exact integer boost math; HJK crash; **confusion self-hit** | **78.8%** |
+| Rock Head/Scrappy/Unnerve; exact integer boost math; HJK crash; **confusion self-hit** | 78.8% |
+| Switch-in/KO boosts (Intrepid Sword/Download/Beast Boost); sand-immunity + weather-heal abilities | 78.9% |
+| **Full paralysis** (25% can't move) + **freeze thaw** (20%) | 80.8% |
+| **Haze** + **Clear Smog** (reset stat stages) | **81.1%** |
+
+> The move-execution volatiles/statuses were the richest vein: **full paralysis** alone was
+> +137 turns (paralysis is everywhere), on top of flinch (+41) and confusion (+10). All are
+> *safe to add* — they only expand the candidate set. From 62.8% (40-trace) to **81.1%**
+> (220-trace) this session, slice held at 100% the whole way. Remaining tail: ±1 damage
+> precision, faint/pivot-replacement `active_index` edges, Tera nuances, and the thinning
+> rare-ability/item list (most top unmapped now don't affect membership: Loaded Dice covered
+> by the multi-hit DP, Wide Lens/Light Clay don't change compared fields).
 
 > Biggest single wins this stretch: **Heavy-Duty Boots** (ubiquitous — every HDB switch-in
 > was over-damaged, +94 turns), **flinch** (+41), **Leech Seed** (+53), **Speed Boost** (+50),
