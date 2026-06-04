@@ -377,6 +377,27 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
 ];
 
+/// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
+const CRIT: f32 = 1.0 / 24.0;
+
+/// Maximum hit count for which we enumerate the *full* per-hit (roll × crit) product.
+/// At 3 hits that's 32³ = 32,768 branches (~28 MB of states) — fine. Above this the
+/// product explodes (Population Bomb's 10 hits → 32¹⁰ ≈ 1.1e15 branches, ~1 EB, which
+/// hard-crashes the machine), so high-hit moves take the sumset-DP path instead.
+const MAX_EXACT_HITS: usize = 3;
+
+/// The damage computation for one move: the 16 damage rolls (non-crit and crit) plus the
+/// defender-side fields needed *after* damage is applied (Sturdy/Sash, contact punishers,
+/// Life Orb). Computed once per move; both the exact and the DP hit paths consume it.
+struct DamageCalc {
+    rolls_nocrit: [i16; 16],
+    rolls_crit: [i16; 16],
+    def_ability: crate::ids::Ability,
+    def_item: Item,
+    def_maxhp: i16,
+    life_orb: bool,
+}
+
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let Action { side, move_idx, pivot } = action;
@@ -459,17 +480,28 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         return out;
     }
 
-    const CRIT: f32 = 1.0 / 24.0;
-    // Each hit rolls damage (16) and crit (independently) on its own. Enumerate the full
-    // product across hits so every mixed crit/roll outcome PS could produce is present.
+    // Each hit rolls damage (16) and crit independently. For small hit counts we enumerate
+    // the full per-hit product (exact, and preserves Substitute/Sturdy interleaving). For
+    // large counts (Population Bomb's 10 hits → 32¹⁰ branches) that explodes the allocator
+    // and crashes the machine, so we instead enumerate the distinct *total* damage via a
+    // sumset DP — same set of observable result states, bounded memory.
     let hits = md.hits.max(1) as usize;
-    for combo in HitCombos::new(hits) {
-        let mut prob = hit_prob;
-        for &(_, crit) in &combo {
-            prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
+    let damaged: Vec<(Branch, bool)> = if hits <= MAX_EXACT_HITS {
+        let mut v = Vec::new();
+        for combo in HitCombos::new(hits) {
+            let mut prob = hit_prob;
+            for &(_, crit) in &combo {
+                prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
+            }
+            let mut hb = scaled(&b, prob);
+            let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
+            v.push((hb, hit_sub));
         }
-        let mut hb = scaled(&b, prob);
-        let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
+        v
+    } else {
+        apply_multihit_dp(&b, side, &md, hits, hit_prob)
+    };
+    for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
         // A Substitute blocks the target's own secondaries (boosts/status).
         let branches = if hit_sub { vec![hb] } else { apply_target_secondary(hb, side, &md) };
@@ -515,9 +547,10 @@ impl Iterator for HitCombos {
     }
 }
 
-/// Applies a damaging move's hits; returns true if a Substitute absorbed the damage
-/// (so the target's own secondaries/volatiles are blocked).
-fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) -> bool {
+/// Compute a move's damage rolls (non-crit and crit) and the defender-side fields needed
+/// after application. Pure with respect to `b` (reads state, mutates nothing) so both the
+/// exact per-hit path and the sumset-DP path can call it once and share the result.
+fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> DamageCalc {
     let foe = side.other();
     let attacker = b.state.side(side).active();
     let defender = b.state.side(foe).active();
@@ -541,8 +574,12 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
         (crate::ids::StatIndex::SpecialDefense, BoostIndex::SpecialDefense)
     };
 
-    let mut atk_stat = (attacker.stat(atk_idx) as f32 * boost_multiplier(b.state.side(side).boost(atk_boost_idx))) as i64;
-    let mut def_stat = (defender.stat(def_idx) as f32 * boost_multiplier(b.state.side(foe).boost(def_boost_idx))) as i64;
+    // Unaware: the attacker ignores the defender's defensive boosts, and a defender with
+    // Unaware ignores the attacker's offensive boosts.
+    let atk_boost = if defender.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
+    let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
+    let mut atk_stat = (attacker.stat(atk_idx) as f32 * boost_multiplier(atk_boost)) as i64;
+    let mut def_stat = (defender.stat(def_idx) as f32 * boost_multiplier(def_boost)) as i64;
 
     // Item stat modifiers (PS applies these via `modify`, round-half-up).
     match (attacker.item, md.category) {
@@ -620,6 +657,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
         Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+        Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
         _ => {}
     }
     // Thick Fat (defender) halves the attack of Fire/Ice moves.
@@ -727,6 +765,17 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     input_crit.is_crit = true;
     let rolls_crit = damage_rolls(&input_crit);
 
+    DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb }
+}
+
+/// Applies a damaging move's hits sequentially (each its own roll and crit), clamped to HP
+/// and routed through any Substitute; returns true if a Substitute absorbed the damage (so
+/// the target's own secondaries/volatiles are blocked).
+fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) -> bool {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    let DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb } =
+        compute_damage(b, side, md);
     // Apply each hit's damage independently (own roll and crit), clamped to current HP
     // (a hit that faints the target ends the sequence; remaining hits add nothing).
     let mut any_damage = false;
@@ -766,6 +815,26 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             total_dealt += dmg as i32;
         }
     }
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, life_orb, def_item, def_ability);
+    hit_sub
+}
+
+/// Effects keyed on the *total* damage a move dealt: drain, move recoil, Life Orb recoil,
+/// contact punishers (Rocky Helmet / Rough Skin / Iron Barbs), and Toxic Debris. Shared by
+/// the exact per-hit path and the multi-hit sumset-DP path so both stay in lockstep.
+fn apply_post_damage(
+    b: &mut Branch,
+    side: SideId,
+    md: &crate::data::MoveData,
+    total_dealt: i32,
+    any_damage: bool,
+    hit_sub: bool,
+    life_orb: bool,
+    def_item: Item,
+    def_ability: crate::ids::Ability,
+) {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
     if any_damage {
         let aslot = b.state.side(side).active_index;
         // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt.
@@ -827,7 +896,57 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             });
         }
     }
-    hit_sub
+}
+
+/// The sumset-DP multi-hit path: enumerate the distinct *total* damage a fixed multi-hit
+/// move can deal (instead of the 32ʰⁱᵗˢ per-hit product) and emit one branch per total.
+///
+/// Each hit independently draws from the 16 non-crit rolls (each w.p. (1/16)·(1−CRIT)) or
+/// the 16 crit rolls (each w.p. (1/16)·CRIT). We convolve that per-hit distribution `hits`
+/// times, clamping every running total at the target's current HP (overkill collapses to a
+/// single "faint" outcome), which yields the exact set of reachable totals in O(hits · HP ·
+/// 32) time and O(HP) branches. Substitute routing and Sturdy/Focus Sash are not modeled on
+/// this path: both are one-hit effects (a Sash/Sturdy is broken by the second hit) that do
+/// not apply to the fixed ≥4-hit moves (Population Bomb) that reach here.
+fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, hits: usize, hit_prob: f32) -> Vec<(Branch, bool)> {
+    use std::collections::HashMap;
+    let foe = side.other();
+    let calc = compute_damage(b, side, md);
+
+    // Per-hit damage value → probability (32 entries: 16 non-crit + 16 crit).
+    let mut per_hit: Vec<(i32, f32)> = Vec::with_capacity(32);
+    for i in 0..16 {
+        per_hit.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - CRIT)));
+        per_hit.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * CRIT));
+    }
+
+    // Convolve the per-hit distribution `hits` times, clamping cumulative damage at the
+    // target's HP so all overkill collapses to one faint outcome (bounds the support size).
+    let cap = b.state.side(foe).active().hp.max(0) as i32;
+    let mut dist: HashMap<i32, f32> = HashMap::new();
+    dist.insert(0, 1.0);
+    for _ in 0..hits {
+        let mut next: HashMap<i32, f32> = HashMap::with_capacity(dist.len() + 32);
+        for (&t, &pt) in &dist {
+            for &(v, pv) in &per_hit {
+                *next.entry((t + v).min(cap)).or_insert(0.0) += pt * pv;
+            }
+        }
+        dist = next;
+    }
+
+    // One branch per distinct total damage.
+    let mut out = Vec::with_capacity(dist.len());
+    for (total, p) in dist {
+        let mut hb = scaled(b, hit_prob * p);
+        if total > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: total as i16 });
+        }
+        apply_post_damage(&mut hb, side, md, total, total > 0, false, calc.life_orb, calc.def_item, calc.def_ability);
+        out.push((hb, false));
+    }
+    out
 }
 
 /// Stat indices in `BoostIndex` order, for iterating a `[i8; 7]` boost array.
@@ -879,7 +998,13 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if !b.state.side(foe).active().is_alive() {
         return vec![b];
     }
-    let chance = md.secondary_chance as f32 / 100.0;
+    // Serene Grace doubles the secondary chance.
+    let pct = if b.state.side(side).active().ability == crate::ids::Ability::SereneGrace {
+        (md.secondary_chance as u16 * 2).min(100) as u8
+    } else {
+        md.secondary_chance
+    };
+    let chance = pct as f32 / 100.0;
     let mut proc = scaled(&b, chance);
     let noproc = scaled(&b, 1.0 - chance);
     for (i, &delta) in md.secondary_boosts.iter().enumerate() {

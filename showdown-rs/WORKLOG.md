@@ -102,7 +102,14 @@ Progression (40 random games, 1105 turns), each a broad data-driven addition:
 | Forced-switch moves (Roar/Whirlwind/Dragon Tail) + self-switch status (Teleport/Chilly Reception/Parting Shot) | 61.1% |
 | Sleep (fixed-counter wake) + Freeze can't-move | 62.3% |
 | Move flags + flag-keyed abilities (Tough Claws/Sharpness/Iron Fist/Strong Jaw/Mega Launcher/Punk Rock), Soundproof/Bulletproof, contact recoil (Rocky Helmet/Rough Skin/Iron Barbs) | 62.7% |
-| Focus Sash; status-immunity (Purifying Salt blanket, Good as Gold vs status moves) | **62.8%** |
+| Focus Sash; status-immunity (Purifying Salt blanket, Good as Gold vs status moves) | **62.8%** (40-trace set) |
+| Hustle (×1.5 physical atk), Unaware (ignore foe boosts), Serene Grace (×2 secondary chance) | — |
+| **Crash fix: multi-hit branch explosion** — Population Bomb (`multihit: 10`) drove `32¹⁰ ≈ 1.1e15` per-hit branches (~1 EB), OOM-crashing the machine. High-hit moves now take a sumset-DP path enumerating distinct *total* damage (O(hits·HP·32), peak RSS ~19 MB). | **64.5%** (120-trace set) |
+
+> Measurement set widened from 40 → 120 random traces here for a stable sub-0.5% signal, so
+> the 62.8% → 64.5% step is partly the new, larger baseline rather than all new mechanics.
+> The exact per-hit product is kept for ≤3 hits (`MAX_EXACT_HITS`), so Substitute/Sturdy
+> interleaving on common 2–3-hit moves is unchanged; only fixed ≥4-hit moves take the DP path.
 
 The grind plateaus into the genuine Pokémon long tail: by ~63% the mismatch buckets are
 noise-dominated (common moves co-occur with any failing turn), and each remaining mechanic

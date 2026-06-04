@@ -172,6 +172,9 @@ id_map!(Ability {
     SandRush => "sandrush",
     SlushRush => "slushrush",
     QuickFeet => "quickfeet",
+    Hustle => "hustle",
+    Unaware => "unaware",
+    SereneGrace => "serenegrace",
 });
 
 id_map!(Item {

@@ -210,6 +210,9 @@ pub enum Ability {
     SandRush,
     SlushRush,
     QuickFeet,
+    Hustle,
+    Unaware,
+    SereneGrace,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
