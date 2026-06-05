@@ -80,6 +80,12 @@ pub struct TSide {
     pub substitute_hp: i16,
     pub side_conditions: TSideConditions,
     pub pokemon: Vec<TPokemon>,
+    /// Consecutive-use tracking of the active mon (defaulted for traces that predate it).
+    #[serde(default)]
+    pub last_used_move: String,
+    /// PS's Protect "stall" failure divisor (1, 3, 9, …); 0 means no stall.
+    #[serde(default)]
+    pub stall_counter: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

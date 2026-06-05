@@ -200,6 +200,10 @@ function projSide(side, sideIdx) {
 			tailwind: dur('tailwind'),
 		},
 		pokemon: inOrder.map(projPokemon),
+		// Consecutive-use tracking of the active mon: last executed move and the Protect
+		// "stall" failure divisor (PS stores it on the `stall` volatile's counter).
+		lastUsedMove: active && active.lastMove ? active.lastMove.id : '',
+		stallCounter: active && active.volatiles.stall ? (active.volatiles.stall.counter || 0) : 0,
 	};
 }
 

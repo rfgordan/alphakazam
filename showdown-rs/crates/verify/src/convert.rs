@@ -101,6 +101,13 @@ fn parse_side(ts: &TSide, unmapped: &mut Unmapped) -> Side {
         }
     }
     s.substitute_hp = ts.substitute_hp;
+    s.last_used_move = MoveId::from_id(&ts.last_used_move).unwrap_or(MoveId::None);
+    // PS stores the Protect "stall" as the next failure divisor (1, 3, 9, …); the engine
+    // stores the exponent n (success = 1/3ⁿ), so n = round(log₃(divisor)).
+    s.stall_counter = match ts.stall_counter {
+        0 | 1 => 0,
+        d => (d as f32).log(3.0).round() as u8,
+    };
     let sc = &ts.side_conditions;
     s.side_conditions.stealth_rock = sc.stealth_rock;
     s.side_conditions.spikes = sc.spikes;
@@ -254,6 +261,9 @@ fn project_side(s: &Side) -> TSide {
             .filter(|p| p.species != Species::None)
             .map(project_pokemon)
             .collect(),
+        last_used_move: s.last_used_move.to_id().to_string(),
+        // Project the exponent n back to PS's divisor (3ⁿ) for symmetry with parse_side.
+        stall_counter: 3u32.pow(s.stall_counter.min(8) as u32).min(u16::MAX as u32) as u16,
     }
 }
 
