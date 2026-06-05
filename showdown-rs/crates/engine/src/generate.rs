@@ -1056,16 +1056,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if def_ab == Ab::PurifyingSalt && md.typ == Type::Ghost {
         atk_stat = crate::damage::modify(atk_stat, 1, 2);
     }
-    // Supreme Overlord: +10% to the offensive stat per fallen ally (max 5).
-    if attacker.ability == crate::ids::Ability::SupremeOverlord {
-        let fallen = b.state.side(side).pokemon.iter()
-            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
-            .count()
-            .min(5) as i64;
-        if fallen > 0 {
-            atk_stat = crate::damage::modify(atk_stat, 10 + fallen, 10);
-        }
-    }
+    // Supreme Overlord is applied to base power below (PS uses an exact lookup table).
     // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
     // chainModify([5325, 4096]) — modifier 5325, NOT 13/10 (which rounds to 5324).
     //
@@ -1234,6 +1225,18 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             base_power = (50u16.saturating_mul(1 + attacker.times_hit as u16)).min(350);
         }
         _ => {}
+    }
+    // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
+    // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
+    if attacker.ability == Ab::SupremeOverlord {
+        let fallen = b.state.side(side).pokemon.iter()
+            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
+            .count()
+            .min(5);
+        if fallen > 0 {
+            const POW: [i64; 6] = [4096, 4506, 4915, 5325, 5734, 6144];
+            base_power = crate::damage::modify(base_power as i64, POW[fallen], 4096) as u16;
+        }
     }
     // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
     // The terrain is part of the projected state, so terrain-setting abilities/moves needn't
