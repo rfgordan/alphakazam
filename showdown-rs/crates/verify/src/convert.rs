@@ -72,6 +72,8 @@ fn parse_pokemon(tp: &TPokemon, unmapped: &mut Unmapped) -> Pokemon {
     p.stats[StatIndex::Speed as usize] = tp.stats.spe;
     p.terastallized = tp.terastallized;
     p.tera_type = Type::from_id(&tp.tera_type).unwrap_or(Type::None);
+    p.times_hit = tp.times_hit;
+    p.ability_used = tp.ability_used;
     for (i, m) in tp.moves.iter().take(4).enumerate() {
         let id = MoveId::from_id(&m.id).unwrap_or_else(|| {
             unmapped.note("move", &m.id);
@@ -137,6 +139,7 @@ fn parse_side(ts: &TSide, unmapped: &mut Unmapped) -> Side {
         d => (d as f32).log(3.0).round() as u8,
     };
     s.pending_move = parse_pending(&ts.pending_move);
+    s.active_turns = ts.active_turns;
     let sc = &ts.side_conditions;
     s.side_conditions.stealth_rock = sc.stealth_rock;
     s.side_conditions.spikes = sc.spikes;
@@ -215,6 +218,8 @@ fn project_pokemon(p: &Pokemon) -> TPokemon {
                 disabled: m.disabled,
             })
             .collect(),
+        times_hit: p.times_hit,
+        ability_used: p.ability_used,
     }
 }
 
@@ -294,6 +299,7 @@ fn project_side(s: &Side) -> TSide {
         // Project the exponent n back to PS's divisor (3ⁿ) for symmetry with parse_side.
         stall_counter: 3u32.pow(s.stall_counter.min(8) as u32).min(u16::MAX as u32) as u16,
         pending_move: pending_to_string(s.pending_move),
+        active_turns: s.active_turns,
     }
 }
 

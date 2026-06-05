@@ -89,6 +89,9 @@ pub struct TSide {
     /// Multi-turn move commitment: "", "charge:<move>", "recharge", "rampage:<move>:<turns>".
     #[serde(default)]
     pub pending_move: String,
+    /// Turns the active mon has been out (Fake Out / First Impression / Slow Start).
+    #[serde(default)]
+    pub active_turns: u8,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -131,6 +134,10 @@ pub struct TPokemon {
     pub terastallized: bool,
     pub tera_type: String,
     pub moves: Vec<TMove>,
+    #[serde(default)]
+    pub times_hit: u8,
+    #[serde(default)]
+    pub ability_used: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

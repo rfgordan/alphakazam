@@ -170,6 +170,10 @@ function projPokemon(p) {
 			maxPp: m.maxpp,
 			disabled: !!m.disabled,
 		})),
+		// Battle-long per-mon history: times hit (Rage Fist) and whether a once-per-battle
+		// ability (Intrepid Sword / Dauntless Shield) has already fired.
+		timesHit: p.timesAttacked || 0,
+		abilityUsed: !!(p.swordBoost || p.shieldBoost),
 	};
 }
 
@@ -209,6 +213,8 @@ function projSide(side, sideIdx) {
 		// "stall" failure divisor (PS stores it on the `stall` volatile's counter).
 		lastUsedMove: active && active.lastMove ? active.lastMove.id : '',
 		stallCounter: active && active.volatiles.stall ? (active.volatiles.stall.counter || 0) : 0,
+		// Turns the active mon has been out (Fake Out / First Impression / Slow Start).
+		activeTurns: active ? (active.activeTurns || 0) : 0,
 		// Multi-turn move commitment, encoded as "", "charge:<move>", "recharge", or
 		// "rampage:<move>:<turns>" (PS volatiles twoturnmove / mustrecharge / lockedmove).
 		pendingMove: (() => {
