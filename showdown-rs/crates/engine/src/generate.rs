@@ -683,7 +683,8 @@ fn apply_struggle_recoil(mut out: Vec<Branch>, side: SideId, struggling: bool) -
         for b in &mut out {
             let p = b.state.side(side).active();
             if p.is_alive() {
-                let rec = (p.max_hp / 4).max(1).min(p.hp);
+                // Struggle recoil is round(maxhp/4) (PS rounds half up), not a floor.
+                let rec = (round_div(p.max_hp as i32, 4) as i16).max(1).min(p.hp);
                 let slot = b.state.side(side).active_index;
                 push(b, Instruction::Damage { side, slot, amount: rec });
             }
