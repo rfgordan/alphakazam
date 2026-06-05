@@ -66,6 +66,12 @@ pub struct Pokemon {
 
     pub tera_type: Type,
     pub terastallized: bool,
+
+    // --- battle-long, per-mon history (persists across switches) ---
+    /// A once-per-battle ability (gen9 Intrepid Sword / Dauntless Shield) has already fired.
+    pub ability_used: bool,
+    /// How many times this Pokémon has been hit by a damaging move this battle (Rage Fist).
+    pub times_hit: u8,
 }
 
 impl Pokemon {
@@ -87,6 +93,8 @@ impl Pokemon {
         moves: [MoveSlot::EMPTY; 4],
         tera_type: Type::None,
         terastallized: false,
+        ability_used: false,
+        times_hit: 0,
     };
 
     #[inline]
@@ -162,6 +170,9 @@ pub struct Side {
     pub confusion_turns: u8,
     pub perish_turns: u8,
     pub yawn_turns: u8,
+    /// Turns the current active Pokémon has been out (0 the turn it switches in). Drives
+    /// first-turn moves (Fake Out, First Impression) and Slow Start. Resets on switch.
+    pub active_turns: u8,
 
     pub side_conditions: SideConditions,
 
@@ -195,6 +206,7 @@ impl Side {
         confusion_turns: 0,
         perish_turns: 0,
         yawn_turns: 0,
+        active_turns: 0,
         side_conditions: SideConditions {
             stealth_rock: false,
             spikes: 0,

@@ -293,11 +293,12 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
 /// deltas so the instruction list stays exactly invertible.
 fn reset_move_tracking(b: &mut Branch, side: SideId) {
     use crate::ids::MoveId;
-    use crate::instruction::ActiveCounter::{Confusion, Perish, Taunt, Yawn};
+    use crate::instruction::ActiveCounter::{ActiveTurns, Confusion, Perish, Taunt, Yawn};
     let s = b.state.side(side);
     let (lm, streak, stall) = (s.last_used_move, s.move_streak, s.stall_counter);
     let (pending, encore, disable) = (s.pending_move, s.encore, s.disable);
-    let (taunt, conf, perish, yawn) = (s.taunt_turns, s.confusion_turns, s.perish_turns, s.yawn_turns);
+    let (taunt, conf, perish, yawn, active) =
+        (s.taunt_turns, s.confusion_turns, s.perish_turns, s.yawn_turns, s.active_turns);
     if lm != MoveId::None {
         push(b, Instruction::SetLastMove { side, previous: lm, new: MoveId::None });
     }
@@ -316,7 +317,7 @@ fn reset_move_tracking(b: &mut Branch, side: SideId) {
     if disable.1 != 0 {
         push(b, Instruction::SetDisable { side, previous: disable, new: (MoveId::None, 0) });
     }
-    for (which, cur) in [(Taunt, taunt), (Confusion, conf), (Perish, perish), (Yawn, yawn)] {
+    for (which, cur) in [(Taunt, taunt), (Confusion, conf), (Perish, perish), (Yawn, yawn), (ActiveTurns, active)] {
         if cur != 0 {
             push(b, Instruction::SetActiveCounter { side, which, previous: cur, new: 0 });
         }
@@ -365,12 +366,13 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             }
         }
     }
-    // Intrepid Sword (Zacian) / Dauntless Shield (Zamazenta): +1 Atk / +1 Def on switch-in.
-    if ability == IntrepidSword {
-        raise_boost(b, side, BoostIndex::Attack, 1);
-    }
-    if ability == DauntlessShield {
-        raise_boost(b, side, BoostIndex::Defense, 1);
+    // Intrepid Sword (Zacian) / Dauntless Shield (Zamazenta): +1 Atk / +1 Def — but only
+    // ONCE per battle in gen9 (not on every switch-in like gen8).
+    if matches!(ability, IntrepidSword | DauntlessShield) && !b.state.side(side).active().ability_used {
+        let stat = if ability == IntrepidSword { BoostIndex::Attack } else { BoostIndex::Defense };
+        raise_boost(b, side, stat, 1);
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::SetAbilityUsed { side, slot, previous: false, new: true });
     }
     // Download: +1 Atk if the foe's Defense ≤ Special Defense, else +1 SpA.
     if ability == Download {
@@ -747,6 +749,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     }
     if executing_charge {
         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+    }
+
+    // Fake Out / First Impression only work on the user's first turn out (active_turns ≤ 1);
+    // after that they fail outright.
+    if matches!(move_id.to_id(), "fakeout" | "firstimpression") && b.state.side(side).active_turns > 1 {
+        return vec![b];
     }
 
     // Status moves handled specially.
@@ -1172,6 +1180,10 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             let streak = b.state.side(side).move_streak.max(1);
             base_power = (40u16) << (streak - 1).min(2);
         }
+        // Rage Fist: 50 + 50 per time the user has been hit this battle, capped at 350.
+        "ragefist" => {
+            base_power = (50u16.saturating_mul(1 + attacker.times_hit as u16)).min(350);
+        }
         _ => {}
     }
     // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
@@ -1415,6 +1427,16 @@ fn apply_post_damage(
                 previous: cur,
                 new: cur + 1,
             });
+        }
+    }
+
+    // Track times the target has been hit by a damaging move (Rage Fist). A hit absorbed by
+    // a Substitute doesn't count.
+    if any_damage && !hit_sub && b.state.side(foe).active().is_alive() {
+        let fslot = b.state.side(foe).active_index;
+        let cur = b.state.side(foe).active().times_hit;
+        if cur < 250 {
+            push(b, Instruction::SetTimesHit { side: foe, slot: fslot, previous: cur, new: cur + 1 });
         }
     }
 }
@@ -2277,6 +2299,18 @@ fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
         let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
         if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
             raise_boost(b, side, BoostIndex::Speed, 1);
+        }
+
+        // Advance the active mon's turn counter (used by Fake Out / First Impression / Slow
+        // Start). Caps so it can't overflow in a long stall.
+        let cur = b.state.side(side).active_turns;
+        if cur < 250 {
+            push(b, Instruction::SetActiveCounter {
+                side,
+                which: crate::instruction::ActiveCounter::ActiveTurns,
+                previous: cur,
+                new: cur + 1,
+            });
         }
     }
 }

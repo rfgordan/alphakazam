@@ -30,6 +30,7 @@ pub enum ActiveCounter {
     Confusion,
     Perish,
     Yawn,
+    ActiveTurns,
 }
 use crate::volatile::VolatileStatus;
 
@@ -132,6 +133,10 @@ pub enum Instruction {
     SetEncore { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
     SetDisable { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
     SetActiveCounter { side: SideId, which: ActiveCounter, previous: u8, new: u8 },
+
+    // --- battle-long per-mon history (persists across switches) ---
+    SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
+    SetTimesHit { side: SideId, slot: u8, previous: u8, new: u8 },
 
     // --- transformations ---
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
@@ -241,6 +246,12 @@ impl State {
             SetActiveCounter { side, which, new, .. } => {
                 set_active_counter(self, side, which, new);
             }
+            SetAbilityUsed { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].ability_used = new;
+            }
+            SetTimesHit { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].times_hit = new;
+            }
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
@@ -344,6 +355,12 @@ impl State {
             SetActiveCounter { side, which, previous, .. } => {
                 set_active_counter(self, side, which, previous);
             }
+            SetAbilityUsed { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].ability_used = previous;
+            }
+            SetTimesHit { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].times_hit = previous;
+            }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;
             }
@@ -369,6 +386,7 @@ fn set_active_counter(state: &mut State, side: SideId, which: ActiveCounter, val
         ActiveCounter::Confusion => s.confusion_turns = value,
         ActiveCounter::Perish => s.perish_turns = value,
         ActiveCounter::Yawn => s.yawn_turns = value,
+        ActiveCounter::ActiveTurns => s.active_turns = value,
     }
 }
 
