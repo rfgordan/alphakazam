@@ -223,9 +223,20 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         if (stab_num, stab_den) != (1, 1) {
             d = modify(d, stab_num, stab_den);
         }
-        // Type effectiveness: ×2 for super, floor(÷2) for resist, applied per type.
-        d = apply_type_step(d, e0);
-        d = apply_type_step(d, e1);
+        // Type effectiveness: PS applies the *net* exponent — ×2 for each super-effective
+        // type, floor(÷2) for each resisted — all the ×2 first, then the ÷2. Applying each
+        // type sequentially (halve-then-double) mis-rounds by 1 when they cancel, e.g. Bug
+        // (×0.5 vs Poison, ×2 vs Psychic) vs Slowking-Galar = ×1, not ×1 − 1.
+        let up = (e0 == 2.0) as i32 + (e1 == 2.0) as i32;
+        let down = (e0 == 0.5) as i32 + (e1 == 0.5) as i32;
+        let net = up - down;
+        if net > 0 {
+            d *= 1 << net;
+        } else if net < 0 {
+            for _ in 0..(-net) {
+                d /= 2;
+            }
+        }
         // Burn (×0.5 via modify).
         if burn {
             d = modify(d, 1, 2);
@@ -239,18 +250,6 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         out[roll as usize] = d.max(1) as i16;
     }
     out
-}
-
-/// Apply one type's effectiveness the way PS does: double for super-effective, halve
-/// (floored) for resisted, leave unchanged for neutral.
-fn apply_type_step(d: i64, eff: f32) -> i64 {
-    if eff == 2.0 {
-        d * 2
-    } else if eff == 0.5 {
-        d / 2
-    } else {
-        d
-    }
 }
 
 fn weather_mult(move_type: Type, weather: Weather) -> f32 {
