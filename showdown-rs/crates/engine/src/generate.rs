@@ -2057,9 +2057,9 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
 
     if md.heal.0 > 0 {
         let p = hit.state.side(side).active();
-        // PS heals with the 4096 round-half-up `modify`, not a plain floor (matters on odd
-        // max HP — Recover/Roost on Corviknight, etc.).
-        let amount = (crate::damage::modify(p.max_hp as i64, md.heal.0 as i64, md.heal.1 as i64) as i16)
+        // PS heals `Math.round(maxhp · num / den)` (round half up), not floor or the 4096
+        // `modify` (which differs from round on some odd max HP — Roost on Dragonite, etc.).
+        let amount = (round_div(p.max_hp as i32 * md.heal.0 as i32, md.heal.1 as i32) as i16)
             .min(p.max_hp - p.hp);
         if amount > 0 {
             let slot = hit.state.side(side).active_index;
