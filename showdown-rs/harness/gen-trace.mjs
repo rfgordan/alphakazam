@@ -204,6 +204,16 @@ function projSide(side, sideIdx) {
 		// "stall" failure divisor (PS stores it on the `stall` volatile's counter).
 		lastUsedMove: active && active.lastMove ? active.lastMove.id : '',
 		stallCounter: active && active.volatiles.stall ? (active.volatiles.stall.counter || 0) : 0,
+		// Multi-turn move commitment, encoded as "", "charge:<move>", "recharge", or
+		// "rampage:<move>:<turns>" (PS volatiles twoturnmove / mustrecharge / lockedmove).
+		pendingMove: (() => {
+			if (!active) return '';
+			const lm = active.lastMove ? active.lastMove.id : '';
+			if (active.volatiles.twoturnmove) return 'charge:' + lm;
+			if (active.volatiles.mustrecharge) return 'recharge';
+			if (active.volatiles.lockedmove) return 'rampage:' + lm + ':' + (active.volatiles.lockedmove.duration || 0);
+			return '';
+		})(),
 	};
 }
 

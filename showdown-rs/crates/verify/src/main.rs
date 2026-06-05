@@ -32,7 +32,7 @@ fn json_diff(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut
                 // Fields the engine models partially (curated enums / subset of volatiles);
                 // excluded from the representation check so random-battle noise doesn't mask
                 // real gaps. Transition checks (relaxed_eq) already ignore these.
-                if matches!(k, "ability" | "item" | "volatiles" | "teraType" | "terastallized" | "statusCounter" | "lastUsedMove" | "stallCounter") {
+                if matches!(k, "ability" | "item" | "volatiles" | "teraType" | "terastallized" | "statusCounter" | "lastUsedMove" | "stallCounter" | "pendingMove") {
                     continue;
                 }
                 let child = if path.is_empty() { k.to_string() } else { format!("{path}.{k}") };

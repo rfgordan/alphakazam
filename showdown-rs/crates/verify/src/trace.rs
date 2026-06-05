@@ -86,6 +86,9 @@ pub struct TSide {
     /// PS's Protect "stall" failure divisor (1, 3, 9, …); 0 means no stall.
     #[serde(default)]
     pub stall_counter: u16,
+    /// Multi-turn move commitment: "", "charge:<move>", "recharge", "rampage:<move>:<turns>".
+    #[serde(default)]
+    pub pending_move: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

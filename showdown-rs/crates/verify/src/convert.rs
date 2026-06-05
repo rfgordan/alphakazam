@@ -7,7 +7,7 @@
 //! the engine's representation back against PS.
 
 use engine::ids::{Ability, BoostIndex, Item, MoveId, Species, StatIndex, Status, Terrain, Type, Weather};
-use engine::state::{MoveSlot, Pokemon, Side, State};
+use engine::state::{MoveSlot, PendingMove, Pokemon, Side, State};
 use engine::volatile::VolatileStatus;
 
 use crate::trace::*;
@@ -82,6 +82,34 @@ fn parse_pokemon(tp: &TPokemon, unmapped: &mut Unmapped) -> Pokemon {
     p
 }
 
+/// Parse the trace's pending-move string ("charge:<move>" / "recharge" / "rampage:<m>:<n>").
+fn parse_pending(s: &str) -> PendingMove {
+    let mut it = s.split(':');
+    match it.next() {
+        Some("charge") => match it.next().and_then(MoveId::from_id) {
+            Some(m) => PendingMove::Charging(m),
+            None => PendingMove::None,
+        },
+        Some("recharge") => PendingMove::Recharging,
+        Some("rampage") => {
+            let m = it.next().and_then(MoveId::from_id).unwrap_or(MoveId::None);
+            let n = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            PendingMove::Rampaging(m, n)
+        }
+        _ => PendingMove::None,
+    }
+}
+
+/// Encode a `PendingMove` back into the trace string form.
+fn pending_to_string(p: PendingMove) -> String {
+    match p {
+        PendingMove::None => String::new(),
+        PendingMove::Charging(m) => format!("charge:{}", m.to_id()),
+        PendingMove::Recharging => "recharge".to_string(),
+        PendingMove::Rampaging(m, n) => format!("rampage:{}:{}", m.to_id(), n),
+    }
+}
+
 fn parse_side(ts: &TSide, unmapped: &mut Unmapped) -> Side {
     let mut s = Side::EMPTY;
     s.active_index = ts.active_index;
@@ -108,6 +136,7 @@ fn parse_side(ts: &TSide, unmapped: &mut Unmapped) -> Side {
         0 | 1 => 0,
         d => (d as f32).log(3.0).round() as u8,
     };
+    s.pending_move = parse_pending(&ts.pending_move);
     let sc = &ts.side_conditions;
     s.side_conditions.stealth_rock = sc.stealth_rock;
     s.side_conditions.spikes = sc.spikes;
@@ -264,6 +293,7 @@ fn project_side(s: &Side) -> TSide {
         last_used_move: s.last_used_move.to_id().to_string(),
         // Project the exponent n back to PS's divisor (3ⁿ) for symmetry with parse_side.
         stall_counter: 3u32.pow(s.stall_counter.min(8) as u32).min(u16::MAX as u32) as u16,
+        pending_move: pending_to_string(s.pending_move),
     }
 }
 
