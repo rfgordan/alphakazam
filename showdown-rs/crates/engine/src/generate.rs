@@ -197,7 +197,7 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
     let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0]), (SideId::Two, s2, pivot[1])]
         .into_iter()
         .filter_map(|(side, c, pv)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv }),
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -447,6 +447,10 @@ struct Action {
     side: SideId,
     move_idx: u8,
     pivot: Option<u8>,
+    /// The move the foe will use *after* this action this turn (None if the foe already
+    /// moved, switched, or there is no second move). Lets Sucker Punch / Thunderclap know
+    /// whether the target is about to attack.
+    foe_pending_move: Option<crate::ids::MoveId>,
 }
 
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action]) -> Vec<Branch> {
@@ -484,7 +488,11 @@ fn scaled(b: &Branch, f: f32) -> Branch {
     Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone() }
 }
 
-fn sequence_two_moves(b: Branch, first: Action, second: Action) -> Vec<Branch> {
+fn sequence_two_moves(b: Branch, mut first: Action, second: Action) -> Vec<Branch> {
+    // Tell the first mover what the (not-yet-moved) second mover is about to do, so Sucker
+    // Punch / Thunderclap can tell whether the target is attacking. The second mover's foe
+    // (the first) has already acted, so it stays None.
+    first.foe_pending_move = Some(b.state.side(second.side).active().moves[second.move_idx as usize].id);
     let mut out = Vec::new();
     for fb in execute_move(b, first) {
         // The second mover acts only if its active is alive and wasn't flinched by the first.
@@ -669,6 +677,21 @@ fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
     out
 }
 
+/// Struggle recoils the user 1/4 of its max HP after it connects.
+fn apply_struggle_recoil(mut out: Vec<Branch>, side: SideId, struggling: bool) -> Vec<Branch> {
+    if struggling {
+        for b in &mut out {
+            let p = b.state.side(side).active();
+            if p.is_alive() {
+                let rec = (p.max_hp / 4).max(1).min(p.hp);
+                let slot = b.state.side(side).active_index;
+                push(b, Instruction::Damage { side, slot, amount: rec });
+            }
+        }
+    }
+    out
+}
+
 /// After a recharge move (Hyper Beam, …) resolves, mark the still-alive user as needing to
 /// recharge next turn. Applied to every outcome branch (hit, miss, or no-target alike).
 fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
@@ -687,13 +710,26 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
 
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
-    let Action { side, move_idx, pivot } = action;
+    let Action { side, move_idx, pivot, .. } = action;
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
         return vec![b];
     }
     let move_id = attacker.moves[move_idx as usize].id;
-    let mut md = move_data(move_id);
+    // Struggle: a mon forced to act with no usable moves (the chosen slot is out of PP) uses
+    // Struggle instead — a typeless 50-BP physical hit that connects on everything and recoils
+    // 1/4 of the user's max HP.
+    let struggling = attacker.moves[move_idx as usize].pp == 0;
+    let mut md = if struggling {
+        let mut m = crate::data::MoveData::none();
+        m.typ = Type::None;
+        m.category = MoveCategory::Physical;
+        m.base_power = 50;
+        m.accuracy = 0;
+        m
+    } else {
+        move_data(move_id)
+    };
     // Tera Blast: when the user is Terastallized it becomes the tera type and uses whichever
     // of Atk/SpA is higher (so the category can flip to physical).
     if md.id.to_id() == "terablast" && attacker.terastallized {
@@ -755,6 +791,19 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // after that they fail outright.
     if matches!(move_id.to_id(), "fakeout" | "firstimpression") && b.state.side(side).active_turns > 1 {
         return vec![b];
+    }
+
+    // Sucker Punch / Thunderclap fail unless the target is about to use a damaging move this
+    // turn (it must not have moved already); Upper Hand additionally needs a priority move.
+    if matches!(move_id.to_id(), "suckerpunch" | "thunderclap" | "upperhand") {
+        let ok = action.foe_pending_move.map_or(false, |m| {
+            let fmd = move_data(m);
+            fmd.category != MoveCategory::Status
+                && (md.id.to_id() != "upperhand" || fmd.priority > 0)
+        });
+        if !ok {
+            return vec![b];
+        }
     }
 
     // Status moves handled specially.
@@ -918,7 +967,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             out.push(sb);
         }
     }
-    apply_recharge(out, side, move_id)
+    apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling)
 }
 
 /// Iterator over all per-hit (roll 0..16, crit bool) combinations for `hits` hits.
@@ -1437,6 +1486,15 @@ fn apply_post_damage(
         let cur = b.state.side(foe).active().times_hit;
         if cur < 250 {
             push(b, Instruction::SetTimesHit { side: foe, slot: fslot, previous: cur, new: cur + 1 });
+        }
+    }
+
+    // Knock Off removes the target's held item (so it no longer triggers Leftovers heals etc.).
+    if md.id.to_id() == "knockoff" && !hit_sub {
+        let f = b.state.side(foe).active();
+        if f.is_alive() && f.item != Item::None {
+            let (prev, fslot) = (f.item, b.state.side(foe).active_index);
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
         }
     }
 }
@@ -1996,10 +2054,28 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
 
     if md.heal.0 > 0 {
         let p = hit.state.side(side).active();
-        let amount = ((p.max_hp as i32 * md.heal.0 as i32 / md.heal.1 as i32) as i16).min(p.max_hp - p.hp);
+        // PS heals with the 4096 round-half-up `modify`, not a plain floor (matters on odd
+        // max HP — Recover/Roost on Corviknight, etc.).
+        let amount = (crate::damage::modify(p.max_hp as i64, md.heal.0 as i64, md.heal.1 as i64) as i16)
+            .min(p.max_hp - p.hp);
         if amount > 0 {
             let slot = hit.state.side(side).active_index;
             push(&mut hit, Instruction::Heal { side, slot, amount });
+        }
+    }
+    // Roost: the user loses its Flying type until the end of the turn, so the foe's move this
+    // turn hits the grounded typing. (Types aren't compared and re-project next turn, so we
+    // simply drop Flying for the rest of this turn's resolution.)
+    if md.id.to_id() == "roost" {
+        let p = hit.state.side(side).active();
+        if p.types.contains(&Type::Flying) {
+            let slot = hit.state.side(side).active_index;
+            let prev = p.types;
+            let new = [
+                if prev[0] == Type::Flying { Type::None } else { prev[0] },
+                if prev[1] == Type::Flying { Type::None } else { prev[1] },
+            ];
+            push(&mut hit, Instruction::ChangeTypes { side, slot, previous: prev, new });
         }
     }
     // Self-boosts (Swords Dance, Dragon Dance, ...).

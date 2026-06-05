@@ -124,6 +124,132 @@ Timid Nature
 - Thunderbolt
 `;
 
+// Full 6-mon, plausible gen9 OU teams (--teamset ou). A standard balance vs offense matchup,
+// used to drive the engine to 100% on a realistic competitive team rather than random sets.
+const TEAM_OU_1 = `
+Great Tusk @ Heavy-Duty Boots
+Ability: Protosynthesis
+Tera Type: Water
+EVs: 252 Atk / 4 Def / 252 Spe
+Jolly Nature
+- Headlong Rush
+- Close Combat
+- Rapid Spin
+- Stealth Rock
+
+Gholdengo @ Choice Scarf
+Ability: Good as Gold
+Tera Type: Flying
+EVs: 252 SpA / 4 Def / 252 Spe
+Timid Nature
+- Make It Rain
+- Shadow Ball
+- Thunderbolt
+- Focus Blast
+
+Kingambit @ Leftovers
+Ability: Supreme Overlord
+Tera Type: Fairy
+EVs: 252 Atk / 4 Def / 252 Spe
+Adamant Nature
+- Kowtow Cleave
+- Sucker Punch
+- Iron Head
+- Swords Dance
+
+Dragapult @ Choice Specs
+Ability: Infiltrator
+Tera Type: Ghost
+EVs: 4 Atk / 252 SpA / 252 Spe
+Timid Nature
+- Draco Meteor
+- Shadow Ball
+- Flamethrower
+- U-turn
+
+Toxapex @ Heavy-Duty Boots
+Ability: Regenerator
+Tera Type: Steel
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+- Surf
+- Toxic
+- Recover
+- Haze
+
+Corviknight @ Leftovers
+Ability: Pressure
+Tera Type: Dragon
+EVs: 252 HP / 4 Atk / 252 Def
+Impish Nature
+- Brave Bird
+- Body Press
+- Roost
+- U-turn
+`;
+
+const TEAM_OU_2 = `
+Iron Valiant @ Booster Energy
+Ability: Quark Drive
+Tera Type: Fairy
+EVs: 4 Atk / 252 SpA / 252 Spe
+Naive Nature
+- Moonblast
+- Close Combat
+- Knock Off
+- Thunderbolt
+
+Roaring Moon @ Booster Energy
+Ability: Protosynthesis
+Tera Type: Flying
+EVs: 252 Atk / 4 Def / 252 Spe
+Jolly Nature
+- Dragon Dance
+- Knock Off
+- Iron Head
+- Earthquake
+
+Raging Bolt @ Leftovers
+Ability: Protosynthesis
+Tera Type: Fairy
+EVs: 252 SpA / 4 Def / 252 Spe
+Modest Nature
+- Thunderclap
+- Draco Meteor
+- Thunderbolt
+- Calm Mind
+
+Garganacl @ Leftovers
+Ability: Purifying Salt
+Tera Type: Ghost
+EVs: 252 HP / 4 Def / 252 SpD
+Careful Nature
+- Salt Cure
+- Recover
+- Earthquake
+- Stealth Rock
+
+Dragonite @ Heavy-Duty Boots
+Ability: Multiscale
+Tera Type: Normal
+EVs: 252 Atk / 4 Def / 252 Spe
+Adamant Nature
+- Dragon Dance
+- Earthquake
+- Roost
+- Extreme Speed
+
+Slowking-Galar @ Leftovers
+Ability: Regenerator
+Tera Type: Water
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+- Sludge Bomb
+- Flamethrower
+- Toxic
+- Recover
+`;
+
 // ---- state projection -------------------------------------------------------
 // Project the live Battle object into the normalized State shape (see TRACE_FORMAT.md).
 // PS reorders side.pokemon on switch, so we pin a canonical order (by object identity)
@@ -288,8 +414,11 @@ async function main() {
 	// — it rolls a fresh seed for team generation — but Teams.generate(format, {seed}) is.)
 	const isRandom = FORMAT.includes('random');
 	const spec = { formatid: FORMAT, seed };
-	const team1 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 1) }) : Teams.import(TEAM_1);
-	const team2 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 2) }) : Teams.import(TEAM_2);
+	const ou = arg('teamset', 'default') === 'ou';
+	const t1 = ou ? TEAM_OU_1 : TEAM_1;
+	const t2 = ou ? TEAM_OU_2 : TEAM_2;
+	const team1 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 1) }) : Teams.import(t1);
+	const team2 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 2) }) : Teams.import(t2);
 	const p1 = { name: 'Bot Red', team: Teams.pack(team1) };
 	const p2 = { name: 'Bot Blue', team: Teams.pack(team2) };
 
