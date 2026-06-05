@@ -1036,31 +1036,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Unaware ignores the attacker's offensive boosts.
     let atk_boost = if def_ab == Ab::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
     let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
-    let mut atk_stat = boosted_stat(attacker.stat(atk_idx) as i64, atk_boost);
-    let mut def_stat = boosted_stat(defender.stat(def_idx) as i64, def_boost);
 
-    // Item stat modifiers (PS applies these via `modify`, round-half-up).
-    match (attacker.item, md.category) {
-        (Item::ChoiceBand, MoveCategory::Physical) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        (Item::ChoiceSpecs, MoveCategory::Special) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        _ => {}
-    }
-    if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
-        def_stat = crate::damage::modify(def_stat, 3, 2);
-    }
-    // Eviolite: ×1.5 to the defensive stat (Def and SpD) of a not-fully-evolved Pokémon.
-    if defender.item == Item::Eviolite && crate::data::species_is_nfe(defender.species) {
-        def_stat = crate::damage::modify(def_stat, 3, 2);
-    }
-    // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
-    // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
-    if def_ab == Ab::PurifyingSalt && md.typ == Type::Ghost {
-        atk_stat = crate::damage::modify(atk_stat, 1, 2);
-    }
-    // Supreme Overlord is applied to base power below (PS uses an exact lookup table).
     // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
     // chainModify([5325, 4096]) — modifier 5325, NOT 13/10 (which rounds to 5324).
-    //
     // Offensive modifiers run on the *category* stat event (ModifyAtk for physical,
     // ModifySpA for special) regardless of `overrideOffensiveStat` — so Body Press
     // (physical, reads Defense) is boosted by an 'atk' best-stat. We therefore compare
@@ -1070,70 +1048,109 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     } else {
         crate::ids::StatIndex::SpecialAttack
     };
-    if has_proto(b.state.side(side)) && proto_stat(attacker) == category_off_stat {
-        atk_stat = crate::damage::modify(atk_stat, 5325, 4096);
-    }
-    if has_proto(b.state.side(foe)) && proto_stat(defender) == def_idx {
-        def_stat = crate::damage::modify(def_stat, 5325, 4096);
-    }
-    // Weather defensive boosts: Sandstorm ×1.5 SpD for Rock types, Snow ×1.5 Def for Ice.
-    if b.state.weather == Weather::Sand
-        && def_idx == crate::ids::StatIndex::SpecialDefense
-        && defender.types.contains(&Type::Rock)
-    {
-        def_stat = crate::damage::modify(def_stat, 3, 2);
-    }
-    if b.state.weather == Weather::Snow
-        && def_idx == crate::ids::StatIndex::Defense
-        && defender.types.contains(&Type::Ice)
-    {
-        def_stat = crate::damage::modify(def_stat, 3, 2);
-    }
-    // Offensive ability multipliers.
+    let proto_atk = has_proto(b.state.side(side)) && proto_stat(attacker) == category_off_stat;
+    let proto_def = has_proto(b.state.side(foe)) && proto_stat(defender) == def_idx;
     let pinch = (attacker.hp as i32) * 3 <= attacker.max_hp as i32; // HP ≤ 1/3
-    match attacker.ability {
-        Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
-        Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Technician if md.base_power <= 60 => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Overgrow if md.typ == Type::Grass && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Blaze if md.typ == Type::Fire && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Swarm if md.typ == Type::Bug && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        // Sheer Force: ×1.3 when the move has a secondary (the secondary is then removed).
-        Ab::SheerForce if md.secondary_chance > 0 => atk_stat = crate::damage::modify(atk_stat, 5325, 4096),
-        Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
-        Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
-        Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
-        Ab::IronFist if md.flag_punch => atk_stat = crate::damage::modify(atk_stat, 4915, 4096), // ×1.2
-        Ab::StrongJaw if md.flag_bite => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
-        Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        // Type-boosting abilities (applied to the offensive stat like the others above).
-        Ab::WaterBubble if md.typ == Type::Water => atk_stat = crate::damage::modify(atk_stat, 2, 1),
-        Ab::Transistor if md.typ == Type::Electric => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
-        Ab::DragonsMaw if md.typ == Type::Dragon => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::RockyPayload if md.typ == Type::Rock => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        Ab::Steelworker if md.typ == Type::Steel => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-        _ => {}
-    }
-    // Thick Fat (defender) halves the attack of Fire/Ice moves; Water Bubble (defender)
-    // halves Fire-move attack.
-    if def_ab == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
-        atk_stat = crate::damage::modify(atk_stat, 1, 2);
-    }
-    if def_ab == Ab::WaterBubble && md.typ == Type::Fire {
-        atk_stat = crate::damage::modify(atk_stat, 1, 2);
-    }
-    // Marvel Scale / Fur Coat (defender) raise physical Defense.
-    if md.category == MoveCategory::Physical && def_idx == crate::ids::StatIndex::Defense {
-        if def_ab == Ab::FurCoat {
-            def_stat = crate::damage::modify(def_stat, 2, 1);
-        } else if def_ab == Ab::MarvelScale && defender.status != Status::None {
+
+    // Both stats are computed via closures so the crit branch can re-derive them with the
+    // boost clamped (a crit ignores the attacker's *negative* offensive boost and the
+    // defender's *positive* defensive boost) while reusing the identical modifier chain.
+    let finalize_atk = |boost: i8| -> i64 {
+        let mut atk_stat = boosted_stat(attacker.stat(atk_idx) as i64, boost);
+        // Item stat modifiers (PS applies these via `modify`, round-half-up).
+        match (attacker.item, md.category) {
+            (Item::ChoiceBand, MoveCategory::Physical) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            (Item::ChoiceSpecs, MoveCategory::Special) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            _ => {}
+        }
+        // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
+        // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
+        if def_ab == Ab::PurifyingSalt && md.typ == Type::Ghost {
+            atk_stat = crate::damage::modify(atk_stat, 1, 2);
+        }
+        if proto_atk {
+            atk_stat = crate::damage::modify(atk_stat, 5325, 4096);
+        }
+        // Offensive ability multipliers.
+        match attacker.ability {
+            Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
+            Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Technician if md.base_power <= 60 => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Overgrow if md.typ == Type::Grass && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Blaze if md.typ == Type::Fire && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Swarm if md.typ == Type::Bug && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            // Sheer Force: ×1.3 when the move has a secondary (the secondary is then removed).
+            Ab::SheerForce if md.secondary_chance > 0 => atk_stat = crate::damage::modify(atk_stat, 5325, 4096),
+            Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
+            Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
+            Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+            Ab::IronFist if md.flag_punch => atk_stat = crate::damage::modify(atk_stat, 4915, 4096), // ×1.2
+            Ab::StrongJaw if md.flag_bite => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+            Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            // Type-boosting abilities (applied to the offensive stat like the others above).
+            Ab::WaterBubble if md.typ == Type::Water => atk_stat = crate::damage::modify(atk_stat, 2, 1),
+            Ab::Transistor if md.typ == Type::Electric => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+            Ab::DragonsMaw if md.typ == Type::Dragon => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::RockyPayload if md.typ == Type::Rock => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::Steelworker if md.typ == Type::Steel => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            _ => {}
+        }
+        // Thick Fat (defender) halves the attack of Fire/Ice moves; Water Bubble (defender)
+        // halves Fire-move attack.
+        if def_ab == Ab::ThickFat && (md.typ == Type::Fire || md.typ == Type::Ice) {
+            atk_stat = crate::damage::modify(atk_stat, 1, 2);
+        }
+        if def_ab == Ab::WaterBubble && md.typ == Type::Fire {
+            atk_stat = crate::damage::modify(atk_stat, 1, 2);
+        }
+        atk_stat
+    };
+    let finalize_def = |boost: i8| -> i64 {
+        let mut def_stat = boosted_stat(defender.stat(def_idx) as i64, boost);
+        if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
             def_stat = crate::damage::modify(def_stat, 3, 2);
         }
-    }
+        // Eviolite: ×1.5 to the defensive stat (Def and SpD) of a not-fully-evolved Pokémon.
+        if defender.item == Item::Eviolite && crate::data::species_is_nfe(defender.species) {
+            def_stat = crate::damage::modify(def_stat, 3, 2);
+        }
+        if proto_def {
+            def_stat = crate::damage::modify(def_stat, 5325, 4096);
+        }
+        // Weather defensive boosts: Sandstorm ×1.5 SpD for Rock types, Snow ×1.5 Def for Ice.
+        if b.state.weather == Weather::Sand
+            && def_idx == crate::ids::StatIndex::SpecialDefense
+            && defender.types.contains(&Type::Rock)
+        {
+            def_stat = crate::damage::modify(def_stat, 3, 2);
+        }
+        if b.state.weather == Weather::Snow
+            && def_idx == crate::ids::StatIndex::Defense
+            && defender.types.contains(&Type::Ice)
+        {
+            def_stat = crate::damage::modify(def_stat, 3, 2);
+        }
+        // Marvel Scale / Fur Coat (defender) raise physical Defense.
+        if md.category == MoveCategory::Physical && def_idx == crate::ids::StatIndex::Defense {
+            if def_ab == Ab::FurCoat {
+                def_stat = crate::damage::modify(def_stat, 2, 1);
+            } else if def_ab == Ab::MarvelScale && defender.status != Status::None {
+                def_stat = crate::damage::modify(def_stat, 3, 2);
+            }
+        }
+        def_stat
+    };
+    // Supreme Overlord is applied to base power below (PS uses an exact lookup table).
+    let atk_stat = finalize_atk(atk_boost);
+    let def_stat = finalize_def(def_boost);
+    // Crit-clamped stats: ignore the attacker's negative offensive boost and the defender's
+    // positive defensive boost (PS `getDamage` with crit/ignore flags).
+    let atk_stat_crit = finalize_atk(atk_boost.max(0));
+    let def_stat_crit = finalize_def(def_boost.min(0));
     // Guts ignores the burn attack drop.
     let burned = attacker.status == Status::Burn && attacker.ability != Ab::Guts;
 
@@ -1283,10 +1300,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         final_num: fnum,
         final_den: fden,
     };
-    // Crit rolls are computed from the screen-free modifiers (a crit ignores screens).
+    // Crit rolls are computed from the screen-free modifiers (a crit ignores screens) and with
+    // the boost-clamped stats (a crit ignores the attacker's negative offensive boost and the
+    // defender's positive defensive boost).
     let mut input = input;
     let mut input_crit = input;
     input_crit.is_crit = true;
+    input_crit.attack_stat = atk_stat_crit as i16;
+    input_crit.defense_stat = (def_stat_crit.max(1)) as i16;
     let rolls_crit = damage_rolls(&input_crit);
     // Screens halve non-crit damage in singles (Reflect: physical, Light Screen: special,
     // Aurora Veil: both), unless the attacker has Infiltrator. ×0.5 = modifier 2048/4096.
