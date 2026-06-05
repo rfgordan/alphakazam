@@ -20,7 +20,7 @@
 //! unnatural (status, weather, types, item, ability, side conditions) the instruction
 //! stores both `previous` and `new`.
 
-use crate::ids::{Ability, BoostIndex, Item, Status, Terrain, Type, Weather};
+use crate::ids::{Ability, BoostIndex, Item, MoveId, Status, Terrain, Type, Weather};
 use crate::state::{SideId, State};
 use crate::volatile::VolatileStatus;
 
@@ -113,6 +113,11 @@ pub enum Instruction {
     DecrementPp { side: SideId, slot: u8, move_index: u8, amount: u8 },
     SetMoveDisabled { side: SideId, slot: u8, move_index: u8, disabled: bool },
 
+    // --- consecutive-use tracking (active Pokémon; resets on switch) ---
+    SetLastMove { side: SideId, previous: MoveId, new: MoveId },
+    SetMoveStreak { side: SideId, previous: u8, new: u8 },
+    SetStallCounter { side: SideId, previous: u8, new: u8 },
+
     // --- transformations ---
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
     ChangeItem { side: SideId, slot: u8, previous: Item, new: Item },
@@ -200,6 +205,15 @@ impl State {
             SetMoveDisabled { side, slot, move_index, disabled } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].disabled = disabled;
             }
+            SetLastMove { side, new, .. } => {
+                self.side_mut(side).last_used_move = new;
+            }
+            SetMoveStreak { side, new, .. } => {
+                self.side_mut(side).move_streak = new;
+            }
+            SetStallCounter { side, new, .. } => {
+                self.side_mut(side).stall_counter = new;
+            }
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
@@ -281,6 +295,15 @@ impl State {
                 // disable restores `!disabled`. We store the post-value, so invert it.
                 let m = &mut self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize];
                 m.disabled = !m.disabled;
+            }
+            SetLastMove { side, previous, .. } => {
+                self.side_mut(side).last_used_move = previous;
+            }
+            SetMoveStreak { side, previous, .. } => {
+                self.side_mut(side).move_streak = previous;
+            }
+            SetStallCounter { side, previous, .. } => {
+                self.side_mut(side).stall_counter = previous;
             }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;

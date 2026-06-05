@@ -138,6 +138,16 @@ pub struct Side {
 
     pub side_conditions: SideConditions,
 
+    /// The active Pokémon's last *executed* move, and how many turns in a row it has been
+    /// used. Reset on switch. Drives consecutive-use mechanics (Fury Cutter / Echoed Voice
+    /// power ramp; Encore/Disable/Torment/Stomping Tantrum read `last_used_move`).
+    pub last_used_move: MoveId,
+    pub move_streak: u8,
+    /// Consecutive successful Protect-family uses (the "stall" counter). Each consecutive
+    /// Protect succeeds with probability 1/3^n; reset to 0 by any non-Protect action or a
+    /// failed Protect. Reset on switch.
+    pub stall_counter: u8,
+
     /// Wish: (turns remaining, heal amount). turns == 0 means inactive.
     pub wish: (u8, i16),
     /// Future Sight: (turns remaining, source party slot). turns == 0 means inactive.
@@ -166,6 +176,9 @@ impl Side {
             aurora_veil: 0,
             tailwind: 0,
         },
+        last_used_move: MoveId::None,
+        move_streak: 0,
+        stall_counter: 0,
         wish: (0, 0),
         future_sight: (0, 0),
     };

@@ -280,10 +280,47 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             push(b, Instruction::Heal { side, slot: previous, amount: heal });
         }
     }
+    // Consecutive-use tracking belongs to the active slot — reset it as the mon leaves.
+    reset_move_tracking(b, side);
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
     apply_switch_in_ability(b, side);
+}
+
+/// Zero a side's consecutive-use tracking (last move / streak / stall). Emitted as explicit
+/// reversible deltas so the instruction list stays exactly invertible.
+fn reset_move_tracking(b: &mut Branch, side: SideId) {
+    let s = b.state.side(side);
+    let (lm, streak, stall) = (s.last_used_move, s.move_streak, s.stall_counter);
+    if lm != crate::ids::MoveId::None {
+        push(b, Instruction::SetLastMove { side, previous: lm, new: crate::ids::MoveId::None });
+    }
+    if streak != 0 {
+        push(b, Instruction::SetMoveStreak { side, previous: streak, new: 0 });
+    }
+    if stall != 0 {
+        push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
+    }
+}
+
+/// Record that `side`'s active executed `move_id` this turn: advance `move_streak` if it's
+/// the same move as last turn (else restart at 1), and reset the Protect `stall_counter`
+/// unless this is itself a Protect-family move. Called once the mon actually acts.
+fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
+    let s = b.state.side(side);
+    let (prev_move, prev_streak, prev_stall) = (s.last_used_move, s.move_streak, s.stall_counter);
+    let new_streak = if move_id == prev_move { prev_streak.saturating_add(1).min(250) } else { 1 };
+    if move_id != prev_move {
+        push(b, Instruction::SetLastMove { side, previous: prev_move, new: move_id });
+    }
+    if new_streak != prev_streak {
+        push(b, Instruction::SetMoveStreak { side, previous: prev_streak, new: new_streak });
+    }
+    // Any non-Protect action breaks the Protect chain.
+    if !is_protect_move(move_id) && prev_stall != 0 {
+        push(b, Instruction::SetStallCounter { side, previous: prev_stall, new: 0 });
+    }
 }
 
 /// On-switch-in ability effects (weather setters and Intimidate).
@@ -652,6 +689,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if b.state.side(side).active().moves[move_idx as usize].pp > 0 {
         push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount: 1 });
     }
+
+    // Record the move use for consecutive-use mechanics (streak / Protect stall chain). The
+    // mon has passed sleep/freeze, so it is actually acting this turn.
+    record_move_use(&mut b, side, move_id);
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
@@ -1064,6 +1105,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             let hp = attacker.hp.max(0) as u32;
             let max = attacker.max_hp.max(1) as u32;
             base_power = ((150 * hp / max).max(1)) as u16;
+        }
+        // Fury Cutter: doubles each consecutive use (40 → 80 → 160 cap). move_streak is the
+        // count including this use, already advanced by record_move_use.
+        "furycutter" => {
+            let streak = b.state.side(side).move_streak.max(1);
+            base_power = (40u16) << (streak - 1).min(2);
         }
         _ => {}
     }
@@ -1693,13 +1740,29 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let foe = side.other();
 
-    // Protect family: set the Protect volatile on the user (blocks the foe's move).
+    // Protect family: succeeds with probability 1/3^n on the (n+1)ᵗʰ consecutive use (n is
+    // the stall counter). Success sets the Protect volatile and bumps the counter; failure
+    // resets it. We enumerate both branches so PS's actual outcome is always a member.
     if is_protect_move(md.id) {
-        let mut b = b;
-        if !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
-            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protect });
+        let n = b.state.side(side).stall_counter;
+        let success_p = 1.0 / 3f32.powi(n.min(6) as i32);
+        let mut out = Vec::new();
+        // Success branch.
+        let mut sb = scaled(&b, success_p);
+        if !sb.state.side(side).volatiles.contains(VolatileStatus::Protect) {
+            push(&mut sb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protect });
         }
-        return vec![b];
+        push(&mut sb, Instruction::SetStallCounter { side, previous: n, new: n.saturating_add(1) });
+        out.push(sb);
+        // Failure branch (the move fails, breaking the chain) — only when failure is possible.
+        if success_p < 1.0 {
+            let mut fb = scaled(&b, 1.0 - success_p);
+            if n != 0 {
+                push(&mut fb, Instruction::SetStallCounter { side, previous: n, new: 0 });
+            }
+            out.push(fb);
+        }
+        return out;
     }
 
     // Haze: reset every stat stage on both actives to 0.
