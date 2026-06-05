@@ -33,13 +33,18 @@ const FORMAT = arg('format', 'gen9customgame');
 const MAX_TURNS = Number(arg('max-turns', '50'));
 const OUT = arg('out', path.join(__dirname, 'traces', `trace-seed${SEED_NUM}.json`));
 
-// A simple deterministic PRNG for *choice* selection (independent of the battle PRNG,
-// which is seeded separately). Keeps the whole trace reproducible from --seed alone.
-let choiceRngState = BigInt(SEED_NUM) * 0x9e3779b97f4a7c15n + 1n;
-function choiceRand(n) {
-	choiceRngState = (choiceRngState * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
-	return Number((choiceRngState >> 33n) % BigInt(n));
+// A simple deterministic PRNG for *choice* selection (independent of the battle PRNG, which
+// is seeded separately). Each player gets its OWN stream so the async interleaving of p1/p2
+// request handling can't change the draw order — that's what makes the trace reproducible
+// from --seed alone (a shared stream drifted with scheduling).
+function makeRng(seed) {
+	let st = (BigInt(seed) * 0x9e3779b97f4a7c15n + 1n) & 0xffffffffffffffffn;
+	return (n) => {
+		st = (st * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
+		return Number((st >> 33n) % BigInt(n));
+	};
 }
+const choiceRng = { p1: makeRng(SEED_NUM * 2 + 1), p2: makeRng(SEED_NUM * 2 + 2) };
 
 // PS PRNG seed (32 bytes hex) derived deterministically from --seed.
 function psSeed(n) {
@@ -233,7 +238,7 @@ function projState(battle) {
 
 // ---- choice selection -------------------------------------------------------
 // Parse a |request| JSON and pick a reproducible legal choice; return the >pN string.
-function chooseFor(request) {
+function chooseFor(request, rand) {
 	if (!request || request.wait) return null;
 	if (request.teamPreview) return 'default';
 	if (request.forceSwitch) {
@@ -246,7 +251,7 @@ function chooseFor(request) {
 			}
 		}
 		if (!options.length) return 'pass';
-		return `switch ${options[choiceRand(options.length)]}`;
+		return `switch ${options[rand(options.length)]}`;
 	}
 	if (request.active) {
 		const act = request.active[0];
@@ -256,9 +261,9 @@ function chooseFor(request) {
 			if (!moves[i].disabled && (moves[i].pp === undefined || moves[i].pp > 0)) legal.push(i + 1);
 		}
 		if (!legal.length) return 'move 1'; // Struggle fallback
-		const mv = legal[choiceRand(legal.length)];
+		const mv = legal[rand(legal.length)];
 		// Terastallize when available (~50%) for Tera coverage — the defining gen9 mechanic.
-		if (act.canTerastallize && choiceRand(2) === 0) {
+		if (act.canTerastallize && rand(2) === 0) {
 			return `move ${mv} terastallize`;
 		}
 		return `move ${mv}`;
@@ -272,12 +277,15 @@ async function main() {
 	const streams = getPlayerStreams(battleStream);
 	const seed = psSeed(SEED_NUM);
 
-	// Random formats (e.g. gen9randombattle) generate teams from the seed; otherwise use
-	// the fixed custom-game teams above.
+	// Random formats: generate each side's team *explicitly* with its own deterministic seed
+	// and pass it in. (Letting BattleStream auto-generate from the spec seed is NOT reproducible
+	// — it rolls a fresh seed for team generation — but Teams.generate(format, {seed}) is.)
 	const isRandom = FORMAT.includes('random');
 	const spec = { formatid: FORMAT, seed };
-	const p1 = isRandom ? { name: 'Bot Red' } : { name: 'Bot Red', team: Teams.pack(Teams.import(TEAM_1)) };
-	const p2 = isRandom ? { name: 'Bot Blue' } : { name: 'Bot Blue', team: Teams.pack(Teams.import(TEAM_2)) };
+	const team1 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 1) }) : Teams.import(TEAM_1);
+	const team2 = isRandom ? Teams.generate(FORMAT, { seed: psSeed(SEED_NUM * 2 + 2) }) : Teams.import(TEAM_2);
+	const p1 = { name: 'Bot Red', team: Teams.pack(team1) };
+	const p2 = { name: 'Bot Blue', team: Teams.pack(team2) };
 
 	const trace = {
 		format: spec.formatid,
@@ -334,7 +342,7 @@ async function main() {
 					const json = line.slice('|request|'.length);
 					if (!json) continue;
 					const request = JSON.parse(json);
-					const choice = chooseFor(request);
+					const choice = chooseFor(request, choiceRng[slot]);
 					if (choice && choice !== 'pass') {
 							const recorded = remapSwitch(slot, choice);
 							if (request.forceSwitch) {
@@ -401,16 +409,21 @@ async function main() {
 		`>player p2 ${JSON.stringify(p2)}`
 	);
 
-	// Safety cap: stop on game end, on the turn limit, or after a wall-clock deadline
-	// (a request type the scripted AI doesn't answer would otherwise hang forever).
+	// Safety cap: stop on game end or the turn limit (both deterministic per seed). The only
+	// other exit is a *stall* — the turn number not advancing for many polls, which means the
+	// scripted AI didn't answer some request. We detect that by lack of turn progress (not by
+	// wall-clock), so the trace length is reproducible regardless of machine speed.
 	const cap = (async () => {
-		let waited = 0;
+		let lastTurn = -1, stalled = 0;
 		while (true) {
 			await new Promise(r => setTimeout(r, 5));
-			waited += 5;
 			const b = battleStream.battle;
-			if (b && (b.ended || b.turn > MAX_TURNS) || waited > 15000) {
-				if (b && !b.ended) { try { void streams.omniscient.write('>forcetie'); } catch {} }
+			if (!b) continue;
+			if (b.ended || b.turn > MAX_TURNS) break;
+			if (b.turn === lastTurn) stalled++;
+			else { stalled = 0; lastTurn = b.turn; }
+			if (stalled > 600) { // ~3s without a single turn advancing → genuinely stuck
+				try { void streams.omniscient.write('>forcetie'); } catch {}
 				break;
 			}
 		}
