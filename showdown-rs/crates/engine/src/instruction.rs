@@ -21,7 +21,16 @@
 //! stores both `previous` and `new`.
 
 use crate::ids::{Ability, BoostIndex, Item, MoveId, Status, Terrain, Type, Weather};
-use crate::state::{SideId, State};
+use crate::state::{PendingMove, SideId, State};
+
+/// Selects which of the active Pokémon's simple turn-countdowns an instruction touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveCounter {
+    Taunt,
+    Confusion,
+    Perish,
+    Yawn,
+}
 use crate::volatile::VolatileStatus;
 
 /// A weighted list of instructions representing one possible outcome of a turn.
@@ -117,6 +126,12 @@ pub enum Instruction {
     SetLastMove { side: SideId, previous: MoveId, new: MoveId },
     SetMoveStreak { side: SideId, previous: u8, new: u8 },
     SetStallCounter { side: SideId, previous: u8, new: u8 },
+
+    // --- multi-turn move state (active Pokémon; resets on switch) ---
+    SetPendingMove { side: SideId, previous: PendingMove, new: PendingMove },
+    SetEncore { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
+    SetDisable { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
+    SetActiveCounter { side: SideId, which: ActiveCounter, previous: u8, new: u8 },
 
     // --- transformations ---
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
@@ -214,6 +229,18 @@ impl State {
             SetStallCounter { side, new, .. } => {
                 self.side_mut(side).stall_counter = new;
             }
+            SetPendingMove { side, new, .. } => {
+                self.side_mut(side).pending_move = new;
+            }
+            SetEncore { side, new, .. } => {
+                self.side_mut(side).encore = new;
+            }
+            SetDisable { side, new, .. } => {
+                self.side_mut(side).disable = new;
+            }
+            SetActiveCounter { side, which, new, .. } => {
+                set_active_counter(self, side, which, new);
+            }
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
@@ -305,6 +332,18 @@ impl State {
             SetStallCounter { side, previous, .. } => {
                 self.side_mut(side).stall_counter = previous;
             }
+            SetPendingMove { side, previous, .. } => {
+                self.side_mut(side).pending_move = previous;
+            }
+            SetEncore { side, previous, .. } => {
+                self.side_mut(side).encore = previous;
+            }
+            SetDisable { side, previous, .. } => {
+                self.side_mut(side).disable = previous;
+            }
+            SetActiveCounter { side, which, previous, .. } => {
+                set_active_counter(self, side, which, previous);
+            }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;
             }
@@ -319,6 +358,17 @@ impl State {
                 p.terastallized = !p.terastallized;
             }
         }
+    }
+}
+
+/// Write a value into the addressed active-Pokémon turn-countdown field.
+fn set_active_counter(state: &mut State, side: SideId, which: ActiveCounter, value: u8) {
+    let s = state.side_mut(side);
+    match which {
+        ActiveCounter::Taunt => s.taunt_turns = value,
+        ActiveCounter::Confusion => s.confusion_turns = value,
+        ActiveCounter::Perish => s.perish_turns = value,
+        ActiveCounter::Yawn => s.yawn_turns = value,
     }
 }
 

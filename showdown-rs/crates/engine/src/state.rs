@@ -100,6 +100,26 @@ impl Pokemon {
     }
 }
 
+/// A multi-turn move the active Pokémon is committed to. Mutually exclusive — a mon is in
+/// at most one of these at a time — so a single field captures charge moves, semi-invulnerable
+/// moves, rampages, and recharges. Resets on switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PendingMove {
+    /// Free to choose and act normally.
+    #[default]
+    None,
+    /// A two-turn move has finished charging; *next* turn it strikes. Covers charge moves
+    /// (Solar Beam, Sky Attack, Meteor Beam, …) and semi-invulnerable moves (Fly, Dig, Dive,
+    /// Phantom Force, Bounce) — whether the user is untargetable while charging is derived
+    /// from the move's data, not stored here.
+    Charging(MoveId),
+    /// Locked into a rampage move for this many more turns, then self-confuse on expiry
+    /// (Outrage, Petal Dance, Thrash).
+    Rampaging(MoveId, u8),
+    /// Just spent a recharge move (Hyper Beam, Giga Impact, …); the next turn is forfeited.
+    Recharging,
+}
+
 /// Entry/field hazards and screens. All small integers so the side stays `Copy`.
 /// Counts/turns are stored directly (e.g. `spikes` is layers 0..=3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,13 +148,20 @@ pub struct Side {
 
     /// Volatile statuses of the active Pokémon (bitset).
     pub volatiles: Volatiles,
-    /// Payloads for volatiles that carry a value.
     pub substitute_hp: i16,
-    pub confusion_turns: u8,
-    pub encore_turns: u8,
+
+    // --- multi-turn state of the active Pokémon (all reset on switch) ---
+    /// The multi-turn move the active is locked into, if any (see [`PendingMove`]).
+    pub pending_move: PendingMove,
+    /// Move-choice restrictions: `(move, turns left)`; `(MoveId::None, 0)` = inactive.
+    pub encore: (MoveId, u8),
+    pub disable: (MoveId, u8),
+    /// Turn countdowns (0 = inactive). `taunt`: no status moves; `confusion`: may hit self;
+    /// `perish`: faints when it ticks past 0; `yawn`: falls asleep when it reaches 0.
     pub taunt_turns: u8,
-    pub disable_turns: u8,
-    pub locked_move_turns: u8,
+    pub confusion_turns: u8,
+    pub perish_turns: u8,
+    pub yawn_turns: u8,
 
     pub side_conditions: SideConditions,
 
@@ -161,11 +188,13 @@ impl Side {
         boosts: [0; BoostIndex::COUNT],
         volatiles: Volatiles::empty(),
         substitute_hp: 0,
-        confusion_turns: 0,
-        encore_turns: 0,
+        pending_move: PendingMove::None,
+        encore: (MoveId::None, 0),
+        disable: (MoveId::None, 0),
         taunt_turns: 0,
-        disable_turns: 0,
-        locked_move_turns: 0,
+        confusion_turns: 0,
+        perish_turns: 0,
+        yawn_turns: 0,
         side_conditions: SideConditions {
             stealth_rock: false,
             spikes: 0,

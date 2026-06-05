@@ -288,19 +288,38 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     apply_switch_in_ability(b, side);
 }
 
-/// Zero a side's consecutive-use tracking (last move / streak / stall). Emitted as explicit
-/// reversible deltas so the instruction list stays exactly invertible.
+/// Zero all of a side's active-only state that resets on switch: consecutive-use tracking
+/// plus the multi-turn move / restriction / countdown fields. Emitted as explicit reversible
+/// deltas so the instruction list stays exactly invertible.
 fn reset_move_tracking(b: &mut Branch, side: SideId) {
+    use crate::ids::MoveId;
+    use crate::instruction::ActiveCounter::{Confusion, Perish, Taunt, Yawn};
     let s = b.state.side(side);
     let (lm, streak, stall) = (s.last_used_move, s.move_streak, s.stall_counter);
-    if lm != crate::ids::MoveId::None {
-        push(b, Instruction::SetLastMove { side, previous: lm, new: crate::ids::MoveId::None });
+    let (pending, encore, disable) = (s.pending_move, s.encore, s.disable);
+    let (taunt, conf, perish, yawn) = (s.taunt_turns, s.confusion_turns, s.perish_turns, s.yawn_turns);
+    if lm != MoveId::None {
+        push(b, Instruction::SetLastMove { side, previous: lm, new: MoveId::None });
     }
     if streak != 0 {
         push(b, Instruction::SetMoveStreak { side, previous: streak, new: 0 });
     }
     if stall != 0 {
         push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
+    }
+    if pending != crate::state::PendingMove::None {
+        push(b, Instruction::SetPendingMove { side, previous: pending, new: crate::state::PendingMove::None });
+    }
+    if encore.1 != 0 {
+        push(b, Instruction::SetEncore { side, previous: encore, new: (MoveId::None, 0) });
+    }
+    if disable.1 != 0 {
+        push(b, Instruction::SetDisable { side, previous: disable, new: (MoveId::None, 0) });
+    }
+    for (which, cur) in [(Taunt, taunt), (Confusion, conf), (Perish, perish), (Yawn, yawn)] {
+        if cur != 0 {
+            push(b, Instruction::SetActiveCounter { side, which, previous: cur, new: 0 });
+        }
     }
 }
 
@@ -648,6 +667,22 @@ fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
     out
 }
 
+/// After a recharge move (Hyper Beam, …) resolves, mark the still-alive user as needing to
+/// recharge next turn. Applied to every outcome branch (hit, miss, or no-target alike).
+fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
+    if is_recharge_move(move_id) {
+        for b in &mut out {
+            if b.state.side(side).active().is_alive()
+                && b.state.side(side).pending_move != crate::state::PendingMove::Recharging
+            {
+                let prev = b.state.side(side).pending_move;
+                push(b, Instruction::SetPendingMove { side, previous: prev, new: crate::state::PendingMove::Recharging });
+            }
+        }
+    }
+    out
+}
+
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let Action { side, move_idx, pivot } = action;
@@ -685,14 +720,34 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return vec![b];
     }
 
-    // PP decrement (every used move).
-    if b.state.side(side).active().moves[move_idx as usize].pp > 0 {
+    // --- multi-turn move commitment (charge / semi-invulnerable / recharge) ---
+    use crate::state::PendingMove;
+    let pending = b.state.side(side).pending_move;
+    // Recharge: the mon spent a recharge move last turn and forfeits this one.
+    if matches!(pending, PendingMove::Recharging) {
+        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+        return vec![b];
+    }
+    // Are we cashing in a two-turn move that finished charging last turn?
+    let executing_charge = matches!(pending, PendingMove::Charging(m) if m == move_id);
+
+    // PP is paid on the charge turn, not the strike turn.
+    if !executing_charge && b.state.side(side).active().moves[move_idx as usize].pp > 0 {
         push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount: 1 });
     }
 
     // Record the move use for consecutive-use mechanics (streak / Protect stall chain). The
     // mon has passed sleep/freeze, so it is actually acting this turn.
     record_move_use(&mut b, side, move_id);
+
+    // A two-turn move spends this turn charging (no attack) unless it strikes instantly.
+    if !executing_charge && is_two_turn_move(move_id) && !charges_instantly(move_id, b.state.weather) {
+        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Charging(move_id) });
+        return vec![b];
+    }
+    if executing_charge {
+        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+    }
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
@@ -746,7 +801,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let foe_alive = b.state.side(foe).active().is_alive();
     if !foe_alive {
         out.push(scaled(&b, hit_prob));
-        return out;
+        return apply_recharge(out, side, move_id);
+    }
+    // A target mid-Fly/Dig/etc. (semi-invulnerable) dodges the move entirely.
+    if matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m)) {
+        out.push(scaled(&b, hit_prob));
+        return apply_recharge(out, side, move_id);
     }
 
     // A type-immune move (e.g. Close Combat vs a Ghost, or Ground vs Levitate) deals no
@@ -771,7 +831,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && !flag_immune;
     if !connects {
         out.push(scaled(&b, hit_prob));
-        return out;
+        return apply_recharge(out, side, move_id);
     }
 
     // Each hit rolls damage (16) and crit independently. For small hit counts we enumerate
@@ -850,7 +910,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             out.push(sb);
         }
     }
-    out
+    apply_recharge(out, side, move_id)
 }
 
 /// Iterator over all per-hit (roll 0..16, crit bool) combinations for `hits` hits.
@@ -1969,6 +2029,41 @@ fn is_protect_move(id: crate::ids::MoveId) -> bool {
         "protect" | "detect" | "spikyshield" | "kingsshield" | "banefulbunker"
             | "silktrap" | "burningbulwark" | "obstruct" | "maxguard"
     )
+}
+
+/// Two-turn charge moves that strike on the second turn (no semi-invulnerability).
+fn is_charge_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "solarbeam" | "solarblade" | "skyattack" | "razorwind" | "skullbash"
+            | "freezeshock" | "iceburn" | "meteorbeam" | "electroshot"
+    )
+}
+
+/// Two-turn moves whose user is untargetable during the charge turn.
+fn is_semi_invuln_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "fly" | "dig" | "dive" | "bounce" | "phantomforce" | "shadowforce"
+    )
+}
+
+fn is_two_turn_move(id: crate::ids::MoveId) -> bool {
+    is_charge_move(id) || is_semi_invuln_move(id)
+}
+
+/// Moves that force the user to recharge (forfeit) the turn after they connect.
+fn is_recharge_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "hyperbeam" | "gigaimpact" | "blastburn" | "hydrocannon" | "frenzyplant"
+            | "rockwrecker" | "roaroftime" | "prismaticlaser" | "eternabeam" | "meteorassault"
+    )
+}
+
+/// Charge moves that skip the charge turn under the right weather (Solar Beam/Blade in sun).
+fn charges_instantly(id: crate::ids::MoveId, weather: Weather) -> bool {
+    matches!(id.to_id(), "solarbeam" | "solarblade") && matches!(weather, Weather::Sun | Weather::HarshSun)
 }
 
 /// Move the active Pokémon's HP to `target_hp` via a Heal or Damage instruction.
