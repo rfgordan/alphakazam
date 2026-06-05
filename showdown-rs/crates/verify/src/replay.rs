@@ -69,6 +69,10 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
         used_force_move(prev_state, SideId::Two, m2),
         used_force_move(prev_state, SideId::One, m1),
     ];
+    // Original active indices — used to tell whether a chosen pivot move actually executed its
+    // self-switch (the user survived to move) vs. fainted first (KO'd by a faster foe), in
+    // which case the single recorded replacement is a faint replacement, not a pivot target.
+    let orig_active = [prev_state.side(SideId::One).active_index, prev_state.side(SideId::Two).active_index];
 
     let mut out = Vec::new();
     for si in generate_instructions_ex(prev_state, m1, m2, pivots, tera) {
@@ -80,8 +84,12 @@ fn candidate_states(prev_state: &State, m1: MoveChoice, m2: MoveChoice, replacem
         let mut drag_unknown: Vec<SideId> = Vec::new();
         for (i, side) in [SideId::One, SideId::Two].into_iter().enumerate() {
             if !cand.side(side).active().is_alive() {
-                // Faint replacement: index 1 if this side already pivoted, else index 0.
-                let idx = if pivots[i].is_some() { 1 } else { 0 };
+                // Faint replacement. A chosen pivot move only consumed the first replacement if
+                // it actually executed (the active index changed); if the pivot user fainted
+                // before moving, the active index is unchanged and the lone replacement is the
+                // faint replacement at index 0.
+                let pivoted = pivots[i].is_some() && cand.side(side).active_index != orig_active[i];
+                let idx = if pivoted { 1 } else { 0 };
                 if let Some(&target) = lists[i].get(idx) {
                     switch_into(&mut cand, side, target);
                 }
