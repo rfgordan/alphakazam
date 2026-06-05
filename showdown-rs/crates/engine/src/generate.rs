@@ -2077,6 +2077,9 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     };
     let mut hit = scaled(&b, hit_prob);
 
+    // Whether the heal user was at full HP *before* healing — a self-heal move (Roost/Recover)
+    // fails outright at full HP, which matters for Roost's Flying-type removal below.
+    let heal_user_was_full = hit.state.side(side).active().hp >= hit.state.side(side).active().max_hp;
     if md.heal.0 > 0 {
         let p = hit.state.side(side).active();
         // PS heals `Math.round(maxhp · num / den)` (round half up), not floor or the 4096
@@ -2090,10 +2093,12 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
     }
     // Roost: the user loses its Flying type until the end of the turn, so the foe's move this
     // turn hits the grounded typing. (Types aren't compared and re-project next turn, so we
-    // simply drop Flying for the rest of this turn's resolution.)
+    // simply drop Flying for the rest of this turn's resolution.) Two PS caveats: Roost fails
+    // entirely at full HP (the heal fails → the `roost` volatile is never added → Flying is
+    // kept), and a Terastallized user keeps its Flying type (the volatile's onStart bails).
     if md.id.to_id() == "roost" {
         let p = hit.state.side(side).active();
-        if p.types.contains(&Type::Flying) {
+        if p.types.contains(&Type::Flying) && !heal_user_was_full && !p.terastallized {
             let slot = hit.state.side(side).active_index;
             let prev = p.types;
             let new = [
