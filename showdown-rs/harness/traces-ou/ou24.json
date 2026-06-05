@@ -18750,7 +18750,7 @@
     {
       "turn": 27,
       "choices": {
-        "p1": "move 1",
+        "p1": "move 4",
         "p2": "move 3"
       },
       "replacements": {},
@@ -19443,7 +19443,7 @@
     {
       "turn": 28,
       "choices": {
-        "p1": "move 1",
+        "p1": "move 4",
         "p2": "move 1"
       },
       "replacements": {

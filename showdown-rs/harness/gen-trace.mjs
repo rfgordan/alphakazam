@@ -392,7 +392,7 @@ function chooseFor(request, rand) {
 		for (let i = 0; i < moves.length; i++) {
 			if (!moves[i].disabled && (moves[i].pp === undefined || moves[i].pp > 0)) legal.push(i + 1);
 		}
-		if (!legal.length) return 'move 1'; // Struggle fallback
+		if (!legal.length) return 'move 1'; // Struggle fallback (PS usually lists Struggle as a move)
 		const mv = legal[rand(legal.length)];
 		// Terastallize when available (~50%) for Tera coverage — the defining gen9 mechanic.
 		if (act.canTerastallize && rand(2) === 0) {
@@ -468,6 +468,35 @@ async function main() {
 		return `switch ${canonIdx + 1}`;
 	}
 
+	// Rewrite a "move N" choice (N = index into the request's *choosable* move list, which PS
+	// reduces to a single entry when the Pokémon is Choice-locked / Encored / disabled) into
+	// "move M" where M is the absolute index into the mon's full moveSlots — the same order the
+	// engine reads. Without this, "move 1" on a Choice-locked mon means the locked move to PS
+	// but the first slot to the engine.
+	function remapMove(slot, choice, request) {
+		const m = choice.match(/^move (\d+)(.*)$/);
+		if (!m) return choice;
+		const reqMoves = request && request.active && request.active[0] && request.active[0].moves;
+		const rel = parseInt(m[1], 10) - 1;
+		if (!reqMoves || !reqMoves[rel]) return choice;
+		const mvId = reqMoves[rel].id;
+		const battle = battleStream.battle;
+		if (!battle) return choice;
+		const sideIdx = slot === 'p1' ? 0 : 1;
+		const active = battle.sides[sideIdx].active[0];
+		if (!active || !active.moveSlots) return choice;
+		// Forced Struggle: PS lists a lone `struggle` pseudo-move (not in the mon's moveSlots).
+		// Record the index of a 0-PP move slot so the engine's Struggle detection (chosen slot
+		// has pp 0) fires; the move PS actually executes is Struggle regardless.
+		if (mvId === 'struggle') {
+			const zi = active.moveSlots.findIndex(ms => ms.pp === 0);
+			return `move ${zi >= 0 ? zi + 1 : 1}${m[2]}`;
+		}
+		const abs = active.moveSlots.findIndex(ms => ms.id === mvId);
+		if (abs < 0) return choice;
+		return `move ${abs + 1}${m[2]}`;
+	}
+
 	// Player loops: respond to each request with a scripted choice.
 	for (const slot of ['p1', 'p2']) {
 		(async () => {
@@ -479,7 +508,7 @@ async function main() {
 					const request = JSON.parse(json);
 					const choice = chooseFor(request, choiceRng[slot]);
 					if (choice && choice !== 'pass') {
-							const recorded = remapSwitch(slot, choice);
+							const recorded = remapMove(slot, remapSwitch(slot, choice), request);
 							if (request.forceSwitch) {
 								recordReplacement(slot, recorded);
 							} else {
