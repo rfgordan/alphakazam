@@ -72,7 +72,8 @@ def train_selfplay(
 
     mode = f"frozen snapshot, refresh every {snapshot_every} updates" if use_snapshot else "live (moving target)"
     print(f"device={device}  params={model.num_params():,}  obs_dim={envs.obs_dim}  "
-          f"batch={cfg.num_envs * cfg.rollout_steps}  (learner=Red samples, opponent=Blue greedy; {mode})")
+          f"batch={cfg.num_envs * cfg.rollout_steps}  (learner samples a random side each episode, "
+          f"opponent greedy on the other; {mode})")
 
     batch_size = cfg.num_envs * cfg.rollout_steps
     num_updates = cfg.total_steps // batch_size
@@ -84,18 +85,18 @@ def train_selfplay(
     start = time.time()
 
     for update in range(1, num_updates + 1):
-        # --- collect a rollout of the learner's (Red's) transitions ---
+        # --- collect a rollout of the learner's transitions (from whichever side it's on) ---
         for t in range(cfg.rollout_steps):
-            obs_r, mask_r = envs.observe(RED)
-            obs_b, mask_b = envs.observe(BLUE)
+            obs_l, mask_l = envs.learner_view()
+            obs_o, mask_o = envs.opponent_view()
 
-            obs_t = torch.as_tensor(obs_r, device=device)
-            mask_t = torch.as_tensor(mask_r, device=device)
+            obs_t = torch.as_tensor(obs_l, device=device)
+            mask_t = torch.as_tensor(mask_l, device=device)
             with torch.no_grad():
                 action, log_prob, _, value = model.act(obs_t, mask_t)         # learner: sample
-            blue_action = greedy_actions(blue_net, obs_b, mask_b, device)      # opponent: greedy (frozen)
+            opp_action = greedy_actions(blue_net, obs_o, mask_o, device)       # opponent: greedy (frozen)
 
-            reward_np, done_np = envs.step(action.cpu().numpy(), blue_action, learner=RED)
+            reward_np, done_np = envs.step(action.cpu().numpy(), opp_action)
 
             buffer.add(
                 t,
@@ -120,9 +121,9 @@ def train_selfplay(
 
         # --- advantages + PPO update ---
         with torch.no_grad():
-            obs_r, mask_r = envs.observe(RED)
+            obs_l, mask_l = envs.learner_view()
             _, last_value = model.forward(
-                torch.as_tensor(obs_r, device=device), torch.as_tensor(mask_r, device=device)
+                torch.as_tensor(obs_l, device=device), torch.as_tensor(mask_l, device=device)
             )
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
         stats = ppo_update(model, optimizer, buffer.flat_view(), cfg, batch_size)

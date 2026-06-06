@@ -73,14 +73,20 @@ flowchart TD
 
 ## 3. Frozen-snapshot self-play
 
-The **learner (Red)** samples actions and trains via PPO. The **opponent (Blue)** plays greedily
-(argmax) from a **frozen snapshot** of the learner — a *separate* network whose weights are
-copied from the learner every `--snapshot-every` updates and otherwise held fixed (no gradients).
-Between refreshes the opponent is a stable reference, so `win_rate(vs snapshot)` is a meaningful
-**sawtooth** progress curve: it climbs as the learner beats the fixed opponent, then drops at each
-refresh when the opponent catches up. Staying above ~0.5 after every refresh = monotonic
-improvement (each policy beats its predecessor). `--snapshot-every 0` falls back to a *live*
-moving-target opponent. Reward is sparse: +1 / -1 to the learner on win / loss.
+The **learner** samples actions and trains via PPO. The **opponent** plays greedily (argmax) from
+a **frozen snapshot** of the learner — a *separate* network whose weights are copied from the
+learner every `--snapshot-every` updates and otherwise held fixed (no gradients).
+`--snapshot-every 0` falls back to a *live* moving-target opponent. Reward is sparse: +1 / -1 to
+the learner on win / loss.
+
+**Both sides are trained.** Observations/actions are egocentric (`encode(state, viewer)` puts "me"
+first), so one policy plays either side — but only if it *sees* both. The learner is therefore
+assigned a **random side each episode** (the snapshot takes the other), so it trains on both
+`red_team`-as-me and `blue_team`-as-me states. Without this the network only ever learns one
+side, the opponent plays its untrained side out-of-distribution, and `win_rate` inflates toward 1
+against an effectively-handicapped opponent. With it, win-rate sits near ~0.5 — the honest signal
+of marginal improvement over a near-equal recent self (a slightly-below-0.5 reading is mostly the
+sampling-learner vs greedy-opponent handicap, not regression).
 
 ```mermaid
 flowchart TD
