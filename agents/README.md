@@ -22,9 +22,28 @@ agents/
     engine_env.py   # EngineVecEnv — vectorized self-play over showdown_engine
     buffer.py       # RolloutBuffer + GAE
     train.py        # PPO loop vs the placeholder env
-    selfplay.py     # greedy self-play vs the Rust engine + live commentary  <-- main
+    selfplay.py     # frozen-snapshot self-play vs the Rust engine + live commentary  <-- main
+    baselines.py    # Baseline protocol + PolicyBaseline/RandomBaseline + evaluate()
+    run_logger.py   # runs/<ts>/ : metrics.jsonl, eval.jsonl, config.json, checkpoints
   DESIGN.md, pyproject.toml
 ```
+
+## Logs & analysis
+
+Each run writes to `runs/<timestamp>/`:
+- `metrics.jsonl` — one line per PPO update (win-rate vs snapshot, losses, entropy, KL, sps)
+- `eval.jsonl` — one line per baseline eval (win-rate, W/L/D, avg turns) — the **absolute** progress curve
+- `config.json`, `ckpt_<update>.pt`
+
+```python
+import json
+evals = [json.loads(l) for l in open("runs/<ts>/eval.jsonl")]
+# win-rate vs the fixed anchor over time:
+[(e["update"], e["win_rate"]) for e in evals if e["baseline"] == "anchor-init"]
+```
+
+Baselines are generic (`baselines.Baseline`: `actions(obs, mask) -> np.ndarray`) — add a heuristic
+bot or a specific checkpoint to the `baselines` list in `selfplay.train_selfplay`.
 
 The Rust↔Python bridge lives in `../showdown-rs/crates/pybridge/` (a `pyo3` crate exposing the
 `showdown_engine` module: `Battle.observe / legal_actions / step / render`). The natural-language
@@ -48,12 +67,17 @@ uv run maturin develop --release -m ../showdown-rs/crates/pybridge/Cargo.toml
 # Watch one game with the (untrained) policy — live commentary:
 uv run python -m ppo.selfplay --watch
 
-# Frozen-snapshot self-play (learner=Red samples + trains; opponent=Blue plays a frozen
-# snapshot of the learner, refreshed every --snapshot-every updates):
-uv run python -m ppo.selfplay --total-steps 300000 --snapshot-every 10 --render-every 20
+# Frozen-snapshot self-play. The learner trains on a random side each episode; the opponent
+# plays a frozen snapshot refreshed every --snapshot-every updates. Every --eval-every updates
+# the learner is scored (greedily) vs fixed baselines (a random-init anchor + a random bot) for
+# an absolute progress curve. Logs land in runs/<timestamp>/.
+uv run python -m ppo.selfplay --total-steps 300000 --snapshot-every 10 --eval-every 25
 
-uv run python -m ppo.selfplay --device cpu          # force device (auto picks MPS/CUDA)
+# Train indefinitely from a clean slate (Ctrl-C to stop; final checkpoint is saved):
+uv run python -m ppo.selfplay --total-steps 0 --device cpu
+
 uv run python -m ppo.selfplay --snapshot-every 0    # live moving-target opponent (no freeze)
+uv run python -m ppo.selfplay --render-every 10     # also watch a narrated game every 10 updates
 
 # Algorithm-only smoke test against the learnable placeholder env (no engine):
 uv run python -m ppo.train --total-steps 50000

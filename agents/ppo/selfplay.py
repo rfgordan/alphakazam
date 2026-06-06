@@ -1,22 +1,23 @@
-"""Greedy self-play PPO training against the Rust engine.
+"""Frozen-snapshot self-play PPO training against the Rust engine.
 
-Both sides are driven by the *same* network (shared-parameter self-play):
-  - the **learner** (Red) samples actions (exploration) and its transitions feed PPO;
-  - the **opponent** (Blue) acts **greedily** (argmax over the masked policy) — a steadily
-    improving sparring partner as the shared weights update.
+The learner samples actions (its transitions feed PPO) and is assigned a **random side each
+episode**, so it learns to play both teams. The opponent plays greedily from a **frozen snapshot**
+of the learner, refreshed every `--snapshot-every` updates. Reward is sparse: +1 / -1 on win/loss.
 
-Reward is sparse: +1 / -1 to the learner on win / loss. Every `--render-every` updates we play
-one full game to the terminal with natural-language commentary so you can watch progress.
+Progress is tracked two ways: `win_rate(vs snapshot)` (marginal improvement over a recent self)
+and a periodic **eval vs fixed baselines** (absolute progress — vs a frozen random-init anchor and
+a random bot by default; see `baselines.py` to add more). Runs are logged to `runs/<timestamp>/`.
 
 Run:
-    uv run python -m ppo.selfplay                      # defaults
-    uv run python -m ppo.selfplay --total-steps 200000 --device cpu
-    uv run python -m ppo.selfplay --watch              # just watch one game with the init policy
+    uv run python -m ppo.selfplay                                   # finite default run
+    uv run python -m ppo.selfplay --total-steps 0                  # train indefinitely (Ctrl-C)
+    uv run python -m ppo.selfplay --watch                          # watch one game, no training
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import time
 
 import numpy as np
@@ -24,34 +25,33 @@ import torch
 
 import showdown_engine as se
 
+from .baselines import PolicyBaseline, RandomBaseline, evaluate, greedy_actions
 from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .engine_env import BLUE, RED, EngineVecEnv
 from .model import ActorCritic
+from .run_logger import RunLogger
 from .train import ppo_update, resolve_device, set_seed
-
-
-@torch.no_grad()
-def greedy_actions(model, obs_np, mask_np, device) -> np.ndarray:
-    """Argmax action under the masked policy (the greedy opponent / eval policy)."""
-    obs = torch.as_tensor(obs_np, device=device)
-    mask = torch.as_tensor(mask_np, device=device)
-    logits, _ = model.forward(obs, mask)
-    return logits.argmax(dim=-1).cpu().numpy()
 
 
 def train_selfplay(
     cfg: PPOConfig,
-    render_every: int = 20,
+    render_every: int = 0,
     max_games: int | None = None,
     snapshot_every: int = 10,
+    eval_every: int = 25,
+    eval_games: int = 100,
+    ckpt_every: int = 50,
+    logdir: str = "runs",
+    run_name: str | None = None,
 ):
-    """Frozen-snapshot self-play.
+    """Frozen-snapshot self-play with periodic fixed-baseline eval and file logging.
 
-    The opponent (Blue) plays from a *frozen copy* of the learner refreshed every
-    `snapshot_every` updates — so between refreshes it's a fixed reference and the
-    win-rate-vs-snapshot curve is a meaningful (sawtooth) progress signal. `snapshot_every == 0`
-    falls back to a *live* opponent (the moving-target variant).
+    `cfg.total_steps <= 0` trains indefinitely (until Ctrl-C). The opponent is a frozen snapshot
+    of the learner refreshed every `snapshot_every` updates (0 = live). Every `eval_every`
+    updates the (greedy) learner is evaluated against each fixed baseline in `baselines` — by
+    default a frozen random-init anchor and a random bot — giving an *absolute* progress curve.
+    Everything is logged to `runs/<timestamp>/` (metrics.jsonl, eval.jsonl, config.json, ckpts).
     """
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -61,7 +61,7 @@ def train_selfplay(
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device)
 
-    # The frozen opponent: same architecture, weights copied from the learner, no gradients.
+    # The frozen *training* opponent: a copy of the learner, refreshed periodically.
     use_snapshot = snapshot_every > 0
     opponent = ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
     opponent.load_state_dict(model.state_dict())
@@ -70,86 +70,128 @@ def train_selfplay(
         p.requires_grad_(False)
     blue_net = opponent if use_snapshot else model
 
-    mode = f"frozen snapshot, refresh every {snapshot_every} updates" if use_snapshot else "live (moving target)"
-    print(f"device={device}  params={model.num_params():,}  obs_dim={envs.obs_dim}  "
-          f"batch={cfg.num_envs * cfg.rollout_steps}  (learner samples a random side each episode, "
-          f"opponent greedy on the other; {mode})")
+    # Fixed *evaluation* baselines (absolute progress). The anchor captures the random-init policy
+    # before any training. Swap/extend this list to add other periodic baselines (heuristics, a
+    # specific checkpoint, ...) — anything implementing baselines.Baseline.
+    anchor = copy.deepcopy(model).to(device).eval()
+    for p in anchor.parameters():
+        p.requires_grad_(False)
+    baselines = [
+        PolicyBaseline(anchor, device, name="anchor-init"),
+        RandomBaseline(seed=cfg.seed, name="random"),
+    ]
 
+    logger = RunLogger(logdir, run_name)
+    logger.config({"cfg": vars(cfg), "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
+                   "snapshot_every": snapshot_every, "eval_every": eval_every,
+                   "eval_games": eval_games, "ckpt_every": ckpt_every, "params": model.num_params(),
+                   "device": str(device), "baselines": [b.name for b in baselines]})
+
+    mode = f"frozen snapshot/{snapshot_every}" if use_snapshot else "live"
+    indefinite = cfg.total_steps <= 0
     batch_size = cfg.num_envs * cfg.rollout_steps
-    num_updates = cfg.total_steps // batch_size
+    num_updates = None if indefinite else max(1, cfg.total_steps // batch_size)
+    print(f"device={device}  params={model.num_params():,}  obs_dim={envs.obs_dim}  batch={batch_size}  "
+          f"opponent={mode}  eval_every={eval_every}({eval_games})  {'INDEFINITE' if indefinite else num_updates} updates")
+
     global_step = 0
     total_games = 0
     wins, losses, draws = 0, 0, 0
-    window_results: list[int] = []  # since the last snapshot refresh; basis for the win-rate
+    window_results: list[int] = []  # since the last snapshot refresh; basis for win_rate(vs snapshot)
     label = "snapshot" if use_snapshot else "live"
     start = time.time()
+    update = 0
 
-    for update in range(1, num_updates + 1):
-        # --- collect a rollout of the learner's transitions (from whichever side it's on) ---
-        for t in range(cfg.rollout_steps):
-            obs_l, mask_l = envs.learner_view()
-            obs_o, mask_o = envs.opponent_view()
+    def save_ckpt(tag: int):
+        torch.save({
+            "update": tag, "global_step": global_step,
+            "model": model.state_dict(),
+            "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
+            "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
+        }, logger.checkpoint_path(tag))
 
-            obs_t = torch.as_tensor(obs_l, device=device)
-            mask_t = torch.as_tensor(mask_l, device=device)
+    try:
+        while True:
+            update += 1
+            # --- collect a rollout of the learner's transitions (from whichever side it's on) ---
+            for t in range(cfg.rollout_steps):
+                obs_l, mask_l = envs.learner_view()
+                obs_o, mask_o = envs.opponent_view()
+
+                obs_t = torch.as_tensor(obs_l, device=device)
+                mask_t = torch.as_tensor(mask_l, device=device)
+                with torch.no_grad():
+                    action, log_prob, _, value = model.act(obs_t, mask_t)        # learner: sample
+                opp_action = greedy_actions(blue_net, obs_o, mask_o, device)      # opponent: greedy (frozen)
+
+                reward_np, done_np = envs.step(action.cpu().numpy(), opp_action)
+
+                buffer.add(t, obs_t, mask_t, action, log_prob, value,
+                           torch.as_tensor(reward_np, device=device),
+                           torch.as_tensor(done_np, device=device))
+                global_step += cfg.num_envs
+
+                for r, d in zip(reward_np, done_np):
+                    if d:
+                        res = 1 if r > 0 else (-1 if r < 0 else 0)
+                        total_games += 1
+                        window_results.append(res)
+                        wins += res == 1
+                        losses += res == -1
+                        draws += res == 0
+
+            # --- advantages + PPO update ---
             with torch.no_grad():
-                action, log_prob, _, value = model.act(obs_t, mask_t)         # learner: sample
-            opp_action = greedy_actions(blue_net, obs_o, mask_o, device)       # opponent: greedy (frozen)
+                obs_l, mask_l = envs.learner_view()
+                _, last_value = model.forward(
+                    torch.as_tensor(obs_l, device=device), torch.as_tensor(mask_l, device=device)
+                )
+            buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
+            stats = ppo_update(model, optimizer, buffer.flat_view(), cfg, batch_size)
 
-            reward_np, done_np = envs.step(action.cpu().numpy(), opp_action)
+            win_rate = float(np.mean([r == 1 for r in window_results])) if window_results else float("nan")
+            sps = int(global_step / (time.time() - start))
+            upd_str = f"{update}" if indefinite else f"{update}/{num_updates}"
+            print(f"update {upd_str:>9}  step {global_step:>9}  games {total_games:>5}  "
+                  f"win_rate(vs {label}) {win_rate:5.2f}  "
+                  f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:.3f}  "
+                  f"ent {stats['entropy']:.3f}  kl {stats['approx_kl']:.4f}  {sps} sps")
+            logger.metrics({"update": update, "step": global_step, "games": total_games,
+                            "win_rate_vs_snapshot": win_rate, "sps": sps, **stats})
 
-            buffer.add(
-                t,
-                obs_t,
-                mask_t,
-                action,
-                log_prob,
-                value,
-                torch.as_tensor(reward_np, device=device),
-                torch.as_tensor(done_np, device=device),
-            )
-            global_step += cfg.num_envs
+            # --- refresh the frozen training opponent ---
+            if use_snapshot and update % snapshot_every == 0:
+                opponent.load_state_dict(model.state_dict())
+                window_results.clear()
+                print(f"    [snapshot refreshed @ update {update}]")
 
-            for r, d in zip(reward_np, done_np):
-                if d:
-                    res = 1 if r > 0 else (-1 if r < 0 else 0)
-                    total_games += 1
-                    window_results.append(res)
-                    wins += res == 1
-                    losses += res == -1
-                    draws += res == 0
+            # --- periodic eval vs fixed baselines (absolute progress) ---
+            if eval_every and update % eval_every == 0:
+                for bl in baselines:
+                    r = evaluate(model, bl, device, n_games=eval_games)
+                    print(f"    [eval @ {update}] vs {bl.name:>11}: win_rate {r['win_rate']:.2f}  "
+                          f"(W/L/D {r['wins']}/{r['losses']}/{r['draws']}, avg_turns {r['avg_turns']:.0f})")
+                    logger.eval({"update": update, "step": global_step, **r})
 
-        # --- advantages + PPO update ---
-        with torch.no_grad():
-            obs_l, mask_l = envs.learner_view()
-            _, last_value = model.forward(
-                torch.as_tensor(obs_l, device=device), torch.as_tensor(mask_l, device=device)
-            )
-        buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
-        stats = ppo_update(model, optimizer, buffer.flat_view(), cfg, batch_size)
+            if ckpt_every and update % ckpt_every == 0:
+                save_ckpt(update)
 
-        win_rate = float(np.mean([r == 1 for r in window_results])) if window_results else float("nan")
-        sps = int(global_step / (time.time() - start))
-        print(f"update {update:4d}/{num_updates}  step {global_step:>8}  games {total_games:>4}  "
-              f"win_rate(vs {label}) {win_rate:5.2f}  "
-              f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:.3f}  "
-              f"ent {stats['entropy']:.3f}  kl {stats['approx_kl']:.4f}  {sps} sps")
+            if render_every and update % render_every == 0:
+                print()
+                play_one_game(model, device, seed=1000 + update, max_turns=200)
+                print()
 
-        # --- refresh the frozen opponent: it catches up to the learner; win-rate resets ---
-        if use_snapshot and update % snapshot_every == 0:
-            opponent.load_state_dict(model.state_dict())
-            window_results.clear()
-            print(f"    [snapshot refreshed @ update {update} — opponent = current learner]")
-
-        if render_every and update % render_every == 0:
-            print()
-            play_one_game(model, device, seed=1000 + update, max_turns=200)
-            print()
-
-        if max_games is not None and total_games >= max_games:
-            print(f"\nReached {total_games} games (target {max_games}); stopping. "
-                  f"record W/L/D = {wins}/{losses}/{draws}.")
-            break
+            if max_games is not None and total_games >= max_games:
+                print(f"\nReached {total_games} games (target {max_games}).")
+                break
+            if not indefinite and update >= num_updates:
+                break
+    except KeyboardInterrupt:
+        print("\ninterrupted — saving final checkpoint.")
+    finally:
+        save_ckpt(update)
+        print(f"record W/L/D = {wins}/{losses}/{draws} over {total_games} games. run dir: {logger.dir}")
+        logger.close()
 
     return model
 
@@ -187,14 +229,19 @@ def play_one_game(model, device, seed: int = 0, max_turns: int = 200, sample: bo
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Greedy self-play PPO against the Rust engine.")
-    parser.add_argument("--total-steps", type=int, default=300_000)
+    parser = argparse.ArgumentParser(description="Frozen-snapshot self-play PPO against the Rust engine.")
+    parser.add_argument("--total-steps", type=int, default=300_000, help="<= 0 trains indefinitely (Ctrl-C to stop)")
     parser.add_argument("--games", type=int, default=None, help="stop after this many completed games")
     parser.add_argument("--device", type=str, default=None, help="auto|cpu|mps|cuda")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--render-every", type=int, default=20, help="watch a game every N updates (0 = never)")
+    parser.add_argument("--render-every", type=int, default=0, help="watch a game every N updates (0 = never)")
     parser.add_argument("--snapshot-every", type=int, default=10,
                         help="refresh the frozen opponent every N updates (0 = live moving-target opponent)")
+    parser.add_argument("--eval-every", type=int, default=25, help="eval vs fixed baselines every N updates (0 = never)")
+    parser.add_argument("--eval-games", type=int, default=100, help="games per baseline evaluation")
+    parser.add_argument("--ckpt-every", type=int, default=50, help="save a checkpoint every N updates (0 = never)")
+    parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
+    parser.add_argument("--run-name", type=str, default=None, help="run subdirectory name (default: timestamp)")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
     args = parser.parse_args()
 
@@ -206,13 +253,22 @@ def main():
 
     if args.watch:
         device = resolve_device(cfg.device)
-        # obs_dim must match the engine; build a model sized to it.
         probe = se.Battle(seed=0)
         model = ActorCritic(probe.obs_dim, probe.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
         play_one_game(model, device, seed=args.seed)
         return
 
-    train_selfplay(cfg, render_every=args.render_every, max_games=args.games, snapshot_every=args.snapshot_every)
+    train_selfplay(
+        cfg,
+        render_every=args.render_every,
+        max_games=args.games,
+        snapshot_every=args.snapshot_every,
+        eval_every=args.eval_every,
+        eval_games=args.eval_games,
+        ckpt_every=args.ckpt_every,
+        logdir=args.logdir,
+        run_name=args.run_name,
+    )
 
 
 if __name__ == "__main__":
