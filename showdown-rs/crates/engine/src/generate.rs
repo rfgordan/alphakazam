@@ -73,7 +73,7 @@ pub fn boosted_stat(stat: i64, stage: i8) -> i64 {
 
 /// Effective speed including boost, paralysis, Choice Scarf, Tailwind and a Speed-based
 /// Protosynthesis / Quark Drive boost.
-fn effective_speed(state: &State, side: SideId) -> i32 {
+pub fn effective_speed(state: &State, side: SideId) -> i32 {
     let s = state.side(side);
     let p = s.active();
     let mut spe = p.stat(crate::ids::StatIndex::Speed) as f32;

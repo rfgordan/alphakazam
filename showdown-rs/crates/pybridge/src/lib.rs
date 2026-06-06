@@ -122,9 +122,10 @@ impl Battle {
         engine::encode::IDS_PER_MON
     }
 
-    /// Which embedding table each ID column indexes into (length `ids_per_mon`).
+    /// Which embedding table each ID column indexes into (length `ids_per_mon`). Last = last-used
+    /// move.
     fn id_columns(&self) -> Vec<String> {
-        ["species", "ability", "item", "type", "move", "move", "move", "move"]
+        ["species", "ability", "item", "type", "move", "move", "move", "move", "move"]
             .iter()
             .map(|s| s.to_string())
             .collect()

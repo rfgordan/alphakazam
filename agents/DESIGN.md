@@ -54,12 +54,16 @@ zeroes illegal actions (no-PP moves, fainted/active switch targets) before sampl
 
 ## 2. The model (~5M parameters, with ID embeddings)
 
-The observation has two parts: a **float vector** (hp/status/types/stats/field — `obs_dim≈464`)
-and **categorical IDs** per Pokémon (species, ability, item, tera type, 4 moves — `12×8` ints).
-Each ID class gets a learned **embedding table** (sized from the bridge's `vocab_sizes()`: species
-912, move 955, ability 112, item 25, type 20); the per-mon embeddings are concatenated with the
-floats and fed to a shared MLP → masked policy head (9) + value head. This is "Level 1":
-embeddings + concat into a flat MLP (not yet a per-entity / attention encoder — that's Level 2).
+The observation has two parts. A **float vector** (`obs_dim≈633`): a roster block per mon
+(hp/status/types/stats/level), plus for the **active mon in the field** a *field block* (substitute,
+27 volatile flags, status counter, multi-turn counters, pending move, can-Tera) and an
+*active-move block* (each of its 4 moves: PP, disabled, base power, category, accuracy, STAB, and
+**type-effectiveness vs the current foe**), plus a speed-matchup and global weather/terrain/hazards.
+And **categorical IDs** (`14×9` ints): species, ability, item, tera, 4 moves, + last-used move, for
+12 roster entities **plus the two active mons duplicated at fixed positions** so the model tracks
+the current mon directly. Each ID class gets a learned **embedding table** (from `vocab_sizes()`);
+embeddings concat with the floats into a shared MLP → masked policy head (9) + value head. This is
+"Level 1": embeddings + concat into a flat MLP (not yet a per-entity / attention encoder — Level 2).
 
 ```mermaid
 flowchart TD
@@ -76,7 +80,7 @@ flowchart TD
     P --> LOGITS["masked logits -> Categorical"]
 ```
 
-With `hidden_dim=928`, `n_hidden_layers=2`, `embed_dim=32` it is **~5.08M** params. The IDs come
+With `hidden_dim=800`, `n_hidden_layers=2`, `embed_dim=32` it is **~5.1M** params. The IDs come
 from `observe(viewer)`, so a hidden foe item/ability/move arrives as its `Unknown`/`None` sentinel
 index — fog-of-war preserved. `embed=None` gives the old pure-float MLP (the placeholder trainer).
 
