@@ -48,6 +48,17 @@ evals = [json.loads(l) for l in open("runs/<ts>/eval.jsonl")]
 Baselines are generic (`baselines.Baseline`: `actions(obs, mask) -> np.ndarray`) — add a heuristic
 bot or a specific checkpoint to the `baselines` list in `selfplay.train_selfplay`.
 
+### Weights & Biases
+
+`--wandb` mirrors everything to W&B: training metrics under `train/*` (incl. the split aux losses
+`aux_opp` / `aux_delta` / `aux_ko`) and evals under `eval/<baseline>/{win_rate,draws,avg_turns}`,
+keyed by environment step.
+```sh
+uv run python -m ppo.selfplay --total-steps 0 --wandb --wandb-project deep-showdown
+WANDB_MODE=offline uv run python -m ppo.selfplay --total-steps 50000 --wandb   # no login/network
+```
+The JSONL files are still written either way.
+
 The Rust↔Python bridge lives in `../showdown-rs/crates/pybridge/` (a `pyo3` crate exposing the
 `showdown_engine` module: `Battle.observe / legal_actions / step / render`). The natural-language
 narration and observation encoder are render-layers in the engine crate (`narrate.rs`,

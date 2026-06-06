@@ -146,18 +146,20 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
 
             # Auxiliary prediction losses — gradient flows to the trunk, NOT the policy head.
             aux_loss = torch.zeros((), device=loss.device)
+            aux_opp_v = aux_delta_v = aux_ko_v = 0.0
             if use_aux:
                 aux = rest[0]
                 # Opponent-move prediction (from state).
                 aux_opp = F.cross_entropy(aux["opp"], data["opp_action"][mb])
                 # World-model prediction CONDITIONED on both actions (HP-Δ/KO depend on them).
-                # Channels 0:2 = signed HP deltas in [-1,1] (tanh); 2:4 = KO logits (BCE).
+                # Channels 0:2 = signed HP deltas in [-1,1] (tanh, MSE); 2:4 = KO logits (BCE).
                 dyn = model.predict_dynamics(aux["h"], data["actions"][mb], data["opp_action"][mb])
                 tgt = data["dyn_target"][mb]
-                aux_dyn = (F.mse_loss(torch.tanh(dyn[:, :2]), tgt[:, :2])
-                           + F.binary_cross_entropy_with_logits(dyn[:, 2:], tgt[:, 2:]))
-                aux_loss = cfg.aux_opp_coef * aux_opp + cfg.aux_dyn_coef * aux_dyn
+                aux_delta = F.mse_loss(torch.tanh(dyn[:, :2]), tgt[:, :2])
+                aux_ko = F.binary_cross_entropy_with_logits(dyn[:, 2:], tgt[:, 2:])
+                aux_loss = cfg.aux_opp_coef * aux_opp + cfg.aux_dyn_coef * (aux_delta + aux_ko)
                 loss = loss + aux_loss
+                aux_opp_v, aux_delta_v, aux_ko_v = aux_opp.item(), aux_delta.item(), aux_ko.item()
 
             optimizer.zero_grad()
             loss.backward()
@@ -172,6 +174,9 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 entropy=entropy_loss.item(),
                 approx_kl=approx_kl.item(),
                 aux_loss=aux_loss.item() if use_aux else 0.0,
+                aux_opp=aux_opp_v,        # opponent-move cross-entropy
+                aux_delta=aux_delta_v,    # world-model HP-Δ MSE (watch vs its irreducible floor)
+                aux_ko=aux_ko_v,          # world-model KO BCE
             )
     return last
 

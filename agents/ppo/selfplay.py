@@ -49,6 +49,7 @@ def train_selfplay(
     mcts_eval_games: int = 20,
     logdir: str = "runs",
     run_name: str | None = None,
+    wandb_project: str | None = None,
 ):
     """Frozen-snapshot self-play with periodic fixed-baseline eval and file logging.
 
@@ -97,7 +98,7 @@ def train_selfplay(
         # poke-engine MCTS — a strong, external validated reference (heavy; keep eval_games modest).
         baselines.append(MctsBaseline(time_ms=mcts_eval_ms))
 
-    logger = RunLogger(logdir, run_name)
+    logger = RunLogger(logdir, run_name, wandb_project=wandb_project)
     logger.config({"cfg": vars(cfg), "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
                    "snapshot_every": snapshot_every, "eval_every": eval_every,
                    "eval_games": eval_games, "ckpt_every": ckpt_every, "params": model.num_params(),
@@ -282,6 +283,8 @@ def main():
                         help="potential-based reward shaping weight (Φ=team HP diff; 0 = off, ~0.5 to enable)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
     parser.add_argument("--run-name", type=str, default=None, help="run subdirectory name (default: timestamp)")
+    parser.add_argument("--wandb", action="store_true", help="mirror metrics/evals to Weights & Biases")
+    parser.add_argument("--wandb-project", type=str, default="deep-showdown", help="W&B project name")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
     args = parser.parse_args()
 
@@ -314,6 +317,7 @@ def main():
         mcts_eval_games=args.mcts_eval_games,
         logdir=args.logdir,
         run_name=args.run_name,
+        wandb_project=args.wandb_project if args.wandb else None,
     )
 
 

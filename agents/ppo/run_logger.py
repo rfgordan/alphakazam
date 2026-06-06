@@ -1,4 +1,5 @@
-"""Tiny run logger: a timestamped directory with JSONL metrics, eval results, config, and checkpoints.
+"""Run logger: a timestamped directory with JSONL metrics, eval results, config, checkpoints —
+and optional Weights & Biases mirroring.
 
     runs/<timestamp>/
         config.json     the PPOConfig + CLI args for this run
@@ -8,6 +9,10 @@
 
 JSONL is append-and-flush so a run can be tailed live or analyzed after the fact:
     import json; [json.loads(l) for l in open("runs/<ts>/eval.jsonl")]
+
+If `wandb_project` is given (and `wandb` is installed/logged-in), every training metric is mirrored
+under `train/*` and every eval under `eval/<baseline>/*`, keyed by environment step. Set
+`WANDB_MODE=offline` to log without a network/login.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from datetime import datetime
 
 
 class RunLogger:
-    def __init__(self, root: str = "runs", name: str | None = None):
+    def __init__(self, root: str = "runs", name: str | None = None, wandb_project: str | None = None):
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.dir = os.path.join(root, name or ts)
         os.makedirs(self.dir, exist_ok=True)
@@ -28,15 +33,39 @@ class RunLogger:
         self.start = time.time()
         print(f"logging to {self.dir}/")
 
+        self._wandb = None
+        if wandb_project:
+            try:
+                import wandb
+                wandb.init(project=wandb_project, name=os.path.basename(self.dir), dir=self.dir)
+                self._wandb = wandb
+                print(f"wandb: project '{wandb_project}' run '{os.path.basename(self.dir)}'")
+            except Exception as e:  # not installed / not logged in -> fall back to files only
+                print(f"wandb disabled ({type(e).__name__}: {e})")
+
     def config(self, d: dict):
         with open(os.path.join(self.dir, "config.json"), "w") as f:
             json.dump(d, f, indent=2, default=str)
+        if self._wandb:
+            self._wandb.config.update(_flatten(d), allow_val_change=True)
 
     def metrics(self, d: dict):
         self._metrics.write(json.dumps({"wall": round(time.time() - self.start, 1), **d}) + "\n")
+        if self._wandb:
+            step = d.get("step")
+            payload = {f"train/{k}": v for k, v in d.items()
+                       if isinstance(v, (int, float)) and k not in ("step", "update")}
+            self._wandb.log(payload, step=step)
 
     def eval(self, d: dict):
         self._eval.write(json.dumps({"wall": round(time.time() - self.start, 1), **d}) + "\n")
+        if self._wandb:
+            bl = d["baseline"]
+            self._wandb.log({
+                f"eval/{bl}/win_rate": d["win_rate"],
+                f"eval/{bl}/draws": d["draws"],
+                f"eval/{bl}/avg_turns": d["avg_turns"],
+            }, step=d.get("step"))
 
     def checkpoint_path(self, update: int) -> str:
         return os.path.join(self.dir, f"ckpt_{update:06d}.pt")
@@ -44,3 +73,16 @@ class RunLogger:
     def close(self):
         self._metrics.close()
         self._eval.close()
+        if self._wandb:
+            self._wandb.finish()
+
+
+def _flatten(d: dict, prefix: str = "") -> dict:
+    """Flatten one level of nested dicts (e.g. {'cfg': {...}}) for wandb.config."""
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(_flatten(v, f"{prefix}{k}."))
+        else:
+            out[f"{prefix}{k}"] = v
+    return out
