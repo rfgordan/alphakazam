@@ -190,6 +190,68 @@ impl Battle {
         (self.is_over(), self.winner(), lines)
     }
 
+    /// The full *true* battle state (both sides, perfect information) as a JSON string, for
+    /// adapters that build a foreign engine's state (e.g. poke-engine for an MCTS baseline).
+    /// All identifiers are PS `toID` strings; the caller maps them to the target engine's format.
+    fn state_json(&self) -> String {
+        use serde_json::{json, Value};
+        let s = &self.state;
+        let ty = |t: engine::ids::Type| t.to_id();
+
+        let side_json = |side: SideId| -> Value {
+            let sd = s.side(side);
+            let mons: Vec<Value> = (0..6)
+                .map(|i| {
+                    let p = &sd.pokemon[i];
+                    let moves: Vec<Value> = (0..4)
+                        .map(|m| {
+                            let mv = p.moves[m];
+                            json!({"id": mv.id.to_id(), "pp": mv.pp, "disabled": mv.disabled})
+                        })
+                        .collect();
+                    json!({
+                        "species": p.species.to_id(),
+                        "level": p.level,
+                        "types": [ty(p.types[0]), ty(p.types[1])],
+                        "base_types": [ty(p.base_types[0]), ty(p.base_types[1])],
+                        "hp": p.hp, "maxhp": p.max_hp,
+                        "ability": p.ability.to_id(), "base_ability": p.base_ability.to_id(),
+                        "item": p.item.to_id(),
+                        "nature": nature_str(p.nature),
+                        "evs": p.evs,
+                        "stats": {"atk": p.stats[1], "def": p.stats[2], "spa": p.stats[3], "spd": p.stats[4], "spe": p.stats[5]},
+                        "status": p.status.to_id(), "status_counter": p.status_counter,
+                        "tera_type": ty(p.tera_type), "terastallized": p.terastallized,
+                        "weight_kg": engine::data::species_weight_hg(p.species) as f64 / 10.0,
+                        "moves": moves,
+                    })
+                })
+                .collect();
+            let sc = &sd.side_conditions;
+            json!({
+                "active_index": sd.active_index,
+                "last_used_move": sd.last_used_move.to_id(),
+                "boosts": {"atk": sd.boosts[0], "def": sd.boosts[1], "spa": sd.boosts[2],
+                           "spd": sd.boosts[3], "spe": sd.boosts[4], "accuracy": sd.boosts[5], "evasion": sd.boosts[6]},
+                "side_conditions": {
+                    "stealth_rock": sc.stealth_rock, "spikes": sc.spikes, "toxic_spikes": sc.toxic_spikes,
+                    "sticky_web": sc.sticky_web, "reflect": sc.reflect, "light_screen": sc.light_screen,
+                    "aurora_veil": sc.aurora_veil, "tailwind": sc.tailwind,
+                },
+                "pokemon": mons,
+            })
+        };
+
+        json!({
+            "weather": s.weather.to_id(), "weather_turns": s.weather_turns,
+            "terrain": s.terrain.to_id(), "terrain_turns": s.terrain_turns,
+            "trick_room": s.trick_room, "trick_room_turns": s.trick_room_turns,
+            "turn": s.turn,
+            "sides": [side_json(SideId::One), side_json(SideId::Two)],
+        })
+        .to_string()
+    }
+
     /// A compact text snapshot of the board (active + bench HP%), for following along.
     fn render(&self) -> String {
         let mut out = String::new();
@@ -281,6 +343,18 @@ impl Battle {
             }
         }
         branches.len() - 1
+    }
+}
+
+/// PS `toID` string for a nature (the engine has no `to_id` for `Nature`).
+fn nature_str(n: engine::ids::Nature) -> &'static str {
+    use engine::ids::Nature::*;
+    match n {
+        Hardy => "hardy", Lonely => "lonely", Brave => "brave", Adamant => "adamant", Naughty => "naughty",
+        Bold => "bold", Docile => "docile", Relaxed => "relaxed", Impish => "impish", Lax => "lax",
+        Timid => "timid", Hasty => "hasty", Serious => "serious", Jolly => "jolly", Naive => "naive",
+        Modest => "modest", Mild => "mild", Quiet => "quiet", Bashful => "bashful", Rash => "rash",
+        Calm => "calm", Gentle => "gentle", Sassy => "sassy", Careful => "careful", Quirky => "quirky",
     }
 }
 

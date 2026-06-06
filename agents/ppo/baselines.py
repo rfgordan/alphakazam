@@ -21,8 +21,10 @@ from .engine_env import EngineVecEnv
 class Baseline(Protocol):
     name: str
 
-    def actions(self, obs: np.ndarray, ids: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Batched action indices for a stack of (float obs, categorical ids, legal-mask) rows."""
+    def actions(self, obs: np.ndarray, ids: np.ndarray, mask: np.ndarray, battles=None, sides=None) -> np.ndarray:
+        """Batched action indices for a stack of rows. `battles`/`sides` (the raw engine `Battle`
+        handles and the side this baseline controls per env) are provided for baselines that need
+        the full state (e.g. an external search); policy/random baselines ignore them."""
 
 
 @torch.no_grad()
@@ -47,7 +49,7 @@ class PolicyBaseline:
         self.greedy = greedy
 
     @torch.no_grad()
-    def actions(self, obs_np, ids_np, mask_np) -> np.ndarray:
+    def actions(self, obs_np, ids_np, mask_np, battles=None, sides=None) -> np.ndarray:
         obs = torch.as_tensor(obs_np, device=self.device)
         ids = torch.as_tensor(ids_np, device=self.device)
         mask = torch.as_tensor(mask_np, device=self.device)
@@ -65,11 +67,48 @@ class RandomBaseline:
         self.rng = np.random.default_rng(seed)
         self.name = name
 
-    def actions(self, obs_np, ids_np, mask_np) -> np.ndarray:
+    def actions(self, obs_np, ids_np, mask_np, battles=None, sides=None) -> np.ndarray:
         out = np.zeros(len(mask_np), dtype=np.int64)
         for i, m in enumerate(mask_np):
             legal = np.flatnonzero(m)
             out[i] = self.rng.choice(legal) if legal.size else 0
+        return out
+
+
+class MctsBaseline:
+    """pmariglia's poke-engine MCTS as an opponent — a strong, validated reference.
+
+    For each battle it builds a *perfect-information* poke-engine state (full teams known, so MCTS
+    plays at full strength), searches `time_ms`, and maps the top-visited move to our action index
+    (falling back to the first legal action on any unmapped/illegal choice). Search is sequential
+    per env and heavy, so keep num_envs/n_games modest for this baseline.
+    """
+
+    def __init__(self, time_ms: int = 100, name: str | None = None):
+        self.time_ms = time_ms
+        self.name = name or f"mcts@{time_ms}ms"
+
+    def actions(self, obs_np, ids_np, mask_np, battles=None, sides=None) -> np.ndarray:
+        import json
+        import poke_engine as pe
+        from .poke_engine_adapter import move_choice_to_action, state_to_poke_engine
+
+        out = np.zeros(len(mask_np), dtype=np.int64)
+        for i in range(len(battles)):
+            mask = mask_np[i]
+            side = int(sides[i])
+            sd = json.loads(battles[i].state_json())
+            try:
+                st = state_to_poke_engine(sd, side)
+                res = pe.monte_carlo_tree_search(st, self.time_ms)
+                best = max(res.side_one, key=lambda x: x.visits)
+                a = move_choice_to_action(best.move_choice, sd["sides"][side])
+            except Exception:
+                a = None
+            if a is None or not mask[a]:
+                legal = np.flatnonzero(mask)
+                a = int(legal[0]) if legal.size else 0
+            out[i] = a
         return out
 
 
@@ -84,7 +123,7 @@ def evaluate(model, baseline: Baseline, device, n_games: int = 100, num_envs: in
         obs_l, ids_l, mask_l = envs.learner_view()
         obs_o, ids_o, mask_o = envs.opponent_view()
         learner_a = greedy_actions(model, obs_l, ids_l, mask_l, device)
-        opp_a = baseline.actions(obs_o, ids_o, mask_o)
+        opp_a = baseline.actions(obs_o, ids_o, mask_o, battles=envs.battles, sides=(1 - envs.learner_side))
         prev_len = envs._ep_len.copy()
         reward, done = envs.step(learner_a, opp_a)
         for r, d, pl in zip(reward, done, prev_len):

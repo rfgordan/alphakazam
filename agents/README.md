@@ -86,6 +86,32 @@ uv run python -m ppo.selfplay --render-every 10     # also watch a narrated game
 uv run python -m ppo.train --total-steps 50000
 ```
 
+## Evaluating vs poke-engine MCTS (validated baseline)
+
+A strong, external reference opponent: pmariglia's [poke-engine](https://github.com/pmariglia/poke-engine)
+Monte-Carlo Tree Search (the engine behind the [foul-play](https://github.com/pmariglia/foul-play)
+bot). Our `MctsBaseline` builds a **perfect-information** poke-engine state from each battle (via
+`Battle.state_json()` → `ppo/poke_engine_adapter.py`), searches, and maps its move back to our
+action space — so MCTS plays at full strength. It's meant to be hard to beat; a random-init policy
+should win ~0%.
+
+Install poke-engine once (needs Rust; uses gen9/terastallization features like foul-play):
+```sh
+uv pip install "poke-engine==0.0.46" \
+  --config-settings="build-args=--features poke-engine/terastallization --no-default-features"
+```
+
+Run an offline eval (greedy policy, side-balanced, with Wilson CIs):
+```sh
+uv run python -m ppo.eval --ckpt runs/<ts>/ckpt_000050.pt --baseline mcts --mcts-ms 100 --games 50
+uv run python -m ppo.eval --baseline mcts --mcts-ms 50 --games 12      # random-init sanity (~0%)
+```
+
+Notes: MCTS is heavy (sequential per env) — keep `--num-envs`/`--games` modest and sweep
+`--mcts-ms` to get a win-rate-vs-search-budget curve. The poke-engine `MctsBaseline` slots into the
+same `evaluate()`/`Baseline` machinery as `random`/`anchor`. Caveats live in
+`poke_engine_adapter.py` (volatiles/substitute/Tera-intent are approximated).
+
 `win_rate(vs snapshot)` traces a **sawtooth**: it climbs as the learner beats the frozen
 opponent, then drops at each `[snapshot refreshed]` when the opponent catches up. Staying above
 ~0.5 after every refresh means each policy beats its predecessor (real improvement). Example
