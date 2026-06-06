@@ -18,7 +18,7 @@ import torch
 
 import showdown_engine as se
 
-from .baselines import MctsBaseline, RandomBaseline, evaluate
+from .baselines import HeuristicBaseline, MctsBaseline, RandomBaseline, evaluate
 from .config import PPOConfig
 from .model import ActorCritic
 from .train import resolve_device
@@ -53,7 +53,7 @@ def wilson_interval(wins: int, n: int, z: float = 1.96):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a policy vs fixed baselines (incl. poke-engine MCTS).")
     parser.add_argument("--ckpt", type=str, default=None, help="checkpoint path (omit = random-init model)")
-    parser.add_argument("--baseline", type=str, default="mcts", choices=["mcts", "random"])
+    parser.add_argument("--baseline", type=str, default="mcts", choices=["mcts", "random", "heuristic"])
     parser.add_argument("--mcts-ms", type=int, default=100, help="MCTS search time per move (ms)")
     parser.add_argument("--games", type=int, default=50)
     parser.add_argument("--num-envs", type=int, default=4, help="parallel battles (MCTS is heavy — keep modest)")
@@ -68,7 +68,12 @@ def main():
     device = resolve_device(cfg.device)
 
     model, tag = build_model(args.ckpt, device, cfg)
-    baseline = MctsBaseline(time_ms=args.mcts_ms) if args.baseline == "mcts" else RandomBaseline(seed=args.seed)
+    if args.baseline == "mcts":
+        baseline = MctsBaseline(time_ms=args.mcts_ms)
+    elif args.baseline == "heuristic":
+        baseline = HeuristicBaseline()
+    else:
+        baseline = RandomBaseline(seed=args.seed)
 
     print(f"policy: {tag}")
     print(f"baseline: {baseline.name}  | {args.games} games, {args.num_envs} parallel battles, device={device}")

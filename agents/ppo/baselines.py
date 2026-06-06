@@ -112,6 +112,118 @@ class MctsBaseline:
         return out
 
 
+class HeuristicBaseline:
+    """A faithful port of poke-env's `SimpleHeuristicsPlayer.choose_move` over our `state_json`.
+
+    Deterministic, no search: estimate the matchup (type advantage + speed + HP), switch out of a
+    bad matchup into a better reserve, set hazards / clear our own, set up when safe at full HP,
+    otherwise click the best-scoring damaging move (base_power × STAB × type-effectiveness ×
+    accuracy). A strong-ish, very fast middle baseline between `random` and `mcts`.
+    """
+
+    ENTRY_HAZARDS = {"spikes": "spikes", "stealthrock": "stealth_rock",
+                     "stickyweb": "sticky_web", "toxicspikes": "toxic_spikes"}
+    ANTI_HAZARDS = {"rapidspin", "defog"}
+    SPEED_COEF = 0.1
+    HP_COEF = 0.4
+    SWITCH_THRESHOLD = -2
+
+    def __init__(self, name: str = "heuristic"):
+        self.name = name
+
+    def _matchup(self, te, mon: dict, opp: dict) -> float:
+        mon_types = [t for t in mon["types"] if t != "none"]
+        opp_types = [t for t in opp["types"] if t != "none"]
+        off = max((te(t, opp["types"]) for t in mon_types), default=1.0)   # our best type vs them
+        deff = max((te(t, mon["types"]) for t in opp_types), default=1.0)  # their best type vs us
+        score = off - deff
+        spe_m, spe_o = mon["stats"]["spe"], opp["stats"]["spe"]
+        score += self.SPEED_COEF if spe_m > spe_o else (-self.SPEED_COEF if spe_o > spe_m else 0.0)
+        score += self.HP_COEF * (mon["hp"] / max(1, mon["maxhp"]))
+        score -= self.HP_COEF * (opp["hp"] / max(1, opp["maxhp"]))
+        return score
+
+    def _action_for(self, te, side: dict, opp_side: dict, mask) -> int:
+        ai = side["active_index"]
+        mons = side["pokemon"]
+        active = mons[ai]
+        opp = opp_side["pokemon"][opp_side["active_index"]]
+        bench = [s for s in range(6) if s != ai]
+
+        legal_moves = [i for i in range(4) if mask[i]]
+        legal_switch_k = [k for k in range(5) if mask[4 + k]]
+        switch_mon = lambda k: mons[bench[k]]
+
+        # Should we switch out? (a good reserve exists AND we're in a bad spot)
+        should_switch = False
+        if legal_switch_k and any(self._matchup(te, switch_mon(k), opp) > 0 for k in legal_switch_k):
+            b = active["boosts"]
+            phys = active["stats"]["atk"] >= active["stats"]["spa"]
+            should_switch = (
+                b["def"] <= -3 or b["spd"] <= -3
+                or (b["atk"] <= -3 and phys) or (b["spa"] <= -3 and not phys)
+                or self._matchup(te, active, opp) < self.SWITCH_THRESHOLD
+            )
+
+        if legal_moves and not (should_switch and legal_switch_k):
+            n_opp = sum(1 for p in opp_side["pokemon"] if p["species"] != "none" and p["hp"] > 0)
+            n_self = sum(1 for p in mons if p["species"] != "none" and p["hp"] > 0)
+            opp_sc = opp_side["side_conditions"]
+            self_sc = side["side_conditions"]
+
+            # Hazards: set them up early; clear our own if any exist.
+            for i in legal_moves:
+                mid = active["moves"][i]["id"]
+                if mid in self.ENTRY_HAZARDS and not opp_sc.get(self.ENTRY_HAZARDS[mid]) and n_opp >= 3:
+                    return i
+                if mid in self.ANTI_HAZARDS and any(self_sc[h] for h in
+                        ("stealth_rock", "spikes", "toxic_spikes", "sticky_web")) and n_self >= 2:
+                    return i
+
+            # Setup: boost when at full HP in a favorable matchup and not maxed.
+            if active["hp"] >= active["maxhp"] and self._matchup(te, active, opp) > 0 \
+                    and max(active["boosts"][s] for s in ("atk", "def", "spa", "spd", "spe")) < 6:
+                for i in legal_moves:
+                    mv = active["moves"][i]
+                    if mv["self_boost_total"] >= 2 and mv["base_power"] == 0:
+                        return i
+
+            # Best damaging move.
+            def score(i):
+                mv = active["moves"][i]
+                stab = 1.5 if mv["type"] in active["types"] else 1.0
+                acc = mv["accuracy"] / 100.0 if mv["accuracy"] > 0 else 1.0
+                return mv["base_power"] * stab * te(mv["type"], opp["types"]) * acc
+
+            dmg = [i for i in legal_moves if active["moves"][i]["base_power"] > 0]
+            if dmg:
+                return max(dmg, key=score)
+
+        # Switch to the best-matchup reserve.
+        if legal_switch_k:
+            return 4 + max(legal_switch_k, key=lambda k: self._matchup(te, switch_mon(k), opp))
+
+        legal = [a for a in range(len(mask)) if mask[a]]
+        return legal[0] if legal else 0
+
+    def actions(self, obs_np, ids_np, mask_np, battles=None, sides=None) -> np.ndarray:
+        import json
+
+        out = np.zeros(len(mask_np), dtype=np.int64)
+        for i in range(len(battles)):
+            side = int(sides[i])
+            sd = json.loads(battles[i].state_json())
+            try:
+                a = self._action_for(battles[i].type_effectiveness, sd["sides"][side], sd["sides"][1 - side], mask_np[i])
+            except Exception:
+                a = None
+            if a is None or not mask_np[i][a]:
+                legal = np.flatnonzero(mask_np[i])
+                a = int(legal[0]) if legal.size else 0
+            out[i] = int(a)
+        return out
+
+
 @torch.no_grad()
 def evaluate(model, baseline: Baseline, device, n_games: int = 100, num_envs: int = 8,
              seed: int = 1234567, max_turns: int = 300) -> dict:

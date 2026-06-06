@@ -206,7 +206,13 @@ impl Battle {
                     let moves: Vec<Value> = (0..4)
                         .map(|m| {
                             let mv = p.moves[m];
-                            json!({"id": mv.id.to_id(), "pp": mv.pp, "disabled": mv.disabled})
+                            let md = engine::data::move_data(mv.id);
+                            json!({
+                                "id": mv.id.to_id(), "pp": mv.pp, "disabled": mv.disabled,
+                                "type": md.typ.to_id(), "base_power": md.base_power, "accuracy": md.accuracy,
+                                "category": cat_str(md.category),
+                                "self_boost_total": md.self_boosts.iter().map(|&x| x as i32).sum::<i32>(),
+                            })
                         })
                         .collect();
                     json!({
@@ -250,6 +256,21 @@ impl Battle {
             "sides": [side_json(SideId::One), side_json(SideId::Two)],
         })
         .to_string()
+    }
+
+    /// Type effectiveness multiplier of `attacking` (a type id) against one or two `defending`
+    /// type ids — the data a heuristic player needs for matchup/move scoring.
+    fn type_effectiveness(&self, attacking: String, defending: Vec<String>) -> f64 {
+        use engine::ids::Type;
+        let at = match Type::from_id(&attacking) {
+            Some(t) => t,
+            None => return 1.0,
+        };
+        let mut d = [Type::None, Type::None];
+        for (i, s) in defending.iter().take(2).enumerate() {
+            d[i] = Type::from_id(s).unwrap_or(Type::None);
+        }
+        engine::damage::type_multiplier(at, d) as f64
     }
 
     /// A compact text snapshot of the board (active + bench HP%), for following along.
@@ -343,6 +364,15 @@ impl Battle {
             }
         }
         branches.len() - 1
+    }
+}
+
+fn cat_str(c: engine::ids::MoveCategory) -> &'static str {
+    use engine::ids::MoveCategory::*;
+    match c {
+        Physical => "physical",
+        Special => "special",
+        Status => "status",
     }
 }
 

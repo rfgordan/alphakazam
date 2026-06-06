@@ -27,7 +27,7 @@ import torch
 
 import showdown_engine as se
 
-from .baselines import MctsBaseline, PolicyBaseline, RandomBaseline, evaluate, greedy_actions
+from .baselines import HeuristicBaseline, MctsBaseline, PolicyBaseline, RandomBaseline, evaluate, greedy_actions
 from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .engine_env import BLUE, RED, EngineVecEnv
@@ -89,6 +89,7 @@ def train_selfplay(
     baselines = [
         PolicyBaseline(anchor, device, name="anchor-init"),
         RandomBaseline(seed=cfg.seed, name="random"),
+        HeuristicBaseline(),  # poke-env-style heuristic — fast, deterministic middle baseline
     ]
     if mcts_eval_ms > 0:
         # poke-engine MCTS — a strong, external validated reference (heavy; keep eval_games modest).

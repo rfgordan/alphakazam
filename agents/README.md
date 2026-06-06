@@ -107,6 +107,22 @@ uv run python -m ppo.eval --ckpt runs/<ts>/ckpt_000050.pt --baseline mcts --mcts
 uv run python -m ppo.eval --baseline mcts --mcts-ms 50 --games 12      # random-init sanity (~0%)
 ```
 
+### Baseline ladder
+
+Three reference opponents of increasing strength — your policy should clear them in this order:
+
+| baseline | what it is | speed |
+|---|---|---|
+| `random` | uniform over legal actions | instant |
+| `heuristic` | port of poke-env's `SimpleHeuristicsPlayer` (matchup/switch/hazards/best-damage) | fast |
+| `mcts` | poke-engine Monte-Carlo Tree Search (perfect info) | heavy |
+
+`random` and `heuristic` run in the **default training evals** (logged to `eval.jsonl` every
+`--eval-every`); `mcts` is opt-in (`--mcts-eval-ms`) since it's heavy. Standalone:
+```sh
+uv run python -m ppo.eval --baseline heuristic --games 100      # fast; no poke-engine needed
+```
+
 Notes: MCTS is heavy (sequential per env) — keep `--num-envs`/`--games` modest and sweep
 `--mcts-ms` to get a win-rate-vs-search-budget curve. The poke-engine `MctsBaseline` slots into the
 same `evaluate()`/`Baseline` machinery as `random`/`anchor`. Caveats live in

@@ -151,6 +151,10 @@ sequenceDiagram
 builder, engine-backed vector env, frozen-snapshot self-play trainer (with a live-opponent
 fallback), live terminal commentary.
 
+**Eval baselines (ladder of increasing strength):** `random` < `heuristic` (port of poke-env's
+`SimpleHeuristicsPlayer`) < `mcts` (poke-engine MCTS, perfect info). `random`/`heuristic` run in the
+default periodic eval; `mcts` is opt-in via `--mcts-eval-ms`.
+
 **Not yet (intentionally):** league / population play (a *pool* of past snapshots à la AlphaStar,
 vs. the single snapshot here); richer reward shaping; determinization over hidden info; randomized
 teams (one fixed matchup for now); special-case action types (forced two-turn locks, etc.); a
