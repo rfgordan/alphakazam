@@ -46,6 +46,7 @@ def train_selfplay(
     ckpt_every: int = 50,
     keep_checkpoints: int = 3,
     mcts_eval_ms: int = 0,
+    mcts_eval_games: int = 20,
     logdir: str = "runs",
     run_name: str | None = None,
 ):
@@ -195,7 +196,10 @@ def train_selfplay(
             # --- periodic eval vs fixed baselines (absolute progress) ---
             if eval_every and update % eval_every == 0:
                 for bl in baselines:
-                    r = evaluate(model, bl, device, n_games=eval_games)
+                    # MCTS is slow but low-variance (the policy reliably loses), so it uses a
+                    # smaller, separate game count; cheap baselines use the larger eval_games.
+                    n = mcts_eval_games if isinstance(bl, MctsBaseline) else eval_games
+                    r = evaluate(model, bl, device, n_games=n)
                     print(f"    [eval @ {update}] vs {bl.name:>11}: win_rate {r['win_rate']:.2f}  "
                           f"(W/L/D {r['wins']}/{r['losses']}/{r['draws']}, avg_turns {r['avg_turns']:.0f})")
                     logger.eval({"update": update, "step": global_step, **r})
@@ -272,6 +276,8 @@ def main():
                         help="keep only the most recent N checkpoints (0 = keep all)")
     parser.add_argument("--mcts-eval-ms", type=int, default=0,
                         help="also eval vs poke-engine MCTS at this search time per move (0 = off; heavy)")
+    parser.add_argument("--mcts-eval-games", type=int, default=20,
+                        help="games for the MCTS eval (separate from --eval-games; MCTS is slow + low-variance)")
     parser.add_argument("--shaping-coef", type=float, default=None,
                         help="potential-based reward shaping weight (Φ=team HP diff; 0 = off, ~0.5 to enable)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
@@ -305,6 +311,7 @@ def main():
         ckpt_every=args.ckpt_every,
         keep_checkpoints=args.keep_checkpoints,
         mcts_eval_ms=args.mcts_eval_ms,
+        mcts_eval_games=args.mcts_eval_games,
         logdir=args.logdir,
         run_name=args.run_name,
     )
