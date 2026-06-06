@@ -40,7 +40,7 @@ def greedy_actions(model, obs_np, mask_np, device) -> np.ndarray:
     return logits.argmax(dim=-1).cpu().numpy()
 
 
-def train_selfplay(cfg: PPOConfig, render_every: int = 20):
+def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None = None):
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
 
@@ -115,6 +115,11 @@ def train_selfplay(cfg: PPOConfig, render_every: int = 20):
             play_one_game(model, device, seed=1000 + update, max_turns=200)
             print()
 
+        if max_games is not None and len(recent_results) >= max_games:
+            print(f"\nReached {len(recent_results)} games (target {max_games}); stopping. "
+                  f"record W/L/D = {wins}/{losses}/{draws}.")
+            break
+
     return model
 
 
@@ -153,6 +158,7 @@ def play_one_game(model, device, seed: int = 0, max_turns: int = 200, sample: bo
 def main():
     parser = argparse.ArgumentParser(description="Greedy self-play PPO against the Rust engine.")
     parser.add_argument("--total-steps", type=int, default=300_000)
+    parser.add_argument("--games", type=int, default=None, help="stop after this many completed games")
     parser.add_argument("--device", type=str, default=None, help="auto|cpu|mps|cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--render-every", type=int, default=20, help="watch a game every N updates (0 = never)")
@@ -173,7 +179,7 @@ def main():
         play_one_game(model, device, seed=args.seed)
         return
 
-    train_selfplay(cfg, render_every=args.render_every)
+    train_selfplay(cfg, render_every=args.render_every, max_games=args.games)
 
 
 if __name__ == "__main__":
