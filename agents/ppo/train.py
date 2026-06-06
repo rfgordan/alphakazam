@@ -20,6 +20,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .buffer import RolloutBuffer
 from .config import PPOConfig
@@ -118,6 +119,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs_ids = data.get("obs_ids")  # present only when the model uses embeddings
+    use_aux = "opp_action" in data  # auxiliary prediction labels present
     last = {}
     for _ in range(cfg.update_epochs):
         np.random.shuffle(idx)
@@ -125,8 +127,8 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             mb = torch.as_tensor(idx[start:start + cfg.minibatch_size], device=data["obs"].device)
             mb_ids = obs_ids[mb] if obs_ids is not None else None
 
-            _, new_log_prob, entropy, new_value = model.act(
-                data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids
+            _, new_log_prob, entropy, new_value, *rest = model.act(
+                data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids, return_aux=use_aux
             )
 
             # Clipped policy (surrogate) objective.
@@ -142,6 +144,20 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             entropy_loss = entropy.mean()
             loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss
 
+            # Auxiliary prediction losses — gradient flows to the trunk, NOT the policy head.
+            aux_loss = torch.zeros((), device=loss.device)
+            if use_aux:
+                aux = rest[0]
+                # Opponent-move prediction (from state).
+                aux_opp = F.cross_entropy(aux["opp"], data["opp_action"][mb])
+                # World-model prediction CONDITIONED on both actions (damage/KO depend on them).
+                dyn = model.predict_dynamics(aux["h"], data["actions"][mb], data["opp_action"][mb])
+                tgt = data["dyn_target"][mb]
+                aux_dyn = (F.mse_loss(torch.sigmoid(dyn[:, :2]), tgt[:, :2])
+                           + F.binary_cross_entropy_with_logits(dyn[:, 2:], tgt[:, 2:]))
+                aux_loss = cfg.aux_opp_coef * aux_opp + cfg.aux_dyn_coef * aux_dyn
+                loss = loss + aux_loss
+
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
@@ -154,6 +170,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 value_loss=value_loss.item(),
                 entropy=entropy_loss.item(),
                 approx_kl=approx_kl.item(),
+                aux_loss=aux_loss.item() if use_aux else 0.0,
             )
     return last
 

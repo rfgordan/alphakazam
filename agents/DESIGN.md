@@ -80,6 +80,16 @@ With `hidden_dim=928`, `n_hidden_layers=2`, `embed_dim=32` it is **~5.08M** para
 from `observe(viewer)`, so a hidden foe item/ability/move arrives as its `Unknown`/`None` sentinel
 index — fog-of-war preserved. `embed=None` gives the old pure-float MLP (the placeholder trainer).
 
+**Auxiliary prediction heads (`aux=True`).** Two extra heads off the *trunk* (never the policy
+head) shape the representation by predicting facts, not prescribing actions — so they can't make
+the policy degenerate/predictable; the policy is still trained only by PPO:
+- **opponent move** — predict the opponent's action this turn from the state (cross-entropy).
+- **world model** — predict `[dmg_self, dmg_opp, ko_self, ko_opp]`, **conditioned on both players'
+  actions** (one-hot), since damage/KO depend on what was done (MSE on damage, BCE on KO).
+
+Labels are free from self-play (opponent's action; pre/post active HP). Weighted modestly
+(`aux_*_coef=0.1`); training-time only, so the eval win-rates stay an unbiased check.
+
 ---
 
 ## 3. Frozen-snapshot self-play

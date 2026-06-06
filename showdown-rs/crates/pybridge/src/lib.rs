@@ -80,6 +80,22 @@ impl Battle {
         self.state.turn
     }
 
+    /// Active party slot for a side (0 = Red, 1 = Blue) — for reading a specific mon over a turn.
+    fn active_index(&self, side: u8) -> u8 {
+        self.state.side(sid(side)).active_index
+    }
+
+    /// HP fraction in [0, 1] of `side`'s party slot `slot` — used to build world-model labels
+    /// (damage dealt / KOs) without re-encoding the whole state.
+    fn hp_fraction(&self, side: u8, slot: u8) -> f32 {
+        let p = &self.state.side(sid(side)).pokemon[slot as usize];
+        if p.max_hp <= 0 {
+            0.0
+        } else {
+            (p.hp.max(0) as f32) / (p.max_hp as f32)
+        }
+    }
+
     /// Encoded float observation from `side`'s perspective (0 = Red, 1 = Blue).
     fn observe(&self, side: u8) -> Vec<f32> {
         engine::encode::encode(&self.state, sid(side))

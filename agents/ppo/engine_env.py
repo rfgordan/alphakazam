@@ -60,18 +60,32 @@ class EngineVecEnv:
         return self._view(1 - self.learner_side)
 
     def step(self, learner_actions, opponent_actions):
-        """Advance every battle. Returns (reward[num_envs], done[num_envs]) for the learner.
+        """Advance every battle. Returns (reward[N], done[N], dyn[N,4]) for the learner.
 
-        Each env routes the learner's action to whichever physical side it controls this episode.
+        `dyn` is the world-model auxiliary label for the turn just played, learner-relative:
+        [damage to my active, damage to foe's active, my active KO'd, foe active KO'd] — computed
+        from the specific active mons (by slot) *before* any auto-reset.
         """
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=np.float32)
+        dyn = np.zeros((self.num_envs, 4), dtype=np.float32)
         for i, b in enumerate(self.battles):
             ls = int(self.learner_side[i])
+            opp_s = 1 - ls
+            # Pre-turn HP of each side's active (read the same slot after the turn).
+            ai = (b.active_index(0), b.active_index(1))
+            pre = (b.hp_fraction(0, ai[0]), b.hp_fraction(1, ai[1]))
+
             la, oa = int(learner_actions[i]), int(opponent_actions[i])
             red_a, blue_a = (la, oa) if ls == RED else (oa, la)
-
             done, winner, _ = b.step(red_a, blue_a)
+
+            post = (b.hp_fraction(0, ai[0]), b.hp_fraction(1, ai[1]))
+            dyn[i, 0] = max(0.0, pre[ls] - post[ls])        # damage to my active
+            dyn[i, 1] = max(0.0, pre[opp_s] - post[opp_s])  # damage to foe's active
+            dyn[i, 2] = 1.0 if pre[ls] > 0 and post[ls] <= 0 else 0.0      # my active fainted
+            dyn[i, 3] = 1.0 if pre[opp_s] > 0 and post[opp_s] <= 0 else 0.0  # foe active fainted
+
             self._ep_len[i] += 1
             if not done and self._ep_len[i] >= self.max_turns:
                 done, winner = True, -1  # timeout -> draw
@@ -82,4 +96,4 @@ class EngineVecEnv:
                 b.reset(seed=self._base_seed * 100003 + i + self._resets[i] * 7919)
                 self._ep_len[i] = 0
                 self.learner_side[i] = self._rng.integers(0, 2)  # re-roll side each episode
-        return rewards, dones
+        return rewards, dones, dyn

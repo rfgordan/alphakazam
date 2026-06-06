@@ -35,6 +35,11 @@ class PPOConfig:
     minibatch_size: int = 256
     norm_advantages: bool = True
 
+    # --- auxiliary prediction losses (representation-shaping; never touch the policy head) ---
+    aux: bool = True            # opponent-move + world-model (damage/KO) prediction heads
+    aux_opp_coef: float = 0.1   # weight on opponent-action cross-entropy
+    aux_dyn_coef: float = 0.1   # weight on damage (MSE) + KO (BCE) prediction
+
     # --- training run ---
     total_steps: int = 200_000  # total environment steps before stopping
     seed: int = 0

@@ -9,17 +9,22 @@ import torch
 
 
 class RolloutBuffer:
-    def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device, id_dim: int = 0):
+    def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device, id_dim: int = 0,
+                 aux: bool = False):
         self.steps = steps
         self.num_envs = num_envs
         self.device = device
         self.id_dim = id_dim
+        self.aux = aux
 
         shape = (steps, num_envs)
         self.obs = torch.zeros(shape + (obs_dim,), device=device)
         # Categorical IDs for embedding (empty when id_dim == 0, e.g. the placeholder env).
         self.obs_ids = torch.zeros(shape + (id_dim,), dtype=torch.long, device=device) if id_dim > 0 else None
         self.masks = torch.ones(shape + (n_actions,), dtype=torch.bool, device=device)
+        # Auxiliary-loss labels: opponent's action this turn, and [dmg_self, dmg_opp, ko_self, ko_opp].
+        self.opp_actions = torch.zeros(shape, dtype=torch.long, device=device) if aux else None
+        self.dyn_targets = torch.zeros(shape + (4,), device=device) if aux else None
         self.actions = torch.zeros(shape, dtype=torch.long, device=device)
         self.log_probs = torch.zeros(shape, device=device)
         self.values = torch.zeros(shape, device=device)
@@ -30,10 +35,14 @@ class RolloutBuffer:
         self.advantages = torch.zeros(shape, device=device)
         self.returns = torch.zeros(shape, device=device)
 
-    def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None):
+    def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None,
+            opp_action=None, dyn_target=None):
         self.obs[t] = obs
         if self.obs_ids is not None and obs_ids is not None:
             self.obs_ids[t] = obs_ids
+        if self.aux and opp_action is not None:
+            self.opp_actions[t] = opp_action
+            self.dyn_targets[t] = dyn_target
         self.masks[t] = mask
         self.actions[t] = action
         self.log_probs[t] = log_prob
@@ -70,4 +79,7 @@ class RolloutBuffer:
         )
         if self.obs_ids is not None:
             d["obs_ids"] = self.obs_ids.reshape(-1, self.id_dim)
+        if self.aux:
+            d["opp_action"] = self.opp_actions.reshape(-1)
+            d["dyn_target"] = self.dyn_targets.reshape(-1, 4)
         return d

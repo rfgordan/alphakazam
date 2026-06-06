@@ -29,11 +29,14 @@ def build_model(ckpt_path, device, cfg):
     embed = {"n_mons": probe.n_mons, "cols": probe.id_columns(), "vocab": probe.vocab_sizes(), "dim": cfg.embed_dim}
     if ckpt_path:
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model = ActorCritic(ckpt["obs_dim"], ckpt["n_actions"], ckpt["hidden_dim"], ckpt["n_hidden_layers"], embed=embed).to(device)
-        model.load_state_dict(ckpt["model"])
+        model = ActorCritic(ckpt["obs_dim"], ckpt["n_actions"], ckpt["hidden_dim"], ckpt["n_hidden_layers"],
+                            embed=embed, aux=cfg.aux).to(device)
+        # strict=False: aux heads exist in the model but are unused at eval; tolerate either presence.
+        model.load_state_dict(ckpt["model"], strict=False)
         tag = f"{ckpt_path} (update {ckpt.get('update')})"
     else:
-        model = ActorCritic(probe.obs_dim, probe.n_actions, cfg.hidden_dim, cfg.n_hidden_layers, embed=embed).to(device)
+        model = ActorCritic(probe.obs_dim, probe.n_actions, cfg.hidden_dim, cfg.n_hidden_layers,
+                            embed=embed, aux=cfg.aux).to(device)
         tag = "random-init (no checkpoint)"
     model.eval()
     return model, tag

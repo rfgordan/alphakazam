@@ -64,16 +64,17 @@ def train_selfplay(
     # Embedding spec for the categorical IDs (species/ability/item/tera/moves), read from the env.
     embed = {"n_mons": envs.n_mons, "cols": envs.id_columns, "vocab": envs.vocab, "dim": cfg.embed_dim}
 
-    def make_net():
-        return ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers, embed=embed).to(device)
+    def make_net(aux=False):
+        return ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers, embed=embed, aux=aux).to(device)
 
-    model = make_net()
+    model = make_net(aux=cfg.aux)  # learner gets the auxiliary prediction heads
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
-    buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device, id_dim=envs.id_dim)
+    buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device,
+                           id_dim=envs.id_dim, aux=cfg.aux)
 
     # The frozen *training* opponent: a copy of the learner, refreshed periodically.
     use_snapshot = snapshot_every > 0
-    opponent = make_net()
+    opponent = make_net(aux=cfg.aux)  # match architecture so load_state_dict works
     opponent.load_state_dict(model.state_dict())
     opponent.eval()
     for p in opponent.parameters():
@@ -145,12 +146,14 @@ def train_selfplay(
                     action, log_prob, _, value = model.act(obs_t, mask_t, obs_ids=ids_t)  # learner: sample
                 opp_action = greedy_actions(blue_net, obs_o, ids_o, mask_o, device)        # opponent: greedy
 
-                reward_np, done_np = envs.step(action.cpu().numpy(), opp_action)
+                reward_np, done_np, dyn_np = envs.step(action.cpu().numpy(), opp_action)
 
                 buffer.add(t, obs_t, mask_t, action, log_prob, value,
                            torch.as_tensor(reward_np, device=device),
                            torch.as_tensor(done_np, device=device),
-                           obs_ids=ids_t)
+                           obs_ids=ids_t,
+                           opp_action=torch.as_tensor(opp_action, device=device) if cfg.aux else None,
+                           dyn_target=torch.as_tensor(dyn_np, device=device) if cfg.aux else None)
                 global_step += cfg.num_envs
 
                 for r, d in zip(reward_np, done_np):
@@ -179,7 +182,7 @@ def train_selfplay(
             print(f"update {upd_str:>9}  step {global_step:>9}  games {total_games:>5}  "
                   f"win_rate(vs {label}) {win_rate:5.2f}  "
                   f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:.3f}  "
-                  f"ent {stats['entropy']:.3f}  kl {stats['approx_kl']:.4f}  {sps} sps")
+                  f"ent {stats['entropy']:.3f}  kl {stats['approx_kl']:.4f}  aux {stats.get('aux_loss', 0):.3f}  {sps} sps")
             logger.metrics({"update": update, "step": global_step, "games": total_games,
                             "win_rate_vs_snapshot": win_rate, "sps": sps, **stats})
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 # Finite stand-in for -inf when masking logits (keeps entropy finite for zeroed actions).
@@ -20,10 +21,15 @@ MASK_FILL = -1e8
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, n_actions, hidden_dim=928, n_hidden_layers=2, embed: dict | None = None):
-        """`embed`, if given: {n_mons, cols: [table-name per ID column], vocab: {table: size}, dim}."""
+    def __init__(self, obs_dim, n_actions, hidden_dim=928, n_hidden_layers=2,
+                 embed: dict | None = None, aux: bool = False):
+        """`embed`, if given: {n_mons, cols: [table-name per ID column], vocab: {table: size}, dim}.
+        `aux=True` adds prediction heads (opponent move + turn dynamics) that share the trunk but
+        NOT the policy head — they enrich the representation without biasing the policy."""
         super().__init__()
         self.embed_cfg = embed
+        self.has_aux = aux
+        self.n_actions = n_actions
         embed_total = 0
         if embed is not None:
             self.n_mons = embed["n_mons"]
@@ -43,6 +49,15 @@ class ActorCritic(nn.Module):
         self.policy_head = nn.Linear(hidden_dim, n_actions)
         self.value_head = nn.Linear(hidden_dim, 1)
 
+        if aux:
+            # Auxiliary *prediction* heads (training-time only). Off the trunk, never the policy
+            # head — so they shape the representation without prescribing behavior.
+            #   opp: predict the opponent's action this turn — from the state alone.
+            #   dyn: predict the turn's outcome [dmg_self, dmg_opp, ko_self, ko_opp] — CONDITIONED
+            #        on both players' actions (one-hot), since damage/KO depend on what was done.
+            self.aux_opp_head = nn.Linear(hidden_dim, n_actions)
+            self.aux_dyn_head = nn.Linear(hidden_dim + 2 * n_actions, 4)
+
         self.apply(_orthogonal_init)
         _orthogonal_init(self.policy_head, gain=0.01)
         _orthogonal_init(self.value_head, gain=1.0)
@@ -60,22 +75,41 @@ class ActorCritic(nn.Module):
             return obs
         return torch.cat([obs, self._embed(obs_ids)], dim=-1)
 
+    def _trunk_features(self, obs, obs_ids):
+        return self.trunk(self._features(obs, obs_ids))
+
     def forward(self, obs, action_mask=None, obs_ids=None):
         """Return (logits, value). `action_mask` [..., n_actions] bool (True = legal)."""
-        h = self.trunk(self._features(obs, obs_ids))
+        h = self._trunk_features(obs, obs_ids)
         logits = self.policy_head(h)
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, MASK_FILL)
         value = self.value_head(h).squeeze(-1)
         return logits, value
 
-    def act(self, obs, action_mask=None, action=None, obs_ids=None):
-        """Sample (or evaluate a given) action. Returns (action, log_prob, entropy, value)."""
-        logits, value = self.forward(obs, action_mask, obs_ids)
+    def act(self, obs, action_mask=None, action=None, obs_ids=None, return_aux=False):
+        """Sample (or evaluate a given) action. Returns (action, log_prob, entropy, value[, aux])."""
+        h = self._trunk_features(obs, obs_ids)
+        logits = self.policy_head(h)
+        if action_mask is not None:
+            logits = logits.masked_fill(~action_mask, MASK_FILL)
+        value = self.value_head(h).squeeze(-1)
         dist = Categorical(logits=logits)
         if action is None:
             action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy(), value
+        out = (action, dist.log_prob(action), dist.entropy(), value)
+        if return_aux:
+            # Return the trunk features so the dynamics head can be conditioned on the actions
+            # (which we only have in the update loop). `opp` predicts the opponent move from state.
+            aux = {"opp": self.aux_opp_head(h), "h": h}
+            return (*out, aux)
+        return out
+
+    def predict_dynamics(self, h, a_self, a_opp):
+        """World-model prediction [dmg_self, dmg_opp, ko_self, ko_opp] conditioned on both actions."""
+        a1 = F.one_hot(a_self, self.n_actions).float()
+        a2 = F.one_hot(a_opp, self.n_actions).float()
+        return self.aux_dyn_head(torch.cat([h, a1, a2], dim=-1))
 
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())

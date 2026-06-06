@@ -237,7 +237,7 @@ def evaluate(model, baseline: Baseline, device, n_games: int = 100, num_envs: in
         learner_a = greedy_actions(model, obs_l, ids_l, mask_l, device)
         opp_a = baseline.actions(obs_o, ids_o, mask_o, battles=envs.battles, sides=(1 - envs.learner_side))
         prev_len = envs._ep_len.copy()
-        reward, done = envs.step(learner_a, opp_a)
+        reward, done, _ = envs.step(learner_a, opp_a)
         for r, d, pl in zip(reward, done, prev_len):
             if d:
                 results.append(1 if r > 0 else (-1 if r < 0 else 0))
