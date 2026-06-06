@@ -71,34 +71,38 @@ flowchart TD
 
 ---
 
-## 3. Greedy self-play training
+## 3. Frozen-snapshot self-play
 
-Both sides are driven by the **same** network. The **learner (Red)** samples actions (its
-transitions feed PPO); the **opponent (Blue)** acts **greedily** (argmax over the masked policy)
-— an ever-improving sparring partner as the shared weights update. Reward is sparse: +1 / -1 to
-the learner on win / loss.
+The **learner (Red)** samples actions and trains via PPO. The **opponent (Blue)** plays greedily
+(argmax) from a **frozen snapshot** of the learner — a *separate* network whose weights are
+copied from the learner every `--snapshot-every` updates and otherwise held fixed (no gradients).
+Between refreshes the opponent is a stable reference, so `win_rate(vs snapshot)` is a meaningful
+**sawtooth** progress curve: it climbs as the learner beats the fixed opponent, then drops at each
+refresh when the opponent catches up. Staying above ~0.5 after every refresh = monotonic
+improvement (each policy beats its predecessor). `--snapshot-every 0` falls back to a *live*
+moving-target opponent. Reward is sparse: +1 / -1 to the learner on win / loss.
 
 ```mermaid
 flowchart TD
     subgraph COLLECT["1 · Collect rollout (per env, per step)"]
         direction TB
         O["obs_red, obs_blue <- env.observe"]
-        SR["red  action ~ sample(policy)   (learner, store)"]
-        SB["blue action = argmax(policy)    (greedy opponent)"]
+        SR["red  action ~ sample(learner)    (store for PPO)"]
+        SB["blue action = argmax(snapshot)    (frozen opponent)"]
         ST["env.step(a_red, a_blue) -> reward, done; auto-reset"]
         O --> SR --> SB --> ST --> O
     end
     COLLECT --> GAE["2 · GAE over the learner's transitions"]
-    GAE --> UPD["3 · PPO clipped update (shared weights)\nopponent strengthens automatically"]
-    UPD --> WATCH{"every N updates?"}
-    WATCH -- yes --> PLAY["play one full game to the terminal\nwith narrate=True (live commentary)"]
-    WATCH -- no --> COLLECT
-    PLAY --> COLLECT
+    GAE --> UPD["3 · PPO clipped update (learner weights only)"]
+    UPD --> REF{"update % snapshot_every == 0?"}
+    REF -- yes --> COPY["snapshot.load_state_dict(learner)\nwin-rate window resets"]
+    REF -- no --> COLLECT
+    COPY --> COLLECT
 ```
 
 The PPO objective (clipped surrogate + value loss + entropy bonus, GAE, minibatch epochs) is
-shared with the placeholder trainer — only data collection differs. Smoke run: win-rate vs the
-greedy opponent climbs ~0.58 → ~0.90 over 20 updates.
+shared with the placeholder trainer — only data collection + the frozen opponent differ. Every
+`--render-every` updates one full game is played to the terminal with live commentary.
 
 ---
 
@@ -127,9 +131,11 @@ sequenceDiagram
 ## 5. Status & what's next
 
 **Done:** PyO3 bridge (`showdown_engine.Battle`), observation encoder, narration layer, team
-builder, engine-backed vector env, greedy self-play trainer, live terminal commentary.
+builder, engine-backed vector env, frozen-snapshot self-play trainer (with a live-opponent
+fallback), live terminal commentary.
 
-**Not yet (intentionally):** richer reward shaping; opponent snapshotting / league play (today the
-greedy opponent is the live policy); determinization over hidden info; randomized teams (one fixed
-matchup for now); special-case action types (forced two-turn locks, etc.); a proper display-name
-table (commentary uses prettified PS ids). Each slots in behind the same `Battle` interface.
+**Not yet (intentionally):** league / population play (a *pool* of past snapshots à la AlphaStar,
+vs. the single snapshot here); richer reward shaping; determinization over hidden info; randomized
+teams (one fixed matchup for now); special-case action types (forced two-turn locks, etc.); a
+proper display-name table (commentary uses prettified PS ids). Each slots in behind the same
+`Battle` interface.

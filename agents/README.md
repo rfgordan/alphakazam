@@ -48,18 +48,21 @@ uv run maturin develop --release -m ../showdown-rs/crates/pybridge/Cargo.toml
 # Watch one game with the (untrained) policy — live commentary:
 uv run python -m ppo.selfplay --watch
 
-# Greedy self-play training (learner=Red samples, opponent=Blue greedy);
-# plays a narrated game every --render-every updates:
-uv run python -m ppo.selfplay --total-steps 300000 --render-every 20
+# Frozen-snapshot self-play (learner=Red samples + trains; opponent=Blue plays a frozen
+# snapshot of the learner, refreshed every --snapshot-every updates):
+uv run python -m ppo.selfplay --total-steps 300000 --snapshot-every 10 --render-every 20
 
-uv run python -m ppo.selfplay --device cpu        # force device (auto picks MPS/CUDA)
+uv run python -m ppo.selfplay --device cpu          # force device (auto picks MPS/CUDA)
+uv run python -m ppo.selfplay --snapshot-every 0    # live moving-target opponent (no freeze)
 
 # Algorithm-only smoke test against the learnable placeholder env (no engine):
 uv run python -m ppo.train --total-steps 50000
 ```
 
-Win-rate vs the greedy opponent should climb as the shared weights improve (≈0.58 → 0.90 in a
-short run). Example commentary:
+`win_rate(vs snapshot)` traces a **sawtooth**: it climbs as the learner beats the frozen
+opponent, then drops at each `[snapshot refreshed]` when the opponent catches up. Staying above
+~0.5 after every refresh means each policy beats its predecessor (real improvement). Example
+commentary:
 
 ```
 ── Turn 3 ──

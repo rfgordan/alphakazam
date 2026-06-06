@@ -40,7 +40,19 @@ def greedy_actions(model, obs_np, mask_np, device) -> np.ndarray:
     return logits.argmax(dim=-1).cpu().numpy()
 
 
-def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None = None):
+def train_selfplay(
+    cfg: PPOConfig,
+    render_every: int = 20,
+    max_games: int | None = None,
+    snapshot_every: int = 10,
+):
+    """Frozen-snapshot self-play.
+
+    The opponent (Blue) plays from a *frozen copy* of the learner refreshed every
+    `snapshot_every` updates — so between refreshes it's a fixed reference and the
+    win-rate-vs-snapshot curve is a meaningful (sawtooth) progress signal. `snapshot_every == 0`
+    falls back to a *live* opponent (the moving-target variant).
+    """
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
 
@@ -49,14 +61,26 @@ def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device)
 
+    # The frozen opponent: same architecture, weights copied from the learner, no gradients.
+    use_snapshot = snapshot_every > 0
+    opponent = ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
+    opponent.load_state_dict(model.state_dict())
+    opponent.eval()
+    for p in opponent.parameters():
+        p.requires_grad_(False)
+    blue_net = opponent if use_snapshot else model
+
+    mode = f"frozen snapshot, refresh every {snapshot_every} updates" if use_snapshot else "live (moving target)"
     print(f"device={device}  params={model.num_params():,}  obs_dim={envs.obs_dim}  "
-          f"batch={cfg.num_envs * cfg.rollout_steps}  (self-play: learner=Red samples, opponent=Blue greedy)")
+          f"batch={cfg.num_envs * cfg.rollout_steps}  (learner=Red samples, opponent=Blue greedy; {mode})")
 
     batch_size = cfg.num_envs * cfg.rollout_steps
     num_updates = cfg.total_steps // batch_size
     global_step = 0
+    total_games = 0
     wins, losses, draws = 0, 0, 0
-    recent_results: list[int] = []  # +1 win, -1 loss, 0 draw
+    window_results: list[int] = []  # since the last snapshot refresh; basis for the win-rate
+    label = "snapshot" if use_snapshot else "live"
     start = time.time()
 
     for update in range(1, num_updates + 1):
@@ -68,8 +92,8 @@ def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None
             obs_t = torch.as_tensor(obs_r, device=device)
             mask_t = torch.as_tensor(mask_r, device=device)
             with torch.no_grad():
-                action, log_prob, _, value = model.act(obs_t, mask_t)        # learner: sample
-            blue_action = greedy_actions(model, obs_b, mask_b, device)        # opponent: greedy
+                action, log_prob, _, value = model.act(obs_t, mask_t)         # learner: sample
+            blue_action = greedy_actions(blue_net, obs_b, mask_b, device)      # opponent: greedy (frozen)
 
             reward_np, done_np = envs.step(action.cpu().numpy(), blue_action, learner=RED)
 
@@ -88,7 +112,8 @@ def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None
             for r, d in zip(reward_np, done_np):
                 if d:
                     res = 1 if r > 0 else (-1 if r < 0 else 0)
-                    recent_results.append(res)
+                    total_games += 1
+                    window_results.append(res)
                     wins += res == 1
                     losses += res == -1
                     draws += res == 0
@@ -102,21 +127,26 @@ def train_selfplay(cfg: PPOConfig, render_every: int = 20, max_games: int | None
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
         stats = ppo_update(model, optimizer, buffer.flat_view(), cfg, batch_size)
 
-        window = recent_results[-200:]
-        win_rate = float(np.mean([r == 1 for r in window])) if window else float("nan")
+        win_rate = float(np.mean([r == 1 for r in window_results])) if window_results else float("nan")
         sps = int(global_step / (time.time() - start))
-        print(f"update {update:4d}/{num_updates}  step {global_step:>8}  games {len(recent_results):>4}  "
-              f"win_rate(vs greedy) {win_rate:5.2f}  "
+        print(f"update {update:4d}/{num_updates}  step {global_step:>8}  games {total_games:>4}  "
+              f"win_rate(vs {label}) {win_rate:5.2f}  "
               f"pi {stats['policy_loss']:+.3f}  v {stats['value_loss']:.3f}  "
               f"ent {stats['entropy']:.3f}  kl {stats['approx_kl']:.4f}  {sps} sps")
+
+        # --- refresh the frozen opponent: it catches up to the learner; win-rate resets ---
+        if use_snapshot and update % snapshot_every == 0:
+            opponent.load_state_dict(model.state_dict())
+            window_results.clear()
+            print(f"    [snapshot refreshed @ update {update} — opponent = current learner]")
 
         if render_every and update % render_every == 0:
             print()
             play_one_game(model, device, seed=1000 + update, max_turns=200)
             print()
 
-        if max_games is not None and len(recent_results) >= max_games:
-            print(f"\nReached {len(recent_results)} games (target {max_games}); stopping. "
+        if max_games is not None and total_games >= max_games:
+            print(f"\nReached {total_games} games (target {max_games}); stopping. "
                   f"record W/L/D = {wins}/{losses}/{draws}.")
             break
 
@@ -162,6 +192,8 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="auto|cpu|mps|cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--render-every", type=int, default=20, help="watch a game every N updates (0 = never)")
+    parser.add_argument("--snapshot-every", type=int, default=10,
+                        help="refresh the frozen opponent every N updates (0 = live moving-target opponent)")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
     args = parser.parse_args()
 
@@ -179,7 +211,7 @@ def main():
         play_one_game(model, device, seed=args.seed)
         return
 
-    train_selfplay(cfg, render_every=args.render_every, max_games=args.games)
+    train_selfplay(cfg, render_every=args.render_every, max_games=args.games, snapshot_every=args.snapshot_every)
 
 
 if __name__ == "__main__":
