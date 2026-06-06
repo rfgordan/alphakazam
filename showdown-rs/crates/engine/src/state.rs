@@ -33,6 +33,40 @@ impl MoveSlot {
     };
 }
 
+/// What the *opponent* has learned about this Pokémon — the engine's hidden-information layer.
+///
+/// Pokémon is a public-information game: a reveal (move used, item triggered, ability fired,
+/// Terastallization) is seen by both players, and each player always knows its own side. So a
+/// single per-Pokémon mask suffices — it records what the *foe* knows about this mon.
+///
+/// Crucially this is **never read by the transition** (the simulator always runs on full ground
+/// truth — that's what keeps turn speed). It is only consulted by [`State::observe`] to produce a
+/// fog-of-war view, and it is written with cheap bitwise ORs at the moment of first reveal via the
+/// reversible [`Instruction::Reveal`]. Two bytes; off the hot path entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reveal {
+    /// Bit `i` set ⇒ move slot `i` has been used in front of the foe.
+    pub moves: u8,
+    /// Disjoint one-shot reveals (`Reveal::SPECIES | ITEM | ABILITY | TERA`).
+    pub flags: u8,
+}
+
+impl Reveal {
+    pub const SPECIES: u8 = 1 << 0;
+    pub const ITEM: u8 = 1 << 1;
+    pub const ABILITY: u8 = 1 << 2;
+    pub const TERA: u8 = 1 << 3;
+
+    #[inline]
+    pub fn move_seen(&self, slot: u8) -> bool {
+        self.moves & (1 << slot) != 0
+    }
+    #[inline]
+    pub fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+}
+
 /// A single Pokémon. Stats are the final computed values (after nature/EV/IV), so the
 /// hot path never recomputes them; `nature`/`evs` are retained for reference and for
 /// abilities that recompute (e.g. Protosynthesis picks the highest stat).
@@ -72,6 +106,10 @@ pub struct Pokemon {
     pub ability_used: bool,
     /// How many times this Pokémon has been hit by a damaging move this battle (Rage Fist).
     pub times_hit: u8,
+
+    /// What the opponent has learned about this mon (hidden-information layer). Not read by the
+    /// transition; consulted only by [`State::observe`]. See [`Reveal`].
+    pub reveal: Reveal,
 }
 
 impl Pokemon {
@@ -95,6 +133,7 @@ impl Pokemon {
         terastallized: false,
         ability_used: false,
         times_hit: 0,
+        reveal: Reveal { moves: 0, flags: 0 },
     };
 
     #[inline]
@@ -298,6 +337,52 @@ impl State {
     #[inline]
     pub fn side_mut(&mut self, id: SideId) -> &mut Side {
         &mut self.sides[id.index()]
+    }
+
+    /// Fog-of-war view from `viewer`'s perspective: the viewer's own side verbatim, the foe's
+    /// side with everything `viewer` hasn't observed collapsed to sentinels. Returned as a full
+    /// `State` (still `Copy`) so it shares the encoder/transition path; an agent acting under
+    /// hidden information samples concrete states from a prior consistent with this view
+    /// (determinization), then runs the perfect-information engine on each.
+    ///
+    /// Public fields (boosts, volatiles, hazards, HP, status, active index, terastallized) stay
+    /// visible — they're announced in the battle log. Hidden until the relevant [`Reveal`] bit is
+    /// set: held item, ability, unused move slots, Tera type, and the spread (EVs/nature). Base
+    /// stats are left intact (they follow from the public species); EVs/nature are zeroed because
+    /// the exact spread is only ever *inferred* from observed damage, never announced.
+    ///
+    /// This is the only place the reveal layer is read, and it is off the hot path — call it when
+    /// feeding an agent or logging a position, not inside the per-turn transition.
+    pub fn observe(&self, viewer: SideId) -> State {
+        use crate::ids::{Ability, Item, Type};
+        let mut obs = *self;
+        let foe = obs.side_mut(viewer.other());
+        for p in foe.pokemon.iter_mut() {
+            if p.species == crate::ids::Species::None {
+                continue;
+            }
+            let r = p.reveal;
+            if !r.has(Reveal::ITEM) {
+                p.item = Item::Unknown;
+            }
+            if !r.has(Reveal::ABILITY) {
+                p.ability = Ability::Unknown;
+                p.base_ability = Ability::Unknown;
+            }
+            if !r.has(Reveal::TERA) {
+                p.tera_type = Type::None;
+            }
+            for i in 0..4u8 {
+                if !r.move_seen(i) {
+                    p.moves[i as usize] = MoveSlot::EMPTY;
+                }
+            }
+            // The spread is hidden; an agent samples it during determinization. Base stats stay
+            // (they're implied by the species and bound the observed damage rolls).
+            p.evs = [0; StatIndex::COUNT];
+            p.nature = Nature::Serious;
+        }
+        obs
     }
 }
 

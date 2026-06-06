@@ -220,6 +220,8 @@ id_map!(Ability {
     Overcoat => "overcoat",
     RainDish => "raindish",
     IceBody => "icebody",
+    // Fog-of-war sentinel (see `State::observe`); never a real PS id.
+    Unknown => "unknown",
 });
 
 id_map!(Item {
@@ -247,6 +249,8 @@ id_map!(Item {
     LumBerry => "lumberry",
     ThroatSpray => "throatspray",
     Other => "other",
+    // Fog-of-war sentinel (see `State::observe`); never a real PS id.
+    Unknown => "unknown",
 });
 
 id_map!(VolatileStatus {

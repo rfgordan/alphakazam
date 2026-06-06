@@ -165,6 +165,8 @@ fn apply_tera(b: &mut Branch, side: SideId) {
         push(b, Instruction::ChangeTypes { side, slot, previous: prev, new: [tera_type, Type::None] });
     }
     push(b, Instruction::ToggleTerastallized { side, slot });
+    // Hidden-info: Terastallizing reveals the Tera type to the foe.
+    reveal(b, side, 0, crate::state::Reveal::TERA);
 }
 
 /// Like [`generate_instructions`], but `pivot` gives each side's switch-in target for a
@@ -238,6 +240,19 @@ pub fn switch_into(state: &mut State, side: SideId, target: u8) {
 fn push(b: &mut Branch, ins: Instruction) {
     b.state.apply_one(ins);
     b.ins.push(ins);
+}
+
+/// Mark hidden-information bits as now seen by the foe (the active mon of `side`). Pushes a
+/// reversible `Reveal` carrying only the *newly*-set bits, so it's a no-op when nothing is new.
+/// Off the critical path of damage/stat math — purely bookkeeping for `State::observe`.
+fn reveal(b: &mut Branch, side: SideId, moves: u8, flags: u8) {
+    let slot = b.state.side(side).active_index;
+    let cur = b.state.side(side).active().reveal;
+    let new_moves = moves & !cur.moves;
+    let new_flags = flags & !cur.flags;
+    if new_moves != 0 || new_flags != 0 {
+        push(b, Instruction::Reveal { side, slot, moves: new_moves, flags: new_flags });
+    }
 }
 
 // --- switching ---------------------------------------------------------------
@@ -340,6 +355,14 @@ fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
     // Any non-Protect action breaks the Protect chain.
     if !is_protect_move(move_id) && prev_stall != 0 {
         push(b, Instruction::SetStallCounter { side, previous: prev_stall, new: 0 });
+    }
+    // Hidden-info: using a move reveals that slot to the foe. (Struggle has no slot; skip it.)
+    let slot_bit = b.state.side(side).active().moves.iter()
+        .position(|m| m.id == move_id)
+        .map(|i| 1u8 << i)
+        .unwrap_or(0);
+    if slot_bit != 0 {
+        reveal(b, side, slot_bit, 0);
     }
 }
 
@@ -1520,6 +1543,8 @@ fn apply_post_damage(
         if f.is_alive() && f.item != Item::None {
             let (prev, fslot) = (f.item, b.state.side(foe).active_index);
             push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
+            // Knocking the item off reveals what it was.
+            reveal(b, foe, 0, crate::state::Reveal::ITEM);
         }
     }
 }

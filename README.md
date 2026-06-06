@@ -15,8 +15,9 @@ correctness is *measured*, not assumed.
 ## Status
 
 - **2-team gen9 slice: 100% per-turn parity** with Showdown across 250 sampled games
-  (1558/1558 turns), 100% state-representation fidelity.
-- **Random battles (full roster): ~55%** turn parity and climbing — the remaining gap is
+  (1673/1673 turns), 100% state-representation fidelity.
+- **Sample gen9 OU team: 100% per-turn parity** across 50 games (1612/1612 turns).
+- **Random battles (full roster): ~85%** turn parity and climbing — the remaining gap is
   the long tail of abilities/items/edge-case mechanics, each diagnosable and mechanical to
   add. See [`showdown-rs/WORKLOG.md`](showdown-rs/WORKLOG.md) for the full fix-by-fix
   history and the current breakdown.
@@ -45,6 +46,28 @@ engines/                third-party reference clones (gitignored — see Setup)
    enumerated outcome branches (membership testing — no need to match PS's RNG).
 3. **`harness/gen-data.mjs`** regenerates `crates/engine/src/gen.rs` (all gen9 species and
    moves) from PS's data files, so move *data* is never hand-written.
+
+## Hidden information & stat spreads (EV/IV gaps)
+
+The engine runs internally on **full ground truth** — that's what keeps the per-turn transition
+fast — and exposes a player's partial view through `State::observe(viewer)`, which masks the
+opponent's unrevealed item, ability, unused moves, and Tera type (a per-Pokémon `Reveal` bitmask
+records what each side has shown). An agent acting under hidden information is expected to
+*determinize*: sample concrete full states consistent with that view and run the perfect-info
+engine on each (cheap, because the state is `Copy`).
+
+Two **known gaps around stat spreads** worth calling out:
+
+- **IVs are not modeled.** A `Pokemon` stores final *computed* `stats` (so the hot path never
+  recomputes them) plus `evs` and `nature` for reference, but **not** IVs. The engine therefore
+  trusts the stats supplied by the trace/harness rather than deriving them from
+  species+level+IV+EV+nature. For RL self-play that builds its own teams, stat computation
+  (including IVs) needs to live in the team builder that populates the state, not in the engine.
+- **The opponent's spread is hidden and only *inferred*, never announced.** Unlike moves/item/
+  ability (discrete one-shot reveals), EV/IV/nature are never shown in the battle log — they're
+  narrowed from observed damage rolls. So `observe()` zeroes the foe's `evs`/`nature` (leaving
+  base stats, which bound the rolls); recovering a concrete spread is a job for the
+  determinization sampler, not the observation layer.
 
 ## Setup
 

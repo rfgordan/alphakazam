@@ -284,6 +284,9 @@ pub enum Ability {
     // Weather healing
     RainDish,
     IceBody,
+    /// Not a real ability — the fog-of-war sentinel `State::observe` writes when the viewer
+    /// hasn't yet seen this Pokémon's ability. Never produced by parsing or the transition.
+    Unknown,
 }
 
 /// Starter item slice. Regenerate from PS `data/items.ts`.
@@ -316,6 +319,10 @@ pub enum Item {
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,
+    /// Not a real item — the fog-of-war sentinel `State::observe` writes when the viewer
+    /// hasn't yet seen whether/what item this Pokémon holds. Distinct from `None` (= "no
+    /// item", which is itself information). Never produced by parsing or the transition.
+    Unknown,
 }
 
 /// All 25 natures. Each nudges one stat +10% and another -10% (Serious-type = neutral).

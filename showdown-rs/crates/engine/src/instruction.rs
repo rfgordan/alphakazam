@@ -138,6 +138,11 @@ pub enum Instruction {
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
     SetTimesHit { side: SideId, slot: u8, previous: u8, new: u8 },
 
+    // --- hidden-information layer (what the foe has learned; never read by the transition) ---
+    /// OR the given *newly-set* bits into a Pokémon's reveal mask. `moves`/`flags` carry only the
+    /// bits this instruction sets (delta vs. the current mask), so reversal clears exactly them.
+    Reveal { side: SideId, slot: u8, moves: u8, flags: u8 },
+
     // --- transformations ---
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
     ChangeItem { side: SideId, slot: u8, previous: Item, new: Item },
@@ -252,6 +257,11 @@ impl State {
             SetTimesHit { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].times_hit = new;
             }
+            Reveal { side, slot, moves, flags } => {
+                let r = &mut self.sides[side.index()].pokemon[slot as usize].reveal;
+                r.moves |= moves;
+                r.flags |= flags;
+            }
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
@@ -360,6 +370,13 @@ impl State {
             }
             SetTimesHit { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].times_hit = previous;
+            }
+            Reveal { side, slot, moves, flags } => {
+                // `moves`/`flags` are the bits this instruction newly set, so clearing exactly
+                // them restores the prior mask (reveals are otherwise monotonic).
+                let r = &mut self.sides[side.index()].pokemon[slot as usize].reveal;
+                r.moves &= !moves;
+                r.flags &= !flags;
             }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;
