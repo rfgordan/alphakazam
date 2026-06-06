@@ -96,6 +96,19 @@ impl Battle {
         }
     }
 
+    /// Mean HP fraction across a side's 6 party slots (fainted/empty count as 0) — the potential
+    /// for reward shaping (a side's "team health").
+    fn team_hp_fraction(&self, side: u8) -> f32 {
+        let s = self.state.side(sid(side));
+        let mut sum = 0.0f32;
+        for p in &s.pokemon {
+            if p.species != engine::ids::Species::None && p.max_hp > 0 {
+                sum += (p.hp.max(0) as f32) / (p.max_hp as f32);
+            }
+        }
+        sum / 6.0
+    }
+
     /// Encoded float observation from `side`'s perspective (0 = Red, 1 = Blue).
     fn observe(&self, side: u8) -> Vec<f32> {
         engine::encode::encode(&self.state, sid(side))

@@ -171,8 +171,13 @@ fallback), live terminal commentary.
 `SimpleHeuristicsPlayer`) < `mcts` (poke-engine MCTS, perfect info). `random`/`heuristic` run in the
 default periodic eval; `mcts` is opt-in via `--mcts-eval-ms`.
 
+**Reward shaping (potential-based, opt-in `--shaping-coef`):** `r += c·(γΦ(s') − Φ(s))` with
+`Φ` = the learner-relative team-HP differential (terminal `Φ=0`). Being potential-based it's
+*policy-invariant* — it densifies the sparse ±1 signal without biasing the policy toward
+HP-hoarding. The true win/loss is returned separately, so eval/win-rate stays unbiased.
+
 **Not yet (intentionally):** league / population play (a *pool* of past snapshots à la AlphaStar,
-vs. the single snapshot here); richer reward shaping; determinization over hidden info; randomized
+vs. the single snapshot here); a richer potential (status/hazards); determinization over hidden info; randomized
 teams (one fixed matchup for now); special-case action types (forced two-turn locks, etc.); a
 proper display-name table (commentary uses prettified PS ids). Each slots in behind the same
 `Battle` interface.

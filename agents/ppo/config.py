@@ -40,6 +40,9 @@ class PPOConfig:
     aux_opp_coef: float = 0.1   # weight on opponent-action cross-entropy
     aux_dyn_coef: float = 0.1   # weight on damage (MSE) + KO (BCE) prediction
 
+    # --- potential-based reward shaping (Φ = team HP differential; policy-invariant) ---
+    shaping_coef: float = 0.0   # 0 = off (pure sparse reward); ~0.5 is a sane on-value
+
     # --- training run ---
     total_steps: int = 200_000  # total environment steps before stopping
     seed: int = 0

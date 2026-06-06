@@ -60,7 +60,7 @@ def train_selfplay(
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
 
-    envs = EngineVecEnv(cfg.num_envs, seed=cfg.seed)
+    envs = EngineVecEnv(cfg.num_envs, seed=cfg.seed, shaping_coef=cfg.shaping_coef, gamma=cfg.gamma)
     # Embedding spec for the categorical IDs (species/ability/item/tera/moves), read from the env.
     embed = {"n_mons": envs.n_mons, "cols": envs.id_columns, "vocab": envs.vocab, "dim": cfg.embed_dim}
 
@@ -146,7 +146,7 @@ def train_selfplay(
                     action, log_prob, _, value = model.act(obs_t, mask_t, obs_ids=ids_t)  # learner: sample
                 opp_action = greedy_actions(blue_net, obs_o, ids_o, mask_o, device)        # opponent: greedy
 
-                reward_np, done_np, dyn_np = envs.step(action.cpu().numpy(), opp_action)
+                reward_np, done_np, dyn_np, outcome_np = envs.step(action.cpu().numpy(), opp_action)
 
                 buffer.add(t, obs_t, mask_t, action, log_prob, value,
                            torch.as_tensor(reward_np, device=device),
@@ -156,7 +156,7 @@ def train_selfplay(
                            dyn_target=torch.as_tensor(dyn_np, device=device) if cfg.aux else None)
                 global_step += cfg.num_envs
 
-                for r, d in zip(reward_np, done_np):
+                for r, d in zip(outcome_np, done_np):  # true win/loss, not the shaped reward
                     if d:
                         res = 1 if r > 0 else (-1 if r < 0 else 0)
                         total_games += 1
@@ -272,6 +272,8 @@ def main():
                         help="keep only the most recent N checkpoints (0 = keep all)")
     parser.add_argument("--mcts-eval-ms", type=int, default=0,
                         help="also eval vs poke-engine MCTS at this search time per move (0 = off; heavy)")
+    parser.add_argument("--shaping-coef", type=float, default=None,
+                        help="potential-based reward shaping weight (Φ=team HP diff; 0 = off, ~0.5 to enable)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
     parser.add_argument("--run-name", type=str, default=None, help="run subdirectory name (default: timestamp)")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
@@ -282,6 +284,8 @@ def main():
     cfg.seed = args.seed
     if args.device is not None:
         cfg.device = args.device
+    if args.shaping_coef is not None:
+        cfg.shaping_coef = args.shaping_coef
 
     if args.watch:
         device = resolve_device(cfg.device)
