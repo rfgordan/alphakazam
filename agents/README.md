@@ -33,7 +33,10 @@ agents/
 Each run writes to `runs/<timestamp>/`:
 - `metrics.jsonl` — one line per PPO update (win-rate vs snapshot, losses, entropy, KL, sps)
 - `eval.jsonl` — one line per baseline eval (win-rate, W/L/D, avg turns) — the **absolute** progress curve
-- `config.json`, `ckpt_<update>.pt`
+- `config.json`, `ckpt_<update>.pt` — checkpoints are **rolling**: only the most recent
+  `--keep-checkpoints` (default 3, ~4 MB each) are kept; older ones are pruned. `--keep-checkpoints 0`
+  keeps all (e.g. for a future snapshot pool). `--snapshot-every` is in-memory only — it never
+  writes to disk.
 
 ```python
 import json

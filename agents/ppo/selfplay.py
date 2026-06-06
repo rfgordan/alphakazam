@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import glob
+import os
 import time
 
 import numpy as np
@@ -42,6 +44,7 @@ def train_selfplay(
     eval_every: int = 25,
     eval_games: int = 100,
     ckpt_every: int = 50,
+    keep_checkpoints: int = 3,
     logdir: str = "runs",
     run_name: str | None = None,
 ):
@@ -109,6 +112,12 @@ def train_selfplay(
             "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
             "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
         }, logger.checkpoint_path(tag))
+        # Rolling retention: keep only the most recent `keep_checkpoints` (0 = keep all, e.g. for
+        # a future league/snapshot pool). Zero-padded names sort chronologically.
+        if keep_checkpoints and keep_checkpoints > 0:
+            existing = sorted(glob.glob(os.path.join(logger.dir, "ckpt_*.pt")))
+            for old in existing[:-keep_checkpoints]:
+                os.remove(old)
 
     try:
         while True:
@@ -240,6 +249,8 @@ def main():
     parser.add_argument("--eval-every", type=int, default=25, help="eval vs fixed baselines every N updates (0 = never)")
     parser.add_argument("--eval-games", type=int, default=100, help="games per baseline evaluation")
     parser.add_argument("--ckpt-every", type=int, default=50, help="save a checkpoint every N updates (0 = never)")
+    parser.add_argument("--keep-checkpoints", type=int, default=3,
+                        help="keep only the most recent N checkpoints (0 = keep all)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
     parser.add_argument("--run-name", type=str, default=None, help="run subdirectory name (default: timestamp)")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
@@ -266,6 +277,7 @@ def main():
         eval_every=args.eval_every,
         eval_games=args.eval_games,
         ckpt_every=args.ckpt_every,
+        keep_checkpoints=args.keep_checkpoints,
         logdir=args.logdir,
         run_name=args.run_name,
     )
