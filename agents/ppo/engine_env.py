@@ -26,29 +26,37 @@ class EngineVecEnv:
         self.max_turns = max_turns
         self._base_seed = seed
         self.battles = [se.Battle(seed=seed * 100003 + i) for i in range(num_envs)]
-        self.obs_dim = self.battles[0].obs_dim
-        self.n_actions = self.battles[0].n_actions
+        b0 = self.battles[0]
+        self.obs_dim = b0.obs_dim
+        self.n_actions = b0.n_actions
+        # Categorical-ID layout for the model's embedding tables.
+        self.id_dim = b0.id_dim
+        self.n_mons = b0.n_mons
+        self.id_columns = b0.id_columns()
+        self.vocab = b0.vocab_sizes()
         self._ep_len = np.zeros(num_envs, dtype=np.int32)
         self._resets = np.zeros(num_envs, dtype=np.int64)
         self._rng = np.random.default_rng(seed ^ 0xA5A5_5A5A)
         # Which physical side (RED/BLUE) the learner controls in each env this episode.
         self.learner_side = self._rng.integers(0, 2, size=num_envs).astype(np.int64)
 
-    def _view(self, sides: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _view(self, sides: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         obs = np.empty((self.num_envs, self.obs_dim), dtype=np.float32)
+        ids = np.empty((self.num_envs, self.id_dim), dtype=np.int64)
         mask = np.empty((self.num_envs, self.n_actions), dtype=bool)
         for i, b in enumerate(self.battles):
             s = int(sides[i])
             obs[i] = np.asarray(b.observe(s), dtype=np.float32)
+            ids[i] = np.asarray(b.observe_ids(s), dtype=np.int64)
             mask[i] = np.asarray(b.legal_actions(s), dtype=bool)
-        return obs, mask
+        return obs, ids, mask
 
-    def learner_view(self) -> tuple[np.ndarray, np.ndarray]:
-        """(obs, mask) from the learner's perspective in each env."""
+    def learner_view(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(obs, ids, mask) from the learner's perspective in each env."""
         return self._view(self.learner_side)
 
-    def opponent_view(self) -> tuple[np.ndarray, np.ndarray]:
-        """(obs, mask) from the opponent's perspective in each env."""
+    def opponent_view(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(obs, ids, mask) from the opponent's perspective in each env."""
         return self._view(1 - self.learner_side)
 
     def step(self, learner_actions, opponent_actions):

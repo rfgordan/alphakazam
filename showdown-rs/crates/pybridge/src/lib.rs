@@ -80,9 +80,50 @@ impl Battle {
         self.state.turn
     }
 
-    /// Encoded observation from `side`'s perspective (0 = Red, 1 = Blue).
+    /// Encoded float observation from `side`'s perspective (0 = Red, 1 = Blue).
     fn observe(&self, side: u8) -> Vec<f32> {
         engine::encode::encode(&self.state, sid(side))
+    }
+
+    /// Categorical IDs from `side`'s perspective: `n_mons * ids_per_mon` integers (row-major per
+    /// mon, columns = `id_columns()`), for the model's embedding tables.
+    fn observe_ids(&self, side: u8) -> Vec<i64> {
+        engine::encode::encode_ids(&self.state, sid(side))
+    }
+
+    #[getter]
+    fn id_dim(&self) -> usize {
+        engine::encode::ID_DIM
+    }
+
+    #[getter]
+    fn n_mons(&self) -> usize {
+        engine::encode::N_MONS
+    }
+
+    #[getter]
+    fn ids_per_mon(&self) -> usize {
+        engine::encode::IDS_PER_MON
+    }
+
+    /// Which embedding table each ID column indexes into (length `ids_per_mon`).
+    fn id_columns(&self) -> Vec<String> {
+        ["species", "ability", "item", "type", "move", "move", "move", "move"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Vocabulary size (number of embedding rows needed) for each table named in `id_columns()`.
+    fn vocab_sizes(&self) -> std::collections::HashMap<String, usize> {
+        use engine::ids::{Ability, Item, Type};
+        let mut m = std::collections::HashMap::new();
+        m.insert("species".to_string(), engine::gen::SPECIES_NAMES.len());
+        m.insert("move".to_string(), engine::gen::MOVE_NAMES.len());
+        m.insert("item".to_string(), Item::Unknown as usize + 1);
+        m.insert("ability".to_string(), Ability::Unknown as usize + 1);
+        m.insert("type".to_string(), Type::Stellar as usize + 1);
+        m
     }
 
     /// Boolean legal-action mask of length 9 for `side`.

@@ -21,17 +21,18 @@ from .engine_env import EngineVecEnv
 class Baseline(Protocol):
     name: str
 
-    def actions(self, obs: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Batched action indices for a stack of (obs, legal-mask) rows."""
+    def actions(self, obs: np.ndarray, ids: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Batched action indices for a stack of (float obs, categorical ids, legal-mask) rows."""
 
 
 @torch.no_grad()
-def greedy_actions(net, obs_np, mask_np, device) -> np.ndarray:
+def greedy_actions(net, obs_np, ids_np, mask_np, device) -> np.ndarray:
     """Argmax action under a network's masked policy (used for the learner at eval and for any
     policy-backed baseline / the greedy training opponent)."""
     obs = torch.as_tensor(obs_np, device=device)
+    ids = torch.as_tensor(ids_np, device=device)
     mask = torch.as_tensor(mask_np, device=device)
-    logits, _ = net.forward(obs, mask)
+    logits, _ = net.forward(obs, mask, obs_ids=ids)
     return logits.argmax(dim=-1).cpu().numpy()
 
 
@@ -46,13 +47,14 @@ class PolicyBaseline:
         self.greedy = greedy
 
     @torch.no_grad()
-    def actions(self, obs_np, mask_np) -> np.ndarray:
+    def actions(self, obs_np, ids_np, mask_np) -> np.ndarray:
         obs = torch.as_tensor(obs_np, device=self.device)
+        ids = torch.as_tensor(ids_np, device=self.device)
         mask = torch.as_tensor(mask_np, device=self.device)
         if self.greedy:
-            logits, _ = self.net.forward(obs, mask)
+            logits, _ = self.net.forward(obs, mask, obs_ids=ids)
             return logits.argmax(dim=-1).cpu().numpy()
-        action, _, _, _ = self.net.act(obs, mask)
+        action, _, _, _ = self.net.act(obs, mask, obs_ids=ids)
         return action.cpu().numpy()
 
 
@@ -63,7 +65,7 @@ class RandomBaseline:
         self.rng = np.random.default_rng(seed)
         self.name = name
 
-    def actions(self, obs_np, mask_np) -> np.ndarray:
+    def actions(self, obs_np, ids_np, mask_np) -> np.ndarray:
         out = np.zeros(len(mask_np), dtype=np.int64)
         for i, m in enumerate(mask_np):
             legal = np.flatnonzero(m)
@@ -79,10 +81,10 @@ def evaluate(model, baseline: Baseline, device, n_games: int = 100, num_envs: in
     results: list[int] = []
     turns: list[int] = []
     while len(results) < n_games:
-        obs_l, mask_l = envs.learner_view()
-        obs_o, mask_o = envs.opponent_view()
-        learner_a = greedy_actions(model, obs_l, mask_l, device)
-        opp_a = baseline.actions(obs_o, mask_o)
+        obs_l, ids_l, mask_l = envs.learner_view()
+        obs_o, ids_o, mask_o = envs.opponent_view()
+        learner_a = greedy_actions(model, obs_l, ids_l, mask_l, device)
+        opp_a = baseline.actions(obs_o, ids_o, mask_o)
         prev_len = envs._ep_len.copy()
         reward, done = envs.step(learner_a, opp_a)
         for r, d, pl in zip(reward, done, prev_len):

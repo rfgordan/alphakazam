@@ -36,6 +36,38 @@ pub const OBS_DIM: usize =
     + WEATHER_COUNT + TERRAIN_COUNT + 1   // weather, terrain, trick room
     + 2 * HAZARD_FEATS;                   // hazards/screens per side
 
+// --- categorical IDs for embedding (Level-1 entity features) -------------------------------
+
+/// Categorical IDs emitted per Pokémon, in order: species, ability, item, tera type, move×4.
+pub const IDS_PER_MON: usize = 8;
+/// Number of Pokémon entities encoded (both teams, 6 each).
+pub const N_MONS: usize = 12;
+/// Length of the integer-ID vector from [`encode_ids`].
+pub const ID_DIM: usize = N_MONS * IDS_PER_MON;
+
+/// Per-Pokémon integer IDs for the model's embedding tables (viewer's 6 then the foe's 6, each a
+/// row of [`IDS_PER_MON`] in the column order above). Read from the fog-of-war `observe(viewer)`
+/// state, so a hidden item/ability/move comes back as its `Unknown`/`None` sentinel index.
+pub fn encode_ids(state: &State, viewer: SideId) -> Vec<i64> {
+    let observed = state.observe(viewer);
+    let mut v = Vec::with_capacity(ID_DIM);
+    for side_id in [viewer, viewer.other()] {
+        let side = observed.side(side_id);
+        for slot in 0..6 {
+            let p = &side.pokemon[slot];
+            v.push(p.species.0 as i64);
+            v.push(p.ability as i64);
+            v.push(p.item as i64);
+            v.push(p.tera_type as i64);
+            for m in 0..4 {
+                v.push(p.moves[m].id.0 as i64);
+            }
+        }
+    }
+    debug_assert_eq!(v.len(), ID_DIM);
+    v
+}
+
 /// Encode the battle from `viewer`'s perspective into a length-[`OBS_DIM`] vector.
 pub fn encode(state: &State, viewer: SideId) -> Vec<f32> {
     let observed = state.observe(viewer);

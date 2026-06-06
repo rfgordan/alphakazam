@@ -9,13 +9,16 @@ import torch
 
 
 class RolloutBuffer:
-    def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device):
+    def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device, id_dim: int = 0):
         self.steps = steps
         self.num_envs = num_envs
         self.device = device
+        self.id_dim = id_dim
 
         shape = (steps, num_envs)
         self.obs = torch.zeros(shape + (obs_dim,), device=device)
+        # Categorical IDs for embedding (empty when id_dim == 0, e.g. the placeholder env).
+        self.obs_ids = torch.zeros(shape + (id_dim,), dtype=torch.long, device=device) if id_dim > 0 else None
         self.masks = torch.ones(shape + (n_actions,), dtype=torch.bool, device=device)
         self.actions = torch.zeros(shape, dtype=torch.long, device=device)
         self.log_probs = torch.zeros(shape, device=device)
@@ -27,8 +30,10 @@ class RolloutBuffer:
         self.advantages = torch.zeros(shape, device=device)
         self.returns = torch.zeros(shape, device=device)
 
-    def add(self, t: int, obs, mask, action, log_prob, value, reward, done):
+    def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None):
         self.obs[t] = obs
+        if self.obs_ids is not None and obs_ids is not None:
+            self.obs_ids[t] = obs_ids
         self.masks[t] = mask
         self.actions[t] = action
         self.log_probs[t] = log_prob
@@ -54,7 +59,7 @@ class RolloutBuffer:
 
     def flat_view(self):
         """Flatten [steps, num_envs, ...] -> [steps*num_envs, ...] for minibatching."""
-        return dict(
+        d = dict(
             obs=self.obs.reshape(-1, self.obs.shape[-1]),
             masks=self.masks.reshape(-1, self.masks.shape[-1]),
             actions=self.actions.reshape(-1),
@@ -63,3 +68,6 @@ class RolloutBuffer:
             advantages=self.advantages.reshape(-1),
             returns=self.returns.reshape(-1),
         )
+        if self.obs_ids is not None:
+            d["obs_ids"] = self.obs_ids.reshape(-1, self.id_dim)
+        return d

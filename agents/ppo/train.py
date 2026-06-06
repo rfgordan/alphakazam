@@ -117,14 +117,16 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
     if cfg.norm_advantages:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+    obs_ids = data.get("obs_ids")  # present only when the model uses embeddings
     last = {}
     for _ in range(cfg.update_epochs):
         np.random.shuffle(idx)
         for start in range(0, batch_size, cfg.minibatch_size):
             mb = torch.as_tensor(idx[start:start + cfg.minibatch_size], device=data["obs"].device)
+            mb_ids = obs_ids[mb] if obs_ids is not None else None
 
             _, new_log_prob, entropy, new_value = model.act(
-                data["obs"][mb], data["masks"][mb], data["actions"][mb]
+                data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids
             )
 
             # Clipped policy (surrogate) objective.

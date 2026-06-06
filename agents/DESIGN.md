@@ -52,22 +52,33 @@ zeroes illegal actions (no-PP moves, fainted/active switch targets) before sampl
 
 ---
 
-## 2. The model (~1M parameters)
+## 2. The model (~5M parameters, with ID embeddings)
 
-Shared trunk + two linear heads. With the engine's `obs_dim≈464`, `hidden_dim=608`,
-`n_hidden_layers=2` it is **1,029,354** params (`ActorCritic.num_params()`).
+The observation has two parts: a **float vector** (hp/status/types/stats/field — `obs_dim≈464`)
+and **categorical IDs** per Pokémon (species, ability, item, tera type, 4 moves — `12×8` ints).
+Each ID class gets a learned **embedding table** (sized from the bridge's `vocab_sizes()`: species
+912, move 955, ability 112, item 25, type 20); the per-mon embeddings are concatenated with the
+floats and fed to a shared MLP → masked policy head (9) + value head. This is "Level 1":
+embeddings + concat into a flat MLP (not yet a per-entity / attention encoder — that's Level 2).
 
 ```mermaid
 flowchart TD
-    OBS["obs [~464]"] --> L0["Linear ->608 + Tanh"]
-    L0 --> L1["Linear 608->608 + Tanh"]
-    L1 --> L2["Linear 608->608 + Tanh"]
-    L2 --> H["trunk [608]"]
+    IDS["ids [12 mons x 8: species,ability,item,tera,move x4]"] --> EMB["embedding tables (one per class)"]
+    EMB --> ECAT["concat per-mon embeddings"]
+    OBSF["float obs [~464]"] --> CAT["concat"]
+    ECAT --> CAT
+    CAT --> L0["Linear ->928 + Tanh"]
+    L0 --> L1["Linear 928->928 + Tanh (xN)"]
+    L1 --> H["trunk [928]"]
     H --> P["policy head -> 9"]
     H --> V["value head -> 1"]
     MASK["action_mask [9]"] --> P
     P --> LOGITS["masked logits -> Categorical"]
 ```
+
+With `hidden_dim=928`, `n_hidden_layers=2`, `embed_dim=32` it is **~5.08M** params. The IDs come
+from `observe(viewer)`, so a hidden foe item/ability/move arrives as its `Unknown`/`None` sentinel
+index — fog-of-war preserved. `embed=None` gives the old pure-float MLP (the placeholder trainer).
 
 ---
 

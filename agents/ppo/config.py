@@ -14,9 +14,10 @@ class PPOConfig:
     obs_dim: int = 128          # flat observation vector length (eventually = encoded State.observe)
     n_actions: int = 9          # 4 move slots + 5 switch targets
 
-    # --- model (sized to land ~1M params at the engine's obs_dim≈464; see model.py) ---
-    hidden_dim: int = 608
+    # --- model (sized to land ~5M params with the engine's float obs + ID embeddings) ---
+    hidden_dim: int = 928
     n_hidden_layers: int = 2    # hidden->hidden layers after the input projection
+    embed_dim: int = 32         # embedding width for each categorical (species/move/item/...)
 
     # --- rollout collection ---
     num_envs: int = 8           # parallel environments stepped in lockstep

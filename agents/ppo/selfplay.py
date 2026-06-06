@@ -60,13 +60,19 @@ def train_selfplay(
     device = resolve_device(cfg.device)
 
     envs = EngineVecEnv(cfg.num_envs, seed=cfg.seed)
-    model = ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
+    # Embedding spec for the categorical IDs (species/ability/item/tera/moves), read from the env.
+    embed = {"n_mons": envs.n_mons, "cols": envs.id_columns, "vocab": envs.vocab, "dim": cfg.embed_dim}
+
+    def make_net():
+        return ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers, embed=embed).to(device)
+
+    model = make_net()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
-    buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device)
+    buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, envs.obs_dim, envs.n_actions, device, id_dim=envs.id_dim)
 
     # The frozen *training* opponent: a copy of the learner, refreshed periodically.
     use_snapshot = snapshot_every > 0
-    opponent = ActorCritic(envs.obs_dim, envs.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
+    opponent = make_net()
     opponent.load_state_dict(model.state_dict())
     opponent.eval()
     for p in opponent.parameters():
@@ -124,20 +130,22 @@ def train_selfplay(
             update += 1
             # --- collect a rollout of the learner's transitions (from whichever side it's on) ---
             for t in range(cfg.rollout_steps):
-                obs_l, mask_l = envs.learner_view()
-                obs_o, mask_o = envs.opponent_view()
+                obs_l, ids_l, mask_l = envs.learner_view()
+                obs_o, ids_o, mask_o = envs.opponent_view()
 
                 obs_t = torch.as_tensor(obs_l, device=device)
+                ids_t = torch.as_tensor(ids_l, device=device)
                 mask_t = torch.as_tensor(mask_l, device=device)
                 with torch.no_grad():
-                    action, log_prob, _, value = model.act(obs_t, mask_t)        # learner: sample
-                opp_action = greedy_actions(blue_net, obs_o, mask_o, device)      # opponent: greedy (frozen)
+                    action, log_prob, _, value = model.act(obs_t, mask_t, obs_ids=ids_t)  # learner: sample
+                opp_action = greedy_actions(blue_net, obs_o, ids_o, mask_o, device)        # opponent: greedy
 
                 reward_np, done_np = envs.step(action.cpu().numpy(), opp_action)
 
                 buffer.add(t, obs_t, mask_t, action, log_prob, value,
                            torch.as_tensor(reward_np, device=device),
-                           torch.as_tensor(done_np, device=device))
+                           torch.as_tensor(done_np, device=device),
+                           obs_ids=ids_t)
                 global_step += cfg.num_envs
 
                 for r, d in zip(reward_np, done_np):
@@ -151,9 +159,11 @@ def train_selfplay(
 
             # --- advantages + PPO update ---
             with torch.no_grad():
-                obs_l, mask_l = envs.learner_view()
+                obs_l, ids_l, mask_l = envs.learner_view()
                 _, last_value = model.forward(
-                    torch.as_tensor(obs_l, device=device), torch.as_tensor(mask_l, device=device)
+                    torch.as_tensor(obs_l, device=device),
+                    torch.as_tensor(mask_l, device=device),
+                    obs_ids=torch.as_tensor(ids_l, device=device),
                 )
             buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
             stats = ppo_update(model, optimizer, buffer.flat_view(), cfg, batch_size)
@@ -216,11 +226,12 @@ def play_one_game(model, device, seed: int = 0, max_turns: int = 200, sample: bo
 
     def pick(side):
         obs = torch.as_tensor(np.asarray(b.observe(side), dtype=np.float32), device=device).unsqueeze(0)
+        ids = torch.as_tensor(np.asarray(b.observe_ids(side), dtype=np.int64), device=device).unsqueeze(0)
         mask = torch.as_tensor(np.asarray(b.legal_actions(side), dtype=bool), device=device).unsqueeze(0)
         if sample:
-            action, _, _, _ = model.act(obs, mask)
+            action, _, _, _ = model.act(obs, mask, obs_ids=ids)
             return int(action.item())
-        logits, _ = model.forward(obs, mask)
+        logits, _ = model.forward(obs, mask, obs_ids=ids)
         return int(logits.argmax(dim=-1).item())
 
     for _ in range(max_turns):
@@ -265,7 +276,8 @@ def main():
     if args.watch:
         device = resolve_device(cfg.device)
         probe = se.Battle(seed=0)
-        model = ActorCritic(probe.obs_dim, probe.n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(device)
+        embed = {"n_mons": probe.n_mons, "cols": probe.id_columns(), "vocab": probe.vocab_sizes(), "dim": cfg.embed_dim}
+        model = ActorCritic(probe.obs_dim, probe.n_actions, cfg.hidden_dim, cfg.n_hidden_layers, embed=embed).to(device)
         play_one_game(model, device, seed=args.seed)
         return
 
