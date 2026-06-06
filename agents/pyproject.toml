@@ -1,0 +1,18 @@
+[project]
+name = "deep-showdown-agents"
+version = "0.1.0"
+description = "PPO agents for the deep-showdown battle engine"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.2",
+]
+
+[dependency-groups]
+# Build tool for the Rust<->Python bridge (crates/pybridge).
+dev = [
+    "maturin>=1.5,<2.0",
+]
+
+[tool.setuptools]
+packages = ["ppo"]

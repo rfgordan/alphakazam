@@ -1,0 +1,23 @@
+[package]
+name = "pybridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["deep-showdown"]
+
+# Excluded from the core workspace (see ../../Cargo.toml) so `cargo build`/`cargo test` for the
+# engine never need a Python toolchain. Built on its own via maturin.
+
+[lib]
+name = "showdown_engine"
+# cdylib: the Python extension module. rlib: lets `cargo test -p pybridge` link normally.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+engine = { path = "../engine" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

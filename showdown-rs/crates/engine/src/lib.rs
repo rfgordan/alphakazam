@@ -11,12 +11,15 @@
 
 pub mod damage;
 pub mod data;
+pub mod encode;
 pub mod gen;
 pub mod generate;
 pub mod ids;
 pub mod instruction;
 pub mod names;
+pub mod narrate;
 pub mod state;
+pub mod team;
 pub mod volatile;
 
 pub use generate::{generate_instructions, MoveChoice};

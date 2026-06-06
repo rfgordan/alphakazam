@@ -1,150 +1,135 @@
 # Agent system design
 
-A small, readable **PPO** agent for the deep-showdown battle engine. This document is the
-living architecture reference — keep it in sync with the code in `ppo/`.
+A small, readable **PPO** agent for the deep-showdown battle engine, now wired to the real Rust
+engine via a PyO3 bridge with **greedy self-play** and **live natural-language commentary**.
+Keep this in sync with the code in `ppo/` and the bridge in `../showdown-rs/crates/pybridge/`.
 
 Design priorities (in order): **simple & readable**, **small model (~1M params)**,
-**machine-agnostic** (CPU / Apple MPS / CUDA), **clean boundary to the Rust engine** so the
-placeholder environment can be swapped for the real simulator without touching the algorithm.
+**machine-agnostic** (CPU / Apple MPS / CUDA), **clean engine boundary** — the agent only ever
+sees `(observation, action mask, reward, done)`, computed by render-layers around an unchanged
+transition.
 
 ---
 
 ## 1. Components
 
-The agent only ever talks to the environment through four values — observation vector,
-action mask, reward, done — so PPO is completely decoupled from where the battle comes from.
-
 ```mermaid
 flowchart LR
-    subgraph ENV["Environment (BattleEnv interface)"]
+    subgraph RUST["showdown-rs (Rust)"]
         direction TB
-        DUMMY["DummyBattleEnv\n(learnable placeholder)"]
-        RUST["showdown-rs engine\n(future, via FFI/PyO3)"]
-        ENC["Observation encoder\nState.observe(viewer) -> float vector"]
-        RUST -.-> ENC
+        ENGINE["engine: generate_instructions\n(canonical transition -> instruction stream)"]
+        TEAM["team: build playable State from MemberSpecs"]
+        ENC["encode: State.observe(viewer) -> float vector"]
+        NARR["narrate: (state, actions, instructions) -> text"]
+        TEAM --> ENGINE
+        ENGINE --> ENC
+        ENGINE --> NARR
     end
 
-    subgraph AGENT["Agent (ppo/)"]
-        direction TB
-        AC["ActorCritic (~1M params)\nshared MLP trunk"]
-        PH["policy head -> 9 logits"]
-        VH["value head -> 1 scalar"]
-        AC --> PH
-        AC --> VH
+    subgraph BRIDGE["pybridge (PyO3): class Battle"]
+        STEP["step(a_red,a_blue) -> done,winner,lines\nobserve(side) / legal_actions(side) / render()"]
     end
 
-    ENV -- "obs[obs_dim], mask[9]" --> AC
-    PH -- "masked sample" --> ACT["action ∈ {move0..3, switch0..4}"]
-    ACT -- "step(action)" --> ENV
-    ENV -- "reward, done" --> BUF["RolloutBuffer + GAE"]
-    VH --> BUF
+    subgraph AGENT["agents/ppo (Python)"]
+        AC["ActorCritic (~1M params)\nshared MLP trunk -> policy(9) + value(1)"]
+    end
+
+    ENC --> STEP
+    NARR --> STEP
+    ENGINE --> STEP
+    STEP -- "obs[464], mask[9]" --> AC
+    AC -- "masked action" --> STEP
+    STEP -- "reward, done" --> AC
+    STEP -- "commentary lines" --> TTY["terminal (watch a game)"]
 ```
 
-**Action space (9):** `0..3` = the four move slots, `4..8` = switch to one of the five
-benched team members. The **action mask** zeroes illegal actions (no-PP / disabled moves,
-fainted or already-active switch targets) before sampling. Special cases (forced switches,
-two-turn locks, etc.) are out of scope for now — the placeholder marks all actions legal.
+The engine produces one canonical artifact per turn — the **instruction stream**. Three readers
+project it: `encode` (for the network), `narrate` (for a human), and the bridge's outcome check
+(reward/done). None of them live in the transition, so RL throughput is unaffected.
+
+**Action space (9):** `0..3` = move slots, `4..8` = switch to the k-th benched mon. The mask
+zeroes illegal actions (no-PP moves, fainted/active switch targets) before sampling.
 
 ---
 
 ## 2. The model (~1M parameters)
 
-A shared trunk with two linear heads. Small on purpose; sized to ~1M at `obs_dim=128`,
-`hidden_dim=672`, `n_hidden_layers=2`. Orthogonal init with a tiny gain on the policy head so
-the initial policy is near-uniform.
+Shared trunk + two linear heads. With the engine's `obs_dim≈464`, `hidden_dim=608`,
+`n_hidden_layers=2` it is **1,029,354** params (`ActorCritic.num_params()`).
 
 ```mermaid
 flowchart TD
-    OBS["obs [obs_dim=128]"] --> L0["Linear 128->672 + Tanh"]
-    L0 --> L1["Linear 672->672 + Tanh"]
-    L1 --> L2["Linear 672->672 + Tanh"]
-    L2 --> H["trunk features [672]"]
-    H --> P["policy head: Linear 672->9"]
-    H --> V["value head: Linear 672->1"]
+    OBS["obs [~464]"] --> L0["Linear ->608 + Tanh"]
+    L0 --> L1["Linear 608->608 + Tanh"]
+    L1 --> L2["Linear 608->608 + Tanh"]
+    L2 --> H["trunk [608]"]
+    H --> P["policy head -> 9"]
+    H --> V["value head -> 1"]
     MASK["action_mask [9]"] --> P
     P --> LOGITS["masked logits -> Categorical"]
-    V --> VALUE["state value V(s)"]
 ```
-
-Total trainable params ≈ **1.0M** (printed at startup via `ActorCritic.num_params()`).
-The bulk sits in the two 672×672 hidden layers, so the count is stable as `obs_dim` changes.
 
 ---
 
-## 3. Training loop (PPO)
+## 3. Greedy self-play training
 
-On-policy: collect a batch of fresh transitions with the current policy, estimate advantages
-with GAE, then take a few epochs of clipped-objective minibatch updates. Repeat.
+Both sides are driven by the **same** network. The **learner (Red)** samples actions (its
+transitions feed PPO); the **opponent (Blue)** acts **greedily** (argmax over the masked policy)
+— an ever-improving sparring partner as the shared weights update. Reward is sparse: +1 / -1 to
+the learner on win / loss.
 
 ```mermaid
 flowchart TD
-    START([reset vector env]) --> COLLECT
-
-    subgraph COLLECT["1 · Collect rollout (num_envs × rollout_steps)"]
+    subgraph COLLECT["1 · Collect rollout (per env, per step)"]
         direction TB
-        S1["model.act(obs, mask) -> action, logπ, value"]
-        S2["env.step(action) -> next_obs, reward, done"]
-        S3["store in RolloutBuffer; auto-reset on done"]
-        S1 --> S2 --> S3 --> S1
+        O["obs_red, obs_blue <- env.observe"]
+        SR["red  action ~ sample(policy)   (learner, store)"]
+        SB["blue action = argmax(policy)    (greedy opponent)"]
+        ST["env.step(a_red, a_blue) -> reward, done; auto-reset"]
+        O --> SR --> SB --> ST --> O
     end
-
-    COLLECT --> GAE["2 · GAE: rewards+values+dones -> advantages, returns\n(bootstrap last_value; cut at dones)"]
-
-    GAE --> UPDATE
-    subgraph UPDATE["3 · PPO update (update_epochs × minibatches)"]
-        direction TB
-        U1["ratio = exp(logπ_new − logπ_old)"]
-        U2["policy_loss = −min(ratio·A, clip(ratio,1±ε)·A)"]
-        U3["value_loss = ½ (V − return)²"]
-        U4["loss = policy + c_v·value − c_ent·entropy"]
-        U5["Adam step (clip grad norm)"]
-        U1 --> U2 --> U4
-        U3 --> U4 --> U5
-    end
-
-    UPDATE --> LOG["log ep_return / losses / approx_kl"]
-    LOG -->|until total_steps| COLLECT
+    COLLECT --> GAE["2 · GAE over the learner's transitions"]
+    GAE --> UPD["3 · PPO clipped update (shared weights)\nopponent strengthens automatically"]
+    UPD --> WATCH{"every N updates?"}
+    WATCH -- yes --> PLAY["play one full game to the terminal\nwith narrate=True (live commentary)"]
+    WATCH -- no --> COLLECT
+    PLAY --> COLLECT
 ```
 
-Key hyperparameters (`config.py`): `gamma=0.99`, `gae_lambda=0.95`, `clip_eps=0.2`,
-`entropy_coef=0.01`, `value_coef=0.5`, `lr=3e-4`, `update_epochs=4`, `minibatch_size=256`,
-`num_envs=8`, `rollout_steps=128` (batch = 1024).
+The PPO objective (clipped surrogate + value loss + entropy bonus, GAE, minibatch epochs) is
+shared with the placeholder trainer — only data collection differs. Smoke run: win-rate vs the
+greedy opponent climbs ~0.58 → ~0.90 over 20 updates.
 
 ---
 
-## 4. Inference (acting in a battle)
+## 4. Inference / watching a battle
+
+`Battle.step(a_red, a_blue, narrate=True)` returns the turn's commentary; `Battle.render()`
+prints an HP board. `python -m ppo.selfplay --watch` plays one game with the current policy.
 
 ```mermaid
 sequenceDiagram
-    participant Env
-    participant Encoder as Obs encoder
-    participant Net as ActorCritic
-    Env->>Encoder: State.observe(viewer)
-    Encoder->>Net: obs[obs_dim], mask[9]
-    Net->>Net: trunk -> policy head -> mask illegal -> softmax
-    Net-->>Env: action (argmax for greedy, sample for stochastic)
-    Env->>Env: apply turn, advance state
+    participant Loop as selfplay
+    participant Br as Battle (bridge)
+    participant Eng as engine
+    Loop->>Br: observe(side), legal_actions(side)
+    Br->>Eng: encode(State.observe(side))
+    Loop->>Loop: action = policy(obs, mask)
+    Loop->>Br: step(a_red, a_blue, narrate=True)
+    Br->>Eng: generate_instructions -> sample branch -> apply
+    Br->>Eng: narrate(pre, actions, instructions)
+    Br-->>Loop: done, winner, commentary lines
+    Loop->>Loop: print lines (follow live)
 ```
-
-At inference the value head is unused; only the masked policy matters. Greedy = `argmax`,
-exploratory = sample from the masked `Categorical`.
 
 ---
 
-## 5. Boundary to the Rust engine (the one thing to build next)
+## 5. Status & what's next
 
-The agent is already written against the final contract. Wiring the real engine means
-implementing one `BattleEnv` whose:
+**Done:** PyO3 bridge (`showdown_engine.Battle`), observation encoder, narration layer, team
+builder, engine-backed vector env, greedy self-play trainer, live terminal commentary.
 
-- **`obs`** is a fixed-length float encoding of `State.observe(viewer)` (the hidden-info view
-  from `showdown-rs`) — set `PPOConfig.obs_dim` to its length.
-- **`step(action)`** maps `0..8` to a `MoveChoice`, advances the engine one turn (sampling a
-  concrete outcome branch, and an opponent action — self-play or a fixed bot), and returns the
-  next observation, the next legal-action mask, the reward (e.g. ±1 on win/loss), and done.
-
-Because the engine state is `Copy`/cheap, the env can run many instances in `SyncVectorEnv`
-(or a future native vectorized bridge) without changing anything above this line.
-
-**Not yet covered (intentionally):** opponent modeling / self-play scheduling, determinization
-over hidden info (sampling concrete states from `observe`), reward shaping, and the special-case
-action types. Each slots in behind the same interface.
+**Not yet (intentionally):** richer reward shaping; opponent snapshotting / league play (today the
+greedy opponent is the live policy); determinization over hidden info; randomized teams (one fixed
+matchup for now); special-case action types (forced two-turn locks, etc.); a proper display-name
+table (commentary uses prettified PS ids). Each slots in behind the same `Battle` interface.

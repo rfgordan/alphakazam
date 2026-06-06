@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "showdown-engine"
+version = "0.1.0"
+description = "Python bridge to the deep-showdown Rust battle engine"
+requires-python = ">=3.10"
+
+[tool.maturin]
+# pyo3 bindings are auto-detected; the module is `showdown_engine` (see Cargo.toml [lib].name).

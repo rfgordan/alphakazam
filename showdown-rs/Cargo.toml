@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/engine", "crates/verify"]
+exclude = ["crates/pybridge"]
 
 [workspace.package]
 edition = "2021"
