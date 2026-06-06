@@ -27,7 +27,7 @@ import torch
 
 import showdown_engine as se
 
-from .baselines import PolicyBaseline, RandomBaseline, evaluate, greedy_actions
+from .baselines import MctsBaseline, PolicyBaseline, RandomBaseline, evaluate, greedy_actions
 from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .engine_env import BLUE, RED, EngineVecEnv
@@ -45,6 +45,7 @@ def train_selfplay(
     eval_games: int = 100,
     ckpt_every: int = 50,
     keep_checkpoints: int = 3,
+    mcts_eval_ms: int = 0,
     logdir: str = "runs",
     run_name: str | None = None,
 ):
@@ -89,6 +90,9 @@ def train_selfplay(
         PolicyBaseline(anchor, device, name="anchor-init"),
         RandomBaseline(seed=cfg.seed, name="random"),
     ]
+    if mcts_eval_ms > 0:
+        # poke-engine MCTS — a strong, external validated reference (heavy; keep eval_games modest).
+        baselines.append(MctsBaseline(time_ms=mcts_eval_ms))
 
     logger = RunLogger(logdir, run_name)
     logger.config({"cfg": vars(cfg), "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
@@ -262,6 +266,8 @@ def main():
     parser.add_argument("--ckpt-every", type=int, default=50, help="save a checkpoint every N updates (0 = never)")
     parser.add_argument("--keep-checkpoints", type=int, default=3,
                         help="keep only the most recent N checkpoints (0 = keep all)")
+    parser.add_argument("--mcts-eval-ms", type=int, default=0,
+                        help="also eval vs poke-engine MCTS at this search time per move (0 = off; heavy)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
     parser.add_argument("--run-name", type=str, default=None, help="run subdirectory name (default: timestamp)")
     parser.add_argument("--watch", action="store_true", help="just play one game with the untrained policy and exit")
@@ -290,6 +296,7 @@ def main():
         eval_games=args.eval_games,
         ckpt_every=args.ckpt_every,
         keep_checkpoints=args.keep_checkpoints,
+        mcts_eval_ms=args.mcts_eval_ms,
         logdir=args.logdir,
         run_name=args.run_name,
     )
