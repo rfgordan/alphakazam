@@ -63,8 +63,10 @@ class EngineVecEnv:
         """Advance every battle. Returns (reward[N], done[N], dyn[N,4]) for the learner.
 
         `dyn` is the world-model auxiliary label for the turn just played, learner-relative:
-        [damage to my active, damage to foe's active, my active KO'd, foe active KO'd] — computed
-        from the specific active mons (by slot) *before* any auto-reset.
+        [signed HP-Δ of my active, signed HP-Δ of foe's active, my active KO'd, foe active KO'd].
+        The HP deltas are signed fractions (negative = took damage, positive = healed) so the world
+        model learns healing/residuals too, not just damage. Read from the specific active mons (by
+        slot) *before* any auto-reset.
         """
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=np.float32)
@@ -81,8 +83,8 @@ class EngineVecEnv:
             done, winner, _ = b.step(red_a, blue_a)
 
             post = (b.hp_fraction(0, ai[0]), b.hp_fraction(1, ai[1]))
-            dyn[i, 0] = max(0.0, pre[ls] - post[ls])        # damage to my active
-            dyn[i, 1] = max(0.0, pre[opp_s] - post[opp_s])  # damage to foe's active
+            dyn[i, 0] = post[ls] - pre[ls]        # my active's signed HP-Δ (neg = damage, pos = heal)
+            dyn[i, 1] = post[opp_s] - pre[opp_s]  # foe active's signed HP-Δ
             dyn[i, 2] = 1.0 if pre[ls] > 0 and post[ls] <= 0 else 0.0      # my active fainted
             dyn[i, 3] = 1.0 if pre[opp_s] > 0 and post[opp_s] <= 0 else 0.0  # foe active fainted
 

@@ -150,10 +150,11 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 aux = rest[0]
                 # Opponent-move prediction (from state).
                 aux_opp = F.cross_entropy(aux["opp"], data["opp_action"][mb])
-                # World-model prediction CONDITIONED on both actions (damage/KO depend on them).
+                # World-model prediction CONDITIONED on both actions (HP-Δ/KO depend on them).
+                # Channels 0:2 = signed HP deltas in [-1,1] (tanh); 2:4 = KO logits (BCE).
                 dyn = model.predict_dynamics(aux["h"], data["actions"][mb], data["opp_action"][mb])
                 tgt = data["dyn_target"][mb]
-                aux_dyn = (F.mse_loss(torch.sigmoid(dyn[:, :2]), tgt[:, :2])
+                aux_dyn = (F.mse_loss(torch.tanh(dyn[:, :2]), tgt[:, :2])
                            + F.binary_cross_entropy_with_logits(dyn[:, 2:], tgt[:, 2:]))
                 aux_loss = cfg.aux_opp_coef * aux_opp + cfg.aux_dyn_coef * aux_dyn
                 loss = loss + aux_loss

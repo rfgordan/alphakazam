@@ -84,8 +84,10 @@ index — fog-of-war preserved. `embed=None` gives the old pure-float MLP (the p
 head) shape the representation by predicting facts, not prescribing actions — so they can't make
 the policy degenerate/predictable; the policy is still trained only by PPO:
 - **opponent move** — predict the opponent's action this turn from the state (cross-entropy).
-- **world model** — predict `[dmg_self, dmg_opp, ko_self, ko_opp]`, **conditioned on both players'
-  actions** (one-hot), since damage/KO depend on what was done (MSE on damage, BCE on KO).
+- **world model** — predict `[hp_Δ_self, hp_Δ_opp, ko_self, ko_opp]`, **conditioned on both
+  players' actions** (one-hot), since HP changes/KOs depend on what was done. HP deltas are
+  *signed* fractions (so it learns healing/Leftovers/Regenerator, not just damage): tanh + MSE;
+  KO via BCE.
 
 Labels are free from self-play (opponent's action; pre/post active HP). Weighted modestly
 (`aux_*_coef=0.1`); training-time only, so the eval win-rates stay an unbiased check.

@@ -106,7 +106,8 @@ class ActorCritic(nn.Module):
         return out
 
     def predict_dynamics(self, h, a_self, a_opp):
-        """World-model prediction [dmg_self, dmg_opp, ko_self, ko_opp] conditioned on both actions."""
+        """World-model prediction [hp_delta_self, hp_delta_opp, ko_self, ko_opp] conditioned on both
+        actions. Deltas are signed (tanh -> [-1,1]); KO are logits."""
         a1 = F.one_hot(a_self, self.n_actions).float()
         a2 = F.one_hot(a_opp, self.n_actions).float()
         return self.aux_dyn_head(torch.cat([h, a1, a2], dim=-1))
