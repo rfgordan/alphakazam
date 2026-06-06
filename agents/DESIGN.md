@@ -17,7 +17,7 @@ transition.
 flowchart LR
     subgraph RUST["showdown-rs (Rust)"]
         direction TB
-        ENGINE["engine: generate_instructions\n(canonical transition -> instruction stream)"]
+        ENGINE["engine: generate_instructions<br/>(canonical transition -> instruction stream)"]
         TEAM["team: build playable State from MemberSpecs"]
         ENC["encode: State.observe(viewer) -> float vector"]
         NARR["narrate: (state, actions, instructions) -> text"]
@@ -27,11 +27,11 @@ flowchart LR
     end
 
     subgraph BRIDGE["pybridge (PyO3): class Battle"]
-        STEP["step(a_red,a_blue) -> done,winner,lines\nobserve(side) / legal_actions(side) / render()"]
+        STEP["step(a_red,a_blue) -> done,winner,lines<br/>observe(side) / legal_actions(side) / render()"]
     end
 
     subgraph AGENT["agents/ppo (Python)"]
-        AC["ActorCritic (~1M params)\nshared MLP trunk -> policy(9) + value(1)"]
+        AC["ActorCritic (~5M params)<br/>shared MLP trunk -> policy(9) + value(1)"]
     end
 
     ENC --> STEP
@@ -112,7 +112,7 @@ flowchart TD
     COLLECT --> GAE["2 · GAE over the learner's transitions"]
     GAE --> UPD["3 · PPO clipped update (learner weights only)"]
     UPD --> REF{"update % snapshot_every == 0?"}
-    REF -- yes --> COPY["snapshot.load_state_dict(learner)\nwin-rate window resets"]
+    REF -- yes --> COPY["snapshot.load_state_dict(learner)<br/>win-rate window resets"]
     REF -- no --> COLLECT
     COPY --> COLLECT
 ```
