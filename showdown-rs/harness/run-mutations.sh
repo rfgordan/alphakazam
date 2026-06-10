@@ -14,37 +14,40 @@ cd "$(dirname "$0")/.."
 GEN=crates/engine/src/generate.rs
 TRACES="harness/cosim-traces/*.json.gz"
 
-if ! git diff --quiet -- "$GEN"; then
-    echo "refusing to run: $GEN has uncommitted changes"; exit 2
+if ! git diff --quiet -- crates/engine/src/; then
+    echo "refusing to run: crates/engine/src has uncommitted changes"; exit 2
 fi
 
-declare -a NAMES SEDS
-add() { NAMES+=("$1"); SEDS+=("$2"); }
+declare -a NAMES FILES SEDS
+add() { NAMES+=("$1"); FILES+=("$2"); SEDS+=("$3"); }
 
-# mutation name                          | one-line bug injected via sed
-add "crit-multiplier-2x"                  's|rolls_crit\[i\] as i32, (1.0 / 16.0) \* CRIT|rolls_crit[i] as i32 * 2, (1.0 / 16.0) * CRIT|'
-add "leftovers-skipped"                   's|Item::Leftovers =>|Item::ChestoBerry =>|'
-add "pressure-removed"                    's|&& pressure_affected(&md)|\&\& false|'
-add "choicelock-not-set"                  's|push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::ChoiceLock });|/* mutated out */|'
-add "roost-never-restores"                's|if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {|if false {|'
-add "times-hit-once-per-move"             's|let new = cur.saturating_add(hits_landed).min(250);|let new = cur.saturating_add(1).min(250);|'
-add "pp-cost-doubled"                     's|let amount = if pressured { 2u8.min(pp) } else { 1 };|let amount = if pressured { 2u8.min(pp) } else { 2u8.min(pp) };|'
-add "stealth-rock-never-set"              's|SideConditionId::StealthRock|SideConditionId::Spikes|'
+GEN=crates/engine/src/generate.rs
+DMG=crates/engine/src/damage.rs
+
+# mutation name              file    | one-line bug injected via sed
+add "crit-multiplier-2x"     "$DMG"  's|d = d \* 3 / 2;|d = d * 2;|'
+add "leftovers-skipped"      "$GEN"  's|if p.item == Item::Leftovers \&\& p.hp < p.max_hp|if false \&\& p.hp < p.max_hp|'
+add "pressure-removed"       "$GEN"  's|&& pressure_affected(&md)|\&\& false|'
+add "choicelock-not-set"     "$GEN"  's|push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::ChoiceLock });|/* mutated out */|'
+add "roost-never-restores"   "$GEN"  's|if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {|if false {|'
+add "times-hit-once-per-move" "$GEN" 's|let new = cur.saturating_add(hits_landed).min(250);|let new = cur.saturating_add(1).min(250);|'
+add "pp-cost-doubled"        "$GEN"  's|let amount = if pressured { 2u8.min(pp) } else { 1 };|let amount = if pressured { 2u8.min(pp) } else { 2u8.min(pp) };|'
+add "stealth-rock-never-set" "$GEN"  's|SideConditionId::StealthRock|SideConditionId::Spikes|'
 
 killed=0; survived=0; broken=0
 for i in "${!NAMES[@]}"; do
-    name="${NAMES[$i]}"; sedexpr="${SEDS[$i]}"
-    cp "$GEN" "$GEN.orig"
-    sed -i '' -e "$sedexpr" "$GEN"
-    if cmp -s "$GEN" "$GEN.orig"; then
+    name="${NAMES[$i]}"; target="${FILES[$i]}"; sedexpr="${SEDS[$i]}"
+    cp "$target" "$target.orig"
+    sed -i '' -e "$sedexpr" "$target"
+    if cmp -s "$target" "$target.orig"; then
         echo "BROKEN  $name (sed matched nothing — update the pattern)"
         broken=$((broken+1))
-        mv "$GEN.orig" "$GEN"; continue
+        mv "$target.orig" "$target"; continue
     fi
     if ! cargo build --release -p cosim >/dev/null 2>&1; then
         echo "BROKEN  $name (mutant does not compile)"
         broken=$((broken+1))
-        mv "$GEN.orig" "$GEN"; continue
+        mv "$target.orig" "$target"; continue
     fi
     if ./target/release/cosim $TRACES >/dev/null 2>&1; then
         echo "SURVIVED  $name  <-- verifier blind spot!"
@@ -53,7 +56,7 @@ for i in "${!NAMES[@]}"; do
         echo "killed  $name"
         killed=$((killed+1))
     fi
-    mv "$GEN.orig" "$GEN"
+    mv "$target.orig" "$target"
 done
 
 # restore a clean build of the unmutated engine
