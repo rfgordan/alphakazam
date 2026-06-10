@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/verify"]
+members = ["crates/engine", "crates/verify", "crates/cosim"]
 exclude = ["crates/pybridge"]
 
 [workspace.package]

@@ -158,7 +158,7 @@ fn apply_tera(b: &mut Branch, side: SideId) {
         let p = s.active();
         (p.terastallized, p.tera_type, p.types, s.active_index)
     };
-    if already {
+    if already || b.state.side(side).tera_used {
         return;
     }
     if tera_type != Type::None && tera_type != Type::Stellar {
@@ -364,6 +364,42 @@ fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
     if slot_bit != 0 {
         reveal(b, side, slot_bit, 0);
     }
+    // Using a move while holding a Choice item locks the user into it (PS `choicelock`
+    // volatile, cleared on switch-out).
+    let item = b.state.side(side).active().item;
+    if matches!(item, Item::ChoiceBand | Item::ChoiceScarf | Item::ChoiceSpecs)
+        && !b.state.side(side).volatiles.contains(VolatileStatus::ChoiceLock)
+    {
+        push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::ChoiceLock });
+    }
+}
+
+/// Does Pressure tax this move's PP? PS deducts the extra PP when the move's resolved target
+/// is the Pressure holder (or its side): all damaging moves, foe-targeting status (Toxic,
+/// hazards, Haze, ...). Self/own-side status moves (heals, weather, screens, self-boosts,
+/// Protect) are exempt. NOTE: MoveData has no codegen'd `target` field yet, so this is a
+/// classification over the fields we have — cosim will surface any move it misclassifies.
+fn pressure_affected(md: &crate::data::MoveData) -> bool {
+    use crate::instruction::SideConditionId as Sc;
+    if md.category != MoveCategory::Status {
+        return true;
+    }
+    let own_side_condition = matches!(
+        md.side_condition,
+        Some(Sc::Reflect | Sc::LightScreen | Sc::AuroraVeil | Sc::Tailwind)
+    );
+    let self_boost_only = md.self_boosts.iter().any(|&x| x != 0)
+        && md.target_boosts.iter().all(|&x| x == 0)
+        && md.status == Status::None
+        && md.target_volatile.is_none()
+        && md.side_condition.is_none();
+    let self_only = md.heal.0 > 0
+        || md.weather != Weather::None
+        || own_side_condition
+        || self_boost_only
+        || is_protect_move(md.id)
+        || matches!(md.id.to_id(), "rest" | "substitute" | "shedtail");
+    !self_only
 }
 
 /// On-switch-in ability effects (weather setters and Intimidate).
@@ -602,8 +638,11 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     VolatileStatus::Nightmare, VolatileStatus::Attract, VolatileStatus::Torment,
     VolatileStatus::SaltCure, VolatileStatus::GlaiveRush, VolatileStatus::LockedMove,
     VolatileStatus::MustRecharge, VolatileStatus::PartiallyTrapped, VolatileStatus::Roosted,
-    // Note: ChoiceLock / Protosynthesis / QuarkDrive intentionally persist through our
-    // switch reset model is N/A — they are not in this list so a switch won't clear
+    // PS clears `choicelock` on switch-out (the lock re-picks on re-entry) — cosim caught the
+    // engine retaining it across switches.
+    VolatileStatus::ChoiceLock,
+    // Note: Protosynthesis / QuarkDrive are not cleared here yet; their re-application on
+    // switch-in isn't modeled, so clearing would lose the boost for the common stay-in case.
     // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
 ];
 
@@ -793,9 +832,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Are we cashing in a two-turn move that finished charging last turn?
     let executing_charge = matches!(pending, PendingMove::Charging(m) if m == move_id);
 
-    // PP is paid on the charge turn, not the strike turn.
-    if !executing_charge && b.state.side(side).active().moves[move_idx as usize].pp > 0 {
-        push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount: 1 });
+    // PP is paid on the charge turn, not the strike turn. Pressure on the opposing active
+    // costs one extra PP for any move that targets it (PS onDeductPP; cosim caught this).
+    if !executing_charge {
+        let pp = b.state.side(side).active().moves[move_idx as usize].pp;
+        if pp > 0 {
+            let foe_active = b.state.side(side.other()).active();
+            let pressured = foe_active.is_alive()
+                && foe_active.ability == crate::ids::Ability::Pressure
+                && pressure_affected(&md);
+            let amount = if pressured { 2u8.min(pp) } else { 1 };
+            push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount });
+        }
     }
 
     // Record the move use for consecutive-use mechanics (streak / Protect stall chain). The
@@ -941,7 +989,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             let slot = hb.state.side(foe).active_index;
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: dealt });
         }
-        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, calc.life_orb, calc.def_item, calc.def_ability);
+        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability);
         vec![(hb, false)]
     } else if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
@@ -1362,6 +1410,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let mut any_damage = false;
     let mut hit_sub = false;
     let mut total_dealt: i32 = 0;
+    let mut hits_landed: u8 = 0;
     for &(roll, crit) in hits {
         let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
         let raw = rolls[roll as usize];
@@ -1394,9 +1443,10 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             push(b, Instruction::Damage { side: foe, slot, amount: dmg });
             any_damage = true;
             total_dealt += dmg as i32;
+            hits_landed += 1;
         }
     }
-    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, life_orb, def_item, def_ability);
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, hits_landed, life_orb, def_item, def_ability);
     hit_sub
 }
 
@@ -1410,6 +1460,7 @@ fn apply_post_damage(
     total_dealt: i32,
     any_damage: bool,
     hit_sub: bool,
+    hits_landed: u8,
     life_orb: bool,
     def_item: Item,
     def_ability: crate::ids::Ability,
@@ -1527,13 +1578,15 @@ fn apply_post_damage(
         }
     }
 
-    // Track times the target has been hit by a damaging move (Rage Fist). A hit absorbed by
-    // a Substitute doesn't count.
-    if any_damage && !hit_sub && b.state.side(foe).active().is_alive() {
+    // Track times the target has been hit (Rage Fist). PS counts each hit of a multi-hit
+    // move separately (cosim caught the engine counting once per move). A hit absorbed by a
+    // Substitute doesn't count.
+    if any_damage && !hit_sub && hits_landed > 0 && b.state.side(foe).active().is_alive() {
         let fslot = b.state.side(foe).active_index;
         let cur = b.state.side(foe).active().times_hit;
-        if cur < 250 {
-            push(b, Instruction::SetTimesHit { side: foe, slot: fslot, previous: cur, new: cur + 1 });
+        let new = cur.saturating_add(hits_landed).min(250);
+        if new != cur {
+            push(b, Instruction::SetTimesHit { side: foe, slot: fslot, previous: cur, new });
         }
     }
 
@@ -1681,10 +1734,12 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
     // Convolve the per-hit distribution up to `max` times, clamping cumulative damage at the
     // target's HP (all overkill collapses to one faint outcome, bounding the support size).
     // After the kᵗʰ convolution, mix in the branch for "exactly k hits" weighted by P(k).
+    // The distribution is keyed by (total damage, hit count): hit count is itself observable
+    // state (Rage Fist's times-hit counts every hit), so merging across it would be lossy.
     let cap = b.state.side(foe).active().hp.max(0) as i32;
     let mut conv: HashMap<i32, f32> = HashMap::new();
     conv.insert(0, 1.0);
-    let mut dist: HashMap<i32, f32> = HashMap::new();
+    let mut dist: HashMap<(i32, usize), f32> = HashMap::new();
     for k in 1..=max {
         let mut next: HashMap<i32, f32> = HashMap::with_capacity(conv.len() + 32);
         for (&t, &pt) in &conv {
@@ -1695,20 +1750,20 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
         conv = next;
         if let Some(&(_, pk)) = counts.iter().find(|(c, _)| *c == k) {
             for (&t, &p) in &conv {
-                *dist.entry(t).or_insert(0.0) += pk * p;
+                *dist.entry((t, k)).or_insert(0.0) += pk * p;
             }
         }
     }
 
-    // One branch per distinct total damage.
+    // One branch per distinct (total damage, hit count).
     let mut out = Vec::with_capacity(dist.len());
-    for (total, p) in dist {
+    for ((total, hits), p) in dist {
         let mut hb = scaled(b, hit_prob * p);
         if total > 0 {
             let slot = hb.state.side(foe).active_index;
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: total as i16 });
         }
-        apply_post_damage(&mut hb, side, md, total, total > 0, false, calc.life_orb, calc.def_item, calc.def_ability);
+        apply_post_damage(&mut hb, side, md, total, total > 0, false, hits as u8, calc.life_orb, calc.def_item, calc.def_ability);
         out.push((hb, false));
     }
     out
@@ -2117,10 +2172,11 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         }
     }
     // Roost: the user loses its Flying type until the end of the turn, so the foe's move this
-    // turn hits the grounded typing. (Types aren't compared and re-project next turn, so we
-    // simply drop Flying for the rest of this turn's resolution.) Two PS caveats: Roost fails
-    // entirely at full HP (the heal fails → the `roost` volatile is never added → Flying is
-    // kept), and a Terastallized user keeps its Flying type (the volatile's onStart bails).
+    // turn hits the grounded typing; the `Roosted` volatile marks it for restoration at end
+    // of turn (PS's `roost` volatile has duration 1 — cosim caught the engine dropping
+    // Flying permanently). Two PS caveats: Roost fails entirely at full HP (the heal fails →
+    // the volatile is never added → Flying is kept), and a Terastallized user keeps its
+    // Flying type (the volatile's onStart bails).
     if md.id.to_id() == "roost" {
         let p = hit.state.side(side).active();
         if p.types.contains(&Type::Flying) && !heal_user_was_full && !p.terastallized {
@@ -2131,6 +2187,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
                 if prev[1] == Type::Flying { Type::None } else { prev[1] },
             ];
             push(&mut hit, Instruction::ChangeTypes { side, slot, previous: prev, new });
+            push(&mut hit, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Roosted });
         }
     }
     // Self-boosts (Swords Dance, Dragon Dance, ...).
@@ -2430,6 +2487,19 @@ fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
         let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
         if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
             raise_boost(b, side, BoostIndex::Speed, 1);
+        }
+
+        // Roost wears off: restore the user's pre-Roost typing. (In the modeled scope, types
+        // only change via Roost and Tera, so base types — or the tera type — are exact.)
+        if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {
+            let p = b.state.side(side).active();
+            if p.is_alive() {
+                let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
+                if p.types != restored {
+                    push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
+                }
+            }
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Roosted });
         }
 
         // Advance the active mon's turn counter (used by Fake Out / First Impression / Slow

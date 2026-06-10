@@ -272,8 +272,11 @@ impl State {
                 self.sides[side.index()].pokemon[slot as usize].ability = new;
             }
             ToggleTerastallized { side, slot } => {
-                let p = &mut self.sides[side.index()].pokemon[slot as usize];
-                p.terastallized = !p.terastallized;
+                let s = &mut self.sides[side.index()];
+                s.pokemon[slot as usize].terastallized = !s.pokemon[slot as usize].terastallized;
+                // Once-per-battle side flag. Recomputation is exact in both directions because
+                // the generator gates tera on !tera_used (a side toggles at most once).
+                s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
         }
     }
@@ -388,8 +391,11 @@ impl State {
                 self.sides[side.index()].pokemon[slot as usize].ability = previous;
             }
             ToggleTerastallized { side, slot } => {
-                let p = &mut self.sides[side.index()].pokemon[slot as usize];
-                p.terastallized = !p.terastallized;
+                let s = &mut self.sides[side.index()];
+                s.pokemon[slot as usize].terastallized = !s.pokemon[slot as usize].terastallized;
+                // Once-per-battle side flag. Recomputation is exact in both directions because
+                // the generator gates tera on !tera_used (a side toggles at most once).
+                s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
         }
     }

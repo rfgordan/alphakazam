@@ -177,7 +177,7 @@ fn encode_field(v: &mut Vec<f32>, side: &Side) {
         PendingMove::Recharging => 3,
     };
     one_hot(v, pend, 4);
-    let side_terad = side.pokemon.iter().any(|m| m.terastallized);
+    let side_terad = side.tera_used || side.pokemon.iter().any(|m| m.terastallized);
     v.push((present && !side_terad && !p.terastallized) as u8 as f32); // can still Terastallize
 }
 

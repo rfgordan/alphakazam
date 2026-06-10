@@ -1,0 +1,10 @@
+# Pinned Pokémon Showdown commit — the ground truth this engine is verified against.
+#
+# The clone at engines/pokemon-showdown is gitignored; this lockfile is the source of truth.
+# Every recorded verification artifact stamps this commit, and the harness refuses to run
+# against a clone at a different commit (see harness/check-ps-pin.mjs).
+#
+# To update: check out the new commit in engines/pokemon-showdown, rebuild dist
+# (`node build` in the clone), update the hash here, and regenerate all corpora.
+commit=b9dc987d344635789116ae46c48f8e2480e0ddc2
+date=2026-06-03

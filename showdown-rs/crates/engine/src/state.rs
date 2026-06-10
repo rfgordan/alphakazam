@@ -225,6 +225,12 @@ pub struct Side {
     /// failed Protect. Reset on switch.
     pub stall_counter: u8,
 
+    /// This side has used its once-per-battle Terastallization. Derivable from
+    /// `pokemon[].terastallized` during engine-only play, but stored explicitly because the
+    /// flag is unrecoverable from a PS snapshot once the tera'd mon faints (and the RL agent
+    /// needs it as a feature).
+    pub tera_used: bool,
+
     /// Wish: (turns remaining, heal amount). turns == 0 means inactive.
     pub wish: (u8, i16),
     /// Future Sight: (turns remaining, source party slot). turns == 0 means inactive.
@@ -259,6 +265,7 @@ impl Side {
         last_used_move: MoveId::None,
         move_streak: 0,
         stall_counter: 0,
+        tera_used: false,
         wish: (0, 0),
         future_sight: (0, 0),
     };
