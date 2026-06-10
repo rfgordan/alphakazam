@@ -61,6 +61,27 @@ const TEAM_OU_2 = [
 	'Toxapex||leftovers|regenerator|surf,sludgebomb,recover,haze|Bold|248,252,8,,,|||||,,,,,Steel',
 ].join(']');
 
+// Directed-coverage teams: deliberately exercise mechanics the OU pair never touches —
+// sleep/yawn/para/burn status, screens + Light Clay, weather abilities, Trick Room, tailwind,
+// spikes/toxic spikes/web stacks, Leech Seed, Substitute, Encore, Taunt, protect stalling.
+const TEAM_DIVERSE_1 = [
+	'Torkoal||heatrock|drought|lavaplume,yawn,stealthrock,rapidspin|Bold|248,,252,,8,|||||,,,,,Fire',
+	'Amoonguss||rockyhelmet|regenerator|spore,gigadrain,sludgebomb,synthesis|Calm|248,,80,,180,|||||,,,,,Water',
+	'Grimmsnarl||lightclay|prankster|reflect,lightscreen,spiritbreak,taunt|Careful|248,,8,,252,|||||,,,,,Steel',
+	'Skarmory||rockyhelmet|sturdy|spikes,roost,bodypress,whirlwind|Impish|252,,252,,4,|||||,,,,,Water',
+	'Slowking||leftovers|regenerator|trickroom,psychic,chillingwater,slackoff|Relaxed|252,,252,4,,|||||,,,,,Fairy',
+	'Garchomp||leftovers|roughskin|substitute,earthquake,swordsdance,dragonclaw|Jolly|,252,,,4,252|||||,,,,,Steel',
+].join(']');
+
+const TEAM_DIVERSE_2 = [
+	'Pelipper||damprock|drizzle|hydropump,hurricane,roost,uturn|Bold|248,,252,,8,|||||,,,,,Water',
+	'Breloom||focussash|technician|machpunch,bulletseed,spore,swordsdance|Adamant|,252,,,4,252|||||,,,,,Fighting',
+	'Klefki||lightclay|prankster|thunderwave,spikes,foulplay,lightscreen|Careful|248,,8,,252,|||||,,,,,Water',
+	'Whimsicott||focussash|prankster|tailwind,encore,moonblast,memento|Timid|,,,252,4,252|||||,,,,,Fairy',
+	'Ninetales-Alola||lightclay|snowwarning|auroraveil,blizzard,moonblast,encore|Timid|,,,252,4,252|||||,,,,,Ice',
+	'Toxtricity||throatspray|punkrock|boomburst,overdrive,toxic,shiftgear|Modest|,,,252,4,252|||||,,,,,Normal',
+].join(']');
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -139,7 +160,7 @@ const DROP_TOP = new Set([
 const DROP_SIDE = new Set(['foe', 'allySide', 'team', 'choice', 'avatar', 'activeRequest']);
 const DROP_POKEMON = new Set(['m', 'set', 'speciesState', 'moveLastTurnResult']);
 
-function snapshot(battle) {
+function snapshot(battle, roster) {
 	const ser = State.serializeBattle(battle);
 	const out = {};
 	for (const k of Object.keys(ser)) {
@@ -150,11 +171,15 @@ function snapshot(battle) {
 		for (const k of Object.keys(side)) {
 			if (!DROP_SIDE.has(k)) s[k] = side[k];
 		}
-		s.pokemon = side.pokemon.map(p => {
+		s.pokemon = side.pokemon.map((p, pi) => {
 			const q = {};
 			for (const k of Object.keys(p)) {
 				if (!DROP_POKEMON.has(k)) q[k] = p[k];
 			}
+			// Stable identity across PS's array reordering AND forme changes (Palafin-Hero
+			// changes `details` mid-battle): index into the battle-start roster, keyed by the
+			// live pokemon's immutable `set` object.
+			q.rosterIndex = roster[si].indexOf(battle.sides[si].pokemon[pi].set);
 			return q;
 		});
 		// Synthesized: has this side spent its Terastallization? PS deletes `terastallized`
@@ -230,15 +255,26 @@ function chooseFor(request, rand) {
 // ---- main -----------------------------------------------------------------------
 
 async function main() {
-	const t1 = TEAMSET === 'ou' ? TEAM_OU_1 : TEAM_OU_1;
-	const t2 = TEAMSET === 'ou' ? TEAM_OU_2 : TEAM_OU_2;
+	// Teams: fixed packed sets, or PS-generated random-battle teams (deterministic per seed).
+	let team1, team2;
+	if (FORMAT.includes('random')) {
+		team1 = Teams.pack(Teams.generate(FORMAT, { seed: [0, 0, 0, SEED_NUM * 2 + 1] }));
+		team2 = Teams.pack(Teams.generate(FORMAT, { seed: [0, 0, 0, SEED_NUM * 2 + 2] }));
+	} else {
+		const [t1, t2] = TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
+		team1 = Teams.pack(Teams.import(t1));
+		team2 = Teams.pack(Teams.import(t2));
+	}
 	const battle = new Battle({
-		formatid: FORMAT,
+		// Random-battle TEAMS are pre-generated above; the battle itself runs as a custom game
+		// so PS doesn't re-roll teams from the battle seed.
+		formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT,
 		seed: [SEED_NUM, SEED_NUM + 7, SEED_NUM + 13, SEED_NUM + 29],
-		p1: { name: 'Red', team: Teams.pack(Teams.import(t1)) },
-		p2: { name: 'Blue', team: Teams.pack(Teams.import(t2)) },
+		p1: { name: 'Red', team: team1 },
+		p2: { name: 'Blue', team: team2 },
 	});
 
+	const roster = battle.sides.map(side => side.pokemon.map(p => p.set));
 	const draws = [];
 	instrumentPrng(battle, draws);
 	const rng = { p1: makeRng(SEED_NUM * 2 + 1), p2: makeRng(SEED_NUM * 2 + 2) };
@@ -254,7 +290,15 @@ async function main() {
 			if (!req || req.wait) continue;
 			requests[side.id] = JSON.parse(JSON.stringify(req));
 			const c = chooseFor(req, rng[side.id]);
-			if (c) choices[side.id] = c;
+			if (c) {
+				// Switch choices: also resolve to the stable roster index (forme-proof identity).
+				const m = c.choice.match(/^switch (\d+)$/);
+				if (m) {
+					const target = side.pokemon[Number(m[1]) - 1];
+					c.resolved.rosterIndex = roster[side.n].indexOf(target.set);
+				}
+				choices[side.id] = c;
+			}
 		}
 		if (!Object.keys(choices).length) {
 			throw new Error(`no side can act at decision ${decisions.length} (requestState=${requestState})`);
@@ -274,7 +318,7 @@ async function main() {
 			requests,
 			choices,
 			draws: draws.splice(0, draws.length),
-			stateAfter: snapshot(battle),
+			stateAfter: snapshot(battle, roster),
 		});
 	}
 

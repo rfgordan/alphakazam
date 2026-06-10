@@ -68,6 +68,9 @@ pub struct Resolved {
     /// For switches: the PS ident ("p2: Slowking") and full details ("Slowking-Galar, M").
     pub ident: Option<String>,
     pub details: Option<String>,
+    /// Stable battle-start roster slot (forme-proof identity); preferred over `details`.
+    #[serde(rename = "rosterIndex")]
+    pub roster_index: Option<u8>,
 }
 
 pub fn load_trace(path: &str) -> Result<Trace, String> {

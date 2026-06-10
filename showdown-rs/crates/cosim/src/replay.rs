@@ -118,12 +118,16 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         let pending_state = if k == 1 { before } else { &unit[k - 1].state_after };
         for (side_key, choice) in &sw.choices {
             let si = if side_key == "p1" { 0 } else { 1 };
-            let Some(details) = &choice.resolved.details else {
-                return mk(Verdict::Unsupported(Unsupported("switch:no-details".into())), legality);
-            };
-            let slot = match canon.slot(si, &species_id_of_details(details)) {
-                Ok(s) => s,
-                Err(u) => return mk(Verdict::Unsupported(u), legality),
+            let slot = if let Some(ri) = choice.resolved.roster_index {
+                ri
+            } else {
+                let Some(details) = &choice.resolved.details else {
+                    return mk(Verdict::Unsupported(Unsupported("switch:no-details".into())), legality);
+                };
+                match canon.slot(si, &species_id_of_details(details)) {
+                    Ok(s) => s,
+                    Err(u) => return mk(Verdict::Unsupported(u), legality),
+                }
             };
             // NOTE: `pending_state` for k==1 is the pre-turn state; the request actually arose
             // mid-resolution. Distinguish pivot vs faint by the *requesting* side's active HP in
@@ -233,6 +237,9 @@ fn resolve_choice(
             Ok((MoveChoice::Move(slot as u8), r.tera))
         }
         "switch" => {
+            if let Some(ri) = r.roster_index {
+                return Ok((MoveChoice::Switch(ri), false));
+            }
             let details = r.details.as_deref().ok_or_else(|| Unsupported("choice:switch-no-details".into()))?;
             let slot = canon.slot(si, &species_id_of_details(details))?;
             Ok((MoveChoice::Switch(slot), false))

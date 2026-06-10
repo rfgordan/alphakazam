@@ -316,6 +316,13 @@ pub enum Item {
     ChestoBerry,
     LumBerry,
     ThroatSpray,
+    /// Extends screens (Reflect / Light Screen / Aurora Veil) to 8 turns.
+    LightClay,
+    /// Extend the matching self-set weather to 8 turns.
+    HeatRock,
+    DampRock,
+    SmoothRock,
+    IcyRock,
     /// Catch-all for a held item the engine doesn't model — preserves "has an item"
     /// (needed by Knock Off, Acrobatics, etc.) without modeling its effect.
     Other,

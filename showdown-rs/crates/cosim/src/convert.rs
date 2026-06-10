@@ -123,7 +123,12 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool) -> Res<Sid
     let mut active: Option<(u8, &Value)> = None;
     for p in mons {
         let id = species_id_of_details(s(p, "details"));
-        let slot = canon.slot(si, &id)?;
+        // Stable identity: the recorder stamps each mon with its battle-start roster slot
+        // (immune to PS array reordering and to forme changes renaming `details`).
+        let slot = match p.get("rosterIndex").and_then(Value::as_i64) {
+            Some(ri) if (0..6).contains(&ri) => ri as u8,
+            _ => canon.slot(si, &id)?,
+        };
         side.pokemon[slot as usize] = convert_pokemon(p, &id)?;
         if b(p, "isActive") {
             active = Some((slot, p));
@@ -433,3 +438,82 @@ fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon:
 pub fn side_id(idx: usize) -> SideId {
     if idx == 0 { SideId::One } else { SideId::Two }
 }
+
+// ---- frontier scanning -----------------------------------------------------------------
+
+/// Walk a full state JSON and report *every* id outside the engine's modeled set — not just
+/// the first conversion failure. This is the work-queue generator for "implement the full
+/// game": the aggregate report ranks these by how many traces they block.
+pub fn scan_frontier(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+    let Some(sides) = v["sides"].as_array() else { return };
+    for side in sides {
+        for p in side["pokemon"].as_array().into_iter().flatten() {
+            let species = species_id_of_details(s(p, "details"));
+            if Species::from_id(&species).is_none() {
+                out.insert(format!("species:{species}"));
+            }
+            let ability = s(p, "ability");
+            if !ability.is_empty() && Ability::from_id(ability).is_none() {
+                out.insert(format!("ability:{ability}"));
+            }
+            let item = s(p, "item");
+            if !item.is_empty() && Item::from_id(item).is_none() {
+                out.insert(format!("item:{item}"));
+            }
+            for m in p["moveSlots"].as_array().into_iter().flatten() {
+                let mid = s(m, "id");
+                if MoveId::from_id(mid).is_none() {
+                    out.insert(format!("move:{mid}"));
+                }
+            }
+            for (k, _) in p["volatiles"].as_object().into_iter().flatten() {
+                if !KNOWN_VOLATILES.contains(&k.as_str()) {
+                    out.insert(format!("volatile:{k}"));
+                }
+            }
+            if b(p, "transformed") {
+                out.insert("pokemon:transformed".into());
+            }
+            if p.get("addedType").and_then(Value::as_str).is_some_and(|t| !t.is_empty()) {
+                out.insert("pokemon:addedType".into());
+            }
+        }
+        for (k, _) in side["sideConditions"].as_object().into_iter().flatten() {
+            if !KNOWN_SIDE_CONDITIONS.contains(&k.as_str()) {
+                out.insert(format!("sidecondition:{k}"));
+            }
+        }
+        if let Some(slots) = side.get("slotConditions").and_then(Value::as_object) {
+            for conds in slots.values() {
+                for (k, _) in conds.as_object().into_iter().flatten() {
+                    if !matches!(k.as_str(), "wish" | "futuremove") {
+                        out.insert(format!("slotcondition:{k}"));
+                    }
+                }
+            }
+        }
+    }
+    for (k, _) in v["field"]["pseudoWeather"].as_object().into_iter().flatten() {
+        if k != "trickroom" {
+            out.insert(format!("pseudoweather:{k}"));
+        }
+    }
+    let weather = s(&v["field"], "weather");
+    if !weather.is_empty() && Weather::from_id(weather).is_none() {
+        out.insert(format!("weather:{weather}"));
+    }
+}
+
+/// Volatile ids `convert_volatiles` knows how to map. Keep in sync with that match.
+const KNOWN_VOLATILES: &[&str] = &[
+    "confusion", "substitute", "leechseed", "taunt", "encore", "disable", "yawn", "perishsong",
+    "perish3", "perish2", "perish1", "stall", "choicelock", "saltcure", "curse", "nightmare",
+    "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
+    "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
+    "flinch", "charge",
+];
+
+const KNOWN_SIDE_CONDITIONS: &[&str] = &[
+    "stealthrock", "spikes", "toxicspikes", "stickyweb", "reflect", "lightscreen", "auroraveil",
+    "tailwind",
+];

@@ -28,6 +28,8 @@ struct Totals {
     legality: BTreeMap<String, u32>,
     /// move id -> (times in matched units, times in non-matched units)
     move_coverage: BTreeMap<String, (u32, u32)>,
+    /// frontier id -> number of traces it appears in (the work queue, ranked by blockage)
+    frontier_traces: BTreeMap<String, u32>,
 }
 
 fn main() -> ExitCode {
@@ -56,6 +58,15 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             _ => {}
+        }
+
+        // Full-frontier scan: every unmapped id anywhere in this trace, deduped.
+        let mut frontier = std::collections::BTreeSet::new();
+        for d in &t.decisions {
+            convert::scan_frontier(&d.state_after, &mut frontier);
+        }
+        for f in frontier {
+            *totals.frontier_traces.entry(f).or_insert(0) += 1;
         }
 
         let units = match replay_trace(&t) {
@@ -129,6 +140,7 @@ fn main() -> ExitCode {
         );
     }
     print_ranked("divergence categories", &totals.divergence_categories);
+    print_ranked("FRONTIER (work queue, by traces blocked)", &totals.frontier_traces);
     print_ranked("unsupported frontier", &totals.unsupported_reasons);
     print_ranked("legality mismatches", &totals.legality);
 

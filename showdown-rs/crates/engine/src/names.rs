@@ -248,6 +248,11 @@ id_map!(Item {
     ChestoBerry => "chestoberry",
     LumBerry => "lumberry",
     ThroatSpray => "throatspray",
+    LightClay => "lightclay",
+    HeatRock => "heatrock",
+    DampRock => "damprock",
+    SmoothRock => "smoothrock",
+    IcyRock => "icyrock",
     Other => "other",
     // Fog-of-war sentinel (see `State::observe`); never a real PS id.
     Unknown => "unknown",

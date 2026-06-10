@@ -414,7 +414,8 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
         _ => Weather::None,
     };
     if weather != Weather::None && b.state.weather != weather {
-        set_weather(b, weather, 5);
+        let turns = weather_set_turns(b.state.side(side).active().item, weather);
+        set_weather(b, weather, turns);
     }
     // Intimidate: lower the opposing active's Attack by 1 on switch-in.
     if ability == IntimidateAbility {
@@ -2214,10 +2215,19 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         }
     }
     if let Some(sc) = md.side_condition {
-        apply_hazard(&mut hit, foe, sc);
+        match sc {
+            // Screens / Tailwind are set on the USER's side with a turn duration (the old code
+            // routed everything to the foe's side with value 1 — caught by cosim).
+            SideConditionId::Reflect | SideConditionId::LightScreen | SideConditionId::AuroraVeil
+            | SideConditionId::Tailwind => {
+                apply_own_side_condition(&mut hit, side, sc);
+            }
+            _ => apply_hazard(&mut hit, foe, sc),
+        }
     }
     if md.weather != Weather::None && hit.state.weather != md.weather {
-        set_weather(&mut hit, md.weather, 5);
+        let turns = weather_set_turns(hit.state.side(side).active().item, md.weather);
+        set_weather(&mut hit, md.weather, turns);
     }
     if md.status != Status::None && !foe_immune && status_applies(hit.state.side(foe).active(), md.status) {
         let slot = hit.state.side(foe).active_index;
@@ -2311,6 +2321,45 @@ fn apply_hazard(b: &mut Branch, target: SideId, sc: SideConditionId) {
     if cur < max {
         push(b, Instruction::SetSideCondition { side: target, condition: sc, previous: cur, new: cur + 1 });
     }
+}
+
+/// Set an own-side duration condition (Reflect / Light Screen / Aurora Veil / Tailwind).
+/// Fails (no-op) if already up; Aurora Veil additionally requires Snow. Light Clay extends
+/// screens to 8 turns.
+fn apply_own_side_condition(b: &mut Branch, side: SideId, sc: SideConditionId) {
+    let conds = &b.state.side(side).side_conditions;
+    let cur = match sc {
+        SideConditionId::Reflect => conds.reflect,
+        SideConditionId::LightScreen => conds.light_screen,
+        SideConditionId::AuroraVeil => conds.aurora_veil,
+        SideConditionId::Tailwind => conds.tailwind,
+        _ => return,
+    };
+    if cur > 0 {
+        return; // already active: the move fails
+    }
+    if sc == SideConditionId::AuroraVeil && b.state.weather != Weather::Snow {
+        return; // Aurora Veil only works in snow
+    }
+    let clay = b.state.side(side).active().item == Item::LightClay;
+    let turns = match sc {
+        SideConditionId::Tailwind => 4,
+        _ if clay => 8,
+        _ => 5,
+    };
+    push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: turns });
+}
+
+/// Self-set weather duration: 8 turns when the setter holds the matching rock, else 5.
+fn weather_set_turns(item: Item, weather: Weather) -> i8 {
+    let extended = matches!(
+        (item, weather),
+        (Item::HeatRock, Weather::Sun)
+            | (Item::DampRock, Weather::Rain)
+            | (Item::SmoothRock, Weather::Sand)
+            | (Item::IcyRock, Weather::Snow)
+    );
+    if extended { 8 } else { 5 }
 }
 
 // --- end of turn -------------------------------------------------------------
@@ -2512,6 +2561,47 @@ fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
                 previous: cur,
                 new: cur + 1,
             });
+        }
+    }
+
+    // --- duration ticking (cosim caught all of these as permanently-stuck effects) ---
+    // Weather / terrain / Trick Room count down each end of turn and expire at 0.
+    if b.state.weather != Weather::None && b.state.weather_turns > 0 {
+        push(b, Instruction::DecrementWeatherTurns);
+        if b.state.weather_turns == 0 {
+            set_weather(b, Weather::None, 0);
+        }
+    }
+    if b.state.terrain != crate::ids::Terrain::None && b.state.terrain_turns > 0 {
+        push(b, Instruction::DecrementTerrainTurns);
+        if b.state.terrain_turns == 0 {
+            push(b, Instruction::ChangeTerrain {
+                previous: b.state.terrain,
+                previous_turns: 0,
+                new: crate::ids::Terrain::None,
+                new_turns: 0,
+            });
+        }
+    }
+    if b.state.trick_room && b.state.trick_room_turns > 0 {
+        push(b, Instruction::DecrementTrickRoomTurns);
+        if b.state.trick_room_turns == 0 {
+            push(b, Instruction::ToggleTrickRoom { previous_turns: 0, new_turns: 0 });
+        }
+    }
+    // Screens / Tailwind tick per side and clear at 0.
+    for side in [SideId::One, SideId::Two] {
+        use SideConditionId::*;
+        let conds = b.state.side(side).side_conditions;
+        for (sc, cur) in [
+            (Reflect, conds.reflect),
+            (LightScreen, conds.light_screen),
+            (AuroraVeil, conds.aurora_veil),
+            (Tailwind, conds.tailwind),
+        ] {
+            if cur > 0 {
+                push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: cur - 1 });
+            }
         }
     }
 }
