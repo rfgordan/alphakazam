@@ -634,6 +634,39 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
 /// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
 const CRIT: f32 = 1.0 / 24.0;
 
+/// Crit chance for this attack. Stages: base 0 (1/24), +(crit_ratio-1) from the move (Slash
+/// family), +2 Focus Energy / Dragon Cheer, +1 Scope Lens / Razor Claw, +1 Super Luck;
+/// stages 0/1/2/3+ -> 1/24, 1/8, 1/2, always. Always-crit moves crit unconditionally;
+/// Battle Armor / Shell Armor (unless ignored) never crit.
+fn crit_chance(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    let def = b.state.side(foe).active();
+    let mb = matches!(b.state.side(side).active().ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
+    if !mb && matches!(def.ability, Ab::BattleArmor | Ab::ShellArmor) {
+        return 0.0;
+    }
+    if md.always_crit {
+        return 1.0;
+    }
+    let mut stage = (md.crit_ratio.max(1) - 1) as u32;
+    if b.state.side(side).volatiles.contains(VolatileStatus::FocusEnergy) {
+        stage += 2;
+    }
+    if matches!(b.state.side(side).active().item, Item::ScopeLens | Item::RazorClaw) {
+        stage += 1;
+    }
+    if b.state.side(side).active().ability == Ab::SuperLuck {
+        stage += 1;
+    }
+    match stage {
+        0 => 1.0 / 24.0,
+        1 => 1.0 / 8.0,
+        2 => 0.5,
+        _ => 1.0,
+    }
+}
+
 /// Maximum hit count for which we enumerate the *full* per-hit (roll × crit) product.
 /// At 3 hits that's 32³ = 32,768 branches (~28 MB of states) — fine. Above this the
 /// product explodes (Population Bomb's 10 hits → 32¹⁰ ≈ 1.1e15 branches, ~1 EB, which
@@ -753,7 +786,9 @@ fn branch_confusion_counter(b: Branch, side: SideId) -> Vec<Branch> {
 fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
     use crate::instruction::ActiveCounter;
     let Some(v) = md.target_volatile else { return vec![b] };
-    let foe = side.other();
+    // Self-targeting moves (Focus Energy, Substitute-likes, Aqua Ring) put the volatile on
+    // the USER; everything else on the foe.
+    let foe = if md.target == crate::data::MoveTarget::User { side } else { side.other() };
     if !b.state.side(foe).active().is_alive() || b.state.side(foe).volatiles.contains(v) {
         return vec![b];
     }
@@ -1133,10 +1168,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         vec![(hb, false)]
     } else if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
+        let crit_p = crit_chance(&b, side, &md);
         for combo in HitCombos::new(hits_min) {
             let mut prob = hit_prob;
             for &(_, crit) in &combo {
-                prob *= (1.0 / 16.0) * if crit { CRIT } else { 1.0 - CRIT };
+                prob *= (1.0 / 16.0) * if crit { crit_p } else { 1.0 - crit_p };
+            }
+            if prob <= 0.0 {
+                continue;
             }
             let mut hb = scaled(&b, prob);
             let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
@@ -1179,6 +1218,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             out.push(sb);
         }
     }
+    let out = if md.force_switch {
+        // Dragon Tail / Circle Throw: the survivor is dragged out (uniform over the bench).
+        out.into_iter().flat_map(|x| apply_drag(x, foe)).collect()
+    } else {
+        out
+    };
     apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling)
 }
 
@@ -1866,9 +1911,14 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
 
     // Per-hit damage value → probability (32 entries: 16 non-crit + 16 crit).
     let mut per_hit: Vec<(i32, f32)> = Vec::with_capacity(32);
+    let crit_p = crit_chance(b, side, md);
     for i in 0..16 {
-        per_hit.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - CRIT)));
-        per_hit.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * CRIT));
+        if crit_p < 1.0 {
+            per_hit.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - crit_p)));
+        }
+        if crit_p > 0.0 {
+            per_hit.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * crit_p));
+        }
     }
 
     // Convolve the per-hit distribution up to `max` times, clamping cumulative damage at the
@@ -2242,6 +2292,29 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     // Rest: cures status, falls asleep, and heals to full. Implemented as an onHit callback
     // in PS (no static fields). Fails at full HP. The sleep counter is excluded from the
     // comparison and re-projected each turn, so we only set the status + heal.
+    // Wish: heals half the caster's max HP into whatever occupies the slot, at the end of
+    // NEXT turn. Fails while one is already pending.
+    if md.id.to_id() == "wish" {
+        let mut b = b;
+        if b.state.side(side).wish.0 == 0 {
+            let amt = b.state.side(side).active().max_hp / 2;
+            let prev = b.state.side(side).wish;
+            push(&mut b, Instruction::SetWish { side, previous: prev, new: (2, amt) });
+        }
+        return vec![b];
+    }
+    // Future Sight / Doom Desire: schedules an attack on the TARGET side that lands at the
+    // end of the second turn from now, computed from the caster's stats at hit time.
+    if matches!(md.id.to_id(), "futuresight" | "doomdesire") {
+        let mut b = b;
+        let target = side.other();
+        if b.state.side(target).future_sight.0 == 0 {
+            let caster_slot = b.state.side(side).active_index;
+            let prev = b.state.side(target).future_sight;
+            push(&mut b, Instruction::SetFutureSight { side: target, previous: prev, new: (3, caster_slot) });
+        }
+        return vec![b];
+    }
     if md.id.to_id() == "rest" {
         let mut b = b;
         let (hp, maxhp, status, item) = {
@@ -2413,6 +2486,10 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
             .flat_map(|x| apply_status_target_volatile(x, side, md, foe_moves_later))
             .collect();
     }
+    if md.force_switch {
+        // Roar / Whirlwind: phaze the foe into a random bench mon.
+        hits = hits.into_iter().flat_map(|x| apply_drag(x, foe)).collect();
+    }
 
     if miss_prob > 0.0 {
         hits.push(scaled(&b, miss_prob));
@@ -2540,6 +2617,68 @@ fn weather_set_turns(item: Item, weather: Weather) -> i8 {
             | (Item::IcyRock, Weather::Snow)
     );
     if extended { 8 } else { 5 }
+}
+
+/// Whirlwind / Roar / Dragon Tail / Circle Throw: drag the foe into a uniformly-random alive
+/// bench mon (each target is its own branch). No-op if the foe has no bench or fainted.
+fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
+    if !b.state.side(dragged).active().is_alive() {
+        return vec![b];
+    }
+    let sd = b.state.side(dragged);
+    let bench: Vec<u8> = (0..6u8)
+        .filter(|&i| {
+            i != sd.active_index
+                && sd.pokemon[i as usize].species != crate::ids::Species::None
+                && sd.pokemon[i as usize].is_alive()
+        })
+        .collect();
+    if bench.is_empty() {
+        return vec![b];
+    }
+    let p = 1.0 / bench.len() as f32;
+    bench
+        .into_iter()
+        .map(|t| {
+            let mut nb = scaled(&b, p);
+            apply_switch(&mut nb, dragged, t);
+            nb
+        })
+        .collect()
+}
+
+/// The 16 damage rolls of a landing Future Sight / Doom Desire: computed at hit time from the
+/// stored caster's Special Attack vs the target's current Special Defense. (Approximation: no
+/// crit branch, no caster boosts.)
+fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i16; 16] {
+    let src_side = target_side.other();
+    let caster = &state.side(src_side).pokemon[(caster_slot as usize).min(5)];
+    let target = state.side(target_side).active();
+    let doom = caster.moves.iter().any(|m| m.id.to_id() == "doomdesire");
+    let (bp, typ) = if doom { (140u16, Type::Steel) } else { (120u16, Type::Psychic) };
+    let sc = &state.side(target_side).side_conditions;
+    let screened = sc.light_screen > 0 || sc.aurora_veil > 0;
+    let input = crate::damage::DamageInput {
+        level: caster.level,
+        base_power: bp,
+        category: MoveCategory::Special,
+        move_type: typ,
+        attacker_types: caster.types,
+        attacker_base_types: caster.base_types,
+        defender_types: target.types,
+        attack_stat: caster.stat(crate::ids::StatIndex::SpecialAttack),
+        defense_stat: target.stat(crate::ids::StatIndex::SpecialDefense).max(1),
+        is_crit: false,
+        attacker_burned: false,
+        weather: state.weather,
+        terastallized: caster.terastallized,
+        tera_type: caster.tera_type,
+        life_orb: false,
+        adaptability: false,
+        final_num: 1,
+        final_den: if screened { 2 } else { 1 },
+    };
+    crate::damage::damage_rolls(&input)
 }
 
 // --- end of turn -------------------------------------------------------------
@@ -2828,6 +2967,21 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 yawn_fired[side.index()] = true;
             }
         }
+        // Wish: ticks each end of turn; heals the slot's occupant when it lands.
+        let wish = b.state.side(side).wish;
+        if wish.0 > 0 {
+            let landed = wish.0 == 1;
+            let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
+            push(b, Instruction::SetWish { side, previous: wish, new });
+            if landed {
+                let p = b.state.side(side).active();
+                if p.is_alive() && p.hp < p.max_hp {
+                    let amt = wish.1.min(p.max_hp - p.hp);
+                    let slot = b.state.side(side).active_index;
+                    push(b, Instruction::Heal { side, slot, amount: amt });
+                }
+            }
+        }
         if b.state.side(side).volatiles.contains(VolatileStatus::PerishSong) {
             let pt = b.state.side(side).perish_turns;
             let new = pt.saturating_sub(1);
@@ -2839,6 +2993,20 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 if hp > 0 {
                     push(b, Instruction::Damage { side, slot, amount: hp });
                 }
+            }
+        }
+    }
+
+    // Future Sight: tick; mark a strike when it lands (stochastic rolls -> branch below).
+    let mut fs_fired: [Option<u8>; 2] = [None, None];
+    for side in [SideId::One, SideId::Two] {
+        let fs = b.state.side(side).future_sight;
+        if fs.0 > 0 {
+            let lands = fs.0 == 1;
+            let new = if lands { (0, 0) } else { (fs.0 - 1, fs.1) };
+            push(b, Instruction::SetFutureSight { side, previous: fs, new });
+            if lands && b.state.side(side).active().is_alive() {
+                fs_fired[side.index()] = Some(fs.1);
             }
         }
     }
@@ -2861,6 +3029,34 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 } else {
                     vec![x]
                 }
+            })
+            .collect();
+    }
+    // Future Sight strikes: 16 damage rolls, each its own branch.
+    for (i, fired) in fs_fired.into_iter().enumerate() {
+        let Some(caster_slot) = fired else { continue };
+        let side = if i == 0 { SideId::One } else { SideId::Two };
+        out = out
+            .into_iter()
+            .flat_map(|x| {
+                let target = x.state.side(side).active();
+                if !target.is_alive() {
+                    return vec![x];
+                }
+                let rolls = future_sight_rolls(&x.state, side, caster_slot);
+                let hp = target.hp;
+                let slot = x.state.side(side).active_index;
+                rolls
+                    .into_iter()
+                    .map(|r| {
+                        let mut nb = scaled(&x, 1.0 / 16.0);
+                        let dmg = r.min(hp).max(0);
+                        if dmg > 0 {
+                            push(&mut nb, Instruction::Damage { side, slot, amount: dmg });
+                        }
+                        nb
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
     }

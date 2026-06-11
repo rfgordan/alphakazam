@@ -139,4 +139,5 @@ id_map!(VolatileStatus {
     ChoiceLock => "choicelock",
     Protosynthesis => "protosynthesis",
     QuarkDrive => "quarkdrive",
+    FocusEnergy => "focusenergy",
 });

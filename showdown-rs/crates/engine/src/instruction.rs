@@ -133,6 +133,8 @@ pub enum Instruction {
     SetEncore { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
     SetDisable { side: SideId, previous: (MoveId, u8), new: (MoveId, u8) },
     SetActiveCounter { side: SideId, which: ActiveCounter, previous: u8, new: u8 },
+    SetWish { side: SideId, previous: (u8, i16), new: (u8, i16) },
+    SetFutureSight { side: SideId, previous: (u8, u8), new: (u8, u8) },
 
     // --- battle-long per-mon history (persists across switches) ---
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
@@ -251,6 +253,12 @@ impl State {
             SetActiveCounter { side, which, new, .. } => {
                 set_active_counter(self, side, which, new);
             }
+            SetWish { side, new, .. } => {
+                self.side_mut(side).wish = new;
+            }
+            SetFutureSight { side, new, .. } => {
+                self.side_mut(side).future_sight = new;
+            }
             SetAbilityUsed { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].ability_used = new;
             }
@@ -367,6 +375,12 @@ impl State {
             }
             SetActiveCounter { side, which, previous, .. } => {
                 set_active_counter(self, side, which, previous);
+            }
+            SetWish { side, previous, .. } => {
+                self.side_mut(side).wish = previous;
+            }
+            SetFutureSight { side, previous, .. } => {
+                self.side_mut(side).future_sight = previous;
             }
             SetAbilityUsed { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].ability_used = previous;

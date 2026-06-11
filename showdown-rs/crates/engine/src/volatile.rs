@@ -41,6 +41,7 @@ pub enum VolatileStatus {
     ChoiceLock,      // locked into one move by a Choice item
     Protosynthesis,  // Booster Energy / sun stat boost active
     QuarkDrive,      // Booster Energy / electric terrain stat boost active
+    FocusEnergy,     // +2 crit stages (Focus Energy / Dragon Cheer)
 }
 
 /// A packed set of active-Pokémon volatile statuses.
