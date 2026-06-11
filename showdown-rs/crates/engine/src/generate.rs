@@ -374,32 +374,11 @@ fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
     }
 }
 
-/// Does Pressure tax this move's PP? PS deducts the extra PP when the move's resolved target
-/// is the Pressure holder (or its side): all damaging moves, foe-targeting status (Toxic,
-/// hazards, Haze, ...). Self/own-side status moves (heals, weather, screens, self-boosts,
-/// Protect) are exempt. NOTE: MoveData has no codegen'd `target` field yet, so this is a
-/// classification over the fields we have — cosim will surface any move it misclassifies.
+/// Does Pressure tax this move's PP? Exact via the move's codegen'd target field.
 fn pressure_affected(md: &crate::data::MoveData) -> bool {
-    use crate::instruction::SideConditionId as Sc;
-    if md.category != MoveCategory::Status {
-        return true;
-    }
-    let own_side_condition = matches!(
-        md.side_condition,
-        Some(Sc::Reflect | Sc::LightScreen | Sc::AuroraVeil | Sc::Tailwind)
-    );
-    let self_boost_only = md.self_boosts.iter().any(|&x| x != 0)
-        && md.target_boosts.iter().all(|&x| x == 0)
-        && md.status == Status::None
-        && md.target_volatile.is_none()
-        && md.side_condition.is_none();
-    let self_only = md.heal.0 > 0
-        || md.weather != Weather::None
-        || own_side_condition
-        || self_boost_only
-        || is_protect_move(md.id)
-        || matches!(md.id.to_id(), "rest" | "substitute" | "shedtail");
-    !self_only
+    // PS: Pressure deducts an extra PP when the move's resolved target includes the Pressure
+    // holder or its side. With the codegen'd target field this is now exact.
+    md.target.targets_foe()
 }
 
 /// On-switch-in ability effects (weather setters and Intimidate).
@@ -418,7 +397,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
         set_weather(b, weather, turns);
     }
     // Intimidate: lower the opposing active's Attack by 1 on switch-in.
-    if ability == IntimidateAbility {
+    if ability == Intimidate {
         let foe = side.other();
         if b.state.side(foe).active().is_alive() {
             if apply_boost_clamped(b, foe, BoostIndex::Attack, -1) < 0 {

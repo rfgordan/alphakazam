@@ -12,9 +12,6 @@ use crate::data::{base_stats, species_types};
 use crate::ids::{Ability, Item, MoveId, Nature, Species, StatIndex, Type};
 use crate::state::{MoveSlot, Pokemon, Side, State};
 
-/// Move PP we assign when building from scratch (PS PP isn't in the data tables yet). Generous
-/// so self-play games rarely PP-stall into Struggle; tune down to exercise Struggle.
-const DEFAULT_PP: u8 = 24;
 const DEFAULT_IV: u8 = 31;
 
 /// A declarative team member. All identifiers are PS `toID` strings.
@@ -57,7 +54,9 @@ pub fn build_member(spec: &MemberSpec, level: u8) -> Pokemon {
     for (i, m) in spec.moves.iter().enumerate() {
         if let Some(id) = MoveId::from_id(m) {
             if id != MoveId::None {
-                moves[i] = MoveSlot { id, pp: DEFAULT_PP, max_pp: DEFAULT_PP, disabled: false };
+                // PS default sets carry max PP Ups: max PP = base × 8/5.
+                let pp = (crate::data::move_data(id).pp as u16 * 8 / 5) as u8;
+                moves[i] = MoveSlot { id, pp, max_pp: pp, disabled: false };
             }
         }
     }

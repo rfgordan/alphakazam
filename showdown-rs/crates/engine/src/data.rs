@@ -11,6 +11,43 @@ use crate::instruction::SideConditionId;
 use crate::volatile::VolatileStatus;
 
 /// The full record for a move: damage fields plus a data description of its effects.
+/// Who a move targets (PS's `target` field). Drives Pressure PP, drag/self routing,
+/// redirection, and spread logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum MoveTarget {
+    Normal = 0,
+    User,               // PS "self"
+    AdjacentAlly,
+    AdjacentAllyOrSelf,
+    AdjacentFoe,
+    AllAdjacent,
+    AllAdjacentFoes,
+    All,
+    Allies,
+    AllySide,
+    AllyTeam,
+    Any,
+    FoeSide,
+    RandomNormal,
+    Scripted,
+}
+
+impl MoveTarget {
+    /// Does this move target the opposing side (Pressure-taxed, can be redirected, ...)?
+    pub fn targets_foe(self) -> bool {
+        !matches!(
+            self,
+            MoveTarget::User
+                | MoveTarget::AdjacentAlly
+                | MoveTarget::AdjacentAllyOrSelf
+                | MoveTarget::Allies
+                | MoveTarget::AllySide
+                | MoveTarget::AllyTeam
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoveData {
     pub id: MoveId,
@@ -20,6 +57,13 @@ pub struct MoveData {
     /// Accuracy in percent; `0` means "never misses" (bypasses the accuracy check).
     pub accuracy: u8,
     pub priority: i8,
+    /// Base PP (before PP Ups; PS default sets carry max PP Ups = ×8/5).
+    pub pp: u8,
+    pub target: MoveTarget,
+    /// Crit-stage bonus from the move itself (1 = normal, 2 = high-crit like Slash, ...).
+    pub crit_ratio: u8,
+    /// Always crits (Wicked Blow, Surging Strikes, Flower Trick, ...).
+    pub always_crit: bool,
     /// Number of hits (1 for most; e.g. Dragon Darts = 2). For a variable multi-hit move
     /// (Bullet Seed, Rock Blast, ...) this is the guaranteed *minimum*; `hits_max` the max.
     pub hits: u8,
@@ -81,6 +125,10 @@ impl MoveData {
             base_power,
             accuracy,
             priority,
+            pp: 0,
+            target: MoveTarget::Normal,
+            crit_ratio: 1,
+            always_crit: false,
             hits: 1,
             hits_max: 1,
             flinch_chance: 0,
