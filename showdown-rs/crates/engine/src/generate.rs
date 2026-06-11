@@ -1601,6 +1601,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
             return vec![b];
         }
+        // A Substitute blocks foe-targeting status moves unless they bypass it (sound
+        // moves, Taunt, Encore, ...) or the user has Infiltrator.
+        if targets_foe
+            && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute)
+            && !md.flag_bypass_sub
+            && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator
+        {
+            return vec![b];
+        }
         let mut branches = execute_status_move(b, side, &md, foe_pending_move.is_some());
         // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
         if let Some(t) = pivot {
@@ -4233,8 +4242,32 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         }
     }
 
-    // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
+    // Shed Skin: 33% chance each end of turn to cure the holder's status (branches).
     let mut out = vec![branch];
+    for side in [SideId::One, SideId::Two] {
+        out = out
+            .into_iter()
+            .flat_map(|b| {
+                let p = b.state.side(side).active();
+                if p.ability == crate::ids::Ability::ShedSkin && p.status != Status::None && p.is_alive() {
+                    let slot = b.state.side(side).active_index;
+                    let (prev, prev_ctr) = (p.status, p.status_counter);
+                    let mut cure = scaled(&b, 33.0 / 100.0);
+                    push(&mut cure, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
+                    if prev_ctr != 0 {
+                        push(&mut cure, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
+                    }
+                    let keep = scaled(&b, 67.0 / 100.0);
+                    vec![cure, keep]
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+    }
+
+    // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
+    let mut out = out;
     for (i, fired) in yawn_fired.into_iter().enumerate() {
         if !fired {
             continue;

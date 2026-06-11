@@ -122,6 +122,8 @@ pub struct MoveData {
     /// Powder move (Spore, Sleep Powder, Stun Spore): no effect on Grass types, Overcoat,
     /// or Safety Goggles holders.
     pub flag_powder: bool,
+    /// `bypasssub` flag: sound moves, Taunt, Encore, ... act through a Substitute.
+    pub flag_bypass_sub: bool,
 }
 
 impl MoveData {
@@ -167,6 +169,7 @@ impl MoveData {
             flag_pulse: false,
             flag_heal: false,
             flag_powder: false,
+            flag_bypass_sub: false,
         }
     }
 }

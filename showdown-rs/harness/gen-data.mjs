@@ -132,6 +132,7 @@ moves.forEach((m, i) => {
 		`flag_pulse: ${!!(m.flags && m.flags.pulse)}`,
 		`flag_heal: ${!!(m.flags && m.flags.heal)}`,
 		`flag_powder: ${!!(m.flags && m.flags.powder)}`,
+		`flag_bypass_sub: ${!!(m.flags && m.flags.bypasssub)}`,
 		`pp: ${m.pp || 0}`,
 		`target: ${targetRs(m.target)}`,
 		`crit_ratio: ${m.critRatio || 1}`,
