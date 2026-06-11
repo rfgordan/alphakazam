@@ -31,6 +31,8 @@ const sideCondRs = (s) => s && SIDECOND[s] ? `Some(SideConditionId::${SIDECOND[s
 const WEATHER = { sunnyday:'Sun', raindance:'Rain', sandstorm:'Sand', snow:'Snow', snowscape:'Snow', hail:'Snow' };
 const weatherRs = (s) => s && WEATHER[s] ? `Weather::${WEATHER[s]}` : 'Weather::None';
 
+// Boost effects PS implements via onHit callbacks (invisible to field extraction).
+const MANUAL_TARGET_BOOSTS = { partingshot: { atk: -1, spa: -1 } };
 const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock' };
 const volatileRs = (s) => s && VOLATILE[s] ? `Some(VolatileStatus::${VOLATILE[s]})` : 'None';
 
@@ -108,7 +110,7 @@ moves.forEach((m, i) => {
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
-		`target_boosts: ${boostsRs(targetBoostsObj)}`,
+		`target_boosts: ${boostsRs(MANUAL_TARGET_BOOSTS[m.id] || targetBoostsObj)}`,
 		`secondary_chance: ${secChance}`,
 		`secondary_boosts: ${boostsRs(sec && sec.boosts)}`,
 		`secondary_status: ${statusRs(sec && sec.status)}`,

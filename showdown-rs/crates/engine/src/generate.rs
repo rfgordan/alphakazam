@@ -235,6 +235,85 @@ fn apply_post_status_self_destruct(b: &mut Branch, side: SideId, _md: &crate::da
     }
 }
 
+/// A status move that affects the FOE (Thunder Wave, Taunt, Parting Shot, ...), as opposed
+/// to self/field moves — used for Prankster's Dark-type immunity.
+fn targets_foe_status(md: &crate::data::MoveData) -> bool {
+    md.status != Status::None
+        || md.target_boosts.iter().any(|&x| x != 0)
+        || md.target_volatile.is_some()
+        || md.force_switch
+        || matches!(md.id.to_id(), "partingshot" | "trick" | "switcheroo" | "encore" | "disable" | "taunt" | "whirlwind" | "roar" | "defog")
+}
+
+/// Sleep Clause Mod: an induced (non-Rest) sleep fails while any other Pokémon on the
+/// target's side is already asleep.
+fn sleep_clause_blocks(state: &State, side: SideId) -> bool {
+    let s = state.side(side);
+    s.pokemon.iter().enumerate().any(|(i, p)| {
+        i as u8 != s.active_index
+            && p.species != crate::ids::Species::None
+            && p.is_alive()
+            && p.status == Status::Sleep
+    })
+}
+
+/// Rampage moves lock the user in for 2-3 turns total, then confuse it.
+fn is_rampage_move(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "outrage" | "petaldance" | "thrash" | "ragingfury")
+}
+
+/// Apply rampage lock state transitions to every outcome branch after the move resolves.
+/// (Approximation: a miss mid-rampage should end the lock without confusion; this treats
+/// all branches alike.)
+fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
+    use crate::state::PendingMove;
+    if !is_rampage_move(move_id) {
+        return out;
+    }
+    out.into_iter()
+        .flat_map(|mut b| {
+            if !b.state.side(side).active().is_alive() {
+                return vec![b];
+            }
+            let pending = b.state.side(side).pending_move;
+            match pending {
+                PendingMove::Rampaging(m, n) if m == move_id => {
+                    if n > 1 {
+                        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Rampaging(m, n - 1) });
+                        vec![b]
+                    } else {
+                        // Natural end: the user becomes confused.
+                        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+                        if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                            push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+                        }
+                        if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
+                            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
+                            return branch_confusion_counter(b, side);
+                        }
+                        vec![b]
+                    }
+                }
+                PendingMove::None => {
+                    // Starting a rampage: total 2 or 3 turns -> 1 or 2 remaining (uniform).
+                    [1u8, 2]
+                        .into_iter()
+                        .map(|rem| {
+                            let mut nb = scaled(&b, 0.5);
+                            push(&mut nb, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Rampaging(move_id, rem) });
+                            if !nb.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                                push(&mut nb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::LockedMove });
+                            }
+                            nb
+                        })
+                        .collect()
+                }
+                _ => vec![b],
+            }
+        })
+        .collect()
+}
+
 /// Heal Block (Psychic Noise): all HP restoration for this side's active is prevented.
 fn heal_blocked(b: &Branch, side: SideId) -> bool {
     b.state.side(side).volatiles.contains(VolatileStatus::HealBlock)
@@ -473,6 +552,14 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
+    // Toxic's damage stage resets whenever the badly-poisoned mon re-enters.
+    {
+        let p = b.state.side(side).active();
+        if p.status == Status::Toxic && p.status_counter != 0 {
+            let (slot, prev) = (b.state.side(side).active_index, p.status_counter);
+            push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev, new: 0 });
+        }
+    }
     // Healing Wish / Lunar Dance: heal the incoming mon if it needs it (wish persists
     // until a damaged-or-statused mon enters).
     if b.state.side(side).healing_wish {
@@ -494,7 +581,9 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             push(b, Instruction::SetHealingWish { side, previous: true, new: false });
         }
     }
-    apply_switch_in_ability(b, side);
+    if b.state.side(side).active().is_alive() {
+        apply_switch_in_ability(b, side);
+    }
 }
 
 /// Zero all of a side's active-only state that resets on switch: consecutive-use tracking
@@ -587,7 +676,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     use crate::ids::Ability::*;
     let ability = b.state.side(side).active().ability;
     let weather = match ability {
-        Drought => Weather::Sun,
+        Drought | OrichalcumPulse => Weather::Sun,
         Drizzle => Weather::Rain,
         SandStream => Weather::Sand,
         SnowWarning => Weather::Snow,
@@ -599,7 +688,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     }
     // Terrain surges set their terrain for 5 turns (8 with Terrain Extender).
     let terrain = match ability {
-        ElectricSurge => crate::ids::Terrain::Electric,
+        ElectricSurge | HadronEngine => crate::ids::Terrain::Electric,
         GrassySurge => crate::ids::Terrain::Grassy,
         PsychicSurge => crate::ids::Terrain::Psychic,
         MistySurge => crate::ids::Terrain::Misty,
@@ -613,6 +702,13 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             new: terrain,
             new_turns: turns,
         });
+    }
+    // Dauntless Shield / Intrepid Sword: +1 Def / +1 Atk, once per battle.
+    if matches!(ability, DauntlessShield | IntrepidSword) && !b.state.side(side).active().ability_used {
+        let stat = if ability == DauntlessShield { BoostIndex::Defense } else { BoostIndex::Attack };
+        raise_boost(b, side, stat, 1);
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::SetAbilityUsed { side, slot, previous: false, new: true });
     }
     // Imposter (Ditto): transform into the foe's active immediately on switch-in.
     if ability == Imposter {
@@ -636,6 +732,11 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
                 | Multitype | NeutralizingGas | PowerConstruct | PowerOfAlchemy | Receiver
                 | RKSSystem | Schooling | ShieldsDown | StanceChange | WonderGuard | ZenMode
                 | ZeroToHero | Commander
+                // PS `notrace` flag additions:
+                | BattleBond | DauntlessShield | EmbodyAspectCornerstone | EmbodyAspectHearthflame
+                | EmbodyAspectTeal | EmbodyAspectWellspring | Hospitality | IntrepidSword
+                | OrichalcumPulse | HadronEngine | PoisonPuppeteer | Protosynthesis | QuarkDrive
+                | TeraShell | TeraShift | TeraformZero
         );
         if b.state.side(foe).active().is_alive() && !untraceable {
             let slot = b.state.side(side).active_index;
@@ -847,6 +948,18 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     let mut pri = md.priority;
     if md.category == MoveCategory::Status
         && state.side(side).active().ability == crate::ids::Ability::Prankster
+    {
+        pri += 1;
+    }
+    if md.id.to_id() == "grassyglide"
+        && state.terrain == crate::ids::Terrain::Grassy
+        && is_grounded(state, side)
+    {
+        pri += 1;
+    }
+    if state.side(side).active().ability == crate::ids::Ability::GaleWings
+        && md.typ == Type::Flying
+        && state.side(side).active().hp >= state.side(side).active().max_hp
     {
         pri += 1;
     }
@@ -1228,7 +1341,37 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
         }
     }
+    // A rampaging mon (Outrage / Thrash / ...) is locked into its move and pays no PP on
+    // continuation turns.
+    let rampaging_now = matches!(b.state.side(side).pending_move, crate::state::PendingMove::Rampaging(..));
+    if let crate::state::PendingMove::Rampaging(m, _) = b.state.side(side).pending_move {
+        if !struggling {
+            if let Some(slot_i) = b.state.side(side).active().moves.iter().position(|ms| ms.id == m) {
+                if slot_i as u8 != move_idx {
+                    move_idx = slot_i as u8;
+                    md = move_data(m);
+                }
+            }
+        }
+    }
     let move_id = if struggling { move_id } else { b.state.side(side).active().moves[move_idx as usize].id };
+
+    // Destiny Bond lasts until the user's next move: moving again drops it.
+    if b.state.side(side).volatiles.contains(VolatileStatus::DestinyBond) {
+        push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::DestinyBond });
+    }
+
+    // Tera Blast: when the user is terastallized it becomes the tera type and uses the
+    // higher of the user's (boosted) Atk / SpA.
+    if md.id.to_id() == "terablast" && b.state.side(side).active().terastallized {
+        let p = b.state.side(side).active();
+        if p.tera_type != Type::None {
+            md.typ = p.tera_type;
+        }
+        let atk = boosted_stat(p.stat(crate::ids::StatIndex::Attack) as i64, b.state.side(side).boost(BoostIndex::Attack));
+        let spa = boosted_stat(p.stat(crate::ids::StatIndex::SpecialAttack) as i64, b.state.side(side).boost(BoostIndex::SpecialAttack));
+        md.category = if atk > spa { MoveCategory::Physical } else { MoveCategory::Special };
+    }
 
     // Disable: the disabled move fails outright; Taunt: status moves fail.
     if !struggling {
@@ -1244,6 +1387,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             return vec![b];
         }
         if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
+            return vec![b];
+        }
+        // Prankster-boosted status moves fail against Dark-type targets.
+        if md.category == MoveCategory::Status
+            && b.state.side(side).active().ability == crate::ids::Ability::Prankster
+            && md.target != crate::data::MoveTarget::User
+            && b.state.side(side.other()).active().types.contains(&Type::Dark)
+            && targets_foe_status(&md)
+        {
             return vec![b];
         }
     }
@@ -1285,7 +1437,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // PP is paid on the charge turn, not the strike turn. Pressure on the opposing active
     // costs one extra PP for any move that targets it (PS onDeductPP; cosim caught this).
-    if !executing_charge {
+    if !executing_charge && !rampaging_now {
         let pp = b.state.side(side).active().moves[move_idx as usize].pp;
         if pp > 0 {
             let foe_active = b.state.side(side.other()).active();
@@ -1362,6 +1514,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Protect: a protected target blocks the incoming damaging move (Protect moves +4
     // priority, so the protector has already set the volatile this turn).
     if b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
+        // High Jump Kick / Jump Kick still crash into the protector (1/2 max HP).
+        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick") {
+            let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
+            let crash = (maxhp / 2).min(hp);
+            if crash > 0 && b.state.side(side).active().ability != crate::ids::Ability::MagicGuard {
+                let slot = b.state.side(side).active_index;
+                push(&mut b, Instruction::Damage { side, slot, amount: crash });
+            }
+        }
         return vec![b];
     }
 
@@ -1526,6 +1687,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         out
     };
+    let out = apply_rampage_state(out, side, move_id);
     apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling)
 }
 
@@ -1820,6 +1982,15 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         // Rage Fist: 50 + 50 per time the user has been hit this battle, capped at 350.
         "ragefist" => {
             base_power = (50u16.saturating_mul(1 + attacker.times_hit as u16)).min(350);
+        }
+        // Stored Power / Power Trip: 20 + 20 per positive stat stage on the user.
+        "storedpower" | "powertrip" => {
+            let stages: i16 = b.state.side(side).boosts.iter().map(|&x| (x.max(0)) as i16).sum();
+            base_power = (20 + 20 * stages as u16).max(20);
+        }
+        // Psyblade: x1.5 in Electric Terrain (any user; terrain applies to the field).
+        "psyblade" if b.state.terrain == crate::ids::Terrain::Electric => {
+            base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
         }
         _ => {}
     }
@@ -2148,6 +2319,7 @@ fn apply_post_damage(
 
     // Defender on-hit reaction abilities (only when the hit connected with the mon itself).
     if any_damage && !hit_sub {
+        maybe_eat_sitrus(b, foe);
         let f = b.state.side(foe).active();
         if f.is_alive() {
             use crate::ids::Ability as Ab;
@@ -2216,11 +2388,18 @@ fn apply_white_herb(b: &mut Branch, side: SideId) {
     if b.state.side(side).active().item != Item::WhiteHerb {
         return;
     }
+    let mut restored = false;
     for stat in BOOST_ORDER {
         let cur = b.state.side(side).boost(stat);
         if cur < 0 {
             push(b, Instruction::Boost { side, stat, amount: -cur });
+            restored = true;
         }
+    }
+    if restored {
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::ChangeItem { side, slot, previous: Item::WhiteHerb, new: Item::None });
+        on_item_lost(b, side);
     }
 }
 
@@ -2282,6 +2461,9 @@ fn apply_weakness_policy(b: &mut Branch, foe: SideId, md: &crate::data::MoveData
     {
         raise_boost(b, foe, BoostIndex::Attack, 2);
         raise_boost(b, foe, BoostIndex::SpecialAttack, 2);
+        let slot = b.state.side(foe).active_index;
+        push(b, Instruction::ChangeItem { side: foe, slot, previous: Item::WeaknessPolicy, new: Item::None });
+        on_item_lost(b, foe);
     }
 }
 
@@ -2428,6 +2610,25 @@ fn status_blocked_by_field(state: &State, target: SideId, status: Status) -> boo
 /// Lum Berry: cures any status the instant it lands, consuming the berry (a real state
 /// change — the old model pretended the status never stuck, leaving the berry in hand).
 fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
+    // Lum also cures confusion (it triggers on any status condition incl. volatile confusion).
+    {
+        let p = b.state.side(side).active();
+        if p.item == Item::LumBerry
+            && p.status == Status::None
+            && p.is_alive()
+            && b.state.side(side).volatiles.contains(VolatileStatus::Confusion)
+        {
+            let slot = b.state.side(side).active_index;
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Confusion });
+            let ct = b.state.side(side).confusion_turns;
+            if ct != 0 {
+                push(b, Instruction::SetActiveCounter { side, which: crate::instruction::ActiveCounter::Confusion, previous: ct, new: 0 });
+            }
+            push(b, Instruction::ChangeItem { side, slot, previous: Item::LumBerry, new: Item::None });
+            on_item_lost(b, side);
+            return;
+        }
+    }
     let p = b.state.side(side).active();
     if p.item == Item::LumBerry && p.status != Status::None && p.is_alive() {
         let slot = b.state.side(side).active_index;
@@ -2458,6 +2659,9 @@ fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
 /// (modeled as a volatile read by `effective_speed`); Cheek Pouch heals 1/3 max HP when the
 /// loss was eating a berry (callers that consume berries call `on_berry_eaten` instead).
 fn on_item_lost(b: &mut Branch, side: SideId) {
+    if b.state.side(side).volatiles.contains(VolatileStatus::ChoiceLock) {
+        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::ChoiceLock });
+    }
     let p = b.state.side(side).active();
     if p.ability == crate::ids::Ability::Unburden
         && !b.state.side(side).volatiles.contains(VolatileStatus::Unburden)
@@ -2467,6 +2671,19 @@ fn on_item_lost(b: &mut Branch, side: SideId) {
 }
 
 /// Berry consumption: item-loss bookkeeping plus Cheek Pouch's 1/3 max HP heal.
+/// Sitrus Berry: when damage leaves the holder at 1/2 max HP or less, it eats the berry
+/// and heals 1/4 max HP.
+fn maybe_eat_sitrus(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if p.item == Item::SitrusBerry && p.is_alive() && p.hp * 2 <= p.max_hp {
+        let slot = b.state.side(side).active_index;
+        let amt = (p.max_hp / 4).max(1).min(p.max_hp - p.hp);
+        push(b, Instruction::Heal { side, slot, amount: amt });
+        push(b, Instruction::ChangeItem { side, slot, previous: Item::SitrusBerry, new: Item::None });
+        on_berry_eaten(b, side);
+    }
+}
+
 fn on_berry_eaten(b: &mut Branch, side: SideId) {
     on_item_lost(b, side);
     let p = b.state.side(side).active();
@@ -2594,7 +2811,6 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
 fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let foe = side.other();
     if b.state.side(foe).active().ability != crate::ids::Ability::CursedBody
-        || !b.state.side(foe).active().is_alive()
         || !b.state.side(side).active().is_alive()
         || b.state.side(side).volatiles.contains(VolatileStatus::Disable)
         || md.id == crate::ids::MoveId::None
@@ -2653,6 +2869,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if md.secondary_status != Status::None
         && status_applies(proc.state.side(foe).active(), md.secondary_status)
         && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
+        && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
     {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
@@ -2708,7 +2925,9 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     use crate::instruction::ActiveCounter;
     if md.id == crate::ids::MoveId::from_id("throatchop").unwrap_or(crate::ids::MoveId::None) && !hit_sub {
         let foe = side.other();
-        if b.state.side(foe).active().is_alive() {
+        let blocked = b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+            || b.state.side(foe).active().item == Item::CovertCloak;
+        if b.state.side(foe).active().is_alive() && !blocked {
             if !b.state.side(foe).volatiles.contains(VolatileStatus::ThroatChop) {
                 push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::ThroatChop });
             }
@@ -2910,6 +3129,20 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         apply_self_boost(&mut b, side, BoostIndex::Speed, 1);
         return vec![b];
     }
+    // Fillet Away: costs 1/2 max HP (fails if HP is half or less) for +2 Atk/SpA/Spe.
+    if md.id.to_id() == "filletaway" {
+        let mut b = b;
+        let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
+        let cost = maxhp / 2;
+        if hp > cost {
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::Damage { side, slot, amount: cost });
+            apply_self_boost(&mut b, side, BoostIndex::Attack, 2);
+            apply_self_boost(&mut b, side, BoostIndex::SpecialAttack, 2);
+            apply_self_boost(&mut b, side, BoostIndex::Speed, 2);
+        }
+        return vec![b];
+    }
     // Healing Wish / Lunar Dance: the user faints (self_destruct) leaving a healing wish
     // for the next damaged replacement. Fails if there is nothing to switch to.
     if matches!(md.id.to_id(), "healingwish" | "lunardance") {
@@ -2953,6 +3186,11 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
             let their_slot = b.state.side(foe2).active_index;
             push(&mut b, Instruction::ChangeItem { side, slot: my_slot, previous: mine, new: theirs });
             push(&mut b, Instruction::ChangeItem { side: foe2, slot: their_slot, previous: theirs, new: mine });
+            for sd in [side, foe2] {
+                if b.state.side(sd).volatiles.contains(VolatileStatus::ChoiceLock) {
+                    push(&mut b, Instruction::RemoveVolatile { side: sd, volatile: VolatileStatus::ChoiceLock });
+                }
+            }
             if theirs == Item::None {
                 on_item_lost(&mut b, side);
             }
@@ -2991,7 +3229,10 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
             let p = b.state.side(side).active();
             (p.hp, p.max_hp, p.status, p.item)
         };
-        if hp < maxhp {
+        let blocked = status == Status::Sleep
+            || matches!(b.state.side(side).active().ability, crate::ids::Ability::Insomnia | crate::ids::Ability::VitalSpirit | crate::ids::Ability::Comatose | crate::ids::Ability::PurifyingSalt)
+            || status_blocked_by_field(&b.state, side, Status::Sleep);
+        if hp < maxhp && !blocked {
             let slot = b.state.side(side).active_index;
             // Chesto Berry immediately cures the Rest sleep, so the user stays awake.
             if status != Status::Sleep && item != Item::ChestoBerry {
@@ -3138,6 +3379,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         && !foe_immune
         && status_applies(hit.state.side(foe).active(), md.status)
         && !status_blocked_by_field(&hit.state, foe, md.status)
+        && !(md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe))
     {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
@@ -3770,6 +4012,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                     && p.status == Status::None
                     && status_applies(p, Status::Sleep)
                     && !status_blocked_by_field(&x.state, side, Status::Sleep)
+                    && !sleep_clause_blocks(&x.state, side)
                 {
                     let slot = x.state.side(side).active_index;
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });

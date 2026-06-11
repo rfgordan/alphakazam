@@ -407,7 +407,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "lockedmove" => {
                 side.volatiles.insert(VolatileStatus::LockedMove);
                 let mv = MoveId::from_id(s(vv, "move")).unwrap_or(MoveId::None);
-                side.pending_move = PendingMove::Rampaging(mv, dur);
+                // `duration` resets to 2 on every use; `trueDuration` is the real number of
+                // rampage turns remaining (1 = next use ends with confusion).
+                let remaining = i(vv, "trueDuration").max(1) as u8;
+                side.pending_move = PendingMove::Rampaging(mv, remaining);
             }
             // Single-turn flags that exist only inside a turn; at decision boundaries they may
             // linger in PS for the active mid-turn snapshot but carry no cross-turn state.
