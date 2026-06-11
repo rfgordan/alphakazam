@@ -30,13 +30,13 @@ const HAZARD_FEATS: usize = 8; // SR, spikes, tspikes, web, reflect, lscreen, au
 const STAT_SCALE: f32 = 600.0; // normalizer for computed stats
 
 /// All volatile statuses, encoded as a binary flag each in the active mon's field block.
-const VOLATILES: [VolatileStatus; 29] = {
+const VOLATILES: [VolatileStatus; 31] = {
     use VolatileStatus::*;
     [
         Confusion, Substitute, LeechSeed, Taunt, Encore, Disable, Protect, Endure, Flinch, Roost,
         Charge, Yawn, PerishSong, DestinyBond, Curse, Nightmare, Attract, Torment, SaltCure,
         GlaiveRush, LockedMove, MustRecharge, PartiallyTrapped, Roosted, ChoiceLock, Protosynthesis,
-        QuarkDrive, FocusEnergy, Unburden,
+        QuarkDrive, FocusEnergy, Unburden, ThroatChop, HealBlock,
     ]
 };
 

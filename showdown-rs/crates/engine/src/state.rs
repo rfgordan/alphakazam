@@ -79,6 +79,13 @@ pub struct Pokemon {
     /// abilities that restore it; `types` reflects type changes (Soak, tera, etc.).
     pub types: [Type; 2],
     pub base_types: [Type; 2],
+    /// Transform bookkeeping: `transformed` marks an active Transform/Imposter copy; the
+    /// `base_*` fields hold what to restore when it switches out (PS reverts transform on
+    /// switch). When not transformed they mirror the current values and are never read.
+    pub transformed: bool,
+    pub base_species: Species,
+    pub base_stats: [i16; StatIndex::COUNT],
+    pub base_moves: [MoveSlot; 4],
 
     pub hp: i16,
     pub max_hp: i16,
@@ -118,6 +125,10 @@ impl Pokemon {
         level: 100,
         types: [Type::None, Type::None],
         base_types: [Type::None, Type::None],
+        transformed: false,
+        base_species: Species::None,
+        base_stats: [0; StatIndex::COUNT],
+        base_moves: [MoveSlot::EMPTY; 4],
         hp: 0,
         max_hp: 0,
         stats: [0; StatIndex::COUNT],
@@ -209,6 +220,9 @@ pub struct Side {
     pub confusion_turns: u8,
     pub perish_turns: u8,
     pub yawn_turns: u8,
+    /// Throat Chop: sound moves unusable while > 0. Heal Block: all healing blocked while > 0.
+    pub throat_chop_turns: u8,
+    pub heal_block_turns: u8,
     /// Turns the current active Pokémon has been out (0 the turn it switches in). Drives
     /// first-turn moves (Fake Out, First Impression) and Slow Start. Resets on switch.
     pub active_turns: u8,
@@ -251,6 +265,8 @@ impl Side {
         confusion_turns: 0,
         perish_turns: 0,
         yawn_turns: 0,
+        throat_chop_turns: 0,
+        heal_block_turns: 0,
         active_turns: 0,
         side_conditions: SideConditions {
             stealth_rock: false,

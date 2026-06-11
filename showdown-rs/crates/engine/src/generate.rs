@@ -165,6 +165,72 @@ fn modified_weight_hg(p: &crate::state::Pokemon) -> u32 {
     }
 }
 
+/// Snapshot the fields Transform touches on a side's active mon.
+fn transform_data_of(state: &State, side: SideId) -> crate::instruction::TransformData {
+    let p = state.side(side).active();
+    crate::instruction::TransformData {
+        species: p.species,
+        stats: p.stats,
+        types: p.types,
+        ability: p.ability,
+        moves: p.moves,
+        transformed: p.transformed,
+    }
+}
+
+/// Transform / Imposter: copy the foe's battle identity onto `side`'s active. Mirrors PS
+/// `transformInto`: species/types/stats(except HP)/ability/boosts copied; each copied move
+/// gets PP = min(5, base PP); crit volatiles (Focus Energy) copied. Fails against a
+/// substitute, a transformed target, or when the user is already transformed.
+fn apply_transform(b: &mut Branch, side: SideId) -> bool {
+    let foe = side.other();
+    let user_ok = b.state.side(side).active().is_alive() && !b.state.side(side).active().transformed;
+    let target = b.state.side(foe).active();
+    let target_ok = target.is_alive()
+        && !target.transformed
+        && !b.state.side(foe).volatiles.contains(VolatileStatus::Substitute);
+    if !user_ok || !target_ok {
+        return false;
+    }
+    let previous = transform_data_of(&b.state, side);
+    let mut new = transform_data_of(&b.state, foe);
+    new.stats[0] = previous.stats[0]; // HP is never copied
+    for m in new.moves.iter_mut() {
+        if m.id != crate::ids::MoveId::None {
+            let pp = crate::data::move_data(m.id).pp.min(5);
+            *m = crate::state::MoveSlot { id: m.id, pp, max_pp: pp, disabled: false };
+        }
+    }
+    new.transformed = true;
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = b.state.side(side).active().base_moves;
+    push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+    // Copy the foe's stat stages.
+    for stat in [
+        BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+        BoostIndex::SpecialDefense, BoostIndex::Speed, BoostIndex::Accuracy, BoostIndex::Evasion,
+    ] {
+        let delta = b.state.side(foe).boost(stat) - b.state.side(side).boost(stat);
+        if delta != 0 {
+            push(b, Instruction::Boost { side, stat, amount: delta });
+        }
+    }
+    // Crit-stage volatiles transfer.
+    let foe_fe = b.state.side(foe).volatiles.contains(VolatileStatus::FocusEnergy);
+    let my_fe = b.state.side(side).volatiles.contains(VolatileStatus::FocusEnergy);
+    if foe_fe && !my_fe {
+        push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::FocusEnergy });
+    } else if !foe_fe && my_fe {
+        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::FocusEnergy });
+    }
+    true
+}
+
+/// Heal Block (Psychic Noise): all HP restoration for this side's active is prevented.
+fn heal_blocked(b: &Branch, side: SideId) -> bool {
+    b.state.side(side).volatiles.contains(VolatileStatus::HealBlock)
+}
+
 fn is_grounded(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
     !(p.types.contains(&Type::Flying)
@@ -329,6 +395,22 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     if previous == target {
         return;
     }
+    // A transformed mon reverts to its own identity as it leaves the field.
+    if b.state.side(side).active().transformed {
+        let prev_data = transform_data_of(&b.state, side);
+        let p = b.state.side(side).active();
+        let new = crate::instruction::TransformData {
+            species: p.base_species,
+            stats: { let mut st = p.base_stats; st[0] = p.stats[0]; st },
+            types: p.base_types,
+            ability: p.base_ability,
+            moves: p.base_moves,
+            transformed: false,
+        };
+        let slot = previous;
+        let previous_base_moves = p.base_moves;
+        push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
+    }
     // Reset the outgoing active's boosts and volatiles (emit explicit deltas so the
     // instruction list stays exactly reversible).
     for stat in [
@@ -374,12 +456,19 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
 /// deltas so the instruction list stays exactly invertible.
 fn reset_move_tracking(b: &mut Branch, side: SideId) {
     use crate::ids::MoveId;
-    use crate::instruction::ActiveCounter::{ActiveTurns, Confusion, Perish, Taunt, Yawn};
+    use crate::instruction::ActiveCounter::{ActiveTurns, Confusion, HealBlock, Perish, Taunt, ThroatChop, Yawn};
     let s = b.state.side(side);
     let (lm, streak, stall) = (s.last_used_move, s.move_streak, s.stall_counter);
     let (pending, encore, disable) = (s.pending_move, s.encore, s.disable);
     let (taunt, conf, perish, yawn, active) =
         (s.taunt_turns, s.confusion_turns, s.perish_turns, s.yawn_turns, s.active_turns);
+    let (tc, hb) = (s.throat_chop_turns, s.heal_block_turns);
+    if tc != 0 {
+        push(b, Instruction::SetActiveCounter { side, which: ThroatChop, previous: tc, new: 0 });
+    }
+    if hb != 0 {
+        push(b, Instruction::SetActiveCounter { side, which: HealBlock, previous: hb, new: 0 });
+    }
     if lm != MoveId::None {
         push(b, Instruction::SetLastMove { side, previous: lm, new: MoveId::None });
     }
@@ -478,6 +567,10 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             new: terrain,
             new_turns: turns,
         });
+    }
+    // Imposter (Ditto): transform into the foe's active immediately on switch-in.
+    if ability == Imposter {
+        apply_transform(b, side);
     }
     // Frisk reveals the opponent's held item on switch-in (information only).
     if ability == Frisk {
@@ -744,6 +837,7 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // PS clears `choicelock` on switch-out (the lock re-picks on re-entry) — cosim caught the
     // engine retaining it across switches.
     VolatileStatus::ChoiceLock,
+    VolatileStatus::ThroatChop, VolatileStatus::HealBlock,
     // Note: Protosynthesis / QuarkDrive are not cleared here yet; their re-application on
     // switch-in isn't modeled, so clearing would lose the boost for the common stay-in case.
     // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
@@ -1092,6 +1186,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if !struggling {
         let dis = b.state.side(side).disable;
         if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
+            return vec![b];
+        }
+        // Throat Chop: sound moves fail. Heal Block: heal-flag moves (incl. drains) fail.
+        if b.state.side(side).volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound {
+            return vec![b];
+        }
+        if b.state.side(side).volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal {
             return vec![b];
         }
         if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
@@ -2504,6 +2605,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         procs = procs.into_iter().flat_map(|x| branch_sleep_counter(x, foe)).collect();
     }
     // Chance-based volatile secondaries (Hurricane / Dynamic Punch confusion, Dire Claw ...).
+    use crate::instruction::ActiveCounter;
     if let Some(v) = md.secondary_volatile {
         procs = procs
             .into_iter()
@@ -2512,6 +2614,15 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
                     push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: v });
                     if v == VolatileStatus::Confusion {
                         return branch_confusion_counter(x, foe);
+                    }
+                    // Psychic Noise / Throat Chop: 2-turn countdowns alongside the volatile.
+                    if v == VolatileStatus::HealBlock {
+                        let prev = x.state.side(foe).heal_block_turns;
+                        push(&mut x, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::HealBlock, previous: prev, new: 2 });
+                    }
+                    if v == VolatileStatus::ThroatChop {
+                        let prev = x.state.side(foe).throat_chop_turns;
+                        push(&mut x, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::ThroatChop, previous: prev, new: 2 });
                     }
                 }
                 vec![x]
@@ -2529,6 +2640,21 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
             apply_self_boost(b, side, BOOST_ORDER[i], delta);
+        }
+    }
+    // Throat Chop's volatile is applied in PS via the secondary's onHit (not volatileStatus),
+    // so the codegen can't see it; special-case it here (100% on hit, refreshes to 2 turns).
+    use crate::instruction::ActiveCounter;
+    if md.id == crate::ids::MoveId::from_id("throatchop").unwrap_or(crate::ids::MoveId::None) && !hit_sub {
+        let foe = side.other();
+        if b.state.side(foe).active().is_alive() {
+            if !b.state.side(foe).volatiles.contains(VolatileStatus::ThroatChop) {
+                push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::ThroatChop });
+            }
+            let prev = b.state.side(foe).throat_chop_turns;
+            if prev != 2 {
+                push(b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::ThroatChop, previous: prev, new: 2 });
+            }
         }
     }
     // A target volatile (Salt Cure, ...) is blocked by a Substitute.
@@ -2701,6 +2827,12 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         apply_self_boost(&mut b, side, BoostIndex::Attack, 1);
         apply_self_boost(&mut b, side, BoostIndex::Speed, 1);
+        return vec![b];
+    }
+    // Transform copies the foe's battle identity.
+    if md.id.to_id() == "transform" {
+        let mut b = b;
+        apply_transform(&mut b, side);
         return vec![b];
     }
     // Trick / Switcheroo: swap held items (blocked by Sticky Hold).
@@ -3186,7 +3318,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             if p.is_alive() {
                 let heal16 = (matches!(ability, Ab::RainDish | Ab::DrySkin) && matches!(b.state.weather, Weather::Rain | Weather::HeavyRain))
                     || (ability == Ab::IceBody && b.state.weather == Weather::Snow);
-                if heal16 && p.hp < p.max_hp {
+                if heal16 && p.hp < p.max_hp && !heal_blocked(b, side) {
                     let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
                     push(b, Instruction::Heal { side, slot, amount: heal });
                 } else if ability == Ab::DrySkin && matches!(b.state.weather, Weather::Sun | Weather::HarshSun) && !magic_guard {
@@ -3198,7 +3330,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
 
         // Leftovers.
         let p = b.state.side(side).active();
-        if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() {
+        if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() && !heal_blocked(b, side) {
             let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
@@ -3206,7 +3338,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         let p = b.state.side(side).active();
         if p.item == Item::BlackSludge && p.is_alive() {
             if p.types.contains(&Type::Poison) {
-                if p.hp < p.max_hp {
+                if p.hp < p.max_hp && !heal_blocked(b, side) {
                     let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
                     push(b, Instruction::Heal { side, slot, amount: heal });
                 }
@@ -3219,7 +3351,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         // Grassy Terrain heals grounded actives 1/16 max HP at end of turn.
         let p = b.state.side(side).active();
         let grounded = !p.types.contains(&Type::Flying) && p.ability != crate::ids::Ability::Levitate;
-        if b.state.terrain == crate::ids::Terrain::Grassy && grounded && p.hp < p.max_hp && p.is_alive() {
+        if b.state.terrain == crate::ids::Terrain::Grassy && grounded && p.hp < p.max_hp && p.is_alive() && !heal_blocked(b, side) {
             let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
@@ -3234,7 +3366,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             let poisoned = matches!(pstatus, Status::Poison | Status::Toxic);
             if ability == Ab::PoisonHeal && poisoned {
                 let heal = (maxhp / 8).max(1).min(maxhp - php);
-                if heal > 0 {
+                if heal > 0 && !heal_blocked(b, side) {
                     push(b, Instruction::Heal { side, slot, amount: heal });
                 }
                 // Toxic still advances its counter even under Poison Heal.
@@ -3283,7 +3415,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 let f = b.state.side(other).active();
                 (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
             };
-            if f_alive {
+            if f_alive && !heal_blocked(b, other) {
                 let heal = drain.min(f_room);
                 if heal > 0 {
                     push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
@@ -3419,6 +3551,20 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Taunt });
             }
         }
+        let tc = b.state.side(side).throat_chop_turns;
+        if tc > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::ThroatChop, previous: tc, new: tc - 1 });
+            if tc == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::ThroatChop });
+            }
+        }
+        let hb = b.state.side(side).heal_block_turns;
+        if hb > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::HealBlock, previous: hb, new: hb - 1 });
+            if hb == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::HealBlock });
+            }
+        }
         let enc = b.state.side(side).encore;
         if enc.1 > 0 {
             let ends = enc.1 == 1
@@ -3454,7 +3600,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             push(b, Instruction::SetWish { side, previous: wish, new });
             if landed {
                 let p = b.state.side(side).active();
-                if p.is_alive() && p.hp < p.max_hp {
+                if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
                     let amt = wish.1.min(p.max_hp - p.hp);
                     let slot = b.state.side(side).active_index;
                     push(b, Instruction::Heal { side, slot, amount: amt });

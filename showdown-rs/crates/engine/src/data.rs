@@ -117,6 +117,8 @@ pub struct MoveData {
     pub flag_slicing: bool,
     pub flag_bullet: bool,
     pub flag_pulse: bool,
+    /// `heal` flag: the move restores HP (Recover, Roost, drains) — fails under Heal Block.
+    pub flag_heal: bool,
 }
 
 impl MoveData {
@@ -160,6 +162,7 @@ impl MoveData {
             flag_slicing: false,
             flag_bullet: false,
             flag_pulse: false,
+            flag_heal: false,
         }
     }
 }

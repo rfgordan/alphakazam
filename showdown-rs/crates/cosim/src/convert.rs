@@ -275,18 +275,38 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         types = [tera_type, Type::None];
     }
 
-    if b(p, "transformed") {
-        return Err(unsup("pokemon:transformed"));
-    }
     if b(p, "illusion") {
         return Err(unsup("pokemon:illusion"));
     }
 
+    // Transform: the snapshot's moveSlots/storedStats/types/ability are already the copied
+    // values; `baseStoredStats` holds the originals. PS doesn't serialize baseMoveSlots, so
+    // for a transformed mon `base_moves` is unknown here — converted states are used for
+    // comparison (base_* fields aren't diffed) and battle-start states are never transformed.
+    let transformed = b(p, "transformed");
+    let mut base_stats = stats;
+    if let Some(bss) = p.get("baseStoredStats").and_then(Value::as_object) {
+        for (idx, key) in ["atk", "def", "spa", "spd", "spe"].iter().enumerate() {
+            if let Some(v) = bss.get(*key).and_then(Value::as_i64) {
+                base_stats[idx + 1] = v as i16;
+            }
+        }
+    }
+    let base_species_id = to_id(s(p, "baseSpecies"));
+    let base_species = if base_species_id.is_empty() {
+        species
+    } else {
+        Species::from_id(&base_species_id).unwrap_or(species)
+    };
     Ok(Pokemon {
         species,
         level,
         types,
         base_types,
+        transformed,
+        base_species,
+        base_stats,
+        base_moves: if transformed { [MoveSlot::EMPTY; 4] } else { moves },
         hp: i(p, "hp") as i16,
         max_hp,
         stats,
@@ -338,6 +358,14 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "yawn" => {
                 side.volatiles.insert(VolatileStatus::Yawn);
                 side.yawn_turns = dur;
+            }
+            "throatchop" => {
+                side.volatiles.insert(VolatileStatus::ThroatChop);
+                side.throat_chop_turns = dur;
+            }
+            "healblock" => {
+                side.volatiles.insert(VolatileStatus::HealBlock);
+                side.heal_block_turns = dur;
             }
             "perishsong" | "perish3" | "perish2" | "perish1" => {
                 side.volatiles.insert(VolatileStatus::PerishSong);
@@ -473,7 +501,7 @@ pub fn scan_frontier(v: &Value, out: &mut std::collections::BTreeSet<String>) {
                     out.insert(format!("volatile:{k}"));
                 }
             }
-            if b(p, "transformed") {
+            if false {
                 out.insert("pokemon:transformed".into());
             }
             if p.get("addedType").and_then(Value::as_str).is_some_and(|t| !t.is_empty()) {
@@ -512,7 +540,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "perish3", "perish2", "perish1", "stall", "choicelock", "saltcure", "curse", "nightmare",
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
-    "flinch", "charge", "focusenergy", "dragoncheer", "unburden",
+    "flinch", "charge", "focusenergy", "dragoncheer", "unburden", "throatchop", "healblock",
 ];
 
 const KNOWN_SIDE_CONDITIONS: &[&str] = &[

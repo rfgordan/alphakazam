@@ -30,9 +30,26 @@ pub enum ActiveCounter {
     Confusion,
     Perish,
     Yawn,
+    ThroatChop,
+    HealBlock,
     ActiveTurns,
 }
 use crate::volatile::VolatileStatus;
+use crate::ids::Species;
+use crate::state::MoveSlot;
+
+/// Everything Transform overwrites on the user (HP/level/status are untouched). `stats[0]`
+/// (HP) is carried through unchanged by convention.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransformData {
+    pub species: Species,
+    pub stats: [i16; 6],
+    pub types: [Type; 2],
+    pub ability: Ability,
+    pub moves: [MoveSlot; 4],
+    pub transformed: bool,
+}
+
 
 /// A weighted list of instructions representing one possible outcome of a turn.
 /// `percentage` is the probability of this branch, in `[0, 100]`.
@@ -135,6 +152,10 @@ pub enum Instruction {
     SetActiveCounter { side: SideId, which: ActiveCounter, previous: u8, new: u8 },
     SetWish { side: SideId, previous: (u8, i16), new: (u8, i16) },
     SetFutureSight { side: SideId, previous: (u8, u8), new: (u8, u8) },
+    /// Transform / Imposter: replace the active's battle identity with a copy of the foe's
+    /// (or restore its own on switch-out). `previous_base_moves` keeps reversal byte-exact:
+    /// entering a transform overwrites `base_moves` with the pre-transform slots.
+    Transform { side: SideId, slot: u8, previous: TransformData, new: TransformData, previous_base_moves: [MoveSlot; 4] },
 
     // --- battle-long per-mon history (persists across switches) ---
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
@@ -180,6 +201,21 @@ impl State {
             }
             Heal { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp += amount;
+            }
+            Transform { side, slot, previous, new, .. } => {
+                let p = &mut self.sides[side.index()].pokemon[slot as usize];
+                p.species = new.species;
+                for i in 1..6 { p.stats[i] = new.stats[i]; }
+                p.types = new.types;
+                p.ability = new.ability;
+                p.moves = new.moves;
+                p.transformed = new.transformed;
+                if !previous.transformed && new.transformed {
+                    // Entering a transform: remember what to restore on switch-out.
+                    p.base_species = previous.species;
+                    p.base_stats = previous.stats;
+                    p.base_moves = previous.moves;
+                }
             }
             DamageSubstitute { side, amount } => {
                 self.side_mut(side).substitute_hp -= amount;
@@ -300,6 +336,21 @@ impl State {
             }
             Heal { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp -= amount;
+            }
+            Transform { side, slot, previous, new, previous_base_moves } => {
+                let p = &mut self.sides[side.index()].pokemon[slot as usize];
+                p.species = previous.species;
+                for i in 1..6 { p.stats[i] = previous.stats[i]; }
+                p.types = previous.types;
+                p.ability = previous.ability;
+                p.moves = previous.moves;
+                p.transformed = previous.transformed;
+                if !previous.transformed && new.transformed {
+                    // Undo the base_* overwrite from entering the transform.
+                    p.base_species = previous.species;
+                    p.base_stats = previous.stats;
+                    p.base_moves = previous_base_moves;
+                }
             }
             DamageSubstitute { side, amount } => {
                 self.side_mut(side).substitute_hp += amount;
@@ -423,6 +474,8 @@ fn set_active_counter(state: &mut State, side: SideId, which: ActiveCounter, val
         ActiveCounter::Confusion => s.confusion_turns = value,
         ActiveCounter::Perish => s.perish_turns = value,
         ActiveCounter::Yawn => s.yawn_turns = value,
+        ActiveCounter::ThroatChop => s.throat_chop_turns = value,
+        ActiveCounter::HealBlock => s.heal_block_turns = value,
         ActiveCounter::ActiveTurns => s.active_turns = value,
     }
 }

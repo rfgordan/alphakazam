@@ -31,7 +31,7 @@ const sideCondRs = (s) => s && SIDECOND[s] ? `Some(SideConditionId::${SIDECOND[s
 const WEATHER = { sunnyday:'Sun', raindance:'Rain', sandstorm:'Sand', snow:'Snow', snowscape:'Snow', hail:'Snow' };
 const weatherRs = (s) => s && WEATHER[s] ? `Weather::${WEATHER[s]}` : 'Weather::None';
 
-const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy' };
+const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock' };
 const volatileRs = (s) => s && VOLATILE[s] ? `Some(VolatileStatus::${VOLATILE[s]})` : 'None';
 
 // boosts object -> [atk,def,spa,spd,spe,accuracy,evasion]
@@ -127,6 +127,7 @@ moves.forEach((m, i) => {
 		`flag_slicing: ${!!(m.flags && m.flags.slicing)}`,
 		`flag_bullet: ${!!(m.flags && m.flags.bullet)}`,
 		`flag_pulse: ${!!(m.flags && m.flags.pulse)}`,
+		`flag_heal: ${!!(m.flags && m.flags.heal)}`,
 		`pp: ${m.pp || 0}`,
 		`target: ${targetRs(m.target)}`,
 		`crit_ratio: ${m.critRatio || 1}`,
@@ -157,6 +158,12 @@ species.forEach((s, i) => {
 	specStats.push(`    [${bs.hp}, ${bs.atk}, ${bs.def}, ${bs.spa}, ${bs.spd}, ${bs.spe}],`);
 	specWeight.push(`    ${Math.round((s.weightkg || 0) * 10)},`); // hectograms (kg*10)
 	specNfe.push(`    ${!!(s.evos && s.evos.length > 0)},`); // has further evolutions
+	// Cosmetic formes (Florges-Yellow, Vivillon patterns we filtered, ...) are mechanically
+	// identical: alias their ids to the base species' dense id.
+	for (const cf of s.cosmeticFormes || []) {
+		const cfid = String(cf).toLowerCase().replace(/[^a-z0-9]/g, '');
+		if (!species.some(sp => sp.id === cfid)) specByName.push([cfid, idx]);
+	}
 });
 
 const byNameRs = (pairs) => pairs.slice().sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([n, i]) => `    ("${esc(n)}", ${i}),`).join('\n');

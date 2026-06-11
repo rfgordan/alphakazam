@@ -42,7 +42,9 @@ pub enum VolatileStatus {
     Protosynthesis,  // Booster Energy / sun stat boost active
     QuarkDrive,      // Booster Energy / electric terrain stat boost active
     FocusEnergy,     // +2 crit stages (Focus Energy / Dragon Cheer)
-    Unburden,        // lost/consumed its item: Speed ×2 until switch-out
+    Unburden,
+    ThroatChop,
+    HealBlock,        // lost/consumed its item: Speed ×2 until switch-out
 }
 
 /// A packed set of active-Pokémon volatile statuses.

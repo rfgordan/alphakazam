@@ -141,4 +141,6 @@ id_map!(VolatileStatus {
     QuarkDrive => "quarkdrive",
     FocusEnergy => "focusenergy",
     Unburden => "unburden",
+    ThroatChop => "throatchop",
+    HealBlock => "healblock",
 });
