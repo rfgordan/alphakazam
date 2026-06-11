@@ -457,6 +457,9 @@ fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon:
                     let slot = canon.slot(si, &src).unwrap_or(0);
                     side.future_sight = (i(cv, "duration") as u8, slot);
                 }
+                "healingwish" | "lunardance" => {
+                    side.healing_wish = true;
+                }
                 other => return Err(unsup(format!("slotcondition:{other}"))),
             }
         }

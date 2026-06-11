@@ -156,6 +156,7 @@ pub enum Instruction {
     /// (or restore its own on switch-out). `previous_base_moves` keeps reversal byte-exact:
     /// entering a transform overwrites `base_moves` with the pre-transform slots.
     Transform { side: SideId, slot: u8, previous: TransformData, new: TransformData, previous_base_moves: [MoveSlot; 4] },
+    SetHealingWish { side: SideId, previous: bool, new: bool },
 
     // --- battle-long per-mon history (persists across switches) ---
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
@@ -201,6 +202,9 @@ impl State {
             }
             Heal { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp += amount;
+            }
+            SetHealingWish { side, new, .. } => {
+                self.side_mut(side).healing_wish = new;
             }
             Transform { side, slot, previous, new, .. } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
@@ -336,6 +340,9 @@ impl State {
             }
             Heal { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp -= amount;
+            }
+            SetHealingWish { side, previous, .. } => {
+                self.side_mut(side).healing_wish = previous;
             }
             Transform { side, slot, previous, new, previous_base_moves } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];

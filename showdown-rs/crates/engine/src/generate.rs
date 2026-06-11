@@ -226,6 +226,15 @@ fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     true
 }
 
+/// Faint the user of a self-sacrificing status move (Healing Wish, Memento, ...).
+fn apply_post_status_self_destruct(b: &mut Branch, side: SideId, _md: &crate::data::MoveData) {
+    let p = b.state.side(side).active();
+    if p.is_alive() {
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::Damage { side, slot, amount: p.hp });
+    }
+}
+
 /// Heal Block (Psychic Noise): all HP restoration for this side's active is prevented.
 fn heal_blocked(b: &Branch, side: SideId) -> bool {
     b.state.side(side).volatiles.contains(VolatileStatus::HealBlock)
@@ -448,6 +457,27 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
+    // Healing Wish / Lunar Dance: heal the incoming mon if it needs it (wish persists
+    // until a damaged-or-statused mon enters).
+    if b.state.side(side).healing_wish {
+        let (hp, max_hp, status, slot) = {
+            let p = b.state.side(side).active();
+            (p.hp, p.max_hp, p.status, b.state.side(side).active_index)
+        };
+        if hp > 0 && (hp < max_hp || status != Status::None) {
+            if hp < max_hp {
+                push(b, Instruction::Heal { side, slot, amount: max_hp - hp });
+            }
+            if status != Status::None {
+                let counter = b.state.side(side).active().status_counter;
+                push(b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+                if counter != 0 {
+                    push(b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
+                }
+            }
+            push(b, Instruction::SetHealingWish { side, previous: true, new: false });
+        }
+    }
     apply_switch_in_ability(b, side);
 }
 
@@ -2827,6 +2857,21 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         apply_self_boost(&mut b, side, BoostIndex::Attack, 1);
         apply_self_boost(&mut b, side, BoostIndex::Speed, 1);
+        return vec![b];
+    }
+    // Healing Wish / Lunar Dance: the user faints (self_destruct) leaving a healing wish
+    // for the next damaged replacement. Fails if there is nothing to switch to.
+    if matches!(md.id.to_id(), "healingwish" | "lunardance") {
+        let mut b = b;
+        let can_switch = b.state.side(side).pokemon.iter().enumerate().any(|(i, p)| {
+            i as u8 != b.state.side(side).active_index && p.species != crate::ids::Species::None && p.is_alive()
+        });
+        if can_switch && !b.state.side(side).healing_wish {
+            push(&mut b, Instruction::SetHealingWish { side, previous: false, new: true });
+        }
+        if can_switch {
+            apply_post_status_self_destruct(&mut b, side, md);
+        }
         return vec![b];
     }
     // Transform copies the foe's battle identity.

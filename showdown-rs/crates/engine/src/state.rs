@@ -245,6 +245,9 @@ pub struct Side {
     /// needs it as a feature).
     pub tera_used: bool,
 
+    /// Healing Wish / Lunar Dance pending on this side: the next damaged-or-statused mon to
+    /// switch in is fully healed and cured (the wish persists until consumed).
+    pub healing_wish: bool,
     /// Wish: (turns remaining, heal amount). turns == 0 means inactive.
     pub wish: (u8, i16),
     /// Future Sight: (turns remaining, source party slot). turns == 0 means inactive.
@@ -282,6 +285,7 @@ impl Side {
         move_streak: 0,
         stall_counter: 0,
         tera_used: false,
+        healing_wish: false,
         wish: (0, 0),
         future_sight: (0, 0),
     };
