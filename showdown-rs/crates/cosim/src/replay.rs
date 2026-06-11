@@ -30,6 +30,8 @@ pub struct UnitResult {
     pub verdict: Verdict,
     /// "p1:<choice> p2:<choice>" summary for diagnostics.
     pub choice_summary: String,
+    /// Compact labeled-PRNG-draw log for diagnostics.
+    pub draws_summary: String,
     /// move ids chosen this unit (for coverage accounting)
     pub moves_used: Vec<String>,
     /// legality mismatches observed at this unit's requests
@@ -94,8 +96,19 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
             }
         }
     }
+    let mut draws_summary = String::new();
+    for d in unit {
+        for v in &d.draws {
+            let kind = v.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+            let eff = v.get("effect").and_then(serde_json::Value::as_str).unwrap_or("");
+            let ev = v.get("event").and_then(serde_json::Value::as_str).unwrap_or("");
+            let res = v.get("result").map(|r| r.to_string()).unwrap_or_default();
+            let args = v.get("args").map(|r| r.to_string()).unwrap_or_default();
+            draws_summary.push_str(&format!("{kind}{args}={res}[{eff}/{ev}] "));
+        }
+    }
     let turn = dp.turn;
-    let mk = |verdict: Verdict, legality: Vec<String>| UnitResult { turn, verdict, moves_used: moves_used.clone(), legality, choice_summary: choice_summary.clone() };
+    let mk = |verdict: Verdict, legality: Vec<String>| UnitResult { turn, verdict, moves_used: moves_used.clone(), legality, choice_summary: choice_summary.clone(), draws_summary: draws_summary.clone() };
 
     // Convert endpoint states; conversion failures are coverage findings.
     let state_before = match convert_state(before, canon) {

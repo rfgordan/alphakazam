@@ -76,14 +76,15 @@ moves.forEach((m, i) => {
 	// A chance-based volatile secondary (Hurricane 30% confusion, Dire Claw, ...) — flinch is
 	// handled separately; 100%-chance volatiles fold into target_volatile below.
 	const secVol = sec && sec.volatileStatus && sec.volatileStatus !== 'flinch'
-		&& sec.chance && sec.chance < 100 ? sec.volatileStatus : null;
+		&& (sec.volatileStatus === 'confusion' || (sec.chance && sec.chance < 100)) ? sec.volatileStatus : null;
 	const secChance = (secHasBoostOrStatus || secVol) ? (sec.chance || 0) : 0;
 	// Flinch is its own chance-based secondary (Iron Head 30%, Fake Out 100%), handled
 	// separately so it can interrupt a not-yet-moved target rather than being a plain volatile.
 	const flinchChance = (sec && sec.volatileStatus === 'flinch') ? (sec.chance || 100)
 		: (m.volatileStatus === 'flinch' ? 100 : 0);
 	let targetVol = m.volatileStatus === 'flinch' ? undefined : m.volatileStatus;
-	if (!targetVol && sec && sec.volatileStatus && sec.volatileStatus !== 'flinch' && (sec.chance === 100 || sec.chance === undefined)) {
+	// Confusion stays a *secondary* even at 100% so the engine branches its duration.
+	if (!targetVol && sec && sec.volatileStatus && sec.volatileStatus !== 'flinch' && sec.volatileStatus !== 'confusion' && (sec.chance === 100 || sec.chance === undefined)) {
 		targetVol = sec.volatileStatus;
 	}
 	// Top-level `boosts` apply to the user when target is 'self' (Swords Dance, Dragon

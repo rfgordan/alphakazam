@@ -104,6 +104,9 @@ fn main() -> ExitCode {
                         println!("  [diverged t{} | {} branches] {}| {}", unit.turn, branches,
                             unit.choice_summary,
                             closest.iter().take(6).map(|d| d.detail.as_str()).collect::<Vec<_>>().join(" | "));
+                        if std::env::var("DRAWS").is_ok() {
+                            println!("      draws: {}", unit.draws_summary);
+                        }
                     }
                 }
                 Verdict::Unsupported(u) => {
