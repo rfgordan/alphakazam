@@ -71,7 +71,11 @@ moves.forEach((m, i) => {
 	// A boost/status secondary is probabilistic; a pure-volatile secondary (e.g. Salt
 	// Cure: 100% volatileStatus) is folded into `target_volatile` instead.
 	const secHasBoostOrStatus = !!(sec && (sec.boosts || sec.status));
-	const secChance = secHasBoostOrStatus ? (sec.chance || 0) : 0;
+	// A chance-based volatile secondary (Hurricane 30% confusion, Dire Claw, ...) — flinch is
+	// handled separately; 100%-chance volatiles fold into target_volatile below.
+	const secVol = sec && sec.volatileStatus && sec.volatileStatus !== 'flinch'
+		&& sec.chance && sec.chance < 100 ? sec.volatileStatus : null;
+	const secChance = (secHasBoostOrStatus || secVol) ? (sec.chance || 0) : 0;
 	// Flinch is its own chance-based secondary (Iron Head 30%, Fake Out 100%), handled
 	// separately so it can interrupt a not-yet-moved target rather than being a plain volatile.
 	const flinchChance = (sec && sec.volatileStatus === 'flinch') ? (sec.chance || 100)
@@ -108,6 +112,7 @@ moves.forEach((m, i) => {
 		`secondary_chance: ${secChance}`,
 		`secondary_boosts: ${boostsRs(sec && sec.boosts)}`,
 		`secondary_status: ${statusRs(sec && sec.status)}`,
+		`secondary_volatile: ${volatileRs(secVol)}`,
 		`status: ${statusRs(m.status)}`,
 		`side_condition: ${sideCondRs(m.sideCondition)}`,
 		`heal: ${heal}`,

@@ -90,6 +90,8 @@ pub struct MoveData {
     pub secondary_boosts: [i8; BoostIndex::COUNT],
     /// Status applied to the target when the secondary procs (`None` = no status).
     pub secondary_status: Status,
+    /// Volatile applied to the target when the secondary procs (Hurricane confusion, ...).
+    pub secondary_volatile: Option<VolatileStatus>,
 
     /// Primary status a status-move inflicts on the target (Will-O-Wisp = Burn).
     pub status: Status,
@@ -140,6 +142,7 @@ impl MoveData {
             secondary_chance: 0,
             secondary_boosts: [0; BoostIndex::COUNT],
             secondary_status: Status::None,
+            secondary_volatile: None,
             status: Status::None,
             side_condition: None,
             heal: (0, 1),

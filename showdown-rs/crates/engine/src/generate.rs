@@ -215,11 +215,16 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
 
     // 3) End-of-turn residuals (deterministic) — skipped if the battle has ended (a side
     //    has no living Pokémon), matching PS, which stops the turn on a win.
-    for b in &mut branches {
-        if !battle_over(&b.state) {
-            apply_end_of_turn(b, switched);
-        }
-    }
+    branches = branches
+        .into_iter()
+        .flat_map(|b| {
+            if battle_over(&b.state) {
+                vec![b]
+            } else {
+                apply_end_of_turn(b, switched)
+            }
+        })
+        .collect();
 
     branches
         .into_iter()
@@ -672,6 +677,24 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         out.extend(execute_move_inner(thawed, action));
         return out;
     }
+    // Confusion counts down on each move attempt and ends ("snapped out") at 0, in which
+    // case the mon acts normally this turn (PS decrements before the 1/3 roll).
+    let mut b = b;
+    let mut confused = confused;
+    if confused {
+        let t = b.state.side(side).confusion_turns;
+        let new_t = t.saturating_sub(1);
+        push(&mut b, Instruction::SetActiveCounter {
+            side,
+            which: crate::instruction::ActiveCounter::Confusion,
+            previous: t,
+            new: new_t,
+        });
+        if new_t == 0 {
+            push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Confusion });
+            confused = false;
+        }
+    }
     let mut out = Vec::new();
     let mut act = 1.0f32;
     if confused {
@@ -688,6 +711,115 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         out.extend(execute_move_inner(scaled(&b, act), action));
         out
     }
+}
+
+/// Freshly-applied Sleep: branch the duration (PS `statusState.time = random(2, 5)` — the
+/// mon misses `time - 1` turns; uniform over 2/3/4).
+fn branch_sleep_counter(b: Branch, side: SideId) -> Vec<Branch> {
+    let slot = b.state.side(side).active_index;
+    let prev = b.state.side(side).active().status_counter;
+    [2u8, 3, 4]
+        .into_iter()
+        .map(|t| {
+            let mut nb = scaled(&b, 1.0 / 3.0);
+            push(&mut nb, Instruction::ChangeStatusCounter { side, slot, previous: prev, new: t });
+            nb
+        })
+        .collect()
+}
+
+/// Freshly-applied Confusion: branch the duration (PS `time = random(2, 6)`; uniform 2-5,
+/// decremented on each move attempt, snaps out at 0).
+fn branch_confusion_counter(b: Branch, side: SideId) -> Vec<Branch> {
+    let prev = b.state.side(side).confusion_turns;
+    [2u8, 3, 4, 5]
+        .into_iter()
+        .map(|t| {
+            let mut nb = scaled(&b, 0.25);
+            push(&mut nb, Instruction::SetActiveCounter {
+                side,
+                which: crate::instruction::ActiveCounter::Confusion,
+                previous: prev,
+                new: t,
+            });
+            nb
+        })
+        .collect()
+}
+
+/// Apply a status move's target volatile with full PS counter semantics. May split the branch
+/// (confusion durations). `foe_moves_later`: the target still has a pending move this turn —
+/// drives the Taunt/Encore +1 and Disable -1 duration adjustments (PS `queue.willMove`).
+fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
+    use crate::instruction::ActiveCounter;
+    let Some(v) = md.target_volatile else { return vec![b] };
+    let foe = side.other();
+    if !b.state.side(foe).active().is_alive() || b.state.side(foe).volatiles.contains(v) {
+        return vec![b];
+    }
+    match v {
+        VolatileStatus::Taunt => {
+            let dur = if foe_moves_later { 3 } else { 4 };
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            let prev = b.state.side(foe).taunt_turns;
+            push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::Taunt, previous: prev, new: dur });
+        }
+        VolatileStatus::Encore => {
+            // Fails unless the target's last move is encorable and still on its set with PP.
+            let last = b.state.side(foe).last_used_move;
+            let encorable = last != crate::ids::MoveId::None
+                && !matches!(last.to_id(), "struggle" | "encore" | "mimic" | "mirrormove" | "sketch" | "transform")
+                && b.state.side(foe).active().moves.iter().any(|m| m.id == last && m.pp > 0);
+            if encorable {
+                let dur = if foe_moves_later { 3 } else { 4 };
+                push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+                let prev = b.state.side(foe).encore;
+                push(&mut b, Instruction::SetEncore { side: foe, previous: prev, new: (last, dur) });
+            }
+        }
+        VolatileStatus::Disable => {
+            let last = b.state.side(foe).last_used_move;
+            let ok = last != crate::ids::MoveId::None
+                && last.to_id() != "struggle"
+                && b.state.side(foe).active().moves.iter().any(|m| m.id == last);
+            if ok {
+                // PS: duration 5, -1 if the target will still move this turn.
+                let dur = if foe_moves_later { 4 } else { 5 };
+                push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+                let prev = b.state.side(foe).disable;
+                push(&mut b, Instruction::SetDisable { side: foe, previous: prev, new: (last, dur) });
+            }
+        }
+        VolatileStatus::Yawn => {
+            let t = b.state.side(foe).active();
+            if t.status == Status::None && status_applies(t, Status::Sleep) {
+                push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+                let prev = b.state.side(foe).yawn_turns;
+                push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::Yawn, previous: prev, new: 2 });
+            }
+        }
+        VolatileStatus::PerishSong => {
+            // Perish Song hits every active (both sides). Counter 4: ticks at each end of
+            // turn; the holder faints when it reaches 0 (PS shows perish3 after the first tick).
+            for ps_side in [side, foe] {
+                if b.state.side(ps_side).active().is_alive()
+                    && !b.state.side(ps_side).volatiles.contains(VolatileStatus::PerishSong)
+                {
+                    push(&mut b, Instruction::ApplyVolatile { side: ps_side, volatile: VolatileStatus::PerishSong });
+                    let prev = b.state.side(ps_side).perish_turns;
+                    push(&mut b, Instruction::SetActiveCounter { side: ps_side, which: ActiveCounter::Perish, previous: prev, new: 4 });
+                }
+            }
+        }
+        VolatileStatus::Confusion => {
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            return branch_confusion_counter(b, foe);
+        }
+        _ => {
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+        }
+    }
+    vec![b]
 }
 
 /// The confusion self-hit: a 40-BP typeless physical attack the mon lands on itself, using
@@ -753,7 +885,7 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
 
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
-    let Action { side, move_idx, pivot, .. } = action;
+    let Action { side, move_idx, pivot, foe_pending_move, .. } = action;
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
         return vec![b];
@@ -784,7 +916,35 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let foe = side.other();
 
     let mut b = b;
+    let mut move_idx = move_idx;
     let slot = b.state.side(side).active_index;
+
+    // Encore: the user is locked into its encored move — the chosen slot is overridden
+    // (PS onOverrideAction). Skipped while committed to a multi-turn move or Struggling.
+    let enc = b.state.side(side).encore;
+    if enc.0 != crate::ids::MoveId::None
+        && !struggling
+        && b.state.side(side).pending_move == crate::state::PendingMove::None
+    {
+        if let Some(enc_slot) = b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0) {
+            if enc_slot as u8 != move_idx {
+                move_idx = enc_slot as u8;
+                md = move_data(enc.0);
+            }
+        }
+    }
+    let move_id = if struggling { move_id } else { b.state.side(side).active().moves[move_idx as usize].id };
+
+    // Disable: the disabled move fails outright; Taunt: status moves fail.
+    if !struggling {
+        let dis = b.state.side(side).disable;
+        if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
+            return vec![b];
+        }
+        if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
+            return vec![b];
+        }
+    }
 
     // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
@@ -870,7 +1030,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
             return vec![b];
         }
-        let mut branches = execute_status_move(b, side, &md);
+        let mut branches = execute_status_move(b, side, &md, foe_pending_move.is_some());
         // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
         if let Some(t) = pivot {
             for sb in &mut branches {
@@ -1922,12 +2082,34 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if lowered {
         react_to_stat_drop(&mut proc, foe);
     }
+    let mut applied_sleep = false;
     if md.secondary_status != Status::None && status_applies(proc.state.side(foe).active(), md.secondary_status) {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
+        applied_sleep = md.secondary_status == Status::Sleep;
         apply_synchronize(&mut proc, foe, md.secondary_status);
     }
-    vec![proc, noproc]
+    let mut procs = vec![proc];
+    if applied_sleep {
+        procs = procs.into_iter().flat_map(|x| branch_sleep_counter(x, foe)).collect();
+    }
+    // Chance-based volatile secondaries (Hurricane / Dynamic Punch confusion, Dire Claw ...).
+    if let Some(v) = md.secondary_volatile {
+        procs = procs
+            .into_iter()
+            .flat_map(|mut x| {
+                if x.state.side(foe).active().is_alive() && !x.state.side(foe).volatiles.contains(v) {
+                    push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: v });
+                    if v == VolatileStatus::Confusion {
+                        return branch_confusion_counter(x, foe);
+                    }
+                }
+                vec![x]
+            })
+            .collect();
+    }
+    procs.push(noproc);
+    procs
 }
 
 /// A damaging move's deterministic on-hit effects: user self-boosts and any target
@@ -1962,7 +2144,7 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 
 /// Execute a status move from its data: self-heal, hazard, and/or target status, with an
 /// accuracy hit/miss branch when the move can miss.
-fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
     let foe = side.other();
 
     // Protect family: succeeds with probability 1/3^n on the (n+1)ᵗʰ consecutive use (n is
@@ -2071,6 +2253,9 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
             // Chesto Berry immediately cures the Rest sleep, so the user stays awake.
             if status != Status::Sleep && item != Item::ChestoBerry {
                 push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::Sleep });
+                // Rest's sleep is a fixed 2-turn nap (PS statusState.time = 3).
+                let prev_ctr = b.state.side(side).active().status_counter;
+                push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 3 });
             } else if status != Status::None && item == Item::ChestoBerry {
                 // Rest first cures the prior status; Chesto then prevents the new sleep.
                 push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
@@ -2208,16 +2393,32 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData) -> V
         let turns = weather_set_turns(hit.state.side(side).active().item, md.weather);
         set_weather(&mut hit, md.weather, turns);
     }
+    let mut applied_sleep = false;
     if md.status != Status::None && !foe_immune && status_applies(hit.state.side(foe).active(), md.status) {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
+        applied_sleep = md.status == Status::Sleep;
         apply_synchronize(&mut hit, foe, md.status);
     }
 
+    // Sleep durations are stochastic (1-3 turns), and target volatiles (Taunt / Encore /
+    // Yawn / Confuse Ray / Perish Song / ...) carry counters and may themselves branch.
+    let mut hits = vec![hit];
+    if applied_sleep {
+        hits = hits.into_iter().flat_map(|x| branch_sleep_counter(x, foe)).collect();
+    }
+    if md.target_volatile.is_some() && !foe_immune {
+        hits = hits
+            .into_iter()
+            .flat_map(|x| apply_status_target_volatile(x, side, md, foe_moves_later))
+            .collect();
+    }
+
     if miss_prob > 0.0 {
-        vec![hit, scaled(&b, miss_prob)]
+        hits.push(scaled(&b, miss_prob));
+        hits
     } else {
-        vec![hit]
+        hits
     }
 }
 
@@ -2343,7 +2544,8 @@ fn weather_set_turns(item: Item, weather: Weather) -> i8 {
 
 // --- end of turn -------------------------------------------------------------
 
-fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
+fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
+    let b = &mut branch;
     // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
     // (PS uses a finer speed-ordered residual queue; this covers the common cases.)
     for side in [SideId::One, SideId::Two] {
@@ -2583,4 +2785,84 @@ fn apply_end_of_turn(b: &mut Branch, switched: [bool; 2]) {
             }
         }
     }
+
+    // Active-mon countdowns: Taunt / Encore / Disable tick and clear; Yawn ticks and puts the
+    // holder to sleep at 0; Perish Song ticks and faints the holder at 0.
+    use crate::instruction::ActiveCounter;
+    let mut yawn_fired = [false; 2];
+    for side in [SideId::One, SideId::Two] {
+        if !b.state.side(side).active().is_alive() {
+            continue;
+        }
+        let t = b.state.side(side).taunt_turns;
+        if t > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::Taunt, previous: t, new: t - 1 });
+            if t == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Taunt });
+            }
+        }
+        let enc = b.state.side(side).encore;
+        if enc.1 > 0 {
+            let ends = enc.1 == 1
+                // Encore also ends when the encored move runs out of PP.
+                || !b.state.side(side).active().moves.iter().any(|m| m.id == enc.0 && m.pp > 0);
+            let new = if ends { (crate::ids::MoveId::None, 0) } else { (enc.0, enc.1 - 1) };
+            push(b, Instruction::SetEncore { side, previous: enc, new });
+            if ends {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Encore });
+            }
+        }
+        let dis = b.state.side(side).disable;
+        if dis.1 > 0 {
+            let new = if dis.1 == 1 { (crate::ids::MoveId::None, 0) } else { (dis.0, dis.1 - 1) };
+            push(b, Instruction::SetDisable { side, previous: dis, new });
+            if dis.1 == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Disable });
+            }
+        }
+        let y = b.state.side(side).yawn_turns;
+        if y > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::Yawn, previous: y, new: y - 1 });
+            if y == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Yawn });
+                yawn_fired[side.index()] = true;
+            }
+        }
+        if b.state.side(side).volatiles.contains(VolatileStatus::PerishSong) {
+            let pt = b.state.side(side).perish_turns;
+            let new = pt.saturating_sub(1);
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::Perish, previous: pt, new });
+            if new == 0 {
+                let p = b.state.side(side).active();
+                let slot = b.state.side(side).active_index;
+                let hp = p.hp;
+                if hp > 0 {
+                    push(b, Instruction::Damage { side, slot, amount: hp });
+                }
+            }
+        }
+    }
+
+    // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
+    let mut out = vec![branch];
+    for (i, fired) in yawn_fired.into_iter().enumerate() {
+        if !fired {
+            continue;
+        }
+        let side = if i == 0 { SideId::One } else { SideId::Two };
+        out = out
+            .into_iter()
+            .flat_map(|mut x| {
+                let p = x.state.side(side).active();
+                if p.is_alive() && p.status == Status::None && status_applies(p, Status::Sleep) {
+                    let slot = x.state.side(side).active_index;
+                    push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
+                    branch_sleep_counter(x, side)
+                } else {
+                    vec![x]
+                }
+            })
+            .collect();
+    }
+    out
 }
