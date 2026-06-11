@@ -131,6 +131,7 @@ moves.forEach((m, i) => {
 		`target: ${targetRs(m.target)}`,
 		`crit_ratio: ${m.critRatio || 1}`,
 		`always_crit: ${m.willCrit === true}`,
+		`self_destruct: ${!!m.selfdestruct}`,
 	];
 	moveRows.push(`    MoveData { ${fields.join(', ')} },`);
 });

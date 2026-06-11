@@ -64,6 +64,8 @@ pub struct MoveData {
     pub crit_ratio: u8,
     /// Always crits (Wicked Blow, Surging Strikes, Flower Trick, ...).
     pub always_crit: bool,
+    /// The user faints on use (Explosion, Self-Destruct, Memento, Misty Explosion, ...).
+    pub self_destruct: bool,
     /// Number of hits (1 for most; e.g. Dragon Darts = 2). For a variable multi-hit move
     /// (Bullet Seed, Rock Blast, ...) this is the guaranteed *minimum*; `hits_max` the max.
     pub hits: u8,
@@ -131,6 +133,7 @@ impl MoveData {
             target: MoveTarget::Normal,
             crit_ratio: 1,
             always_crit: false,
+            self_destruct: false,
             hits: 1,
             hits_max: 1,
             flinch_chance: 0,

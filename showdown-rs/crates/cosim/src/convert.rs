@@ -362,6 +362,7 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
             "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }
+            "unburden" => { side.volatiles.insert(VolatileStatus::Unburden); }
             "mustrecharge" => {
                 side.volatiles.insert(VolatileStatus::MustRecharge);
                 side.pending_move = PendingMove::Recharging;
@@ -511,7 +512,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "perish3", "perish2", "perish1", "stall", "choicelock", "saltcure", "curse", "nightmare",
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
-    "flinch", "charge", "focusenergy", "dragoncheer",
+    "flinch", "charge", "focusenergy", "dragoncheer", "unburden",
 ];
 
 const KNOWN_SIDE_CONDITIONS: &[&str] = &[

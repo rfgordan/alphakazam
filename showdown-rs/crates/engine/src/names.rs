@@ -140,4 +140,5 @@ id_map!(VolatileStatus {
     Protosynthesis => "protosynthesis",
     QuarkDrive => "quarkdrive",
     FocusEnergy => "focusenergy",
+    Unburden => "unburden",
 });

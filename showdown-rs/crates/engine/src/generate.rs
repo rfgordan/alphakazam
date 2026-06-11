@@ -87,6 +87,9 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
     if s.side_conditions.tailwind > 0 {
         spe *= 2.0;
     }
+    if s.volatiles.contains(VolatileStatus::Unburden) {
+        spe *= 2.0;
+    }
     if has_proto(s) && proto_stat(p) == crate::ids::StatIndex::Speed {
         spe *= 1.5;
     }
@@ -141,7 +144,42 @@ fn battle_over(state: &State) -> bool {
 /// Is the active Pokémon grounded (subject to Spikes / Toxic Spikes / Sticky Web)?
 fn is_grounded(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
-    !(p.types.contains(&Type::Flying))
+    !(p.types.contains(&Type::Flying)
+        || p.ability == crate::ids::Ability::Levitate
+        || p.item == Item::AirBalloon)
+}
+
+/// Move accuracy as a hit probability, with the modifiers that change it: No Guard (either
+/// side) and weather-perfect moves -> always hit; Compound Eyes ×1.3, Wide Lens ×1.1,
+/// Hustle ×0.8 on physical.
+fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
+    use crate::ids::Ability as Ab;
+    if md.accuracy == 0 {
+        return 1.0;
+    }
+    let atk = b.state.side(side).active();
+    let def = b.state.side(side.other()).active();
+    if atk.ability == Ab::NoGuard || def.ability == Ab::NoGuard {
+        return 1.0;
+    }
+    let id = md.id.to_id();
+    match (id, b.state.weather) {
+        ("blizzard", Weather::Snow) => return 1.0,
+        ("thunder" | "hurricane" | "bleakwindstorm" | "wildboltstorm" | "sandsearstorm", Weather::Rain | Weather::HeavyRain) => return 1.0,
+        ("thunder" | "hurricane", Weather::Sun | Weather::HarshSun) => return 0.5,
+        _ => {}
+    }
+    let mut acc = md.accuracy as f32;
+    if atk.ability == Ab::CompoundEyes {
+        acc *= 1.3;
+    }
+    if atk.ability == Ab::Hustle && md.category == MoveCategory::Physical {
+        acc *= 0.8;
+    }
+    if atk.item == Item::WideLens {
+        acc *= 1.1;
+    }
+    (acc / 100.0).min(1.0)
 }
 
 /// Public entry point. `s1`/`s2` are side one's and side two's chosen actions.
@@ -401,10 +439,49 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
         let turns = weather_set_turns(b.state.side(side).active().item, weather);
         set_weather(b, weather, turns);
     }
-    // Intimidate: lower the opposing active's Attack by 1 on switch-in.
+    // Terrain surges set their terrain for 5 turns (8 with Terrain Extender).
+    let terrain = match ability {
+        ElectricSurge => crate::ids::Terrain::Electric,
+        GrassySurge => crate::ids::Terrain::Grassy,
+        PsychicSurge => crate::ids::Terrain::Psychic,
+        MistySurge => crate::ids::Terrain::Misty,
+        _ => crate::ids::Terrain::None,
+    };
+    if terrain != crate::ids::Terrain::None && b.state.terrain != terrain {
+        let turns = if b.state.side(side).active().item == Item::TerrainExtender { 8 } else { 5 };
+        push(b, Instruction::ChangeTerrain {
+            previous: b.state.terrain,
+            previous_turns: b.state.terrain_turns,
+            new: terrain,
+            new_turns: turns,
+        });
+    }
+    // Trace copies the opponent's ability on switch-in (a few abilities are untraceable).
+    if ability == Trace {
+        let foe = side.other();
+        let fa = b.state.side(foe).active().ability;
+        let untraceable = matches!(
+            fa,
+            None | Trace | AsOneGlastrier | AsOneSpectrier | Comatose | Disguise | FlowerGift
+                | Forecast | GulpMissile | HungerSwitch | IceFace | Illusion | Imposter
+                | Multitype | NeutralizingGas | PowerConstruct | PowerOfAlchemy | Receiver
+                | RKSSystem | Schooling | ShieldsDown | StanceChange | WonderGuard | ZenMode
+                | ZeroToHero | Commander
+        );
+        if b.state.side(foe).active().is_alive() && !untraceable {
+            let slot = b.state.side(side).active_index;
+            push(b, Instruction::ChangeAbility { side, slot, previous: Trace, new: fa });
+        }
+    }
+    // Intimidate: lower the opposing active's Attack by 1 on switch-in. Inner Focus /
+    // Oblivious / Own Tempo / Scrappy and a Substitute block it in gen 8+.
     if ability == Intimidate {
         let foe = side.other();
-        if b.state.side(foe).active().is_alive() {
+        let blocked = matches!(
+            b.state.side(foe).active().ability,
+            InnerFocus | Oblivious | OwnTempo | Scrappy
+        ) || b.state.side(foe).volatiles.contains(VolatileStatus::Substitute);
+        if b.state.side(foe).active().is_alive() && !blocked {
             if apply_boost_clamped(b, foe, BoostIndex::Attack, -1) < 0 {
                 react_to_stat_drop(b, foe);
             }
@@ -981,6 +1058,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
     }
 
+    // Damp shuts down self-destructing moves entirely (either active).
+    if md.self_destruct {
+        let damp = b.state.side(side).active().ability == crate::ids::Ability::Damp
+            || b.state.side(foe).active().ability == crate::ids::Ability::Damp;
+        if damp {
+            return vec![b];
+        }
+    }
+
     // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
     let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
@@ -1026,9 +1112,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     record_move_use(&mut b, side, move_id);
 
     // A two-turn move spends this turn charging (no attack) unless it strikes instantly.
+    // Power Herb is consumed to skip the charge turn entirely.
     if !executing_charge && is_two_turn_move(move_id) && !charges_instantly(move_id, b.state.weather) {
-        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Charging(move_id) });
-        return vec![b];
+        if b.state.side(side).active().item == Item::PowerHerb {
+            push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::PowerHerb, new: Item::None });
+            on_item_lost(&mut b, side);
+        } else {
+            push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Charging(move_id) });
+            return vec![b];
+        }
     }
     if executing_charge {
         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
@@ -1083,10 +1175,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return vec![b];
     }
 
+    // Psychic Terrain blocks priority moves aimed at grounded targets.
+    if b.state.terrain == crate::ids::Terrain::Psychic
+        && md.priority > 0
+        && is_grounded(&b.state, foe)
+        && b.state.side(foe).active().is_alive()
+    {
+        return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+    }
+
+    // Air Balloon: the holder is untargetable by Ground moves until the balloon pops.
+    if md.typ == Type::Ground
+        && b.state.side(foe).active().item == Item::AirBalloon
+        && b.state.side(foe).active().is_alive()
+    {
+        return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+    }
+
     // Damaging move: branch on accuracy (hit/miss), then crit, then the 16 rolls.
     let mut out = Vec::new();
-    let acc = md.accuracy;
-    let (hit_prob, miss_prob) = if acc == 0 || acc >= 100 { (1.0, 0.0) } else { (acc as f32 / 100.0, 1.0 - acc as f32 / 100.0) };
+    let hit_prob = accuracy_of(&b, side, &md);
+    let miss_prob = 1.0 - hit_prob;
 
     if miss_prob > 0.0 {
         let mut mb = scaled(&b, miss_prob);
@@ -1143,8 +1252,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // large counts (Population Bomb's 10 hits → 32¹⁰ branches) that explodes the allocator
     // and crashes the machine, so we instead enumerate the distinct *total* damage via a
     // sumset DP — same set of observable result states, bounded memory.
-    let hits_min = md.hits.max(1) as usize;
-    let hits_max = (md.hits_max as usize).max(hits_min);
+    let (hits_min, hits_max) = multihit_bounds(&b, side, &md);
+    let hits_min = hits_min.max(1);
+    let hits_max = hits_max.max(hits_min);
     // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
     // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
     // take the sumset-DP path, which also folds in the distribution over the hit count.
@@ -1206,6 +1316,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .into_iter()
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                .flat_map(|sb| apply_cursed_body(sb, side, &md))
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -1500,6 +1611,33 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         }
         _ => {}
     }
+    // Type-boosting held items: ×1.2 base power for the matching move type (PS onBasePower
+    // chainModify([4915, 4096])).
+    let type_item_boost = matches!(
+        (attacker.item, md.typ),
+        (Item::Charcoal, Type::Fire)
+            | (Item::MysticWater, Type::Water)
+            | (Item::Magnet, Type::Electric)
+            | (Item::MiracleSeed, Type::Grass)
+            | (Item::NeverMeltIce, Type::Ice)
+            | (Item::BlackBelt, Type::Fighting)
+            | (Item::PoisonBarb, Type::Poison)
+            | (Item::SoftSand, Type::Ground)
+            | (Item::SharpBeak, Type::Flying)
+            | (Item::TwistedSpoon, Type::Psychic)
+            | (Item::SilverPowder, Type::Bug)
+            | (Item::HardStone, Type::Rock)
+            | (Item::SpellTag, Type::Ghost)
+            | (Item::DragonFang, Type::Dragon)
+            | (Item::BlackGlasses, Type::Dark)
+            | (Item::MetalCoat, Type::Steel)
+            | (Item::SilkScarf, Type::Normal)
+            | (Item::FairyFeather, Type::Fairy)
+    );
+    if type_item_boost {
+        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
+    }
+
     // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
     // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
     if attacker.ability == Ab::SupremeOverlord {
@@ -1763,6 +1901,27 @@ fn apply_post_damage(
         }
     }
 
+    // Air Balloon pops on the first hit that lands (the holder becomes grounded).
+    if any_damage && !hit_sub {
+        let f = b.state.side(foe).active();
+        if f.is_alive() && f.item == Item::AirBalloon {
+            let fslot = b.state.side(foe).active_index;
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: Item::AirBalloon, new: Item::None });
+            on_item_lost(b, foe);
+        }
+    }
+
+    // Self-destructing moves faint the user (even on a miss in PS — handled here for hits;
+    // the miss/immune branches go through apply_self_destruct at the call sites).
+    if md.self_destruct {
+        let p = b.state.side(side).active();
+        if p.is_alive() {
+            let aslot = b.state.side(side).active_index;
+            let hp = p.hp;
+            push(b, Instruction::Damage { side, slot: aslot, amount: hp });
+        }
+    }
+
     // Track times the target has been hit (Rage Fist). PS counts each hit of a multi-hit
     // move separately (cosim caught the engine counting once per move). A hit absorbed by a
     // Substitute doesn't count.
@@ -1781,6 +1940,7 @@ fn apply_post_damage(
         if f.is_alive() && f.item != Item::None {
             let (prev, fslot) = (f.item, b.state.side(foe).active_index);
             push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
+            on_item_lost(b, foe);
             // Knocking the item off reveals what it was.
             reveal(b, foe, 0, crate::state::Reveal::ITEM);
         }
@@ -1892,6 +2052,22 @@ fn hit_count_probs(min: usize, max: usize) -> Vec<(usize, f32)> {
     }
 }
 
+/// Variable multi-hit bounds after the attacker's modifiers: Skill Link always hits the max;
+/// Loaded Dice rolls 4-5 (uniform).
+fn multihit_bounds(b: &Branch, side: SideId, md: &crate::data::MoveData) -> (usize, usize) {
+    let (mut min, max) = (md.hits as usize, md.hits_max as usize);
+    if min != max {
+        let p = b.state.side(side).active();
+        if p.ability == crate::ids::Ability::SkillLink {
+            return (max, max);
+        }
+        if p.item == Item::LoadedDice {
+            min = min.max(4);
+        }
+    }
+    (min, max)
+}
+
 /// The sumset-DP multi-hit path: enumerate the distinct *total* damage a multi-hit move can
 /// deal (instead of the 32ʰⁱᵗˢ per-hit product) and emit one branch per total.
 ///
@@ -1970,23 +2146,87 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
     if p.status != Status::None || !p.is_alive() {
         return false;
     }
-    // Purifying Salt grants blanket status immunity (to both moves and secondaries).
-    if p.ability == crate::ids::Ability::PurifyingSalt {
-        return false;
-    }
-    // A Lum Berry holder immediately cures any inflicted status, so it never sticks (the
-    // berry's consumption isn't compared, and the holder's item is re-projected each turn).
-    if p.item == crate::ids::Item::LumBerry {
-        return false;
-    }
     use crate::ids::Ability as Ab;
+    // Blanket status immunities.
+    if matches!(p.ability, Ab::PurifyingSalt | Ab::Comatose) {
+        return false;
+    }
     match status {
-        Status::Burn => !p.types.contains(&Type::Fire),
-        Status::Paralysis => !p.types.contains(&Type::Electric),
-        Status::Poison | Status::Toxic => !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel)),
+        Status::Burn => !p.types.contains(&Type::Fire) && !matches!(p.ability, Ab::WaterVeil | Ab::WaterBubble | Ab::ThermalExchange),
+        Status::Paralysis => !p.types.contains(&Type::Electric) && p.ability != Ab::Limber,
+        Status::Poison | Status::Toxic => {
+            !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel))
+                && p.ability != Ab::Immunity
+        }
         // Insomnia / Vital Spirit / Sweet Veil grant immunity to sleep.
         Status::Sleep => !matches!(p.ability, Ab::Insomnia | Ab::VitalSpirit | Ab::SweetVeil),
+        Status::Freeze => !p.types.contains(&Type::Ice) && p.ability != Ab::MagmaArmor,
         _ => true,
+    }
+}
+
+/// Field-level status blocks: Electric Terrain blocks sleep and Misty Terrain blocks all
+/// status for grounded targets. Checked alongside `status_applies` at application sites.
+fn status_blocked_by_field(state: &State, target: SideId, status: Status) -> bool {
+    if !is_grounded(state, target) {
+        return false;
+    }
+    match state.terrain {
+        crate::ids::Terrain::Electric => status == Status::Sleep,
+        crate::ids::Terrain::Misty => true,
+        _ => false,
+    }
+}
+
+/// Lum Berry: cures any status the instant it lands, consuming the berry (a real state
+/// change — the old model pretended the status never stuck, leaving the berry in hand).
+fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if p.item == Item::LumBerry && p.status != Status::None && p.is_alive() {
+        let slot = b.state.side(side).active_index;
+        let prev_status = p.status;
+        let prev_ctr = p.status_counter;
+        push(b, Instruction::ChangeStatus { side, slot, previous: prev_status, new: Status::None });
+        if prev_ctr != 0 {
+            push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
+        }
+        push(b, Instruction::ChangeItem { side, slot, previous: Item::LumBerry, new: Item::None });
+        on_item_lost(b, side);
+    }
+    // Chesto wakes the holder the instant it sleeps.
+    let p = b.state.side(side).active();
+    if p.item == Item::ChestoBerry && p.status == Status::Sleep && p.is_alive() {
+        let slot = b.state.side(side).active_index;
+        let prev_ctr = p.status_counter;
+        push(b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+        if prev_ctr != 0 {
+            push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
+        }
+        push(b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
+        on_item_lost(b, side);
+    }
+}
+
+/// Bookkeeping when the active's held item is consumed or removed: Unburden doubles Speed
+/// (modeled as a volatile read by `effective_speed`); Cheek Pouch heals 1/3 max HP when the
+/// loss was eating a berry (callers that consume berries call `on_berry_eaten` instead).
+fn on_item_lost(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if p.ability == crate::ids::Ability::Unburden
+        && !b.state.side(side).volatiles.contains(VolatileStatus::Unburden)
+    {
+        push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Unburden });
+    }
+}
+
+/// Berry consumption: item-loss bookkeeping plus Cheek Pouch's 1/3 max HP heal.
+fn on_berry_eaten(b: &mut Branch, side: SideId) {
+    on_item_lost(b, side);
+    let p = b.state.side(side).active();
+    if p.ability == crate::ids::Ability::CheekPouch && p.is_alive() && p.hp < p.max_hp {
+        let amt = (p.max_hp / 3).max(1).min(p.max_hp - p.hp);
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::Heal { side, slot, amount: amt });
     }
 }
 
@@ -2085,6 +2325,8 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     let d = b.state.side(foe).active();
     if !d.is_alive()
         || d.ability == crate::ids::Ability::InnerFocus
+        || d.ability == crate::ids::Ability::ShieldDust
+        || d.item == Item::CovertCloak
         || b.state.side(foe).volatiles.contains(VolatileStatus::Flinch)
     {
         return vec![b];
@@ -2101,6 +2343,28 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     vec![proc, noproc]
 }
 
+/// Cursed Body (defender): 30% chance to Disable the move that just hit it.
+fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    let foe = side.other();
+    if b.state.side(foe).active().ability != crate::ids::Ability::CursedBody
+        || !b.state.side(foe).active().is_alive()
+        || !b.state.side(side).active().is_alive()
+        || b.state.side(side).volatiles.contains(VolatileStatus::Disable)
+        || md.id == crate::ids::MoveId::None
+        || !b.state.side(side).active().moves.iter().any(|m| m.id == md.id)
+    {
+        return vec![b];
+    }
+    let mut proc = scaled(&b, 0.30);
+    let noproc = scaled(&b, 0.70);
+    push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Disable });
+    let prev = proc.state.side(side).disable;
+    // The attacker has already moved this turn -> full 4-turn disable (PS duration 5 - 1
+    // only when the target will still move; here it has just moved).
+    push(&mut proc, Instruction::SetDisable { side, previous: prev, new: (md.id, 4) });
+    vec![proc, noproc]
+}
+
 /// Split a hit branch on a move's chance-based target secondary (proc vs no-proc).
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     if md.secondary_chance == 0 {
@@ -2112,6 +2376,12 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     let foe = side.other();
     if !b.state.side(foe).active().is_alive() {
+        return vec![b];
+    }
+    // Shield Dust / Covert Cloak block chance-based secondaries against the holder.
+    if b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+        || b.state.side(foe).active().item == Item::CovertCloak
+    {
         return vec![b];
     }
     // Serene Grace doubles the secondary chance.
@@ -2133,11 +2403,16 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         react_to_stat_drop(&mut proc, foe);
     }
     let mut applied_sleep = false;
-    if md.secondary_status != Status::None && status_applies(proc.state.side(foe).active(), md.secondary_status) {
+    if md.secondary_status != Status::None
+        && status_applies(proc.state.side(foe).active(), md.secondary_status)
+        && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
+    {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
         applied_sleep = md.secondary_status == Status::Sleep;
         apply_synchronize(&mut proc, foe, md.secondary_status);
+        consume_lum_if_statused(&mut proc, foe);
+        applied_sleep = applied_sleep && proc.state.side(foe).active().status == Status::Sleep;
     }
     let mut procs = vec![proc];
     if applied_sleep {
@@ -2388,11 +2663,8 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         return vec![b];
     }
 
-    let (hit_prob, miss_prob) = if md.accuracy == 0 || md.accuracy >= 100 {
-        (1.0, 0.0)
-    } else {
-        (md.accuracy as f32 / 100.0, 1.0 - md.accuracy as f32 / 100.0)
-    };
+    let hit_prob = accuracy_of(&b, side, md);
+    let miss_prob = 1.0 - hit_prob;
     let mut hit = scaled(&b, hit_prob);
 
     // Whether the heal user was at full HP *before* healing — a self-heal move (Roost/Recover)
@@ -2467,11 +2739,17 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         set_weather(&mut hit, md.weather, turns);
     }
     let mut applied_sleep = false;
-    if md.status != Status::None && !foe_immune && status_applies(hit.state.side(foe).active(), md.status) {
+    if md.status != Status::None
+        && !foe_immune
+        && status_applies(hit.state.side(foe).active(), md.status)
+        && !status_blocked_by_field(&hit.state, foe, md.status)
+    {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
         applied_sleep = md.status == Status::Sleep;
         apply_synchronize(&mut hit, foe, md.status);
+        consume_lum_if_statused(&mut hit, foe);
+        applied_sleep = applied_sleep && hit.state.side(foe).active().status == Status::Sleep;
     }
 
     // Sleep durations are stochastic (1-3 turns), and target volatiles (Taunt / Encore /
@@ -2735,6 +3013,19 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() {
             let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
             push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+        // Black Sludge: Leftovers for Poison types; 1/8 chip for anyone else.
+        let p = b.state.side(side).active();
+        if p.item == Item::BlackSludge && p.is_alive() {
+            if p.types.contains(&Type::Poison) {
+                if p.hp < p.max_hp {
+                    let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+                    push(b, Instruction::Heal { side, slot, amount: heal });
+                }
+            } else if !magic_guard {
+                let dmg = (maxhp / 8).max(1).min(p.hp);
+                push(b, Instruction::Damage { side, slot, amount: dmg });
+            }
         }
 
         // Grassy Terrain heals grounded actives 1/16 max HP at end of turn.
@@ -3022,10 +3313,19 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             .into_iter()
             .flat_map(|mut x| {
                 let p = x.state.side(side).active();
-                if p.is_alive() && p.status == Status::None && status_applies(p, Status::Sleep) {
+                if p.is_alive()
+                    && p.status == Status::None
+                    && status_applies(p, Status::Sleep)
+                    && !status_blocked_by_field(&x.state, side, Status::Sleep)
+                {
                     let slot = x.state.side(side).active_index;
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
-                    branch_sleep_counter(x, side)
+                    consume_lum_if_statused(&mut x, side);
+                    if x.state.side(side).active().status == Status::Sleep {
+                        branch_sleep_counter(x, side)
+                    } else {
+                        vec![x]
+                    }
                 } else {
                     vec![x]
                 }
