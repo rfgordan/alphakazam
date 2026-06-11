@@ -143,4 +143,5 @@ id_map!(VolatileStatus {
     Unburden => "unburden",
     ThroatChop => "throatchop",
     HealBlock => "healblock",
+    TypeShifted => "typeshifted",
 });

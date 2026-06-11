@@ -172,6 +172,11 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
         }
     }
     convert_volatiles(active_v, &mut side)?;
+    // Protean/Libero once-per-switch-in marker lives in abilityState, not volatiles.
+    let ast = &active_v["abilityState"];
+    if b(ast, "libero") || b(ast, "protean") {
+        side.volatiles.insert(VolatileStatus::TypeShifted);
+    }
 
     // Bench mons must not carry volatiles (PS clears them on switch-out; anything left is a
     // mechanic like Baton Pass residue we don't model).
@@ -191,6 +196,15 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
 }
 
 fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
+    // A transformed mon keeps its original `details` but its working species is the copied
+    // one (serialized as a "[Species:x]" ref).
+    let mut species_id = species_id.to_string();
+    if b(p, "transformed") {
+        if let Some(r) = p.get("species").and_then(Value::as_str) {
+            species_id = r.trim_start_matches("[Species:").trim_end_matches(']').to_string();
+        }
+    }
+    let species_id = species_id.as_str();
     let species = Species::from_id(species_id).ok_or_else(|| unsup(format!("species:{species_id}")))?;
 
     let details = s(p, "details");

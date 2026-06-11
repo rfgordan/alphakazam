@@ -214,6 +214,12 @@ impl State {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
                 p.species = new.species;
                 for i in 1..6 { p.stats[i] = new.stats[i]; }
+                // Forme changes (Tera Shift) can change max HP; damage taken is preserved.
+                if new.stats[0] != previous.stats[0] {
+                    p.stats[0] = new.stats[0];
+                    p.max_hp = new.stats[0];
+                    p.hp += new.stats[0] - previous.stats[0];
+                }
                 p.types = new.types;
                 p.ability = new.ability;
                 p.moves = new.moves;
@@ -355,6 +361,11 @@ impl State {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
                 p.species = previous.species;
                 for i in 1..6 { p.stats[i] = previous.stats[i]; }
+                if new.stats[0] != previous.stats[0] {
+                    p.stats[0] = previous.stats[0];
+                    p.max_hp = previous.stats[0];
+                    p.hp -= new.stats[0] - previous.stats[0];
+                }
                 p.types = previous.types;
                 p.ability = previous.ability;
                 p.moves = previous.moves;

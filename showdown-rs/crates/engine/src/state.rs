@@ -336,6 +336,8 @@ impl SideId {
 /// The complete battle state. `Copy`: `let snapshot = *state;` is a flat memcpy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct State {
+    /// Format rule: Sleep Clause Mod (OU / random battles). Customgames don't have it.
+    pub sleep_clause: bool,
     pub sides: [Side; 2],
 
     pub weather: Weather,
@@ -350,6 +352,7 @@ pub struct State {
 
 impl State {
     pub const EMPTY: State = State {
+        sleep_clause: true,
         sides: [Side::EMPTY; 2],
         weather: Weather::None,
         weather_turns: 0,

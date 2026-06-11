@@ -44,7 +44,8 @@ pub enum VolatileStatus {
     FocusEnergy,     // +2 crit stages (Focus Energy / Dragon Cheer)
     Unburden,
     ThroatChop,
-    HealBlock,        // lost/consumed its item: Speed ×2 until switch-out
+    HealBlock,
+    TypeShifted,        // lost/consumed its item: Speed ×2 until switch-out
 }
 
 /// A packed set of active-Pokémon volatile statuses.

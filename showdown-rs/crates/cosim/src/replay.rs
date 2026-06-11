@@ -43,6 +43,9 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
         .ok_or_else(|| Unsupported("trace:empty".into()))?;
     let canon = Canonical::from_first_state(&first.state_after)?;
 
+    // Sleep Clause Mod exists in ranked formats (incl. random battles) but not customgame
+    // (the recorded-team corpora).
+    let sleep_clause = trace.format.contains("randombattle");
     let mut results = Vec::new();
     let mut i = 0;
     // The state each unit replays from: the previous decision boundary.
@@ -65,14 +68,14 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
             j += 1;
         }
         let target = &unit.last().unwrap().state_after;
-        results.push(replay_unit(boundary, &unit, target, &canon));
+        results.push(replay_unit(boundary, &unit, target, &canon, sleep_clause));
         boundary = target;
         i = j;
     }
     Ok(results)
 }
 
-fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical) -> UnitResult {
+fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical, sleep_clause: bool) -> UnitResult {
     let dp = unit[0];
     let mut moves_used = Vec::new();
     for c in dp.choices.values() {
@@ -96,11 +99,11 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
 
     // Convert endpoint states; conversion failures are coverage findings.
     let state_before = match convert_state(before, canon) {
-        Ok(s) => s,
+        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
         Err(u) => return mk(Verdict::Unsupported(u), vec![]),
     };
     let state_target = match convert_state(target, canon) {
-        Ok(s) => s,
+        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
         Err(u) => return mk(Verdict::Unsupported(u), vec![]),
     };
 
