@@ -142,6 +142,29 @@ fn battle_over(state: &State) -> bool {
 }
 
 /// Is the active Pokémon grounded (subject to Spikes / Toxic Spikes / Sticky Web)?
+/// The weather as mechanics see it: Air Lock / Cloud Nine on either active suppresses all
+/// weather effects (the weather itself keeps ticking).
+fn effective_weather(state: &State) -> Weather {
+    use crate::ids::Ability as Ab;
+    for side in [SideId::One, SideId::Two] {
+        let p = state.side(side).active();
+        if p.is_alive() && matches!(p.ability, Ab::AirLock | Ab::CloudNine) {
+            return Weather::None;
+        }
+    }
+    state.weather
+}
+
+/// A mon's weight after ability modifiers (Light Metal ×0.5, Heavy Metal ×2).
+fn modified_weight_hg(p: &crate::state::Pokemon) -> u32 {
+    let w = crate::data::species_weight_hg(p.species);
+    match p.ability {
+        crate::ids::Ability::LightMetal => w / 2,
+        crate::ids::Ability::HeavyMetal => w * 2,
+        _ => w,
+    }
+}
+
 fn is_grounded(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
     !(p.types.contains(&Type::Flying)
@@ -163,7 +186,7 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
         return 1.0;
     }
     let id = md.id.to_id();
-    match (id, b.state.weather) {
+    match (id, effective_weather(&b.state)) {
         ("blizzard", Weather::Snow) => return 1.0,
         ("thunder" | "hurricane" | "bleakwindstorm" | "wildboltstorm" | "sandsearstorm", Weather::Rain | Weather::HeavyRain) => return 1.0,
         ("thunder" | "hurricane", Weather::Sun | Weather::HarshSun) => return 0.5,
@@ -456,6 +479,13 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             new_turns: turns,
         });
     }
+    // Frisk reveals the opponent's held item on switch-in (information only).
+    if ability == Frisk {
+        let foe = side.other();
+        if b.state.side(foe).active().is_alive() {
+            reveal(b, foe, 0, crate::state::Reveal::ITEM);
+        }
+    }
     // Trace copies the opponent's ability on switch-in (a few abilities are untraceable).
     if ability == Trace {
         let foe = side.other();
@@ -546,9 +576,20 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
     let tspikes = b.state.side(side).side_conditions.toxic_spikes;
     if grounded && tspikes > 0 {
         let p = b.state.side(side).active();
-        let status = if tspikes >= 2 { Status::Toxic } else { Status::Poison };
-        if !p.types.contains(&Type::Poison) && status_applies(p, status) {
-            push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
+        if p.types.contains(&Type::Poison) {
+            // A grounded Poison type absorbs the spikes, clearing them.
+            push(b, Instruction::SetSideCondition {
+                side,
+                condition: SideConditionId::ToxicSpikes,
+                previous: tspikes,
+                new: 0,
+            });
+        } else {
+            let status = if tspikes >= 2 { Status::Toxic } else { Status::Poison };
+            if status_applies(p, status) && !status_blocked_by_field(&b.state, side, status) {
+                push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
+                consume_lum_if_statused(b, side);
+            }
         }
     }
     // Sticky Web — grounded: −1 Speed on entry.
@@ -1113,7 +1154,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // A two-turn move spends this turn charging (no attack) unless it strikes instantly.
     // Power Herb is consumed to skip the charge turn entirely.
-    if !executing_charge && is_two_turn_move(move_id) && !charges_instantly(move_id, b.state.weather) {
+    if !executing_charge && is_two_turn_move(move_id) && !charges_instantly(move_id, effective_weather(&b.state)) {
         if b.state.side(side).active().item == Item::PowerHerb {
             push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::PowerHerb, new: Item::None });
             on_item_lost(&mut b, side);
@@ -1303,6 +1344,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_justified(&mut hb, foe, &md);
         apply_weak_armor(&mut hb, foe, &md);
         apply_throat_spray(&mut hb, side, &md);
+        apply_spin_clear(&mut hb, side, &md);
         apply_white_herb(&mut hb, side);
         // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
         apply_pinch_berry(&mut hb, foe);
@@ -1458,6 +1500,17 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
             Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::ToxicBoost
+                if matches!(attacker.status, Status::Poison | Status::Toxic)
+                    && md.category == MoveCategory::Physical =>
+            {
+                atk_stat = crate::damage::modify(atk_stat, 3, 2)
+            }
+            Ab::FlareBoost
+                if attacker.status == Status::Burn && md.category == MoveCategory::Special =>
+            {
+                atk_stat = crate::damage::modify(atk_stat, 3, 2)
+            }
             // Type-boosting abilities (applied to the offensive stat like the others above).
             Ab::WaterBubble if md.typ == Type::Water => atk_stat = crate::damage::modify(atk_stat, 2, 1),
             Ab::Transistor if md.typ == Type::Electric => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
@@ -1576,13 +1629,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Weight-based moves compute their base power dynamically.
     match md.id.to_id() {
         "grassknot" | "lowkick" => {
-            let w = crate::data::species_weight_hg(defender.species);
+            let w = modified_weight_hg(defender);
             base_power = if w >= 2000 { 120 } else if w >= 1000 { 100 } else if w >= 500 { 80 }
                 else if w >= 250 { 60 } else if w >= 100 { 40 } else { 20 };
         }
         "heavyslam" | "heatcrash" => {
-            let wu = crate::data::species_weight_hg(attacker.species).max(1);
-            let wt = crate::data::species_weight_hg(defender.species).max(1);
+            let wu = modified_weight_hg(attacker).max(1);
+            let wt = modified_weight_hg(defender).max(1);
             let ratio = wu / wt;
             base_power = if ratio >= 5 { 120 } else if ratio >= 4 { 100 } else if ratio >= 3 { 80 }
                 else if ratio >= 2 { 60 } else { 40 };
@@ -1686,7 +1739,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         defense_stat: def_stat.max(1) as i16,
         is_crit: false,
         attacker_burned: burned,
-        weather: b.state.weather,
+        weather: effective_weather(&b.state),
         terastallized: attacker.terastallized,
         tera_type: attacker.tera_type,
         life_orb,
@@ -1931,6 +1984,38 @@ fn apply_post_damage(
         let new = cur.saturating_add(hits_landed).min(250);
         if new != cur {
             push(b, Instruction::SetTimesHit { side: foe, slot: fslot, previous: cur, new });
+        }
+    }
+
+    // Defender on-hit reaction abilities (only when the hit connected with the mon itself).
+    if any_damage && !hit_sub {
+        let f = b.state.side(foe).active();
+        if f.is_alive() {
+            use crate::ids::Ability as Ab;
+            match f.ability {
+                Ab::Stamina => {
+                    raise_boost(b, foe, BoostIndex::Defense, 1);
+                }
+                Ab::WaterCompaction if md.typ == Type::Water => {
+                    raise_boost(b, foe, BoostIndex::Defense, 2);
+                }
+                Ab::Berserk => {
+                    // Fires when the hit drops the holder below half.
+                    let hp = f.hp as i32;
+                    let pre = hp + total_dealt;
+                    if pre * 2 > f.max_hp as i32 && hp * 2 <= f.max_hp as i32 {
+                        raise_boost(b, foe, BoostIndex::SpecialAttack, 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Soul-Heart: +1 SpA whenever a Pokémon faints from this hit.
+        if !b.state.side(foe).active().is_alive()
+            && b.state.side(side).active().ability == crate::ids::Ability::SoulHeart
+            && b.state.side(side).active().is_alive()
+        {
+            raise_boost(b, side, BoostIndex::SpecialAttack, 1);
         }
     }
 
@@ -2567,6 +2652,77 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     // Rest: cures status, falls asleep, and heals to full. Implemented as an onHit callback
     // in PS (no static fields). Fails at full HP. The sleep counter is excluded from the
     // comparison and re-projected each turn, so we only set the status + heal.
+    // Defog: -1 evasion to the target, clears hazards on BOTH sides, the target's screens,
+    // and terrain (gen 8+).
+    if md.id.to_id() == "defog" {
+        let mut b = b;
+        let foe2 = side.other();
+        if b.state.side(foe2).active().is_alive() {
+            if apply_boost_clamped(&mut b, foe2, BoostIndex::Evasion, -1) < 0 {
+                react_to_stat_drop(&mut b, foe2);
+            }
+        }
+        for sd in [side, foe2] {
+            clear_hazards(&mut b, sd);
+        }
+        let fc = b.state.side(foe2).side_conditions;
+        for (sc, cur) in [
+            (SideConditionId::Reflect, fc.reflect),
+            (SideConditionId::LightScreen, fc.light_screen),
+            (SideConditionId::AuroraVeil, fc.aurora_veil),
+        ] {
+            if cur > 0 {
+                push(&mut b, Instruction::SetSideCondition { side: foe2, condition: sc, previous: cur, new: 0 });
+            }
+        }
+        let (prev_t, prev_tt) = (b.state.terrain, b.state.terrain_turns);
+        if prev_t != crate::ids::Terrain::None {
+            push(&mut b, Instruction::ChangeTerrain {
+                previous: prev_t,
+                previous_turns: prev_tt,
+                new: crate::ids::Terrain::None,
+                new_turns: 0,
+            });
+        }
+        return vec![b];
+    }
+    // Tidy Up: clears hazards and Substitutes on BOTH sides, then +1 Atk / +1 Spe.
+    if md.id.to_id() == "tidyup" {
+        let mut b = b;
+        for sd in [side, side.other()] {
+            clear_hazards(&mut b, sd);
+            if b.state.side(sd).volatiles.contains(VolatileStatus::Substitute) {
+                push(&mut b, Instruction::RemoveVolatile { side: sd, volatile: VolatileStatus::Substitute });
+                let sub = b.state.side(sd).substitute_hp;
+                if sub > 0 {
+                    push(&mut b, Instruction::ChangeSubstituteHp { side: sd, amount: sub });
+                }
+            }
+        }
+        apply_self_boost(&mut b, side, BoostIndex::Attack, 1);
+        apply_self_boost(&mut b, side, BoostIndex::Speed, 1);
+        return vec![b];
+    }
+    // Trick / Switcheroo: swap held items (blocked by Sticky Hold).
+    if matches!(md.id.to_id(), "trick" | "switcheroo") {
+        let mut b = b;
+        let foe2 = side.other();
+        let (mine, theirs) = (b.state.side(side).active().item, b.state.side(foe2).active().item);
+        let sticky = b.state.side(foe2).active().ability == crate::ids::Ability::StickyHold;
+        if b.state.side(foe2).active().is_alive() && !sticky && (mine != Item::None || theirs != Item::None) {
+            let my_slot = b.state.side(side).active_index;
+            let their_slot = b.state.side(foe2).active_index;
+            push(&mut b, Instruction::ChangeItem { side, slot: my_slot, previous: mine, new: theirs });
+            push(&mut b, Instruction::ChangeItem { side: foe2, slot: their_slot, previous: theirs, new: mine });
+            if theirs == Item::None {
+                on_item_lost(&mut b, side);
+            }
+            if mine == Item::None {
+                on_item_lost(&mut b, foe2);
+            }
+        }
+        return vec![b];
+    }
     // Wish: heals half the caster's max HP into whatever occupies the slot, at the end of
     // NEXT turn. Fails while one is already pending.
     if md.id.to_id() == "wish" {
@@ -2897,6 +3053,38 @@ fn weather_set_turns(item: Item, weather: Weather) -> i8 {
     if extended { 8 } else { 5 }
 }
 
+/// Clear entry hazards from one side (Rapid Spin's own-side sweep; Defog/Tidy Up both sides).
+fn clear_hazards(b: &mut Branch, side: SideId) {
+    use SideConditionId::*;
+    let c = b.state.side(side).side_conditions;
+    for (sc, cur) in [
+        (StealthRock, c.stealth_rock as u8),
+        (Spikes, c.spikes),
+        (ToxicSpikes, c.toxic_spikes),
+        (StickyWeb, c.sticky_web as u8),
+    ] {
+        if cur > 0 {
+            push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: 0 });
+        }
+    }
+}
+
+/// Post-hit hazard removal for spin moves; Defog / Tidy Up handle theirs in the status path.
+fn apply_spin_clear(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if !matches!(md.id.to_id(), "rapidspin" | "mortalspin") {
+        return;
+    }
+    if !b.state.side(side).active().is_alive() {
+        return;
+    }
+    clear_hazards(b, side);
+    for v in [VolatileStatus::LeechSeed, VolatileStatus::PartiallyTrapped] {
+        if b.state.side(side).volatiles.contains(v) {
+            push(b, Instruction::RemoveVolatile { side, volatile: v });
+        }
+    }
+}
+
 /// Whirlwind / Roar / Dragon Tail / Circle Throw: drag the foe into a uniformly-random alive
 /// bench mon (each target is its own branch). No-op if the foe has no bench or fainted.
 fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
@@ -2979,7 +3167,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         let magic_guard = ability == Ab::MagicGuard;
 
         // Sandstorm chip — skipped for Rock/Ground/Steel types and sand-immune abilities.
-        if b.state.weather == Weather::Sand && !magic_guard {
+        if effective_weather(&b.state) == Weather::Sand && !magic_guard {
             let immune = p.types.contains(&Type::Rock)
                 || p.types.contains(&Type::Ground)
                 || p.types.contains(&Type::Steel)
