@@ -249,12 +249,20 @@ fn targets_foe_status(md: &crate::data::MoveData) -> bool {
 /// target's side is already asleep.
 fn sleep_clause_blocks(state: &State, side: SideId) -> bool {
     let s = state.side(side);
-    s.pokemon.iter().enumerate().any(|(i, p)| {
-        i as u8 != s.active_index
-            && p.species != crate::ids::Species::None
+    s.pokemon.iter().any(|p| {
+        p.species != crate::ids::Species::None
             && p.is_alive()
             && p.status == Status::Sleep
+            && p.slept_by_foe
     })
+}
+
+/// Mark the active of `side` as foe-slept (for Sleep Clause).
+fn mark_slept_by_foe(b: &mut Branch, side: SideId) {
+    let slot = b.state.side(side).active_index;
+    if !b.state.side(side).active().slept_by_foe {
+        push(b, Instruction::SetSleptByFoe { side, slot, previous: false, new: true });
+    }
 }
 
 /// Rampage moves lock the user in for 2-3 turns total, then confuse it.
@@ -1811,7 +1819,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Swarm if md.typ == Type::Bug && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             // Sheer Force: ×1.3 when the move has a secondary (the secondary is then removed).
-            Ab::SheerForce if md.secondary_chance > 0 => atk_stat = crate::damage::modify(atk_stat, 5325, 4096),
+
             Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
             Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
             Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
@@ -1939,7 +1947,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let def_ability = def_ab;
     let def_item = defender.item;
     let def_maxhp = defender.max_hp;
-    let life_orb = attacker.item == Item::LifeOrb;
+    let sheer_force_active = attacker.ability == Ab::SheerForce
+        && (md.secondary_chance > 0 || md.flinch_chance > 0);
+    let life_orb = attacker.item == Item::LifeOrb && !sheer_force_active;
 
     // Knock Off: ×1.5 base power when the target is holding a (removable) item.
     let mut base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
@@ -2021,6 +2031,10 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
     }
 
+    // Sheer Force: x1.3 base power for moves with any secondary (which is then removed).
+    if sheer_force_active {
+        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
+    }
     // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
     // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
     if attacker.ability == Ab::SupremeOverlord {
@@ -2121,8 +2135,11 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
         let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
         let raw = rolls[roll as usize];
         // Route to the Substitute if the target has one up (it absorbs the whole hit).
+        // Sound moves and Infiltrator users go straight through it.
+        let bypass_sub = md.flag_sound
+            || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
         let sub_hp = b.state.side(foe).substitute_hp;
-        if sub_hp > 0 && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
+        if sub_hp > 0 && !bypass_sub && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
             let sub_dmg = raw.min(sub_hp);
             push(b, Instruction::DamageSubstitute { side: foe, amount: sub_dmg });
             if raw >= sub_hp {
@@ -2785,6 +2802,10 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     if md.flinch_chance == 0 {
         return vec![b];
     }
+    // Sheer Force trades the flinch secondary for its x1.3 power boost.
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return vec![b];
+    }
     let foe = side.other();
     let d = b.state.side(foe).active();
     if !d.is_alive()
@@ -2874,6 +2895,9 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
         applied_sleep = md.secondary_status == Status::Sleep;
+        if applied_sleep {
+            mark_slept_by_foe(&mut proc, foe);
+        }
         apply_synchronize(&mut proc, foe, md.secondary_status);
         consume_lum_if_statused(&mut proc, foe);
         applied_sleep = applied_sleep && proc.state.side(foe).active().status == Status::Sleep;
@@ -3384,6 +3408,9 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
         applied_sleep = md.status == Status::Sleep;
+        if applied_sleep {
+            mark_slept_by_foe(&mut hit, foe);
+        }
         apply_synchronize(&mut hit, foe, md.status);
         consume_lum_if_statused(&mut hit, foe);
         applied_sleep = applied_sleep && hit.state.side(foe).active().status == Status::Sleep;
@@ -4016,6 +4043,7 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 {
                     let slot = x.state.side(side).active_index;
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
+                    mark_slept_by_foe(&mut x, side);
                     consume_lum_if_statused(&mut x, side);
                     if x.state.side(side).active().status == Status::Sleep {
                         branch_sleep_counter(x, side)

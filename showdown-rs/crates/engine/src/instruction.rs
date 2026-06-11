@@ -157,6 +157,7 @@ pub enum Instruction {
     /// entering a transform overwrites `base_moves` with the pre-transform slots.
     Transform { side: SideId, slot: u8, previous: TransformData, new: TransformData, previous_base_moves: [MoveSlot; 4] },
     SetHealingWish { side: SideId, previous: bool, new: bool },
+    SetSleptByFoe { side: SideId, slot: u8, previous: bool, new: bool },
 
     // --- battle-long per-mon history (persists across switches) ---
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
@@ -205,6 +206,9 @@ impl State {
             }
             SetHealingWish { side, new, .. } => {
                 self.side_mut(side).healing_wish = new;
+            }
+            SetSleptByFoe { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].slept_by_foe = new;
             }
             Transform { side, slot, previous, new, .. } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
@@ -343,6 +347,9 @@ impl State {
             }
             SetHealingWish { side, previous, .. } => {
                 self.side_mut(side).healing_wish = previous;
+            }
+            SetSleptByFoe { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].slept_by_foe = previous;
             }
             Transform { side, slot, previous, new, previous_base_moves } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];

@@ -301,12 +301,21 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     } else {
         Species::from_id(&base_species_id).unwrap_or(species)
     };
+    // Sleep Clause bookkeeping: a sleep whose statusState.source is on the other side.
+    let slept_by_foe = status == Status::Sleep && {
+        let src = p["statusState"].get("source").and_then(Value::as_str).unwrap_or("");
+        let tgt = p["statusState"].get("target").and_then(Value::as_str).unwrap_or("");
+        // refs look like "[Pokemon:p1a]"; different player prefix => foe-induced
+        let pside = |r: &str| r.split(':').nth(1).map(|x| x.chars().take(2).collect::<String>()).unwrap_or_default();
+        !src.is_empty() && !tgt.is_empty() && pside(src) != pside(tgt)
+    };
     Ok(Pokemon {
         species,
         level,
         types,
         base_types,
         transformed,
+        slept_by_foe,
         base_species,
         base_stats,
         base_moves: if transformed { [MoveSlot::EMPTY; 4] } else { moves },
@@ -463,7 +472,9 @@ fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon:
                     // live occupant — fresh (made this turn) and lingering (slot was empty
                     // at its maturity residual) both map to remaining = 1.
                     let _ = turn;
-                    side.wish = (1, i(cv, "hp") as i16);
+                    // hp can be fractional (maxhp/2 of an odd max); PS truncates on heal.
+                    let hp = cv.get("hp").and_then(Value::as_f64).unwrap_or(0.0) as i16;
+                    side.wish = (1, hp);
                 }
                 "futuremove" => {
                     // source pokemon decides the attack's stats; map to a canonical slot

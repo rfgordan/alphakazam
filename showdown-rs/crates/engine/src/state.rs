@@ -83,6 +83,9 @@ pub struct Pokemon {
     /// `base_*` fields hold what to restore when it switches out (PS reverts transform on
     /// switch). When not transformed they mirror the current values and are never read.
     pub transformed: bool,
+    /// This mon's current Sleep was inflicted by the opponent (drives Sleep Clause Mod;
+    /// Rest sleep doesn't count). Only meaningful while status == Sleep.
+    pub slept_by_foe: bool,
     pub base_species: Species,
     pub base_stats: [i16; StatIndex::COUNT],
     pub base_moves: [MoveSlot; 4],
@@ -126,6 +129,7 @@ impl Pokemon {
         types: [Type::None, Type::None],
         base_types: [Type::None, Type::None],
         transformed: false,
+        slept_by_foe: false,
         base_species: Species::None,
         base_stats: [0; StatIndex::COUNT],
         base_moves: [MoveSlot::EMPTY; 4],
