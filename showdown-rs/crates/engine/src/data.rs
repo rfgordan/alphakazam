@@ -119,6 +119,9 @@ pub struct MoveData {
     pub flag_pulse: bool,
     /// `heal` flag: the move restores HP (Recover, Roost, drains) — fails under Heal Block.
     pub flag_heal: bool,
+    /// Powder move (Spore, Sleep Powder, Stun Spore): no effect on Grass types, Overcoat,
+    /// or Safety Goggles holders.
+    pub flag_powder: bool,
 }
 
 impl MoveData {
@@ -163,6 +166,7 @@ impl MoveData {
             flag_bullet: false,
             flag_pulse: false,
             flag_heal: false,
+            flag_powder: false,
         }
     }
 }

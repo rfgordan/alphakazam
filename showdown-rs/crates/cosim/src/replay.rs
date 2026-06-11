@@ -28,6 +28,8 @@ pub enum Verdict {
 pub struct UnitResult {
     pub turn: u32,
     pub verdict: Verdict,
+    /// "p1:<choice> p2:<choice>" summary for diagnostics.
+    pub choice_summary: String,
     /// move ids chosen this unit (for coverage accounting)
     pub moves_used: Vec<String>,
     /// legality mismatches observed at this unit's requests
@@ -78,8 +80,19 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
             moves_used.push(m.clone());
         }
     }
+    let mut choice_summary = String::new();
+    for d in unit {
+        for sk in ["p1", "p2"] {
+            if let Some(c) = d.choices.get(sk) {
+                let what = c.resolved.move_id.clone()
+                    .or_else(|| c.resolved.details.clone())
+                    .unwrap_or_else(|| c.choice.clone());
+                choice_summary.push_str(&format!("{sk}:{what} "));
+            }
+        }
+    }
     let turn = dp.turn;
-    let mk = |verdict: Verdict, legality: Vec<String>| UnitResult { turn, verdict, moves_used: moves_used.clone(), legality };
+    let mk = |verdict: Verdict, legality: Vec<String>| UnitResult { turn, verdict, moves_used: moves_used.clone(), legality, choice_summary: choice_summary.clone() };
 
     // Convert endpoint states; conversion failures are coverage findings.
     let state_before = match convert_state(before, canon) {

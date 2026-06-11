@@ -82,11 +82,12 @@ pub fn convert_state(v: &Value, canon: &Canonical) -> Res<State> {
     let mut state = State::EMPTY;
     let ended = b(v, "ended");
     let sides = v["sides"].as_array().ok_or_else(|| unsup("state:no-sides"))?;
+    let turn = i(v, "turn") as u32;
     for (si, side_v) in sides.iter().enumerate() {
-        state.sides[si] = convert_side(side_v, si, canon, ended)?;
+        state.sides[si] = convert_side(side_v, si, canon, ended, turn)?;
     }
     convert_field(&v["field"], &mut state)?;
-    state.turn = i(v, "turn") as u32;
+    state.turn = turn;
     Ok(state)
 }
 
@@ -115,7 +116,7 @@ fn convert_field(f: &Value, state: &mut State) -> Res<()> {
     Ok(())
 }
 
-fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool) -> Res<Side> {
+fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32) -> Res<Side> {
     let mut side = Side::EMPTY;
 
     // Party, into canonical slots.
@@ -146,7 +147,7 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool) -> Res<Sid
         if ended {
             side.active_index = u8::MAX;
             convert_side_conditions(&v["sideConditions"], &mut side)?;
-            convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon)?;
+            convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon, turn)?;
             return Ok(side);
         }
         return Err(unsup("side:no-active"));
@@ -164,7 +165,9 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool) -> Res<Sid
     // endTurn before turn 1; that propagates consistently through both engines.)
     side.active_turns = i(active_v, "activeTurns") as u8;
     if let Some(lm) = active_v.get("lastMove") {
-        if let Some(id) = lm.get("id").and_then(Value::as_str) {
+        // Serialized as {move: "[Move:gigadrain]", hit: 1, ...}.
+        if let Some(mref) = lm.get("move").and_then(Value::as_str) {
+            let id = mref.trim_start_matches("[Move:").trim_end_matches(']');
             side.last_used_move = MoveId::from_id(id).unwrap_or(MoveId::None);
         }
     }
@@ -183,7 +186,7 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool) -> Res<Sid
     }
 
     convert_side_conditions(&v["sideConditions"], &mut side)?;
-    convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon)?;
+    convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon, turn)?;
     Ok(side)
 }
 
@@ -376,7 +379,9 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
                 }
             }
             "stall" => {
-                side.stall_counter = i(vv, "counter") as u8;
+                // PS stores the denominator (3^n, capped 729); the engine stores n.
+                let c = i(vv, "counter").max(1);
+                side.stall_counter = (c as f64).log(3.0).round() as u8;
             }
             "choicelock" => { side.volatiles.insert(VolatileStatus::ChoiceLock); }
             "saltcure" => { side.volatiles.insert(VolatileStatus::SaltCure); }
@@ -438,14 +443,24 @@ fn convert_side_conditions(v: &Value, side: &mut Side) -> Res<()> {
     Ok(())
 }
 
-fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon: &Canonical) -> Res<()> {
-    let Some(slots) = v.and_then(Value::as_object) else { return Ok(()) };
-    for (_slot, conds) in slots {
+fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon: &Canonical, turn: u32) -> Res<()> {
+    // Serialized as an array (one object per slot); accept the object form too.
+    let entries: Vec<&Value> = match v {
+        Some(Value::Array(a)) => a.iter().collect(),
+        Some(Value::Object(o)) => o.values().collect(),
+        _ => return Ok(()),
+    };
+    for conds in entries {
         let Some(conds) = conds.as_object() else { continue };
         for (k, cv) in conds {
             match k.as_str() {
                 "wish" => {
-                    side.wish = (i(cv, "duration") as u8, i(cv, "hp") as i16);
+                    // No duration field (turn arithmetic via startingTurn). A wish present
+                    // in a post-turn snapshot always heals at the next end-of-turn with a
+                    // live occupant — fresh (made this turn) and lingering (slot was empty
+                    // at its maturity residual) both map to remaining = 1.
+                    let _ = turn;
+                    side.wish = (1, i(cv, "hp") as i16);
                 }
                 "futuremove" => {
                     // source pokemon decides the attack's stats; map to a canonical slot

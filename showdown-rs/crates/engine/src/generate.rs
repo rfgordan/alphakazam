@@ -313,12 +313,24 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     let mut branches = vec![start];
 
-    // 1) Switches resolve before moves (deterministic).
-    for (side, choice) in [(SideId::One, s1), (SideId::Two, s2)] {
-        if let MoveChoice::Switch(target) = choice {
-            for b in &mut branches {
-                apply_switch(b, side, target);
-            }
+    // 1) Switches resolve before moves, in speed order when both sides switch (the slower
+    //    side's switch-in ability resolves last and e.g. its weather wins).
+    let mut switch_actions: Vec<(SideId, u8)> = [(SideId::One, s1), (SideId::Two, s2)]
+        .into_iter()
+        .filter_map(|(side, c)| match c {
+            MoveChoice::Switch(t) => Some((side, t)),
+            _ => None,
+        })
+        .collect();
+    if switch_actions.len() == 2 {
+        let sp = |side: SideId| effective_speed(state, side);
+        if sp(switch_actions[1].0) > sp(switch_actions[0].0) {
+            switch_actions.swap(0, 1);
+        }
+    }
+    for (side, target) in switch_actions {
+        for b in &mut branches {
+            apply_switch(b, side, target);
         }
     }
 
@@ -436,6 +448,10 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
         if vols.contains(*v) {
             push(b, Instruction::RemoveVolatile { side, volatile: *v });
         }
+    }
+    let sub = b.state.side(side).substitute_hp;
+    if sub != 0 {
+        push(b, Instruction::ChangeSubstituteHp { side, amount: -sub });
     }
     // Natural Cure heals the outgoing Pokémon's non-volatile status as it switches out;
     // Regenerator restores 1/3 of its max HP. Both act on the mon before it leaves.
@@ -1036,7 +1052,9 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
     }
     match v {
         VolatileStatus::Taunt => {
-            let dur = if foe_moves_later { 3 } else { 4 };
+            // PS: base 3, +1 only when the target has already moved this turn
+            // (activeTurns truthy and not in the queue) — a fresh switch-in stays at 3.
+            let dur = if foe_moves_later || b.state.side(foe).active_turns == 0 { 3 } else { 4 };
             push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
             let prev = b.state.side(foe).taunt_turns;
             push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::Taunt, previous: prev, new: dur });
@@ -1553,6 +1571,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
     let def_ab = if mb { Ab::None } else { defender.ability };
 
+    // Foul Play uses the defender's Attack stat and Attack boost (attacker's burn still
+    // applies; Unaware on the defender ignores... the defender's own boost is used as-is).
+    let foul_play = md.id.to_id() == "foulplay";
     // Choose offensive / defensive stats (Body Press uses Defense to attack).
     let atk_idx = if md.uses_defense_as_attack {
         crate::ids::StatIndex::Defense
@@ -1574,7 +1595,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 
     // Unaware: the attacker ignores the defender's defensive boosts, and a defender with
     // Unaware ignores the attacker's offensive boosts.
-    let atk_boost = if def_ab == Ab::Unaware { 0 } else { b.state.side(side).boost(atk_boost_idx) };
+    let atk_boost = if def_ab == Ab::Unaware {
+        0
+    } else if foul_play {
+        b.state.side(foe).boost(atk_boost_idx)
+    } else {
+        b.state.side(side).boost(atk_boost_idx)
+    };
     let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
 
     // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
@@ -1596,7 +1623,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // boost clamped (a crit ignores the attacker's *negative* offensive boost and the
     // defender's *positive* defensive boost) while reusing the identical modifier chain.
     let finalize_atk = |boost: i8| -> i64 {
-        let mut atk_stat = boosted_stat(attacker.stat(atk_idx) as i64, boost);
+        let atk_owner = if foul_play { defender } else { attacker };
+        let mut atk_stat = boosted_stat(atk_owner.stat(atk_idx) as i64, boost);
         // Item stat modifiers (PS applies these via `modify`, round-half-up).
         match (attacker.item, md.category) {
             (Item::ChoiceBand, MoveCategory::Physical) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -2238,6 +2266,9 @@ fn apply_weak_armor(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
 fn apply_throat_spray(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
     if md.flag_sound && b.state.side(side).active().item == Item::ThroatSpray {
         raise_boost(b, side, BoostIndex::SpecialAttack, 1);
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::ChangeItem { side, slot, previous: Item::ThroatSpray, new: Item::None });
+        on_item_lost(b, side);
     }
 }
 
@@ -2713,11 +2744,31 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
     let foe = side.other();
 
+    // Powder moves have no effect on Grass types, Overcoat, or Safety Goggles holders.
+    if md.flag_powder && md.target != crate::data::MoveTarget::User {
+        let t = b.state.side(foe).active();
+        if t.types.contains(&Type::Grass)
+            || t.ability == crate::ids::Ability::Overcoat
+            || t.item == Item::SafetyGoggles
+        {
+            return vec![b];
+        }
+    }
+
     // Protect family: succeeds with probability 1/3^n on the (n+1)ᵗʰ consecutive use (n is
     // the stall counter). Success sets the Protect volatile and bumps the counter; failure
     // resets it. We enumerate both branches so PS's actual outcome is always a member.
     if is_protect_move(md.id) {
         let n = b.state.side(side).stall_counter;
+        // PS gates Protect on `queue.willAct()`: it fails outright (and resets the chain)
+        // when nothing acts after it this turn — foe switched, already moved, or no foe move.
+        if !foe_moves_later {
+            let mut fb = b;
+            if fb.state.side(side).stall_counter != 0 {
+                push(&mut fb, Instruction::SetStallCounter { side, previous: n, new: 0 });
+            }
+            return vec![fb];
+        }
         let success_p = 1.0 / 3f32.powi(n.min(6) as i32);
         let mut out = Vec::new();
         // Success branch.
@@ -2871,6 +2922,17 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         if can_switch {
             apply_post_status_self_destruct(&mut b, side, md);
+        }
+        return vec![b];
+    }
+    // Trick Room: toggles; setting gives 5 turns (ticked at residual), reusing cancels.
+    if md.id.to_id() == "trickroom" {
+        let mut b = b;
+        let (prev_tr, prev_turns) = (b.state.trick_room, b.state.trick_room_turns);
+        if prev_tr {
+            push(&mut b, Instruction::ToggleTrickRoom { previous_turns: prev_turns, new_turns: 0 });
+        } else {
+            push(&mut b, Instruction::ToggleTrickRoom { previous_turns: prev_turns, new_turns: 5 });
         }
         return vec![b];
     }
@@ -3100,6 +3162,12 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     if md.force_switch {
         // Roar / Whirlwind: phaze the foe into a random bench mon.
         hits = hits.into_iter().flat_map(|x| apply_drag(x, foe)).collect();
+    }
+    // Self-sacrificing status moves (Memento, Final Gambit-likes) faint the user on hit.
+    if md.self_destruct {
+        for x in hits.iter_mut() {
+            apply_post_status_self_destruct(x, side, md);
+        }
     }
 
     if miss_prob > 0.0 {
@@ -3637,18 +3705,24 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                 yawn_fired[side.index()] = true;
             }
         }
-        // Wish: ticks each end of turn; heals the slot's occupant when it lands.
+        // Wish: ticks each end of turn; heals the slot's occupant when it lands. PS's
+        // residual handler doesn't run for an empty/fainted slot, so a matured wish
+        // LINGERS until an end-of-turn where the slot has a live occupant.
         let wish = b.state.side(side).wish;
         if wish.0 > 0 {
             let landed = wish.0 == 1;
-            let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
-            push(b, Instruction::SetWish { side, previous: wish, new });
-            if landed {
-                let p = b.state.side(side).active();
-                if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
-                    let amt = wish.1.min(p.max_hp - p.hp);
-                    let slot = b.state.side(side).active_index;
-                    push(b, Instruction::Heal { side, slot, amount: amt });
+            if landed && !b.state.side(side).active().is_alive() {
+                // linger: try again next end of turn
+            } else {
+                let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
+                push(b, Instruction::SetWish { side, previous: wish, new });
+                if landed {
+                    let p = b.state.side(side).active();
+                    if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
+                        let amt = wish.1.min(p.max_hp - p.hp);
+                        let slot = b.state.side(side).active_index;
+                        push(b, Instruction::Heal { side, slot, amount: amt });
+                    }
                 }
             }
         }

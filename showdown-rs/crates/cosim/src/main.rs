@@ -101,8 +101,9 @@ fn main() -> ExitCode {
                         *totals.divergence_categories.entry(diff.category.clone()).or_insert(0) += 1;
                     }
                     if verbose {
-                        println!("  [diverged t{} | {} branches] {}", unit.turn, branches,
-                            closest.iter().take(4).map(|d| d.detail.as_str()).collect::<Vec<_>>().join(" | "));
+                        println!("  [diverged t{} | {} branches] {}| {}", unit.turn, branches,
+                            unit.choice_summary,
+                            closest.iter().take(6).map(|d| d.detail.as_str()).collect::<Vec<_>>().join(" | "));
                     }
                 }
                 Verdict::Unsupported(u) => {
