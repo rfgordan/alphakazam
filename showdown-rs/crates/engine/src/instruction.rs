@@ -48,6 +48,8 @@ pub struct TransformData {
     pub ability: Ability,
     pub moves: [MoveSlot; 4],
     pub transformed: bool,
+    /// Transform copies `timesAttacked` (Rage Fist counts).
+    pub times_hit: u8,
 }
 
 
@@ -224,6 +226,7 @@ impl State {
                 p.ability = new.ability;
                 p.moves = new.moves;
                 p.transformed = new.transformed;
+                p.times_hit = new.times_hit;
                 if !previous.transformed && new.transformed {
                     // Entering a transform: remember what to restore on switch-out.
                     p.base_species = previous.species;
@@ -370,6 +373,7 @@ impl State {
                 p.ability = previous.ability;
                 p.moves = previous.moves;
                 p.transformed = previous.transformed;
+                p.times_hit = previous.times_hit;
                 if !previous.transformed && new.transformed {
                     // Undo the base_* overwrite from entering the transform.
                     p.base_species = previous.species;

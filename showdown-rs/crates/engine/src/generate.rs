@@ -175,6 +175,7 @@ fn transform_data_of(state: &State, side: SideId) -> crate::instruction::Transfo
         ability: p.ability,
         moves: p.moves,
         transformed: p.transformed,
+        times_hit: p.times_hit,
     }
 }
 
@@ -284,6 +285,30 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
     if !is_rampage_move(move_id) {
         return out;
     }
+    // A failed rampage (immune target) doesn't lock; mid-rampage it ends without confusion.
+    let failed = {
+        let probe = out.first();
+        probe.is_some_and(|b| {
+            let foe = side.other();
+            let t = b.state.side(foe).active();
+            t.is_alive() && crate::damage::type_multiplier(move_data(move_id).typ, t.types) == 0.0
+        })
+    };
+    if failed {
+        return out
+            .into_iter()
+            .map(|mut b| {
+                let pending = b.state.side(side).pending_move;
+                if matches!(pending, PendingMove::Rampaging(m, _) if m == move_id) {
+                    push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+                    if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                        push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+                    }
+                }
+                b
+            })
+            .collect();
+    }
     out.into_iter()
         .flat_map(|mut b| {
             if !b.state.side(side).active().is_alive() {
@@ -303,6 +328,10 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                         }
                         if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
                             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
+                            consume_lum_if_statused(&mut b, side);
+                            if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
+                                return vec![b];
+                            }
                             return branch_confusion_counter(b, side);
                         }
                         vec![b]
@@ -509,6 +538,14 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     if previous == target {
         return;
     }
+    // A traced / copied ability reverts on switch-out (Transform handles its own below).
+    {
+        let p = b.state.side(side).active();
+        if !p.transformed && p.ability != p.base_ability {
+            let slot = previous;
+            push(b, Instruction::ChangeAbility { side, slot, previous: p.ability, new: p.base_ability });
+        }
+    }
     // A transformed mon reverts to its own identity as it leaves the field.
     if b.state.side(side).active().transformed {
         let prev_data = transform_data_of(&b.state, side);
@@ -520,6 +557,7 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             ability: p.base_ability,
             moves: p.base_moves,
             transformed: false,
+            times_hit: p.times_hit,
         };
         let slot = previous;
         let previous_base_moves = p.base_moves;
@@ -776,14 +814,16 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
                 | RKSSystem | Schooling | ShieldsDown | StanceChange | WonderGuard | ZenMode
                 | ZeroToHero | Commander
                 // PS `notrace` flag additions:
-                | BattleBond | DauntlessShield | EmbodyAspectCornerstone | EmbodyAspectHearthflame
-                | EmbodyAspectTeal | EmbodyAspectWellspring | Hospitality | IntrepidSword
-                | OrichalcumPulse | HadronEngine | PoisonPuppeteer | Protosynthesis | QuarkDrive
+                | BattleBond | EmbodyAspectCornerstone | EmbodyAspectHearthflame
+                | EmbodyAspectTeal | EmbodyAspectWellspring | Hospitality
+                | PoisonPuppeteer | Protosynthesis | QuarkDrive
                 | TeraShell | TeraShift | TeraformZero
         );
         if b.state.side(foe).active().is_alive() && !untraceable {
             let slot = b.state.side(side).active_index;
             push(b, Instruction::ChangeAbility { side, slot, previous: Trace, new: fa });
+            // The copied ability activates as if the holder just switched in.
+            apply_switch_in_ability(b, side);
         }
     }
     // Intimidate: lower the opposing active's Attack by 1 on switch-in. Inner Focus /
@@ -1848,6 +1888,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         (crate::ids::StatIndex::SpecialDefense, BoostIndex::SpecialDefense)
     };
 
+    // Ruin abilities (gen9): each lowers one stat of all OTHER active mons by 25%.
+    let tablets = def_ab == Ab::TabletsOfRuin && attacker.ability != Ab::TabletsOfRuin;
+    let vessel = def_ab == Ab::VesselOfRuin && attacker.ability != Ab::VesselOfRuin;
+    let sword = attacker.ability == Ab::SwordOfRuin && def_ab != Ab::SwordOfRuin;
+    let beads = attacker.ability == Ab::BeadsOfRuin && def_ab != Ab::BeadsOfRuin;
+
     // Unaware: the attacker ignores the defender's defensive boosts, and a defender with
     // Unaware ignores the attacker's offensive boosts.
     let atk_boost = if def_ab == Ab::Unaware {
@@ -1880,6 +1926,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let finalize_atk = |boost: i8| -> i64 {
         let atk_owner = if foul_play { defender } else { attacker };
         let mut atk_stat = boosted_stat(atk_owner.stat(atk_idx) as i64, boost);
+        if tablets && md.category == MoveCategory::Physical {
+            atk_stat = crate::damage::modify(atk_stat, 3, 4);
+        }
+        if vessel && md.category == MoveCategory::Special {
+            atk_stat = crate::damage::modify(atk_stat, 3, 4);
+        }
         // Item stat modifiers (PS applies these via `modify`, round-half-up).
         match (attacker.item, md.category) {
             (Item::ChoiceBand, MoveCategory::Physical) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -1945,6 +1997,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     };
     let finalize_def = |boost: i8| -> i64 {
         let mut def_stat = boosted_stat(defender.stat(def_idx) as i64, boost);
+        if sword && md.category == MoveCategory::Physical {
+            def_stat = crate::damage::modify(def_stat, 3, 4);
+        }
+        if beads && md.category == MoveCategory::Special {
+            def_stat = crate::damage::modify(def_stat, 3, 4);
+        }
         if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
             def_stat = crate::damage::modify(def_stat, 3, 2);
         }
@@ -2082,6 +2140,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         "storedpower" | "powertrip" => {
             let stages: i16 = b.state.side(side).boosts.iter().map(|&x| (x.max(0)) as i16).sum();
             base_power = (20 + 20 * stages as u16).max(20);
+        }
+        // Collision Course / Electro Drift: ~x1.33 when super effective.
+        "collisioncourse" | "electrodrift"
+            if crate::damage::type_multiplier(md.typ, b.state.side(side.other()).active().types) > 1.0 =>
+        {
+            base_power = crate::damage::modify(base_power as i64, 5461, 4096) as u16;
         }
         // Psyblade: x1.5 in Electric Terrain (any user; terrain applies to the field).
         "psyblade" if b.state.terrain == crate::ids::Terrain::Electric => {
@@ -3400,15 +3464,18 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
             || status_blocked_by_field(&b.state, side, Status::Sleep);
         if hp < maxhp && !blocked {
             let slot = b.state.side(side).active_index;
-            // Chesto Berry immediately cures the Rest sleep, so the user stays awake.
-            if status != Status::Sleep && item != Item::ChestoBerry {
+            // Chesto Berry immediately cures the Rest sleep (and is eaten).
+            if item == Item::ChestoBerry {
+                if status != Status::None {
+                    push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+                }
+                push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
+                on_berry_eaten(&mut b, side);
+            } else {
                 push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::Sleep });
                 // Rest's sleep is a fixed 2-turn nap (PS statusState.time = 3).
                 let prev_ctr = b.state.side(side).active().status_counter;
                 push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 3 });
-            } else if status != Status::None && item == Item::ChestoBerry {
-                // Rest first cures the prior status; Chesto then prevents the new sleep.
-                push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
             }
             push(&mut b, Instruction::Heal { side, slot, amount: maxhp - hp });
         }
