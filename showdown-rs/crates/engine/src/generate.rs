@@ -3309,20 +3309,22 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
         }
     }
     // Throat Chop's volatile is applied in PS via the secondary's onHit (not volatileStatus),
-    // so the codegen can't see it; special-case it here (100% on hit, refreshes to 2 turns).
+    // so the codegen can't see it; special-case it here (100% on hit, 2-turn duration). PS's
+    // throatchop condition has no `onRestart`, so re-hitting a target that ALREADY has it does
+    // nothing — the existing countdown keeps ticking and is not refreshed. Only set the counter
+    // when the volatile is applied fresh.
     use crate::instruction::ActiveCounter;
     if md.id == crate::ids::MoveId::from_id("throatchop").unwrap_or(crate::ids::MoveId::None) && !hit_sub {
         let foe = side.other();
         let blocked = b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
             || b.state.side(foe).active().item == Item::CovertCloak;
-        if b.state.side(foe).active().is_alive() && !blocked {
-            if !b.state.side(foe).volatiles.contains(VolatileStatus::ThroatChop) {
-                push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::ThroatChop });
-            }
+        if b.state.side(foe).active().is_alive()
+            && !blocked
+            && !b.state.side(foe).volatiles.contains(VolatileStatus::ThroatChop)
+        {
+            push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::ThroatChop });
             let prev = b.state.side(foe).throat_chop_turns;
-            if prev != 2 {
-                push(b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::ThroatChop, previous: prev, new: 2 });
-            }
+            push(b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::ThroatChop, previous: prev, new: 2 });
         }
     }
     // A target volatile (Salt Cure, ...) is blocked by a Substitute.
