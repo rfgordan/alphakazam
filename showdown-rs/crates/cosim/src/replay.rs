@@ -191,7 +191,11 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         let mut cand = state_before;
         cand.apply_instructions(&si.instructions);
         let mut replaced = [false; 2];
-        if replacements.len() == 2 {
+        // `switch_into_pair` is for a SIMULTANEOUS double replacement — one fresh mon per side,
+        // both fainted. Two replacements on the SAME side instead mean a cascade (the first
+        // replacement fainted to entry hazards, the next came in); those are sequential and
+        // must go through `switch_into` one at a time, marking only that side as replaced.
+        if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
             switch_into_pair(&mut cand, [
                 (crate::convert::side_id(replacements[0].0), replacements[0].1),
                 (crate::convert::side_id(replacements[1].0), replacements[1].1),
@@ -203,12 +207,22 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 replaced[side] = true;
             }
         }
-        // PS increments activeTurns in nextTurn — *after* faint replacements enter — while the
-        // engine increments at end-of-turn, before the caller applies replacements. Same
-        // convention except across a replacement boundary: the fresh mon is 1 in PS, 0 here.
+        // activeTurns timing across a faint-replacement boundary. PS's endTurn does its per-mon
+        // `activeTurns++` as the LAST step — and turn++ as its FIRST step. So the unit's target
+        // snapshot sits relative to that increment exactly as its turn number reveals:
+        //   - target turn > move turn: endTurn already ran (post-increment). Every mon is
+        //     counted; the fresh replacement enters at 0 here but reads 1 in PS, so +1 it.
+        //   - target turn == move turn: a mid-turn faint replacement captured BEFORE endTurn
+        //     (pre-increment). The engine already counted this turn at end-of-turn, so the
+        //     staying side is one ahead of the snapshot. (Mid-turn replacements snapshot at the
+        //     request, before the fresh mon enters, so the replaced side isn't compared.)
+        let pre_end_turn = !replacements.is_empty()
+            && unit.last().is_some_and(|d| d.turn == dp.turn);
         for (side, was_replaced) in replaced.iter().enumerate() {
-            if *was_replaced {
+            if *was_replaced && !pre_end_turn {
                 cand.sides[side].active_turns = cand.sides[side].active_turns.saturating_add(1);
+            } else if !*was_replaced && pre_end_turn && cand.sides[side].active().is_alive() {
+                cand.sides[side].active_turns = cand.sides[side].active_turns.saturating_sub(1);
             }
         }
         let diffs = diff_states(&cand, &state_target);
