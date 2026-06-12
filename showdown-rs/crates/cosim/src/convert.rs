@@ -323,6 +323,12 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         let pside = |r: &str| r.split(':').nth(1).map(|x| x.chars().take(2).collect::<String>()).unwrap_or_default();
         !src.is_empty() && !tgt.is_empty() && pside(src) != pside(tgt)
     };
+    // Harvest bookkeeping: the eaten berry (PS lastItem + ateBerry).
+    let last_berry = if b(p, "ateBerry") {
+        Item::from_id(s(p, "lastItem")).unwrap_or(Item::None)
+    } else {
+        Item::None
+    };
     Ok(Pokemon {
         species,
         level,
@@ -330,6 +336,7 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         base_types,
         transformed,
         slept_by_foe,
+        last_berry,
         base_species,
         base_stats,
         base_moves: if transformed { [MoveSlot::EMPTY; 4] } else { moves },

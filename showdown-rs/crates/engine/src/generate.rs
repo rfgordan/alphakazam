@@ -445,14 +445,33 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
         })
         .collect();
     if switch_actions.len() == 2 {
-        let sp = |side: SideId| effective_speed(state, side);
-        if sp(switch_actions[1].0) > sp(switch_actions[0].0) {
-            switch_actions.swap(0, 1);
-        }
-    }
-    for (side, target) in switch_actions {
+        let pairs = [switch_actions[0], switch_actions[1]];
         for b in &mut branches {
-            apply_switch(b, side, target);
+            let mut nb = Branch { prob: b.prob, state: b.state, ins: Vec::new() };
+            let mut order = pairs;
+            if effective_speed(&nb.state, order[1].0) > effective_speed(&nb.state, order[0].0) {
+                order.swap(0, 1);
+            }
+            for &(side, target) in &order {
+                apply_switch_inner(&mut nb, side, target, false);
+            }
+            let mut ab_order = [order[0].0, order[1].0];
+            if effective_speed(&nb.state, ab_order[1]) > effective_speed(&nb.state, ab_order[0]) {
+                ab_order.swap(0, 1);
+            }
+            for side in ab_order {
+                if nb.state.side(side).active().is_alive() {
+                    apply_switch_in_ability(&mut nb, side);
+                }
+            }
+            b.state = nb.state;
+            b.ins.extend(nb.ins);
+        }
+    } else {
+        for (side, target) in switch_actions {
+            for b in &mut branches {
+                apply_switch(b, side, target);
+            }
         }
     }
 
@@ -533,6 +552,13 @@ fn reveal(b: &mut Branch, side: SideId, moves: u8, flags: u8) {
 // --- switching ---------------------------------------------------------------
 
 fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
+    apply_switch_inner(b, side, target, true);
+}
+
+/// `fire_ability: false` defers the incoming mon's switch-in ability (simultaneous entries
+/// run all abilities after every replacement is on the field, in speed order — PS event
+/// semantics; Intimidate must see the other fresh switch-in).
+fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bool) {
     let s = b.state.side(side);
     let previous = s.active_index;
     if previous == target {
@@ -633,9 +659,32 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
             push(b, Instruction::SetHealingWish { side, previous: true, new: false });
         }
     }
-    if b.state.side(side).active().is_alive() {
+    if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
     }
+}
+
+/// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
+/// actives, then switch-in abilities in speed order of the INCOMING actives.
+pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    let mut order = pairs;
+    if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
+        order.swap(0, 1);
+    }
+    for &(side, target) in &order {
+        apply_switch_inner(&mut b, side, target, false);
+    }
+    let mut ab_order = [order[0].0, order[1].0];
+    if effective_speed(&b.state, ab_order[1]) > effective_speed(&b.state, ab_order[0]) {
+        ab_order.swap(0, 1);
+    }
+    for side in ab_order {
+        if b.state.side(side).active().is_alive() {
+            apply_switch_in_ability(&mut b, side);
+        }
+    }
+    *state = b.state;
 }
 
 /// Zero all of a side's active-only state that resets on switch: consecutive-use tracking
@@ -2593,18 +2642,9 @@ fn apply_post_damage(
 /// of max HP. The berry's *consumption* isn't compared (item is excluded from `relaxed_eq`,
 /// and the harness re-projects PS's pre-turn item each turn), so we only emit the heal.
 fn apply_pinch_berry(b: &mut Branch, side: SideId) {
-    // Unnerve on the opponent's active suppresses this side's berries.
-    if b.state.side(side.other()).active().ability == crate::ids::Ability::Unnerve {
-        return;
-    }
-    let p = b.state.side(side).active();
-    if p.is_alive() && p.item == Item::SitrusBerry && p.hp * 2 <= p.max_hp {
-        let heal = (p.max_hp / 4).min(p.max_hp - p.hp);
-        if heal > 0 {
-            let slot = b.state.side(side).active_index;
-            push(b, Instruction::Heal { side, slot, amount: heal });
-        }
-    }
+    // (Historical name.) Routed through the consuming implementation — the old version
+    // healed without eating the berry, double-healing alongside maybe_eat_sitrus.
+    maybe_eat_sitrus(b, side);
 }
 
 /// White Herb: once any of the holder's stats is below 0, it restores every negative stage
@@ -2854,7 +2894,7 @@ fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
                 push(b, Instruction::SetActiveCounter { side, which: crate::instruction::ActiveCounter::Confusion, previous: ct, new: 0 });
             }
             push(b, Instruction::ChangeItem { side, slot, previous: Item::LumBerry, new: Item::None });
-            on_item_lost(b, side);
+            on_berry_eaten_id(b, side, Item::LumBerry);
             return;
         }
     }
@@ -2868,7 +2908,7 @@ fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
             push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
         }
         push(b, Instruction::ChangeItem { side, slot, previous: Item::LumBerry, new: Item::None });
-        on_item_lost(b, side);
+        on_berry_eaten_id(b, side, Item::LumBerry);
     }
     // Chesto wakes the holder the instant it sleeps.
     let p = b.state.side(side).active();
@@ -2912,11 +2952,23 @@ fn maybe_eat_sitrus(b: &mut Branch, side: SideId) {
         let amt = (p.max_hp / 4).max(1).min(p.max_hp - p.hp);
         push(b, Instruction::Heal { side, slot, amount: amt });
         push(b, Instruction::ChangeItem { side, slot, previous: Item::SitrusBerry, new: Item::None });
-        on_berry_eaten(b, side);
+        on_berry_eaten_id(b, side, Item::SitrusBerry);
     }
 }
 
 fn on_berry_eaten(b: &mut Branch, side: SideId) {
+    on_berry_eaten_id(b, side, Item::None)
+}
+
+/// `berry`: the eaten berry id, recorded for Harvest regrowth.
+fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
+    if berry != Item::None {
+        let slot = b.state.side(side).active_index;
+        let prev = b.state.side(side).active().last_berry;
+        if prev != berry {
+            push(b, Instruction::SetLastBerry { side, slot, previous: prev, new: berry });
+        }
+    }
     on_item_lost(b, side);
     let p = b.state.side(side).active();
     if p.ability == crate::ids::Ability::CheekPouch && p.is_alive() && p.hp < p.max_hp {
@@ -3100,6 +3152,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     if lowered {
         react_to_stat_drop(&mut proc, foe);
+        apply_white_herb(&mut proc, foe);
     }
     let mut applied_sleep = false;
     if md.secondary_status != Status::None
@@ -3479,7 +3532,7 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
                     push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
                 }
                 push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
-                on_berry_eaten(&mut b, side);
+                on_berry_eaten_id(&mut b, side, Item::ChestoBerry);
             } else {
                 push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::Sleep });
                 // Rest's sleep is a fixed 2-turn nap (PS statusState.time = 3).
@@ -4242,8 +4295,39 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         }
     }
 
+    // Harvest: 50% chance (always in sun) to regrow the holder's eaten berry.
+    let mut out_h = vec![branch];
+    for side in [SideId::One, SideId::Two] {
+        out_h = out_h
+            .into_iter()
+            .flat_map(|b| {
+                let p = b.state.side(side).active();
+                if p.ability == crate::ids::Ability::Harvest
+                    && p.item == Item::None
+                    && p.last_berry != Item::None
+                    && p.is_alive()
+                {
+                    let slot = b.state.side(side).active_index;
+                    let berry = p.last_berry;
+                    let sunny = matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun);
+                    let mut grow = scaled(&b, if sunny { 1.0 } else { 0.5 });
+                    push(&mut grow, Instruction::ChangeItem { side, slot, previous: Item::None, new: berry });
+                    push(&mut grow, Instruction::SetLastBerry { side, slot, previous: berry, new: Item::None });
+                    if sunny {
+                        vec![grow]
+                    } else {
+                        vec![grow, scaled(&b, 0.5)]
+                    }
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+    }
+    let branches_after_harvest = out_h;
+
     // Shed Skin: 33% chance each end of turn to cure the holder's status (branches).
-    let mut out = vec![branch];
+    let mut out = branches_after_harvest;
     for side in [SideId::One, SideId::Two] {
         out = out
             .into_iter()

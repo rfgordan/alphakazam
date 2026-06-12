@@ -86,6 +86,8 @@ pub struct Pokemon {
     /// This mon's current Sleep was inflicted by the opponent (drives Sleep Clause Mod;
     /// Rest sleep doesn't count). Only meaningful while status == Sleep.
     pub slept_by_foe: bool,
+    /// The berry this mon ate (for Harvest regrowth). `Item::None` = none eaten.
+    pub last_berry: Item,
     pub base_species: Species,
     pub base_stats: [i16; StatIndex::COUNT],
     pub base_moves: [MoveSlot; 4],
@@ -130,6 +132,7 @@ impl Pokemon {
         base_types: [Type::None, Type::None],
         transformed: false,
         slept_by_foe: false,
+        last_berry: Item::None,
         base_species: Species::None,
         base_stats: [0; StatIndex::COUNT],
         base_moves: [MoveSlot::EMPTY; 4],

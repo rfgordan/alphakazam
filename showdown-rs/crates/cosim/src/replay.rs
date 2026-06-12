@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use engine::generate::{generate_instructions_ex, switch_into, MoveChoice};
+use engine::generate::{generate_instructions_ex, switch_into, switch_into_pair, MoveChoice};
 use engine::state::State;
 use serde_json::Value;
 
@@ -191,9 +191,17 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         let mut cand = state_before;
         cand.apply_instructions(&si.instructions);
         let mut replaced = [false; 2];
-        for &(side, slot) in &replacements {
-            switch_into(&mut cand, crate::convert::side_id(side), slot);
-            replaced[side] = true;
+        if replacements.len() == 2 {
+            switch_into_pair(&mut cand, [
+                (crate::convert::side_id(replacements[0].0), replacements[0].1),
+                (crate::convert::side_id(replacements[1].0), replacements[1].1),
+            ]);
+            replaced = [true, true];
+        } else {
+            for &(side, slot) in &replacements {
+                switch_into(&mut cand, crate::convert::side_id(side), slot);
+                replaced[side] = true;
+            }
         }
         // PS increments activeTurns in nextTurn — *after* faint replacements enter — while the
         // engine increments at end-of-turn, before the caller applies replacements. Same

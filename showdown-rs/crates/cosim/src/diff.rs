@@ -128,6 +128,7 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
         cmp!(out, p("times_hit"), pa.times_hit, pb.times_hit);
         cmp!(out, p("ability_used"), pa.ability_used, pb.ability_used);
         cmp!(out, p("transformed"), pa.transformed, pb.transformed);
+        cmp!(out, p("last_berry"), pa.last_berry, pb.last_berry);
         for mi in 0..4 {
             let (ma, mb) = (pa.moves[mi], pb.moves[mi]);
             cmp!(out, p(&format!("move{mi}.id")), ma.id, mb.id);
