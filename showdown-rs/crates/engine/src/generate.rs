@@ -445,27 +445,23 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
         })
         .collect();
     if switch_actions.len() == 2 {
+        // A turn-action double switch resolves SEQUENTIALLY in speed order (PS: the `switch`
+        // action queues a `runSwitch` at order 101, which preempts the slower side's pending
+        // `switch` at order 103). So the faster side completes its full switch — including its
+        // switch-in ability — while the slower side's OLD mon is still on the field; that
+        // Intimidate/etc. lands on the outgoing mon (and is wiped when it leaves). Only the
+        // slower side's switch-in ability sees a freshly-entered foe. This differs from a
+        // double REPLACEMENT (both fainted), where `switch_into_pair` enters both then fires
+        // abilities so each sees the other fresh mon.
         let pairs = [switch_actions[0], switch_actions[1]];
         for b in &mut branches {
-            let mut nb = Branch { prob: b.prob, state: b.state, ins: Vec::new() };
             let mut order = pairs;
-            if effective_speed(&nb.state, order[1].0) > effective_speed(&nb.state, order[0].0) {
+            if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
                 order.swap(0, 1);
             }
             for &(side, target) in &order {
-                apply_switch_inner(&mut nb, side, target, false);
+                apply_switch(b, side, target);
             }
-            let mut ab_order = [order[0].0, order[1].0];
-            if effective_speed(&nb.state, ab_order[1]) > effective_speed(&nb.state, ab_order[0]) {
-                ab_order.swap(0, 1);
-            }
-            for side in ab_order {
-                if nb.state.side(side).active().is_alive() {
-                    apply_switch_in_ability(&mut nb, side);
-                }
-            }
-            b.state = nb.state;
-            b.ins.extend(nb.ins);
         }
     } else {
         for (side, target) in switch_actions {
