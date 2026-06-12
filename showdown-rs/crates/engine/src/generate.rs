@@ -569,22 +569,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
         }
     }
     // A transformed mon reverts to its own identity as it leaves the field.
-    if b.state.side(side).active().transformed {
-        let prev_data = transform_data_of(&b.state, side);
-        let p = b.state.side(side).active();
-        let new = crate::instruction::TransformData {
-            species: p.base_species,
-            stats: { let mut st = p.base_stats; st[0] = p.stats[0]; st },
-            types: p.base_types,
-            ability: p.base_ability,
-            moves: p.base_moves,
-            transformed: false,
-            times_hit: p.times_hit,
-        };
-        let slot = previous;
-        let previous_base_moves = p.base_moves;
-        push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
-    }
+    revert_transform(b, side);
     // Zero to Hero (Palafin): on switch-out, the base forme transforms into Palafin-Hero
     // (higher offensive stats; HP base is unchanged so max HP carries). One-way — once Hero it
     // stays Hero. Random-battle spread (31 IV / 85 EV / neutral) assumed for the stat recompute.
@@ -1426,6 +1411,28 @@ fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
     out
 }
 
+/// Revert a transformed active to its own identity (species/stats/types/ability/moves). PS's
+/// `clearVolatile` does this both on switch-out and on faint, so the engine calls it from both.
+fn revert_transform(b: &mut Branch, side: SideId) {
+    if !b.state.side(side).active().transformed {
+        return;
+    }
+    let prev_data = transform_data_of(&b.state, side);
+    let p = b.state.side(side).active();
+    let new = crate::instruction::TransformData {
+        species: p.base_species,
+        stats: { let mut st = p.base_stats; st[0] = p.stats[0]; st },
+        types: p.base_types,
+        ability: p.base_ability,
+        moves: p.base_moves,
+        transformed: false,
+        times_hit: p.times_hit,
+    };
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = p.base_moves;
+    push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
+}
+
 /// Struggle recoils the user 1/4 of its max HP after it connects.
 fn apply_struggle_recoil(mut out: Vec<Branch>, side: SideId, struggling: bool) -> Vec<Branch> {
     if struggling {
@@ -1436,6 +1443,10 @@ fn apply_struggle_recoil(mut out: Vec<Branch>, side: SideId, struggling: bool) -
                 let rec = (round_div(p.max_hp as i32, 4) as i16).max(1).min(p.hp);
                 let slot = b.state.side(side).active_index;
                 push(b, Instruction::Damage { side, slot, amount: rec });
+                // A transformed mon that faints to its own recoil reverts (PS clearVolatile).
+                if !b.state.side(side).active().is_alive() {
+                    revert_transform(b, side);
+                }
             }
         }
     }
@@ -2675,6 +2686,15 @@ fn apply_post_damage(
             // Knocking the item off reveals what it was.
             reveal(b, foe, 0, crate::state::Reveal::ITEM);
         }
+    }
+
+    // A transformed mon that fainted this hit (the target, or the attacker via a contact
+    // punisher / recoil) reverts to its own identity — PS runs clearVolatile on faint.
+    if !b.state.side(foe).active().is_alive() {
+        revert_transform(b, foe);
+    }
+    if !b.state.side(side).active().is_alive() {
+        revert_transform(b, side);
     }
 }
 

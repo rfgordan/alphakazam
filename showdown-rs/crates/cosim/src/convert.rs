@@ -309,7 +309,11 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
             }
         }
     }
-    let base_species_id = to_id(s(p, "baseSpecies"));
+    // `baseSpecies` serializes as a "[Species:x]" ref (like `species`), so strip that prefix
+    // before resolving — otherwise a transformed mon's base species fails to parse and falls
+    // back to its transformed species (breaking the revert-to-base on faint/switch-out).
+    let base_species_raw = s(p, "baseSpecies");
+    let base_species_id = to_id(base_species_raw.trim_start_matches("[Species:").trim_end_matches(']'));
     let base_species = if base_species_id.is_empty() {
         species
     } else {
