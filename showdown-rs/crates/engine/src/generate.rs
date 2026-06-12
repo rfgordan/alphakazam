@@ -2057,7 +2057,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::StrongJaw if md.flag_bite => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-            Ab::PunkRock if md.flag_sound => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
+            // Punk Rock is handled as a base-power modifier below (PS `onBasePower`), not here.
             Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::ToxicBoost
                 if matches!(attacker.status, Status::Poison | Status::Toxic)
@@ -2275,6 +2275,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 
     // Sheer Force: x1.3 base power for moves with any secondary (which is then removed).
     if sheer_force_active {
+        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
+    }
+    // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
+    // rather than the attack stat so the floor lands where PS's does.
+    if attacker.ability == Ab::PunkRock && md.flag_sound {
         base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
     }
     // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
