@@ -1,8 +1,22 @@
 # Deep-Showdown Handoff: Divergence Burn-Down
 
-**State as of 2026-06-12 (commit 4811b49):** 1532 cosim units, **1494 matched / 38 diverged / 0 unsupported** → EXACTNESS 97.52%, COVERAGE 100%. The OU corpus (`c*.json.gz`, 389 units) is at **100.00% and must stay there** — it is the regression gate. Campaign so far: 237 → 122 → 82 → 70 → 53 → 46 → 44 → 40 → 38.
+**State as of 2026-06-12 (latest):** 1532 cosim units, **1507 matched / 25 diverged / 0 unsupported** → EXACTNESS 98.37%, COVERAGE 100%. The OU corpus (`c*.json.gz`, 389 units) is at **100.00% and must stay there** — it is the regression gate. Campaign so far: 237 → … → 38 → 37 → 35 → 32 → 31 → 29 → 28 → 27 → 26 → 25.
 
-**The directive:** keep grinding the 38 remaining divergences to zero, one cluster at a time, committing each verified batch.
+**The directive:** keep grinding the remaining divergences to zero, one cluster at a time, committing each verified batch.
+
+### Fixes landed this session (38 → 25)
+1. **Protean/Libero type revert on switch-out** — engine cleared the `TypeShifted` volatile but never reverted the `types` field; PS's `clearVolatile` resets to base types (unless terastallized).
+2. **Turn-action double switch resolves sequentially** in speed order — PS's `runSwitch` (queue order 101) preempts the slower side's pending `switch` (order 103), so the faster switch-in's Intimidate hits the foe's *outgoing* mon (wasted) and only the slower one lands. This differs from a double *replacement* (both fainted) which still uses `switch_into_pair`.
+3. **Faint-replacement `activeTurns` timing** (two bugs): (a) two replacements on the SAME side (hazard-faint cascade) wrongly took the `switch_into_pair` path and +1'd the staying side — now gated on different sides; (b) a mid-turn faint replacement snapshots BEFORE PS's `endTurn` `activeTurns++` (detect via `unit.last().turn == move.turn`), so the staying side is decremented.
+4. **Variable multi-hit through Substitute** — the sumset-DP path (`apply_multihit_dp`) ignored the target's sub; added `apply_multihit_dp_sub` keyed on `(sub_remaining, mon_damage)`.
+5. **Poison Puppeteer** (Pecharunt) — confuses a foe it poisons/badly-poisons with a move (added in `apply_target_secondary`).
+6. **Throat Chop re-hit** doesn't refresh its 2-turn countdown (PS condition has no `onRestart`) — only set the counter when applying the volatile fresh.
+7. **Zero to Hero** (Palafin) — forme change to Palafin-Hero on switch-out (Terapagos-style Transform with recomputed stats).
+8. **Punk Rock ×1.3 → base power** (PS `onBasePower`), not the attack stat — the floor lands where PS's does. NOTE: Technician/Tough Claws/Iron Fist/Sharpness/Strong Jaw/Mega Launcher/Reckless are ALSO `onBasePower` in PS but still applied to `atk_stat` in the engine; moving them risks multi-modifier rounding regressions, so do it surgically when a specific divergence demands it.
+9. **Transform reverts on faint** — `revert_transform` helper called from `apply_post_damage` (target/attacker faint) and struggle recoil; **plus** a converter bug: `baseSpecies` is a `"[Species:x]"` ref that wasn't being prefix-stripped, so a transformed mon's base species fell back to its transformed species.
+
+### Two divergences deemed NOT engine-fixable from the trace (skip / investigate the recorder)
+- **Stored Power cluster** (`r5 t3`, `r5 t27`): PS's recorded damage requires Stored Power BP 60 (= `20 + 20·positiveBoosts()` with +2 boosts), but the serialized `boosts` are 0 in every snapshot of that game, and PS's formula is identical to the engine's. The trace's post-state boosts are internally inconsistent with the damage dealt — likely a recorder artifact (boosts captured at a different point than when `basePowerCallback` ran). Confirmed Polteageist SpA 254, Delibird SpD 147, BP would be 20 → engine deals max 36, PS dealt 103.
 
 ---
 
