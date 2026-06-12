@@ -2050,6 +2050,20 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         if proto_atk {
             atk_stat = crate::damage::modify(atk_stat, 5325, 4096);
         }
+        // Orichalcum Pulse (physical Atk in sun) / Hadron Engine (special SpA in Electric
+        // Terrain): ×5461/4096 — PS onModifyAtk / onModifySpA.
+        if attacker.ability == Ab::OrichalcumPulse
+            && md.category == MoveCategory::Physical
+            && matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun)
+        {
+            atk_stat = crate::damage::modify(atk_stat, 5461, 4096);
+        }
+        if attacker.ability == Ab::HadronEngine
+            && md.category == MoveCategory::Special
+            && b.state.terrain == crate::ids::Terrain::Electric
+        {
+            atk_stat = crate::damage::modify(atk_stat, 5461, 4096);
+        }
         // Offensive ability multipliers.
         match attacker.ability {
             Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
