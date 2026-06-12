@@ -2798,6 +2798,18 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
         }
     }
 
+    // If the target has a Substitute up (and the move doesn't bypass it), route the convolution
+    // through it: PS caps each hit at the sub's remaining HP (overflow is lost), removes the sub
+    // when cumulative hits reach its HP, and only hits AFTER the break damage the Pokémon. State
+    // is (sub_remaining, mon_damage): while the sub stands mon_damage stays 0, and once it breaks
+    // sub_remaining stays 0 — so the support is bounded by sub_hp + target HP, not their product.
+    let bypass_sub = md.flag_sound
+        || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
+    let sub_hp0 = b.state.side(foe).substitute_hp as i32;
+    if sub_hp0 > 0 && !bypass_sub && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
+        return apply_multihit_dp_sub(b, side, md, &per_hit, &counts, &calc, max, hit_prob, sub_hp0);
+    }
+
     // Convolve the per-hit distribution up to `max` times, clamping cumulative damage at the
     // target's HP (all overkill collapses to one faint outcome, bounding the support size).
     // After the kᵗʰ convolution, mix in the branch for "exactly k hits" weighted by P(k).
@@ -2832,6 +2844,63 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
         }
         apply_post_damage(&mut hb, side, md, total, total > 0, false, hits as u8, calc.life_orb, calc.def_item, calc.def_ability);
         out.push((hb, false));
+    }
+    out
+}
+
+/// Sumset-DP multi-hit against a Substitute. The convolution state is `(sub_remaining, mon_dmg)`:
+/// each hit caps at the sub's remaining HP (overflow lost) until it breaks, after which hits land
+/// on the Pokémon. One branch per distinct `(sub_remaining, mon_dmg, hit count)`.
+#[allow(clippy::too_many_arguments)]
+fn apply_multihit_dp_sub(
+    b: &Branch, side: SideId, md: &crate::data::MoveData,
+    per_hit: &[(i32, f32)], counts: &[(usize, f32)], calc: &DamageCalc,
+    max: usize, hit_prob: f32, sub_hp0: i32,
+) -> Vec<(Branch, bool)> {
+    use std::collections::HashMap;
+    let foe = side.other();
+    let cap = b.state.side(foe).active().hp.max(0) as i32;
+    // Key: (sub_remaining, mon_damage). While the sub stands mon_damage == 0; once it breaks
+    // (sub_remaining == 0) it absorbs no more and the overflow of the breaking hit is discarded.
+    let mut conv: HashMap<(i32, i32), f32> = HashMap::new();
+    conv.insert((sub_hp0, 0), 1.0);
+    let mut dist: HashMap<(i32, i32, usize), f32> = HashMap::new();
+    for k in 1..=max {
+        let mut next: HashMap<(i32, i32), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(sub_rem, mon), &pt) in &conv {
+            for &(v, pv) in per_hit {
+                let key = if sub_rem > 0 {
+                    if v < sub_rem { (sub_rem - v, mon) } else { (0, mon) }
+                } else {
+                    (0, (mon + v).min(cap))
+                };
+                *next.entry(key).or_insert(0.0) += pt * pv;
+            }
+        }
+        conv = next;
+        if let Some(&(_, pk)) = counts.iter().find(|(c, _)| *c == k) {
+            for (&(sub_rem, mon), &p) in &conv {
+                *dist.entry((sub_rem, mon, k)).or_insert(0.0) += pk * p;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(dist.len());
+    for ((sub_rem, mon, hits), p) in dist {
+        let mut hb = scaled(b, hit_prob * p);
+        let sub_dmg = sub_hp0 - sub_rem;
+        if sub_dmg > 0 {
+            push(&mut hb, Instruction::DamageSubstitute { side: foe, amount: sub_dmg as i16 });
+        }
+        if sub_rem == 0 {
+            push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
+        }
+        if mon > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
+        }
+        apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0, true, hits as u8, calc.life_orb, calc.def_item, calc.def_ability);
+        out.push((hb, true));
     }
     out
 }
