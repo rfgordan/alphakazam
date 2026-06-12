@@ -74,7 +74,7 @@ const u=t.units.find(u=>u.turn===3); console.log(JSON.stringify(u,null,1).slice(
 
 **Per-cluster cycle:** pick a cluster → dump trace + draws → form hypothesis → check PS source at the pin → implement → `cargo test` → full sweep → confirm cluster cleared, count dropped, **c\* still 100.00%** → commit as `parity: <what> — N -> M`.
 
-**Final checks when count hits 0:** run `harness/run-mutations.sh` (mutation kill suite — damage-path code changed a lot, the verifier must still catch injected bugs), and update the project memory file.
+**Final checks when count hits 0:** run `harness/run-mutations.sh` (mutation kill suite — damage-path code changed a lot, the verifier must still catch injected bugs; currently 8/8 killed), and update the project memory file. **GOTCHA: the mutation suite restores the source but leaves the last mutant's compiled binary in place.** After running it, `touch crates/engine/src/generate.rs && cargo build --release -p cosim` before any sweep, or you'll see ~40 phantom hazard divergences from the leftover `StealthRock→Spikes` mutant.
 
 ## 4. PS serialization conventions already decoded (converter knowledge)
 
@@ -89,67 +89,41 @@ const u=t.units.find(u=>u.turn===3); console.log(JSON.stringify(u,null,1).slice(
 - PS taunt duration: 3, +1 only if `target.activeTurns` truthy && !willMove (fresh switch-ins get 3).
 - Protect fails outright when `queue.willAct()` is false (no action after it) and the stall counter resets.
 
-## 5. The 38 remaining divergences (fresh list, commit 4811b49)
+## 5. The 23 remaining divergences (refreshed, current HEAD)
 
-Grouped by suspected cause. Format: `file tN | choice summary | diff`.
+Run `VERBOSE=1 cargo run --release -p cosim -- harness/cosim-traces/*.json.gz 2>/dev/null | grep "diverged t"` for the live list. All are randombattle (r*) except the storedpower pair (those live in r5). Grouped by diagnosis:
 
-### A. Damage-formula tails (one-off modifier wrong or missing) — likely several distinct small bugs
-1. `r1 t16` p1:psyblade p2:hypervoice | s0#5.hp engine=204 ps=157 — Psyblade/terrain or spread-mod interplay.
-2. `r19 t18` liquidation vs surgingstrikes | s1#5.hp 103 vs 89 — Surging Strikes is always-crit multihit; check crit interaction with the defender's mods (Multiscale?).
-3. `r6 t18` doubleedge vs liquidation | s1#0.hp 58 vs 129 — large; dump trace (ability/item on defender).
-4. `r3 t2` collisioncourse vs stoneedge | s1#0.hp 188 vs 155 — Collision Course ×5461/4096 was added; maybe ordering vs other chainmods, or the *other* mon's damage.
-5. `r3 t19` flareblitz vs destinybond | s1#3.hp 46 vs 48 — recoil ±2 (recoil rounding: PS uses `this.clampIntRange(Math.round(damage/3),1)` on *damage dealt incl. sub?*).
-6. `r15 t20` acrobatics vs earthquake | s1#5.hp 190 vs 189 — ±1 rounding.
-7. `r8 t18` ivycudgel vs photongeyser | s1#2.hp 189 vs 186 — ±3; Photon Geyser category by boosted stat? Ivy Cudgel mask forme type?
-8. `r11 t6` thunderbolt vs thunderwave, Bellibolt | s0#0.hp 212 vs 246 — Bellibolt has **Electromorphosis** (Charge when hit) — likely PS's Charge doubles a later Electric hit, or LO recoil diff. Dump trace.
-9. `r2 t38` protect vs sacredfire, Necrozma-Dusk-Mane | s0#0.hp 243 vs 272 — Prism Armor reducing super-effective damage?
-10. `r4 t30` uturn vs calmmind, Snorlax | s1#2.hp 221 vs 251 — 30 hp; check defender item/ability in trace.
-11. `r12 t35` Pincurchin switch-in vs stompingtantrum | s0#2.hp 156 vs 62 — engine deals far less; Stomping Tantrum doubles after a failed move? Electric Surge interplay?
-12. `r2 t23` psychicnoise vs tripleaxel, Entei | s0#0.hp 138 vs 216 — Psychic Noise heal-block vs something; 2.1M branches — also check Triple Axel branch explosion sanity.
-13. `r16 t17` stickyweb vs leafstorm | both sides' hp off by 36/16 — possibly hazard + Contrary/White Herb chain, or wrong target of Sticky Web boost-drop.
+### A. Per-unit damage-formula tails (each a distinct small calc bug; needs precise PS-formula reproduction)
+- `r1 t16` psyblade vs hypervoice | s0#5.hp 204 vs 157 (engine LOW) — Psyblade ×1.5 in Electric Terrain; check terrain/spread interplay.
+- `r19 t18` liquidation vs surgingstrikes | s1#5.hp 103 vs 89 — Surging Strikes is always-crit 3-hit; check crit×multihit interleave.
+- `r5 t18` doubleedge vs liquidation | s1#0.hp 58 vs 129 (engine LOW by ~70) — large; dump defender ability/item.
+- `r8 t18` ivycudgel vs photongeyser | s1#2.hp 189 vs 186 — ±3; Photon Geyser category-by-boosted-stat, or Ivy Cudgel mask type.
+- `r4 t30` uturn vs calmmind, Snorlax | s1#2.hp 221 vs 251 — 30hp; check defender item/ability.
+- `r2 t38` protect vs sacredfire, Necrozma-Dusk-Mane | s0#0.hp 243 vs 272 — Prism Armor (×0.75 super-effective) is handled at line ~2161; verify it fires here.
+- `r16 t17` stickyweb vs leafstorm | both sides' hp off — Contrary/White-Herb + hazard-boost interaction.
+- `r17 t6`,`t7` icepunch vs drainingkiss | hp ±8/±12 — attacker is Feraligatr (Sheer Force + Life Orb); the constant-26 SF+LO cluster was supposedly fixed — re-examine Draining Kiss 75% drain rounding / Big Root.
+- `r17 t17` icepunch vs filletaway | s1#0.hp 72 vs 65 — small icepunch damage diff (Fillet Away should FAIL: Veluza hp 112 < cost 146).
+- `r15 t20` acrobatics vs earthquake | s1#5.hp 190 vs 189 — ±1 rounding.
 
-### B. Stored Power chain (same game, Polteageist) — one cluster
-14. `r5 t3` storedpower vs rapidspin | s1#0.hp 77 vs 10.
-15. `r5 t27` storedpower vs terablast | s1#1.hp 251 vs 224.
-   Stored Power BP = 20+20×positive stages was added — check which stages PS counts (incl. from White Herb timing, Stockpile?) and whether the *user's* boosts at damage time differ. Dump the Polteageist boost table from the trace.
+> Several of these may be `onBasePower` abilities applied to `atk_stat` instead of base power (see the Punk Rock fix). Technician/Tough Claws/Iron Fist/Sharpness/Strong Jaw/Mega Launcher/Reckless are ALL `onBasePower` in PS but still on `atk_stat`. Check each diverging unit's attacker ability; if it's one of these, move it to the base-power chain (next to Punk Rock at ~line 2255) — but watch for multi-modifier rounding regressions on the OU gate.
 
-### C. Substitute interactions
-16. `d1 t21` substitute vs bulletseed | s0#5.hp engine=0 ps=312 — engine kills *through* the sub on multihit; PS stops remaining hits at sub break? No — PS continues hitting the mon? Actually PS: each hit of a multihit hits the sub until it breaks, remaining hits hit... (gen5+: remaining hits do hit the pokemon, BUT this diff says ps=312 i.e. mon untouched → at this gen PS stops? Verify in pinned `sim/battle-actions.ts` hitStepMoveHitLoop + getDamage vs sub).
-17. `r12 t27` substitute vs struggle | engine sub gone, ps sub at 15 hp — Struggle vs sub: recoil basis / sub damage wrong.
-18. `r12 t28` shadowball vs struggle, Dusknoir | s1#3.species engine=Species(591) ps=Species(188) — species mismatch on bench slot; almost certainly an Illusion or forme/convert bug, not battle logic. Dump trace slot 3.
+### B. Diagnosed, NOT engine-fixable from current traces (need recorder change or are artifacts)
+- `r5 t3`, `r5 t27` **storedpower** | engine LOW — PS damage requires BP 60 (= +2 positiveBoosts) but serialized `boosts` are 0 in every snapshot and PS's formula is identical to the engine's. The trace's post-state boosts are internally inconsistent with the damage. **Recorder artifact** — skip, or patch the recorder to capture boosts at basePowerCallback time.
+- `r12 t35` Pincurchin-switch vs **stompingtantrum** | s0#2.hp 156 vs 62 (engine LOW) — Stomping Tantrum doubles to 150 BP because the user's PREVIOUS move failed (`moveLastTurnResult === false`). **`moveLastTurnResult` is NOT serialized by the recorder** (confirmed absent), so the converter can't reconstruct it. Either patch the recorder to emit it, or heuristically infer from `lastMove.hitTargets == []` in the converter (fragile).
 
-### D. Volatile/status bookkeeping
-19. `r10 t29` + 20. `r10 t43` drainingkiss/roost vs malignantchain | engine missing confusion (confusion_turns 0 vs 4) — Malignant Chain's 50% is *toxic chain* → badly poisoned, not confusion… but PS shows confusion: dump trace; maybe the mon has a confusion-inducing item/ability (berserk gene?) or it's leftover from the codegen confusion-fold fix not covering this path (secondary chance 50?).
-21. `r17 t29` throatchop vs irondefense | engine has volatile bit 2^29 set, PS none — Throat Chop volatile applied when PS blocked it (Shield Dust/Covert Cloak handled — check this target) or wrong duration expiry.
-22. `r18 t21` swordsdance, Urshifu-Rapid-Strike benched | s1#3.types engine=[Dark,None] ps=[Water,Dark] — **Protean/Libero type not reverting on switch-out** (or converter applying TypeShifted types to a benched mon). Likely quick fix: restore base types in `apply_switch`.
-23. `r9 t43` outrage | s1.wish engine=(1,165) ps=(0,0) and 24. `r9 t45` outrage vs wish | engine still Rampaging+LockedMove, PS none — same game: wish consumed/expired differently AND rampage ended in PS (move failed → rampage breaks? Wish heal target fainted?). The two are probably one causal chain; replay that game's turns 43–45.
+### C. Complex state machines (deferred — need careful semantics)
+- `r9 t43` outrage, p2 wish then faint-replacements | s1.wish engine=(1,165) ps=(0,0) — a wish that LINGERED past its residual (slot occupant absent at startingTurn+1) is consumed/cleared as the replacement enters; engine keeps it. Wish-linger + faint-replacement interaction.
+- `r9 t45` outrage vs wish | engine still Rampaging(outrage,2), PS ended | the rampage's `trueDuration` mid-turn snapshot (idx 50, a t44 faint-replacement) reads td:2 BEFORE PS decrements it, so the converter maps 2 turns remaining when only the final turn is left. Same pre-endTurn-snapshot class as the activeTurns fix, but for lockedmove trueDuration.
+- `r17 t22` trailblaze vs roost | s0.boost.spe 2 vs 1 + hp — engine gives +2 Spe here but +1 in isolation; cause is UPSTREAM state in the same game (replay preceding r17 units).
 
-### E. Intimidate / switch-in ordering edges
-25. `r2 t15` Flareon switch vs Arcanine | s0.boost.atk engine=-1 ps=0 — Intimidate fired in engine, not in PS (or PS's was blocked: Inner Focus? Oblivious? Own Tempo? Guard Dog reverses!). Check Flareon's ability in trace.
-26. `r2 t30` Qwilfish-Hisui switch vs Arcanine | same pattern, same game.
-27. `r1 t9` Squawkabilly-White vs Vikavolt double replacement | s0#1/s1#5 hp diffs of 18/16 — switch-in damage (hazards? Spiky Shield residue?) on simultaneous replacement; `switch_into_pair` landed but this unit still diverges — re-dump.
-28. `d1 t46`, 29. `d6 t43` sludgebomb units | s0.active_turns off by one (engine high) — active_turns increment on a turn the mon was switched/dragged? Compare PS `activeTurns` semantics at residual vs start-of-turn.
-30. `d8 t50` gigadrain/hydropump + Grimmsnarl replacement | s1.active_turns 2 vs 1 — same family.
-
-### F. Species/forme mysteries
-31. `r2 t27` Empoleon vs sacredfire, Qwilfish-Hisui benched | s0#3.species engine=559 ps=560 — engine has Qwilfish-Hisui (559?) PS has 560; converter forme-mapping off by one for regional forme after... something. Check what Species(559)/(560) are in gen.rs and what the trace's `details`/`species` refs say.
-32. (same family as #18 — species 591 vs 188.)
-
-### G. PP off-by-ones (Pressure)
-33. `r11 t22` earthquake vs poltergeist | s1#3.move1.pp engine=1 ps=2 — engine deducted one extra (double Pressure application? Pressure on failed/immune move?).
-
-### H. Tera mechanics
-34. `r18 t10` freezedry vs terastarstorm | s1#2.hp 194 vs 238 — Tera Stellar: Tera Starstorm BP/type vs non-Terapagos? Stellar one-time ×2/×1.2 boost bookkeeping.
-
-### I. Sturdy / endure-like
-35. `d6 t52` Skarmory vs overdrive | s0#3.hp engine=1 ps=14 — engine triggered Sturdy (left at 1?) but PS shows 14 — i.e. damage roll difference, not Sturdy; or engine's Sturdy clamp applied when damage wouldn't have KO'd.
-
-### J. Berry/heal timing
-36. `r17 t6`, 37. `r17 t7` icepunch vs drainingkiss | hp ±8/±12 — Draining Kiss 75% drain rounding vs Big Root? Sitrus timing? (The pinch-berry double-heal fix did NOT clear these.)
-38. `r17 t17` icepunch vs filletaway | s1#0.hp 72 vs 65 — Fillet Away cost rounding or Sitrus-after-cost.
-   Also `r17 t22` trailblaze vs roost | s0.boost.spe 2 vs 1 + hp diff — engine double-applied Trailblaze boost in *this* unit only; empirical repro showed engine gives +1 correctly in isolation → cause is upstream state in the same game (boost carried in by converter? White Herb?). Replay the preceding units of r17.
-
-> Note: items 16/18/31/32 overlap in numbering with cluster sizes — total distinct diverged units = 38; trust the VERBOSE sweep output over this list if they disagree.
+### D. Other identified mechanics
+- `r10 t6` thunderbolt, p2 thunderwave + Bellibolt switch-in | s0#0.hp 212 vs 246 (engine over-damaged its OWN s0#0) — Bellibolt has **Electromorphosis** (Charge on being hit); the s0#0 hp diff is on p1's side though, so this may be a damage carryover / Static-para / different cause — re-dump.
+- `r10 t22` earthquake vs poltergeist | s1#3.move1.pp 1 vs 2 (engine deducted one extra) — Pressure PP over-deduction on a benched mon (was active earlier); upstream Pressure accounting.
+- `r12 t27` substitute vs struggle | engine sub gone (0), PS sub at 15 — engine's struggle dealt ≥60 to a 60-hp sub (broke it), PS dealt 45 (survives). Struggle damage-vs-sub magnitude diff.
+- `r18 t10` freezedry vs terastarstorm | s1#2.hp 194 vs 238 — Tera Stellar / Tera Starstorm one-time boost bookkeeping.
+- `r2 t23` psychicnoise vs tripleaxel, Entei | s0#0.hp 138 vs 216 — Psychic Noise heal-block + Triple Axel; 2.1M-branch unit (sanity-check the explosion).
+- `r1 t9` Squawkabilly-White vs Vikavolt double switch | s0#1/s1#5 hp off by ~18/16 — simultaneous switch-in hazard/residue on a double switch.
+- `r3 t19`-ish flareblitz vs destinybond | recoil ±2 rounding (PS recoil = round(damage/3)).
 
 ## 6. Process rules & hard-won gotchas
 
