@@ -3230,6 +3230,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         apply_white_herb(&mut proc, foe);
     }
     let mut applied_sleep = false;
+    let mut applied_status_now = false;
     if md.secondary_status != Status::None
         && status_applies(proc.state.side(foe).active(), md.secondary_status)
         && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
@@ -3237,6 +3238,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
+        applied_status_now = true;
         applied_sleep = md.secondary_status == Status::Sleep;
         if applied_sleep {
             mark_slept_by_foe(&mut proc, foe);
@@ -3248,6 +3250,25 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     let mut procs = vec![proc];
     if applied_sleep {
         procs = procs.into_iter().flat_map(|x| branch_sleep_counter(x, foe)).collect();
+    }
+    // Poison Puppeteer (Pecharunt): a foe it poisons or badly-poisons with a move is also
+    // confused. Fires after the status actually lands; the confusion rolls its own 2-5 duration.
+    if applied_status_now
+        && b.state.side(side).active().ability == crate::ids::Ability::PoisonPuppeteer
+        && matches!(md.secondary_status, Status::Poison | Status::Toxic)
+    {
+        procs = procs
+            .into_iter()
+            .flat_map(|mut x| {
+                if x.state.side(foe).active().is_alive()
+                    && !x.state.side(foe).volatiles.contains(VolatileStatus::Confusion)
+                {
+                    push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Confusion });
+                    return branch_confusion_counter(x, foe);
+                }
+                vec![x]
+            })
+            .collect();
     }
     // Chance-based volatile secondaries (Hurricane / Dynamic Punch confusion, Dire Claw ...).
     use crate::instruction::ActiveCounter;
