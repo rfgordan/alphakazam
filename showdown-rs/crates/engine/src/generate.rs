@@ -589,6 +589,16 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
         let previous_base_moves = p.base_moves;
         push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
     }
+    // Type changes (Protean/Libero, Conversion, Reflect Type, …) revert as the mon leaves
+    // the field — PS's clearVolatile resets `types` to baseTypes. A terastallized mon keeps
+    // its Tera typing across switches, so leave that untouched.
+    {
+        let p = b.state.side(side).active();
+        if !p.terastallized && p.types != p.base_types {
+            let slot = previous;
+            push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: p.base_types });
+        }
+    }
     // Reset the outgoing active's boosts and volatiles (emit explicit deltas so the
     // instruction list stays exactly reversible).
     for stat in [
