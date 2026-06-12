@@ -585,6 +585,35 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
         let previous_base_moves = p.base_moves;
         push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
     }
+    // Zero to Hero (Palafin): on switch-out, the base forme transforms into Palafin-Hero
+    // (higher offensive stats; HP base is unchanged so max HP carries). One-way — once Hero it
+    // stays Hero. Random-battle spread (31 IV / 85 EV / neutral) assumed for the stat recompute.
+    {
+        let p = b.state.side(side).active();
+        let palafin = crate::ids::Species::from_id("palafin");
+        if p.ability == crate::ids::Ability::ZeroToHero && Some(p.species) == palafin {
+            if let Some(hero) = crate::ids::Species::from_id("palafinhero") {
+                let level = p.level;
+                let base = crate::data::base_stats(hero);
+                let mut stats = [0i16; 6];
+                stats[0] = p.stats[0];
+                for (si, stat) in [
+                    crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
+                    crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
+                    crate::ids::StatIndex::Speed,
+                ].into_iter().enumerate() {
+                    stats[si + 1] = crate::damage::compute_stat(base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat);
+                }
+                let prev_data = transform_data_of(&b.state, side);
+                let mut new = prev_data;
+                new.species = hero;
+                new.stats = stats;
+                let slot = previous;
+                let previous_base_moves = b.state.side(side).active().base_moves;
+                push(b, Instruction::Transform { side, slot, previous: prev_data, new, previous_base_moves });
+            }
+        }
+    }
     // Type changes (Protean/Libero, Conversion, Reflect Type, …) revert as the mon leaves
     // the field — PS's clearVolatile resets `types` to baseTypes. A terastallized mon keeps
     // its Tera typing across switches, so leave that untouched.
