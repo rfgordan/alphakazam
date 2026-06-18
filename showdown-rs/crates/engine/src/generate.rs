@@ -2210,7 +2210,10 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let def_maxhp = defender.max_hp;
     let sheer_force_active = attacker.ability == Ab::SheerForce
         && (md.secondary_chance > 0 || md.flinch_chance > 0);
-    let life_orb = attacker.item == Item::LifeOrb && !sheer_force_active;
+    // Life Orb's ×1.3 DAMAGE (onModifyDamage) always applies while held; Sheer Force only
+    // suppresses the RECOIL (onAfterMoveSecondarySelf). Keep the two flags separate.
+    let life_orb = attacker.item == Item::LifeOrb;
+    let life_orb_recoil = life_orb && !sheer_force_active;
 
     // Knock Off: ×1.5 base power when the target is holding a (removable) item.
     let mut base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
@@ -2386,7 +2389,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     }
     let rolls_nocrit = damage_rolls(&input);
 
-    DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb }
+    DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb: life_orb_recoil }
 }
 
 /// Applies a damaging move's hits sequentially (each its own roll and crit), clamped to HP
