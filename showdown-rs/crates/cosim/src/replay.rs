@@ -325,6 +325,19 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             .filter(|m| m.id != engine::ids::MoveId::None && m.pp > 0 && !m.disabled)
             .map(|m| m.id.to_id().to_string())
             .collect();
+        // A locked mon (mid-rampage Outrage/Thrash, charging a two-turn move, recharging, or
+        // Encored) can only pick that one move — PS's request offers just it.
+        let locked = match side.pending_move {
+            engine::state::PendingMove::Rampaging(m, _)
+            | engine::state::PendingMove::Charging(m) => Some(m),
+            _ => None,
+        }
+        .or(if side.encore.1 > 0 { Some(side.encore.0) } else { None });
+        if let Some(m) = locked {
+            if m != engine::ids::MoveId::None {
+                eng_moves = vec![m.to_id().to_string()];
+            }
+        }
         eng_moves.sort();
         if ps_moves != eng_moves && ps_moves != vec!["struggle".to_string()] {
             out.push(format!("moves[{side_key}]: ps={ps_moves:?} engine={eng_moves:?}"));
