@@ -1499,6 +1499,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             md.category = MoveCategory::Physical;
         }
     }
+    // -ate abilities (Pixilate/Refrigerate/Aerilate/Galvanize): a Normal-type move becomes the
+    // ability's type and gains ×1.2 base power (PS onModifyType + onBasePower). Excludes moves
+    // whose type is determined dynamically, and Tera Blast while terastallized.
+    if md.typ == Type::Normal
+        && !matches!(md.id.to_id(),
+            "judgment" | "multiattack" | "naturalgift" | "revelationdance"
+            | "technoblast" | "terrainpulse" | "weatherball")
+        && !(md.id.to_id() == "terablast" && attacker.terastallized)
+    {
+        let ate_type = match attacker.ability {
+            crate::ids::Ability::Pixilate => Some(Type::Fairy),
+            crate::ids::Ability::Refrigerate => Some(Type::Ice),
+            crate::ids::Ability::Aerilate => Some(Type::Flying),
+            crate::ids::Ability::Galvanize => Some(Type::Electric),
+            _ => None,
+        };
+        if let Some(t) = ate_type {
+            md.typ = t;
+            md.base_power = crate::damage::modify(md.base_power as i64, 4915, 4096) as u16;
+        }
+    }
     let foe = side.other();
 
     let mut b = b;
