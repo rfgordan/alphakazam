@@ -1705,6 +1705,34 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
     }
 
+    // Absorbing abilities (Volt Absorb / Water Absorb / Dry Skin / Earth Eater) nullify a move
+    // of their type that targets the holder AND heal it 1/4 max HP (PS onTryHit). This fires for
+    // damaging AND status moves alike — e.g. Thunder Wave vs Volt Absorb heals and prevents the
+    // paralysis. Mold Breaker bypasses. Side/field moves (hazards) don't target the mon.
+    {
+        use crate::ids::Ability as A;
+        let foe_status_target = md.status != Status::None
+            || md.target_boosts.iter().any(|&x| x != 0)
+            || md.target_volatile.is_some()
+            || md.force_switch;
+        let affects_foe_mon = md.category != MoveCategory::Status || foe_status_target;
+        let mb = matches!(b.state.side(side).active().ability, A::MoldBreaker | A::Teravolt | A::Turboblaze);
+        let fa = b.state.side(foe).active().ability;
+        let absorbs = matches!((md.typ, fa),
+            (Type::Water, A::WaterAbsorb | A::DrySkin)
+            | (Type::Electric, A::VoltAbsorb)
+            | (Type::Ground, A::EarthEater));
+        if affects_foe_mon && absorbs && !mb && b.state.side(foe).active().is_alive() {
+            let p = b.state.side(foe).active();
+            if p.hp < p.max_hp {
+                let heal = (p.max_hp / 4).max(1).min(p.max_hp - p.hp);
+                let fslot = b.state.side(foe).active_index;
+                push(&mut b, Instruction::Heal { side: foe, slot: fslot, amount: heal });
+            }
+            return vec![b];
+        }
+    }
+
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
         // Protect blocks a status move that targets the foe (Thunder Wave, Will-O-Wisp,
