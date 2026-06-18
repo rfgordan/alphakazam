@@ -4218,6 +4218,18 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
 
 fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     let b = &mut branch;
+    // PS decrements a residual effect's duration FIRST and, if it hits 0, ends the effect and
+    // SKIPS its onResidual that turn (battle.ts residual loop). The SANDSTORM/snow CHIP and the
+    // weather-tied ability heals (Rain Dish, Ice Body) are part of the weather's own residual, so
+    // they are skipped on the weather's final turn — tick the weather here, before that loop. (The
+    // Grassy Terrain heal is a separate per-mon handler that still fires on the terrain's final
+    // turn, so the terrain duration is ticked AFTER the loop, below.)
+    if b.state.weather != Weather::None && b.state.weather_turns > 0 {
+        push(b, Instruction::DecrementWeatherTurns);
+        if b.state.weather_turns == 0 {
+            set_weather(b, Weather::None, 0);
+        }
+    }
     // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
     // (PS uses a finer speed-ordered residual queue; this covers the common cases.)
     for side in [SideId::One, SideId::Two] {
@@ -4442,13 +4454,10 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     }
 
     // --- duration ticking (cosim caught all of these as permanently-stuck effects) ---
-    // Weather / terrain / Trick Room count down each end of turn and expire at 0.
-    if b.state.weather != Weather::None && b.state.weather_turns > 0 {
-        push(b, Instruction::DecrementWeatherTurns);
-        if b.state.weather_turns == 0 {
-            set_weather(b, Weather::None, 0);
-        }
-    }
+    // Terrain / Trick Room count down at end of turn and expire at 0. (Weather is ticked BEFORE
+    // the residual loop above so sandstorm doesn't chip on its final turn; terrain is ticked here,
+    // AFTER, so Grassy Terrain still heals on its final turn — its heal is a separate per-mon
+    // residual handler, not skipped by the field-duration decrement.)
     if b.state.terrain != crate::ids::Terrain::None && b.state.terrain_turns > 0 {
         push(b, Instruction::DecrementTerrainTurns);
         if b.state.terrain_turns == 0 {
