@@ -1850,7 +1850,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && !flag_immune;
     if !connects {
         out.push(scaled(&b, hit_prob));
-        return apply_recharge(out, side, move_id);
+        // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
+        // confusion) — route through the rampage/recoil tail rather than returning bare.
+        let out = apply_rampage_state(out, side, move_id);
+        return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
     // Each hit rolls damage (16) and crit independently. For small hit counts we enumerate
