@@ -79,8 +79,12 @@ pub struct MoveData {
     /// Forces the *target* to switch out (Roar, Whirlwind, Dragon Tail, ...).
     pub force_switch: bool,
 
-    /// Stat-stage changes applied to the *user* (Close Combat self-drop, Swords Dance).
+    /// Stat-stage changes applied to the *user* (Close Combat self-drop, Swords Dance). These are
+    /// primary effects and survive Sheer Force.
     pub self_boosts: [i8; BoostIndex::COUNT],
+    /// User stat-stages from a 100%-chance self-SECONDARY (Trailblaze +Spe, Power-Up Punch +Atk).
+    /// Being a secondary, Sheer Force removes these (and makes the move Sheer-Force-eligible).
+    pub secondary_self_boosts: [i8; BoostIndex::COUNT],
     /// Stat-stage changes a status move applies to the *target* (Growl, Charm, ...).
     pub target_boosts: [i8; BoostIndex::COUNT],
 
@@ -148,6 +152,7 @@ impl MoveData {
             self_switch: false,
             force_switch: false,
             self_boosts: [0; BoostIndex::COUNT],
+            secondary_self_boosts: [0; BoostIndex::COUNT],
             target_boosts: [0; BoostIndex::COUNT],
             secondary_chance: 0,
             secondary_boosts: [0; BoostIndex::COUNT],

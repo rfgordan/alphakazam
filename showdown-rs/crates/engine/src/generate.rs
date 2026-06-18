@@ -2263,7 +2263,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let def_item = defender.item;
     let def_maxhp = defender.max_hp;
     let sheer_force_active = attacker.ability == Ab::SheerForce
-        && (md.secondary_chance > 0 || md.flinch_chance > 0);
+        && (md.secondary_chance > 0 || md.flinch_chance > 0
+            || md.secondary_self_boosts.iter().any(|&x| x != 0));
     // Life Orb's ×1.3 DAMAGE (onModifyDamage) always applies while held; Sheer Force only
     // suppresses the RECOIL (onAfterMoveSecondarySelf). Keep the two flags separate.
     let life_orb = attacker.item == Item::LifeOrb;
@@ -3489,6 +3490,17 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
             apply_self_boost(b, side, BOOST_ORDER[i], delta);
+        }
+    }
+    // Secondary self-boosts (Trailblaze +Spe, Power-Up Punch +Atk) are SECONDARIES, so Sheer
+    // Force removes them (in exchange for the ×1.3 base power it already applied).
+    let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce
+        && md.secondary_self_boosts.iter().any(|&x| x != 0);
+    if !sheer_force {
+        for (i, &delta) in md.secondary_self_boosts.iter().enumerate() {
+            if delta != 0 {
+                apply_self_boost(b, side, BOOST_ORDER[i], delta);
+            }
         }
     }
     // Throat Chop's volatile is applied in PS via the secondary's onHit (not volatileStatus),

@@ -93,9 +93,11 @@ moves.forEach((m, i) => {
 	// Some moves boost the user via a 100%-chance self-secondary (Rapid Spin, Trailblaze,
 	// Meteor Mash, ...) — fold those into the deterministic self-boosts too.
 	const secSelfBoosts = sec && sec.self && (sec.chance === 100 || sec.chance === undefined) ? sec.self.boosts : null;
-	// `self.boosts` (most), `selfBoost.boosts` (Scale Shot's post-hit +Spe/−Def), top-level
-	// boosts when target is self, and a 100%-chance self-secondary all feed the user's boosts.
-	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, m.selfBoost && m.selfBoost.boosts, selfTarget ? m.boosts : null, secSelfBoosts);
+	// `self.boosts` (most), `selfBoost.boosts` (Scale Shot's post-hit +Spe/−Def), and top-level
+	// boosts when target is self feed the user's PRIMARY boosts (Close Combat, Leaf Storm — these
+	// survive Sheer Force). A 100%-chance self-SECONDARY (Trailblaze spe, Power-Up Punch atk) is a
+	// secondary, so Sheer Force removes it — keep it in a separate field.
+	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, m.selfBoost && m.selfBoost.boosts, selfTarget ? m.boosts : null);
 	const targetBoostsObj = !selfTarget ? m.boosts : null;
 	const fields = [
 		`id: MoveId(${idx})`,
@@ -111,6 +113,7 @@ moves.forEach((m, i) => {
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
+		`secondary_self_boosts: ${boostsRs(secSelfBoosts)}`,
 		`target_boosts: ${boostsRs(MANUAL_TARGET_BOOSTS[m.id] || targetBoostsObj)}`,
 		`secondary_chance: ${secChance}`,
 		`secondary_boosts: ${boostsRs(sec && sec.boosts)}`,
