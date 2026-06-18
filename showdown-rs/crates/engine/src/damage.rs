@@ -161,6 +161,11 @@ pub fn base_damage(level: u8, base_power: u16, attack: i16, defense: i16) -> i32
 /// and any matching original type at the normal rate.
 fn stab_mod(input: &DamageInput) -> (i64, i64) {
     let mt = input.move_type;
+    // Typeless moves (Struggle, confusion self-hit) never get STAB — but a mon's `types` array
+    // carries `Type::None` in its empty second slot, so guard against `None == None` matching.
+    if mt == Type::None {
+        return (1, 1);
+    }
     let (from_orig, from_tera) = if input.terastallized {
         (input.attacker_base_types.contains(&mt), input.tera_type == mt)
     } else {
