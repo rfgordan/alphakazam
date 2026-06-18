@@ -2371,6 +2371,22 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if terrain_halve {
         base_power = crate::damage::modify(base_power as i64, 2048, 4096) as u16;
     }
+    // Terastallization STAB floor: a terastallized mon's move matching its (post-Tera) type with
+    // base power < 60 is raised to 60 — applied AFTER every onBasePower modifier. Excludes
+    // priority moves, multi-hit moves, and variable-power moves whose dex base power is 0 or 150
+    // (Dragon Energy / Eruption / Water Spout, …). Stellar Tera uses a different rule (skipped).
+    if attacker.terastallized
+        && attacker.tera_type != Type::Stellar
+        && attacker.types.contains(&md.typ)
+        && base_power < 60
+        && md.priority <= 0
+        && md.hits_max <= 1
+    {
+        let dex_bp = crate::data::move_data(md.id).base_power;
+        if dex_bp != 0 && dex_bp != 150 {
+            base_power = 60;
+        }
+    }
 
     let input = DamageInput {
         level: attacker.level,
