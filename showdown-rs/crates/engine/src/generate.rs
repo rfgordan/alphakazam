@@ -2368,6 +2368,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if attacker.ability == Ab::PunkRock && md.flag_sound {
         base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
     }
+    // Ogerpon masks (Hearthflame / Wellspring / Cornerstone) give ×1.2 base power to all of
+    // Ogerpon's moves (PS `onBasePower`). Only Ogerpon holds them.
+    if matches!(attacker.item, Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask) {
+        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
+    }
     // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
     // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
     if attacker.ability == Ab::SupremeOverlord {
