@@ -139,6 +139,8 @@ pub struct DamageInput {
     pub life_orb: bool,
     /// Adaptability: STAB becomes ×2 instead of ×1.5.
     pub adaptability: bool,
+    /// Tera Shell (Terapagos-Terastal at full HP): one extra resist step (PS onEffectiveness −1).
+    pub tera_shell: bool,
     /// A final defender-side damage modifier as a 4096-based ratio (num/den), applied
     /// after type/burn/Life Orb — e.g. Multiscale (×0.5), Filter (×0.75). `(1, 1)` = none.
     pub final_num: i64,
@@ -228,7 +230,7 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         // type sequentially (halve-then-double) mis-rounds by 1 when they cancel, e.g. Bug
         // (×0.5 vs Poison, ×2 vs Psychic) vs Slowking-Galar = ×1, not ×1 − 1.
         let up = (e0 == 2.0) as i32 + (e1 == 2.0) as i32;
-        let down = (e0 == 0.5) as i32 + (e1 == 0.5) as i32;
+        let down = (e0 == 0.5) as i32 + (e1 == 0.5) as i32 + (input.tera_shell as i32);
         let net = up - down;
         if net > 0 {
             d *= 1 << net;
@@ -319,6 +321,7 @@ mod tests {
             tera_type: None,
             life_orb: false,
             adaptability: false,
+            tera_shell: false,
             final_num: 1,
             final_den: 1,
         };

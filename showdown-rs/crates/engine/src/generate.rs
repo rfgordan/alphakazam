@@ -2225,6 +2225,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         fden *= 4096;
     }
     let adaptability = attacker.ability == Ab::Adaptability;
+    // Tera Shell: Terapagos-Terastal at full HP resists every hit by one extra step (breakable,
+    // so `def_ab` already reflects Mold Breaker suppressing it).
+    let tera_shell = def_ab == Ab::TeraShell
+        && defender.hp == defender.max_hp
+        && crate::ids::Species::from_id("terapagosterastal") == Some(defender.species);
     // Returned for post-damage (contact punishers); also suppressed under Mold Breaker.
     let def_ability = def_ab;
     let def_item = defender.item;
@@ -2384,6 +2389,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         tera_type: attacker.tera_type,
         life_orb,
         adaptability,
+        tera_shell,
         final_num: fnum,
         final_den: fden,
     };
@@ -4116,6 +4122,7 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
         tera_type: caster.tera_type,
         life_orb: false,
         adaptability: false,
+        tera_shell: false,
         final_num: 1,
         final_den: if screened { 2 } else { 1 },
     };
