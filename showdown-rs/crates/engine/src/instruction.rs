@@ -161,6 +161,7 @@ pub enum Instruction {
     SetHealingWish { side: SideId, previous: bool, new: bool },
     SetSleptByFoe { side: SideId, slot: u8, previous: bool, new: bool },
     SetLastBerry { side: SideId, slot: u8, previous: Item, new: Item },
+    SetCudChew { side: SideId, slot: u8, previous: u8, new: u8 },
 
     // --- battle-long per-mon history (persists across switches) ---
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
@@ -215,6 +216,9 @@ impl State {
             }
             SetLastBerry { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].last_berry = new;
+            }
+            SetCudChew { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].cudchew_turns = new;
             }
             Transform { side, slot, previous, new, .. } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
@@ -366,6 +370,9 @@ impl State {
             }
             SetLastBerry { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].last_berry = previous;
+            }
+            SetCudChew { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].cudchew_turns = previous;
             }
             Transform { side, slot, previous, new, previous_base_moves } => {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];

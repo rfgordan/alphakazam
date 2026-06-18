@@ -3149,6 +3149,47 @@ fn on_berry_eaten(b: &mut Branch, side: SideId) {
     on_berry_eaten_id(b, side, Item::None)
 }
 
+/// Apply a berry's on-eat effect to the active mon WITHOUT consuming an item — used by Cud Chew
+/// to re-apply the effect of an already-eaten berry. Covers the healing/status-curing berries
+/// that random battles actually carry on Cud Chew users (Sitrus, Lum, single-status cures).
+fn apply_berry_eat_effect(b: &mut Branch, side: SideId, berry: Item) {
+    let (hp, max, status, slot) = {
+        let p = b.state.side(side).active();
+        (p.hp, p.max_hp, p.status, b.state.side(side).active_index)
+    };
+    let cure = |b: &mut Branch, want: Status| {
+        if status == want || want == Status::None {
+            let counter = b.state.side(side).active().status_counter;
+            push(b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+            if counter != 0 {
+                push(b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
+            }
+        }
+    };
+    match berry {
+        Item::SitrusBerry => {
+            let heal = (max / 4).max(1).min(max - hp);
+            if heal > 0 {
+                push(b, Instruction::Heal { side, slot, amount: heal });
+            }
+        }
+        Item::LumBerry => {
+            if status != Status::None {
+                cure(b, Status::None);
+            }
+            if b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Confusion });
+            }
+        }
+        Item::ChestoBerry => cure(b, Status::Sleep),
+        Item::PechaBerry => { if matches!(status, Status::Poison | Status::Toxic) { cure(b, status); } }
+        Item::RawstBerry => cure(b, Status::Burn),
+        Item::CheriBerry => cure(b, Status::Paralysis),
+        Item::AspearBerry => cure(b, Status::Freeze),
+        _ => {}
+    }
+}
+
 /// `berry`: the eaten berry id, recorded for Harvest regrowth.
 fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
     if berry != Item::None {
@@ -4326,6 +4367,17 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             };
             if orb_status != Status::None && status_applies(p, orb_status) {
                 push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
+            }
+        }
+
+        // Cud Chew: re-apply the eaten berry's effect at end of turn (PS onResidualOrder 28).
+        // The counter was set to 2 on eat and ticks down here; at 0 the berry effect fires again.
+        let cc = b.state.side(side).active().cudchew_turns;
+        if cc > 0 {
+            push(b, Instruction::SetCudChew { side, slot, previous: cc, new: cc - 1 });
+            if cc - 1 == 0 && b.state.side(side).active().is_alive() {
+                let berry = b.state.side(side).active().last_berry;
+                apply_berry_eat_effect(b, side, berry);
             }
         }
 

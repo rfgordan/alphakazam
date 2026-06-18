@@ -88,6 +88,9 @@ pub struct Pokemon {
     pub slept_by_foe: bool,
     /// The berry this mon ate (for Harvest regrowth). `Item::None` = none eaten.
     pub last_berry: Item,
+    /// Cud Chew (Tauros-Paldea): turns until the eaten berry's effect is re-applied. PS stores
+    /// `abilityState.counter` (2 on eat, ticked each end-of-turn); 0 = no pending re-eat.
+    pub cudchew_turns: u8,
     pub base_species: Species,
     pub base_stats: [i16; StatIndex::COUNT],
     pub base_moves: [MoveSlot; 4],
@@ -133,6 +136,7 @@ impl Pokemon {
         transformed: false,
         slept_by_foe: false,
         last_berry: Item::None,
+        cudchew_turns: 0,
         base_species: Species::None,
         base_stats: [0; StatIndex::COUNT],
         base_moves: [MoveSlot::EMPTY; 4],

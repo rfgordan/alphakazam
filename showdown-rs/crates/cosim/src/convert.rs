@@ -333,6 +333,8 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     } else {
         Item::None
     };
+    // Cud Chew pending re-eat timer lives in abilityState.counter (absent = 0).
+    let cudchew_turns = p["abilityState"].get("counter").and_then(Value::as_i64).unwrap_or(0).max(0) as u8;
     Ok(Pokemon {
         species,
         level,
@@ -341,6 +343,7 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         transformed,
         slept_by_foe,
         last_berry,
+        cudchew_turns,
         base_species,
         base_stats,
         base_moves: if transformed { [MoveSlot::EMPTY; 4] } else { moves },
