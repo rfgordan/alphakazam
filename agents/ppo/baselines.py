@@ -112,6 +112,62 @@ class MctsBaseline:
         return out
 
 
+class PokeEnvBaseline:
+    """A **real poke-env** `Player` as an opponent, driven over our `state_json()`.
+
+    Unlike `HeuristicBaseline` (a hand port), this runs poke-env's *own* code: each turn we build a
+    genuine `poke_env.battle.Battle` from our perfect-info state (`poke_env_adapter`), let the
+    chosen poke-env player pick, and map its `BattleOrder` back to our 9-action index — so poke-env
+    is a first-class, externally-maintained reference opponent. `kind`: "max" (MaxBasePowerPlayer),
+    "heuristic" (SimpleHeuristicsPlayer), or "random" (RandomPlayer). Any unmapped/illegal pick
+    (e.g. move-lock states poke-env doesn't model) falls back to the first legal action.
+    """
+
+    _PLAYERS = {"max": "MaxBasePowerPlayer",
+                "heuristic": "SimpleHeuristicsPlayer",
+                "random": "RandomPlayer"}
+
+    def __init__(self, kind: str = "max", name: str | None = None):
+        if kind not in self._PLAYERS:
+            raise ValueError(f"unknown poke-env player kind {kind!r} (choices: {list(self._PLAYERS)})")
+        self.kind = kind
+        self.name = name or f"pokeenv-{kind}"
+        self._player = None
+
+    def _get_player(self):
+        # Instantiate the player without Player.__init__ (which would open a Showdown websocket);
+        # the singles decision path needs only `_format` + choose_move (static helpers otherwise).
+        if self._player is None:
+            import poke_env.player as pep
+            cls = getattr(pep, self._PLAYERS[self.kind])
+            pl = cls.__new__(cls)
+            pl._format = "gen9customgame"
+            self._player = pl
+        return self._player
+
+    def actions(self, obs_np, ids_np, mask_np, battles=None, sides=None) -> np.ndarray:
+        import json
+
+        from .poke_env_adapter import order_to_action, state_to_poke_env_battle
+
+        player = self._get_player()
+        out = np.zeros(len(mask_np), dtype=np.int64)
+        for i in range(len(battles)):
+            mask = mask_np[i]
+            side = int(sides[i])
+            sd = json.loads(battles[i].state_json())
+            try:
+                battle = state_to_poke_env_battle(sd, side, mask)
+                a = order_to_action(player.choose_move(battle), sd["sides"][side])
+            except Exception:
+                a = None
+            if a is None or not mask[a]:
+                legal = np.flatnonzero(mask)
+                a = int(legal[0]) if legal.size else 0
+            out[i] = int(a)
+        return out
+
+
 class HeuristicBaseline:
     """A faithful port of poke-env's `SimpleHeuristicsPlayer.choose_move` over our `state_json`.
 

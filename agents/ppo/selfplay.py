@@ -27,7 +27,7 @@ import torch
 
 import showdown_engine as se
 
-from .baselines import HeuristicBaseline, MctsBaseline, PolicyBaseline, RandomBaseline, evaluate, greedy_actions
+from .baselines import HeuristicBaseline, MctsBaseline, PokeEnvBaseline, PolicyBaseline, RandomBaseline, evaluate, greedy_actions
 from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .engine_env import BLUE, RED, EngineVecEnv
@@ -47,6 +47,7 @@ def train_selfplay(
     keep_checkpoints: int = 3,
     mcts_eval_ms: int = 0,
     mcts_eval_games: int = 20,
+    poke_env_eval: tuple[str, ...] = (),
     logdir: str = "runs",
     run_name: str | None = None,
     wandb_project: str | None = None,
@@ -97,6 +98,9 @@ def train_selfplay(
     if mcts_eval_ms > 0:
         # poke-engine MCTS — a strong, external validated reference (heavy; keep eval_games modest).
         baselines.append(MctsBaseline(time_ms=mcts_eval_ms))
+    for kind in poke_env_eval:
+        # Real poke-env players (MaxBasePower / SimpleHeuristics / Random) as external opponents.
+        baselines.append(PokeEnvBaseline(kind=kind))
 
     logger = RunLogger(logdir, run_name, wandb_project=wandb_project)
     logger.config({"cfg": vars(cfg), "obs_dim": envs.obs_dim, "n_actions": envs.n_actions,
@@ -279,6 +283,9 @@ def main():
                         help="also eval vs poke-engine MCTS at this search time per move (0 = off; heavy)")
     parser.add_argument("--mcts-eval-games", type=int, default=20,
                         help="games for the MCTS eval (separate from --eval-games; MCTS is slow + low-variance)")
+    parser.add_argument("--pokeenv-eval", type=str, default="",
+                        help="comma-separated real poke-env opponents to add to the periodic eval: "
+                             "max,heuristic,random (empty = none)")
     parser.add_argument("--shaping-coef", type=float, default=None,
                         help="potential-based reward shaping weight (Φ=team HP diff; 0 = off, ~0.5 to enable)")
     parser.add_argument("--logdir", type=str, default="runs", help="root directory for run logs")
@@ -315,6 +322,7 @@ def main():
         keep_checkpoints=args.keep_checkpoints,
         mcts_eval_ms=args.mcts_eval_ms,
         mcts_eval_games=args.mcts_eval_games,
+        poke_env_eval=tuple(k.strip() for k in args.pokeenv_eval.split(",") if k.strip()),
         logdir=args.logdir,
         run_name=args.run_name,
         wandb_project=args.wandb_project if args.wandb else None,

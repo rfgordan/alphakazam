@@ -14,6 +14,11 @@ dependencies = [
 dev = [
     "maturin>=1.5,<2.0",
 ]
+# Real poke-env players as external eval opponents (PokeEnvBaseline). Install with
+# `uv sync --group pokeenv`. Opt-in so the core training deps stay lean.
+pokeenv = [
+    "poke-env>=0.15",
+]
 
 [tool.setuptools]
 packages = ["ppo"]
