@@ -165,11 +165,17 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
     // endTurn before turn 1; that propagates consistently through both engines.)
     side.active_turns = i(active_v, "activeTurns") as u8;
     if let Some(lm) = active_v.get("lastMove") {
-        // Serialized as {move: "[Move:gigadrain]", hit: 1, ...}.
+        // Serialized as {move: "[Move:gigadrain]", hit: 1, hitTargets: [...], ...}.
         if let Some(mref) = lm.get("move").and_then(Value::as_str) {
             let id = mref.trim_start_matches("[Move:").trim_end_matches(']');
             side.last_used_move = MoveId::from_id(id).unwrap_or(MoveId::None);
         }
+        // PS strips `moveLastTurnResult`, but a last move that hit nothing (empty hitTargets)
+        // is the failure case Stomping Tantrum's doubler keys on. Approximate it from lastMove.
+        side.last_move_failed = lm
+            .get("hitTargets")
+            .and_then(Value::as_array)
+            .is_some_and(|t| t.is_empty());
     }
     convert_volatiles(active_v, &mut side)?;
     // Protean/Libero once-per-switch-in marker lives in abilityState, not volatiles.

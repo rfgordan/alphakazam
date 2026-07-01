@@ -244,6 +244,9 @@ pub struct Side {
     /// used. Reset on switch. Drives consecutive-use mechanics (Fury Cutter / Echoed Voice
     /// power ramp; Encore/Disable/Torment/Stomping Tantrum read `last_used_move`).
     pub last_used_move: MoveId,
+    /// The active mon's move LAST TURN failed (missed/immune/no effect) — PS `moveLastTurnResult
+    /// === false`, which doubles Stomping Tantrum. Reconstructed from the serialized `lastMove`.
+    pub last_move_failed: bool,
     pub move_streak: u8,
     /// Consecutive successful Protect-family uses (the "stall" counter). Each consecutive
     /// Protect succeeds with probability 1/3^n; reset to 0 by any non-Protect action or a
@@ -293,6 +296,7 @@ impl Side {
             tailwind: 0,
         },
         last_used_move: MoveId::None,
+        last_move_failed: false,
         move_streak: 0,
         stall_counter: 0,
         tera_used: false,

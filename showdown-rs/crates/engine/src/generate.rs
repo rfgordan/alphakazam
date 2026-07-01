@@ -2294,6 +2294,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
                 else if ratio >= 2 { 60 } else { 40 };
         }
         // Status / HP / item-conditional doublers.
+        "stompingtantrum" if b.state.side(side).last_move_failed => base_power = base_power.saturating_mul(2),
         "facade" if attacker.status != Status::None => base_power = base_power.saturating_mul(2),
         "hex" | "infernalparade" if defender.status != Status::None => base_power = base_power.saturating_mul(2),
         "venoshock" | "barbbarrage" if matches!(defender.status, Status::Poison | Status::Toxic) => base_power = base_power.saturating_mul(2),
