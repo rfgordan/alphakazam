@@ -4,3 +4,4 @@ __pycache__/
 *.pt
 runs/
 foul-play/
+games/

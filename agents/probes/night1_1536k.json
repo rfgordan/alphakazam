@@ -1,0 +1,37 @@
+{
+  "checkpoint": "runs/night1/model_1536000.pt",
+  "arch": "slot",
+  "opponent": "maxbp",
+  "games": 15,
+  "win_rate": 1.0,
+  "avg_turns": 16.5,
+  "flakes": 0,
+  "decision_mix": {
+    "attack": 0.642,
+    "setup": 0.028,
+    "switch": 0.33
+  },
+  "setup": {
+    "uses_per_game": 0.6,
+    "games_with_setup_frac": 0.4,
+    "safe_use_frac": 0.33,
+    "avg_max_boost": 2.0,
+    "boosted_kos_per_game": 0.13,
+    "wasted_frac": 0.78,
+    "post_setup_dmg_per_decision": 0.058,
+    "baseline_dmg_per_attack": 0.431
+  },
+  "hazards": {
+    "games_with_hazards_frac": 0.0,
+    "avg_first_hazard_turn": null
+  },
+  "status": {
+    "uses_per_game": 0.0,
+    "redundant_frac": 0.0
+  },
+  "recovery": {
+    "uses_per_game": 0.0,
+    "well_timed_frac": 0.0
+  },
+  "kos_per_game": 6.0
+}

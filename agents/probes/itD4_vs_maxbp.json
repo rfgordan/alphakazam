@@ -1,0 +1,37 @@
+{
+  "checkpoint": "runs/it-D4/model_final.pt",
+  "arch": "slot",
+  "opponent": "maxbp",
+  "games": 20,
+  "win_rate": 0.9,
+  "avg_turns": 17.9,
+  "flakes": 0,
+  "decision_mix": {
+    "attack": 0.633,
+    "setup": 0.004,
+    "switch": 0.363
+  },
+  "setup": {
+    "uses_per_game": 0.1,
+    "games_with_setup_frac": 0.15,
+    "safe_use_frac": 1.0,
+    "avg_max_boost": 0.85,
+    "boosted_kos_per_game": 0.05,
+    "wasted_frac": 0.5,
+    "post_setup_dmg_per_decision": 0.043,
+    "baseline_dmg_per_attack": 0.403
+  },
+  "hazards": {
+    "games_with_hazards_frac": 0.0,
+    "avg_first_hazard_turn": null
+  },
+  "status": {
+    "uses_per_game": 0.0,
+    "redundant_frac": 0.0
+  },
+  "recovery": {
+    "uses_per_game": 0.0,
+    "well_timed_frac": 0.0
+  },
+  "kos_per_game": 5.85
+}

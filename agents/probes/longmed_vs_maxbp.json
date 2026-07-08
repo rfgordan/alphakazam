@@ -1,0 +1,38 @@
+{
+  "checkpoint": "runs/long-med/model_final.pt",
+  "arch": "slot",
+  "opponent": "maxbp",
+  "games": 30,
+  "win_rate": 0.867,
+  "avg_turns": 18.3,
+  "flakes": 0,
+  "decision_mix": {
+    "attack": 0.775,
+    "hazard": 0.007,
+    "setup": 0.001,
+    "switch": 0.216
+  },
+  "setup": {
+    "uses_per_game": 0.03,
+    "games_with_setup_frac": 0.27,
+    "safe_use_frac": 1.0,
+    "avg_max_boost": 1.0,
+    "boosted_kos_per_game": 0.17,
+    "wasted_frac": 0.0,
+    "post_setup_dmg_per_decision": 0.15,
+    "baseline_dmg_per_attack": 0.336
+  },
+  "hazards": {
+    "games_with_hazards_frac": 0.03,
+    "avg_first_hazard_turn": 3.0
+  },
+  "status": {
+    "uses_per_game": 0.0,
+    "redundant_frac": 0.0
+  },
+  "recovery": {
+    "uses_per_game": 0.0,
+    "well_timed_frac": 0.0
+  },
+  "kos_per_game": 5.87
+}
