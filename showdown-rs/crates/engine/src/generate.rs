@@ -557,6 +557,7 @@ fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
 fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bool) {
     let s = b.state.side(side);
     let previous = s.active_index;
+    let replacing_fainted = !s.active().is_alive();
     if previous == target {
         return;
     }
@@ -648,6 +649,17 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // Consecutive-use tracking belongs to the active slot — reset it as the mon leaves.
     reset_move_tracking(b, side);
     push(b, Instruction::Switch { side, previous, next: target });
+
+    // A matured Wish can linger while its slot is empty.  When a faint replacement finally
+    // enters that slot, PS removes the stale slot condition without healing the replacement
+    // (the healing event belonged to the earlier residual).  Keeping it for another residual
+    // incorrectly lets the new occupant receive an expired Wish.
+    if replacing_fainted {
+        let wish = b.state.side(side).wish;
+        if wish.0 == 1 {
+            push(b, Instruction::SetWish { side, previous: wish, new: (0, 0) });
+        }
+    }
 
     apply_entry_hazards(b, side);
     // Toxic's damage stage resets whenever the badly-poisoned mon re-enters.
@@ -1051,7 +1063,12 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action) -> Vec<Branc
     for fb in execute_move(b, first) {
         // The second mover acts only if its active is alive and wasn't flinched by the first.
         let flinched = fb.state.side(second.side).volatiles.contains(VolatileStatus::Flinch);
-        if fb.state.side(second.side).active().is_alive() && !flinched {
+        // Once the first action ends the battle (for example Life Orb recoil KOs that side's
+        // final Pokémon), PS never runs the queued slower action and therefore pays no PP for
+        // it.  Do not use merely `first mover is alive` here: if it has a replacement available
+        // PS can continue the queue, and that broader condition regresses valid Memento/status
+        // cases.
+        if fb.state.side(second.side).active().is_alive() && !flinched && !battle_over(&fb.state) {
             out.extend(execute_move(fb, second));
         } else {
             out.push(fb);
@@ -2120,7 +2137,6 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         match attacker.ability {
             Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
             Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
-            Ab::Technician if md.base_power <= 60 => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Overgrow if md.typ == Type::Grass && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Blaze if md.typ == Type::Fire && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -2363,6 +2379,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Sheer Force: x1.3 base power for moves with any secondary (which is then removed).
     if sheer_force_active {
         base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
+    }
+    // Technician is an onBasePower modifier in PS.  This placement matters for rounding and
+    // for variable-power moves such as Triple Axel, whose 20/40/60-power hits are evaluated
+    // independently.  Applying it to Attack produces a different damage support.
+    if attacker.ability == Ab::Technician && base_power <= 60 {
+        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
     }
     // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
     // rather than the attack stat so the floor lands where PS's does.
@@ -4324,6 +4346,26 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
 
+        // Leech Seed has residual order 8 in PS, before burn/poison (order 9).  This matters
+        // when the seeded mon is also in range to faint from status: the drain and heal happen
+        // first, then status damage KOs it.
+        let p = b.state.side(side).active();
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
+            let drain = (maxhp / 8).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: drain });
+            let other = side.other();
+            let (f_alive, f_room, fslot) = {
+                let f = b.state.side(other).active();
+                (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
+            };
+            if f_alive && !heal_blocked(b, other) {
+                let heal = drain.min(f_room);
+                if heal > 0 {
+                    push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
+                }
+            }
+        }
+
         // Status residual. Poison Heal *heals* 1/8 instead of taking poison/toxic damage;
         // Magic Guard cancels the damage entirely.
         let (palive, pstatus, php) = {
@@ -4370,25 +4412,6 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         {
             let prev = p.status;
             push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
-        }
-
-        // Leech Seed: the seeded active loses 1/8 max HP and the opposing active heals that
-        // amount (Magic Guard prevents the drain entirely).
-        let p = b.state.side(side).active();
-        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
-            let drain = (maxhp / 8).max(1).min(p.hp);
-            push(b, Instruction::Damage { side, slot, amount: drain });
-            let other = side.other();
-            let (f_alive, f_room, fslot) = {
-                let f = b.state.side(other).active();
-                (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
-            };
-            if f_alive && !heal_blocked(b, other) {
-                let heal = drain.min(f_room);
-                if heal > 0 {
-                    push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
-                }
-            }
         }
 
         // Salt Cure.
@@ -4636,6 +4659,10 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
                     let mut grow = scaled(&b, if sunny { 1.0 } else { 0.5 });
                     push(&mut grow, Instruction::ChangeItem { side, slot, previous: Item::None, new: berry });
                     push(&mut grow, Instruction::SetLastBerry { side, slot, previous: berry, new: Item::None });
+                    // Restoring a berry runs PS's item Update event immediately.  A Harvested
+                    // Sitrus is therefore eaten in the same residual event when HP is already
+                    // at or below half (it does not wait for the next damage/end-turn check).
+                    maybe_eat_sitrus(&mut grow, side);
                     if sunny {
                         vec![grow]
                     } else {
