@@ -426,6 +426,11 @@ pub fn generate_move_action(
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    // In the full turn resolver the queue suppresses a flinched action before calling the move
+    // executor. The factorized/request-model entry point must preserve that same boundary.
+    if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
+        return vec![StateInstructions { percentage: 100.0, instructions: Vec::new() }];
+    }
     execute_move(start, Action { side, move_idx, pivot, foe_pending_move })
         .into_iter()
         .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
@@ -2264,44 +2269,42 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Guts ignores the burn attack drop.
     let burned = attacker.status == Status::Burn && attacker.ability != Ab::Guts;
 
-    // Final defender-side damage modifiers (stack multiplicatively).
-    let (mut fnum, mut fden) = (1i64, 1i64);
+    // Final damage modifiers use PS's 4096-based `chainModify`: combine each modifier with
+    // round-half-up, then apply the resulting modifier to damage once. Sequentially modifying
+    // damage (or multiplying rational numerators) gives different support when effects stack.
+    let chain_final = |previous: i64, next: i64| (previous * next + 2048) >> 12;
+    let mut fmod = 4096i64;
     if matches!(def_ab, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
-        fden *= 2;
+        fmod = chain_final(fmod, 2048);
     }
     let scrappy = attacker.ability == Ab::Scrappy;
     let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
     let type_mult = crate::damage::type_multiplier(md.typ, def_types_eff);
     if matches!(def_ab, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
-        fnum *= 3072;
-        fden *= 4096;
+        fmod = chain_final(fmod, 3072);
     }
     if def_ab == Ab::IceScales && md.category == MoveCategory::Special {
-        fden *= 2;
+        fmod = chain_final(fmod, 2048);
     }
     // Punk Rock halves sound-move damage taken.
     if def_ab == Ab::PunkRock && md.flag_sound {
-        fden *= 2;
+        fmod = chain_final(fmod, 2048);
     }
     // Attacker final-damage modifiers keyed on effectiveness / item.
     if attacker.ability == Ab::TintedLens && type_mult < 1.0 {
-        fnum *= 2;
+        fmod = chain_final(fmod, 8192);
     }
     if attacker.ability == Ab::Neuroforce && type_mult > 1.0 {
-        fnum *= 5120;
-        fden *= 4096;
+        fmod = chain_final(fmod, 5120);
     }
     if attacker.item == Item::ExpertBelt && type_mult > 1.0 {
-        fnum *= 4915;
-        fden *= 4096;
+        fmod = chain_final(fmod, 4915);
     }
     if attacker.item == Item::MuscleBand && md.category == MoveCategory::Physical {
-        fnum *= 4505;
-        fden *= 4096;
+        fmod = chain_final(fmod, 4505);
     }
     if attacker.item == Item::WiseGlasses && md.category == MoveCategory::Special {
-        fnum *= 4505;
-        fden *= 4096;
+        fmod = chain_final(fmod, 4505);
     }
     let adaptability = attacker.ability == Ab::Adaptability;
     // Tera Shell: Terapagos-Terastal at full HP resists every hit by one extra step (breakable,
@@ -2320,6 +2323,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // suppresses the RECOIL (onAfterMoveSecondarySelf). Keep the two flags separate.
     let life_orb = attacker.item == Item::LifeOrb;
     let life_orb_recoil = life_orb && !sheer_force_active;
+    if life_orb {
+        fmod = chain_final(fmod, 5324);
+    }
 
     // Knock Off: ×1.5 base power when the target is holding a (removable) item.
     let mut base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
@@ -2500,11 +2506,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         weather: effective_weather(&b.state),
         terastallized: attacker.terastallized,
         tera_type: attacker.tera_type,
-        life_orb,
+        life_orb: false,
         adaptability,
         tera_shell,
-        final_num: fnum,
-        final_den: fden,
+        final_num: fmod,
+        final_den: 4096,
     };
     // Crit rolls are computed from the screen-free modifiers (a crit ignores screens) and with
     // the boost-clamped stats (a crit ignores the attacker's negative offensive boost and the
@@ -2525,7 +2531,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             MoveCategory::Status => false,
         };
     if screened {
-        input.final_den *= 2;
+        input.final_num = chain_final(input.final_num, 2048);
     }
     let rolls_nocrit = damage_rolls(&input);
 
