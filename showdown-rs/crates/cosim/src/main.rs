@@ -167,6 +167,18 @@ fn main() -> ExitCode {
     if !unverified.is_empty() {
         println!("  used but never in a matched unit: {unverified:?}");
     }
+    // Strict coverage accounting for the equivalence campaign: EXERCISED_DUMP=1 prints the full
+    // matched-unit move-id set (one line, sorted) for diffing against the randbats-eligible list
+    // (harness/coverage-worklist.json).
+    if std::env::var("EXERCISED_DUMP").is_ok() {
+        let ids: Vec<&str> = totals
+            .move_coverage
+            .iter()
+            .filter(|(_, (m, _))| *m > 0)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        println!("EXERCISED: {}", ids.join(" "));
+    }
 
     // Gate decision: any divergence is a hard failure. Unsupported units are ALSO a failure by
     // default — otherwise a converter regression that pushes units into Unsupported would make

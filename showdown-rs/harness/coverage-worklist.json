@@ -1,0 +1,580 @@
+{
+ "generated": "2026-07-11",
+ "eligible": 349,
+ "missing": [
+  "accelerock",
+  "aeroblast",
+  "agility",
+  "aquastep",
+  "armorcannon",
+  "astralbarrage",
+  "aurawheel",
+  "beatup",
+  "behemothblade",
+  "bellydrum",
+  "bitterblade",
+  "bittermalice",
+  "bloodmoon",
+  "blueflare",
+  "boltstrike",
+  "bugbite",
+  "bulletpunch",
+  "burningjealousy",
+  "chillyreception",
+  "circlethrow",
+  "clangingscales",
+  "clangoroussoul",
+  "clearsmog",
+  "coil",
+  "courtchange",
+  "doubleshock",
+  "drillrun",
+  "dynamaxcannon",
+  "endeavor",
+  "eruption",
+  "esperwing",
+  "expandingforce",
+  "explosion",
+  "fakeout",
+  "ficklebeam",
+  "fierydance",
+  "fierywrath",
+  "firefang",
+  "firstimpression",
+  "flowertrick",
+  "fusionbolt",
+  "fusionflare",
+  "futuresight",
+  "gigaimpact",
+  "gigatonhammer",
+  "glaciallance",
+  "glaiverush",
+  "gravapple",
+  "healbell",
+  "hex",
+  "highhorsepower",
+  "hydrosteam",
+  "hypnosis",
+  "icefang",
+  "icehammer",
+  "iciclespear",
+  "irontail",
+  "judgment",
+  "lusterpurge",
+  "magmastorm",
+  "matchagotcha",
+  "meteorbeam",
+  "meteormash",
+  "mightycleave",
+  "milkdrink",
+  "mirrorcoat",
+  "mortalspin",
+  "mysticalfire",
+  "nightshade",
+  "noretreat",
+  "nuzzle",
+  "payback",
+  "petalblizzard",
+  "petaldance",
+  "poisonfang",
+  "pollenpuff",
+  "pounce",
+  "precipiceblades",
+  "psychicfangs",
+  "ragefist",
+  "raindance",
+  "razorshell",
+  "relicsong",
+  "revivalblessing",
+  "ruination",
+  "sacredsword",
+  "secretsword",
+  "seedbomb",
+  "seismictoss",
+  "shadowclaw",
+  "shedtail",
+  "shellsidearm",
+  "softboiled",
+  "sparklingaria",
+  "spiritshackle",
+  "stoneaxe",
+  "strangesteam",
+  "supercellslam",
+  "switcheroo",
+  "tachyoncutter",
+  "takeheart",
+  "teleport",
+  "thunderpunch",
+  "torchsong",
+  "triplearrows",
+  "vacuumwave",
+  "victorydance",
+  "volttackle",
+  "waterpulse",
+  "whirlpool",
+  "wickedblow",
+  "workup",
+  "xscissor"
+ ],
+ "carriers": {
+  "coil": [
+   "arbok",
+   "dunsparce",
+   "eelektross",
+   "sandaconda",
+   "orthworm"
+  ],
+  "fakeout": [
+   "pikachu",
+   "persian",
+   "hariyama",
+   "ambipom",
+   "mienshao",
+   "incineroar",
+   "ironhands",
+   "munkidori"
+  ],
+  "volttackle": [
+   "pikachu"
+  ],
+  "nuzzle": [
+   "raichu",
+   "pachirisu",
+   "dedenne",
+   "hatterene",
+   "pawmot"
+  ],
+  "switcheroo": [
+   "persian",
+   "seviper"
+  ],
+  "burningjealousy": [
+   "persianalola"
+  ],
+  "hypnosis": [
+   "persianalola",
+   "politoed",
+   "bronzong",
+   "darkrai"
+  ],
+  "ragefist": [
+   "annihilape"
+  ],
+  "raindance": [
+   "poliwrath",
+   "kingdra",
+   "ludicolo"
+  ],
+  "circlethrow": [
+   "poliwrath",
+   "spidops"
+  ],
+  "explosion": [
+   "golem",
+   "golemalola",
+   "electrode",
+   "azelf",
+   "regieleki"
+  ],
+  "futuresight": [
+   "slowbro",
+   "slowking",
+   "slowkinggalar"
+  ],
+  "shellsidearm": [
+   "slowbrogalar"
+  ],
+  "drillrun": [
+   "dodrio",
+   "cloyster",
+   "delibird"
+  ],
+  "iciclespear": [
+   "cloyster",
+   "lapras",
+   "kyurem",
+   "kyuremblack",
+   "baxcalibur"
+  ],
+  "strangesteam": [
+   "weezinggalar"
+  ],
+  "bugbite": [
+   "scyther",
+   "scizor"
+  ],
+  "sparklingaria": [
+   "lapras",
+   "primarina"
+  ],
+  "agility": [
+   "moltresgalar",
+   "ampharos",
+   "metagross",
+   "porygonz",
+   "gallade",
+   "braviaryhisui",
+   "calyrexice",
+   "enamorustherian"
+  ],
+  "fierywrath": [
+   "moltresgalar"
+  ],
+  "psychicfangs": [
+   "mew",
+   "metagross",
+   "lycanroc",
+   "lycanrocdusk",
+   "bruxish",
+   "solgaleo",
+   "barraskewda",
+   "zacian",
+   "zamazenta",
+   "mabosstiff",
+   "okidogi"
+  ],
+  "petalblizzard": [
+   "meganium"
+  ],
+  "eruption": [
+   "typhlosion",
+   "typhlosionhisui"
+  ],
+  "bellydrum": [
+   "azumarill",
+   "eiscue",
+   "cetitan"
+  ],
+  "chillyreception": [
+   "slowking",
+   "slowkinggalar"
+  ],
+  "bulletpunch": [
+   "scizor",
+   "hariyama",
+   "medicham",
+   "metagross"
+  ],
+  "healbell": [
+   "chansey",
+   "blissey",
+   "chimecho"
+  ],
+  "seismictoss": [
+   "chansey",
+   "blissey"
+  ],
+  "softboiled": [
+   "chansey",
+   "blissey"
+  ],
+  "aeroblast": [
+   "lugia"
+  ],
+  "shedtail": [
+   "sceptile",
+   "cyclizar",
+   "orthworm"
+  ],
+  "poisonfang": [
+   "mightyena"
+  ],
+  "mysticalfire": [
+   "gardevoir",
+   "mismagius",
+   "hatterene",
+   "enamorus",
+   "enamorustherian",
+   "fluttermane"
+  ],
+  "gigaimpact": [
+   "slaking"
+  ],
+  "clearsmog": [
+   "swalot",
+   "gastrodon",
+   "amoonguss"
+  ],
+  "seedbomb": [
+   "cacturne",
+   "brutebonnet"
+  ],
+  "endeavor": [
+   "luvdisc"
+  ],
+  "whirlpool": [
+   "luvdisc"
+  ],
+  "lusterpurge": [
+   "latios"
+  ],
+  "precipiceblades": [
+   "groudon"
+  ],
+  "nightshade": [
+   "deoxysdefense"
+  ],
+  "teleport": [
+   "deoxysdefense",
+   "solgaleo"
+  ],
+  "pounce": [
+   "kricketune"
+  ],
+  "supercellslam": [
+   "luxray",
+   "electivire",
+   "zebstrika",
+   "eelektross",
+   "copperajah"
+  ],
+  "icefang": [
+   "luxray",
+   "bruxish"
+  ],
+  "firefang": [
+   "garchomp"
+  ],
+  "meteormash": [
+   "lucario"
+  ],
+  "vacuumwave": [
+   "lucario",
+   "braviaryhisui",
+   "cobalion",
+   "keldeoresolute",
+   "ursalunabloodmoon"
+  ],
+  "mirrorcoat": [
+   "magnezone",
+   "araquanid"
+  ],
+  "sacredsword": [
+   "gallade",
+   "samurott",
+   "samurotthisui",
+   "chienpao"
+  ],
+  "magmastorm": [
+   "heatran"
+  ],
+  "takeheart": [
+   "phione"
+  ],
+  "shadowclaw": [
+   "arceus",
+   "mimikyu"
+  ],
+  "judgment": [
+   "arceusbug",
+   "arceusdark",
+   "arceusdragon",
+   "arceuselectric",
+   "arceusfairy",
+   "arceusfire",
+   "arceusflying",
+   "arceusghost",
+   "arceusgrass",
+   "arceusground",
+   "arceusice",
+   "arceusrock",
+   "arceussteel",
+   "arceuswater"
+  ],
+  "razorshell": [
+   "samurotthisui"
+  ],
+  "highhorsepower": [
+   "zebstrika",
+   "sawsbuck",
+   "rillaboom",
+   "glastrier",
+   "calyrexice",
+   "oinkologne",
+   "oinkolognef",
+   "klawf",
+   "revavroom",
+   "okidogi"
+  ],
+  "petaldance": [
+   "lilligant"
+  ],
+  "victorydance": [
+   "lilliganthisui"
+  ],
+  "bittermalice": [
+   "zoroarkhisui"
+  ],
+  "esperwing": [
+   "braviaryhisui"
+  ],
+  "fierydance": [
+   "volcarona",
+   "ironmoth"
+  ],
+  "blueflare": [
+   "reshiram"
+  ],
+  "boltstrike": [
+   "zekrom"
+  ],
+  "fusionflare": [
+   "kyuremwhite"
+  ],
+  "fusionbolt": [
+   "kyuremblack"
+  ],
+  "secretsword": [
+   "keldeoresolute"
+  ],
+  "relicsong": [
+   "meloetta"
+  ],
+  "workup": [
+   "pyroar"
+  ],
+  "milkdrink": [
+   "gogoat"
+  ],
+  "waterpulse": [
+   "clawitzer"
+  ],
+  "spiritshackle": [
+   "decidueye"
+  ],
+  "triplearrows": [
+   "decidueyehisui"
+  ],
+  "icehammer": [
+   "crabominable"
+  ],
+  "accelerock": [
+   "lycanroc",
+   "lycanrocdusk"
+  ],
+  "clangingscales": [
+   "kommoo"
+  ],
+  "clangoroussoul": [
+   "kommoo"
+  ],
+  "courtchange": [
+   "cinderace"
+  ],
+  "gravapple": [
+   "flapple"
+  ],
+  "noretreat": [
+   "falinks"
+  ],
+  "expandingforce": [
+   "indeedee"
+  ],
+  "aurawheel": [
+   "morpeko"
+  ],
+  "hex": [
+   "dragapult",
+   "skeledirge"
+  ],
+  "behemothblade": [
+   "zaciancrowned"
+  ],
+  "dynamaxcannon": [
+   "eternatus"
+  ],
+  "meteorbeam": [
+   "eternatus",
+   "armarouge",
+   "glimmora",
+   "ironjugulis"
+  ],
+  "wickedblow": [
+   "urshifu"
+  ],
+  "glaciallance": [
+   "calyrexice"
+  ],
+  "astralbarrage": [
+   "calyrexshadow"
+  ],
+  "pollenpuff": [
+   "calyrexshadow"
+  ],
+  "stoneaxe": [
+   "kleavor"
+  ],
+  "xscissor": [
+   "kleavor"
+  ],
+  "bloodmoon": [
+   "ursalunabloodmoon"
+  ],
+  "flowertrick": [
+   "meowscarada"
+  ],
+  "torchsong": [
+   "skeledirge"
+  ],
+  "aquastep": [
+   "quaquaval"
+  ],
+  "firstimpression": [
+   "lokix",
+   "slitherwing"
+  ],
+  "doubleshock": [
+   "pawmot"
+  ],
+  "revivalblessing": [
+   "pawmot",
+   "rabsca"
+  ],
+  "armorcannon": [
+   "armarouge"
+  ],
+  "bitterblade": [
+   "ceruledge"
+  ],
+  "gigatonhammer": [
+   "tinkaton"
+  ],
+  "irontail": [
+   "orthworm"
+  ],
+  "mortalspin": [
+   "glimmora"
+  ],
+  "hydrosteam": [
+   "walkingwake"
+  ],
+  "thunderpunch": [
+   "ironhands"
+  ],
+  "glaiverush": [
+   "baxcalibur"
+  ],
+  "payback": [
+   "tinglu"
+  ],
+  "ruination": [
+   "tinglu",
+   "wochien"
+  ],
+  "matchagotcha": [
+   "sinistcha"
+  ],
+  "beatup": [
+   "fezandipiti"
+  ],
+  "ficklebeam": [
+   "hydrapple"
+  ],
+  "mightycleave": [
+   "ironboulder"
+  ],
+  "tachyoncutter": [
+   "ironcrown"
+  ]
+ }
+}
