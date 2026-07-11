@@ -168,10 +168,21 @@ fn main() -> ExitCode {
         println!("  used but never in a matched unit: {unverified:?}");
     }
 
-    if totals.diverged == 0 {
-        ExitCode::SUCCESS
-    } else {
+    // Gate decision: any divergence is a hard failure. Unsupported units are ALSO a failure by
+    // default — otherwise a converter regression that pushes units into Unsupported would make
+    // the gate silently vacuous (it would exit 0 while verifying nothing). Set ALLOW_UNSUPPORTED=1
+    // to restore the old behavior when deliberately growing coverage on a new corpus.
+    let allow_unsupported = std::env::var("ALLOW_UNSUPPORTED").is_ok();
+    if totals.diverged > 0 {
         ExitCode::FAILURE
+    } else if totals.unsupported > 0 && !allow_unsupported {
+        println!(
+            "\nFAIL: {} unsupported unit(s) — gate would be vacuous. Set ALLOW_UNSUPPORTED=1 to permit while growing coverage.",
+            totals.unsupported
+        );
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
