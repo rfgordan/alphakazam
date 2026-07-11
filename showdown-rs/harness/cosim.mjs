@@ -284,12 +284,20 @@ function cleanCheckpoint(state) {
 	return checkpoint;
 }
 
+function checkpointJson(state) {
+	return JSON.stringify(cleanCheckpoint(state));
+}
+
 function enumerateDecisionDistribution(checkpoint, choices, roster) {
 	// Expand one queued Showdown action at a time and coalesce identical serialized states
 	// between actions. This computes the same exact distribution as whole-turn prefix replay,
 	// but avoids multiplying independent damage/crit/secondary paths across both moves.
 	let replayLeaves = 0;
-	let frontier = [{ checkpoint: cleanCheckpoint(checkpoint), probability: 1, initial: true }];
+	// A serialized battle is a large, deeply nested object. Keeping one expanded object per
+	// stochastic state makes V8 spend several times the JSON payload size on object metadata.
+	// Store the restartable frontier in its wire representation and parse only the state being
+	// replayed. The same string is also its exact coalescing key, avoiding a second full copy.
+	let frontier = [{ checkpoint: checkpointJson(checkpoint), probability: 1, initial: true }];
 	const outcomes = new Map();
 	const kernels = [];
 
@@ -300,7 +308,7 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 			const kernelGroups = new Map();
 			while (work.length) {
 				const job = work.pop();
-				const branch = State.deserializeBattle(structuredClone(stage.checkpoint));
+				const branch = State.deserializeBattle(JSON.parse(stage.checkpoint));
 				branch.restart(() => {});
 				installForcedPrng(branch, job.prefix);
 				const originalRunAction = branch.runAction.bind(branch);
@@ -348,13 +356,19 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					if (prev) prev.probability += job.probability;
 					else outcomes.set(key, { probability: job.probability, requestState, midTurn, state });
 				} else {
-					const next = cleanCheckpoint(State.serializeBattle(branch));
-					const key = JSON.stringify(next);
+					const next = checkpointJson(State.serializeBattle(branch));
+					const key = next;
 					const prev = nextStages.get(key);
 					if (prev) prev.probability += job.probability;
 					else nextStages.set(key, { checkpoint: next, probability: job.probability, initial: false });
 				}
-				if (completedAction) {
+				// Rust currently certifies stochastic move kernels. Retaining kernels for
+				// residual/beforeTurn/tera actions is pure duplication: a residual stage can
+				// have thousands of distinct inputs, and every entry embeds two full battle
+				// snapshots even though the consumer immediately filters it out. Continue
+				// staging every action (and include its effects in terminal outcomes), but
+				// materialize only the move kernels that are actually compared.
+				if (completedAction?.action.choice === 'move') {
 					const groupKey = JSON.stringify({ action: completedAction.action, input: completedAction.inputState });
 					let group = kernelGroups.get(groupKey);
 					if (!group) {
