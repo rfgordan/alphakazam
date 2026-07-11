@@ -26,10 +26,15 @@ def random_legal(mask: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return noise.argmax(axis=1).astype(np.int64)
 
 
-def bench(envs: int, seconds: float, mode: str) -> tuple[float, int]:
-    from showdown_engine import BattleVec
+def bench(envs: int, seconds: float, mode: str, api: str = "battle") -> tuple[float, int]:
+    if api == "flow":
+        from showdown_engine import FlowVec
 
-    vec = BattleVec(envs, seed=7)
+        vec = FlowVec(envs, seed=7)
+    else:
+        from showdown_engine import BattleVec
+
+        vec = BattleVec(envs, seed=7)
     rng = np.random.default_rng(7)
 
     model = None
@@ -56,15 +61,20 @@ def bench(envs: int, seconds: float, mode: str) -> tuple[float, int]:
             gumbel = -torch.log(-torch.log(torch.rand_like(logits)))
             return (logits + gumbel).argmax(dim=-1).numpy()
 
+    # For the flow API a side only acts when its request names it; feed the masked sample where it
+    # acts and a harmless 0 where it doesn't (step_all drops the non-acting side's choice anyway).
+    def pick(side: int) -> np.ndarray:
+        if model is None:
+            a = random_legal(vec.legal_all(side), rng)
+        else:
+            a = act(side)
+        return a
+
     steps = 0
     episodes = 0
     start = time.perf_counter()
     while time.perf_counter() - start < seconds:
-        if model is None:
-            red = random_legal(vec.legal_all(0), rng)
-            blue = random_legal(vec.legal_all(1), rng)
-        else:
-            red, blue = act(0), act(1)
+        red, blue = pick(0), pick(1)
         done, _winner = vec.step_all(red, blue)
         steps += envs
         episodes += int(done.sum())
@@ -76,11 +86,13 @@ def main():
     ap.add_argument("--envs", type=int, default=512)
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--modes", default="raw,model")
+    ap.add_argument("--api", choices=("battle", "flow"), default="battle")
     args = ap.parse_args()
 
+    unit = "requests" if args.api == "flow" else "turns"
     for mode in args.modes.split(","):
-        sps, eps = bench(args.envs, args.seconds, mode)
-        print(f"{mode:>8}: {sps:>10.0f} env-steps/s (turns; x2 agent decisions)  [{eps} episodes]")
+        sps, eps = bench(args.envs, args.seconds, mode, args.api)
+        print(f"{mode:>8}: {sps:>10.0f} env-steps/s ({unit}; x2 agent decisions)  [{eps} episodes]")
 
 
 if __name__ == "__main__":

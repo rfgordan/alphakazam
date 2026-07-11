@@ -649,9 +649,303 @@ impl BattleVec {
     }
 }
 
+// ---- request-driven vectorized bridge (13-action decision-point MDP) ------------------------
+
+use engine::request::{Flow, PlayerChoice, Request};
+
+/// Number of actions in the decision-point space: 4 moves + 5 switches + 4 tera-moves.
+const N_ACTIONS_FLOW: usize = 13;
+
+/// Whether `side` must answer the pending `req` (Turn: both; Replace: flagged; PivotLanding: the
+/// named side; Terminal: neither).
+fn acting_for(req: Request, side: SideId) -> bool {
+    match req {
+        Request::Turn => true,
+        Request::Replace { sides } => sides[side.index()],
+        Request::PivotLanding { side: s } => s == side,
+        Request::Terminal { .. } => false,
+    }
+}
+
+/// Party index of the k-th non-active slot (0..5), independent of whether it is filled/alive —
+/// so a switch action always maps to *some* slot and `Flow::submit` coerces empty/dead targets.
+fn bench_party_slot(state: &State, side: SideId, k: usize) -> u8 {
+    let ai = state.side(side).active_index;
+    let mut j = 0;
+    for i in 0..6u8 {
+        if i != ai {
+            if j == k {
+                return i;
+            }
+            j += 1;
+        }
+    }
+    ai
+}
+
+/// Map an action int to a `PlayerChoice` (0-3 move, 4-8 switch to k-th bench slot, 9-12 tera-move).
+fn flow_choice(state: &State, side: SideId, action: u8) -> PlayerChoice {
+    match action {
+        0..=3 => PlayerChoice::Move { slot: action, tera: false },
+        4..=8 => PlayerChoice::Switch { slot: bench_party_slot(state, side, (action - 4) as usize) },
+        9..=12 => PlayerChoice::Move { slot: action - 9, tera: true },
+        _ => PlayerChoice::Move { slot: 0, tera: false },
+    }
+}
+
+/// Phase-aware (N=13) legal mask for `side` under the pending `req`.
+fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTIONS_FLOW] {
+    let mut mask = [false; N_ACTIONS_FLOW];
+    if !acting_for(req, side) {
+        return mask;
+    }
+    let s = state.side(side);
+    match req {
+        Request::Turn => {
+            let alive = s.active().is_alive();
+            if alive {
+                let active = s.active();
+                for i in 0..N_MOVES {
+                    let m = active.moves[i];
+                    let ok = m.id != engine::ids::MoveId::None && m.pp > 0;
+                    mask[i] = ok;
+                    if ok && !s.tera_used {
+                        mask[9 + i] = true;
+                    }
+                }
+            }
+            for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
+                if let Some(slot) = slot {
+                    mask[N_MOVES + k] = s.pokemon[slot as usize].is_alive();
+                }
+            }
+            // PP-stalled active with nowhere to go: expose move 0 so the engine Struggle-detects it.
+            if alive && mask.iter().all(|&b| !b) {
+                mask[0] = true;
+            }
+        }
+        Request::Replace { .. } | Request::PivotLanding { .. } => {
+            for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
+                if let Some(slot) = slot {
+                    mask[N_MOVES + k] = s.pokemon[slot as usize].is_alive();
+                }
+            }
+        }
+        Request::Terminal { .. } => {}
+    }
+    mask
+}
+
+/// A batch of independent decision-point battles (`request::Flow`) stepped/encoded in parallel,
+/// exchanged with Python as numpy in a single GIL crossing per call. The request-driven training
+/// path with the real rules (faint replacements, pivots, tera) and the 13-action space.
+#[pyclass]
+pub struct FlowVec {
+    flows: Vec<Flow>,
+    /// Per-env request (decision-point) counters; episodes hitting `max_requests` are truncated.
+    reqs: Vec<u32>,
+    max_requests: u32,
+    seed: u64,
+}
+
+impl FlowVec {
+    fn fresh_flow(seed: u64, i: usize) -> Flow {
+        Flow::new(engine::team::default_matchup(), seed.wrapping_add(1).wrapping_add((i as u64) << 32))
+    }
+}
+
+#[pymethods]
+impl FlowVec {
+    #[new]
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000))]
+    fn new(num_envs: usize, seed: u64, max_requests_per_episode: u32) -> Self {
+        FlowVec {
+            flows: (0..num_envs).map(|i| FlowVec::fresh_flow(seed, i)).collect(),
+            reqs: vec![0; num_envs],
+            max_requests: max_requests_per_episode,
+            seed,
+        }
+    }
+
+    #[getter]
+    fn num_envs(&self) -> usize {
+        self.flows.len()
+    }
+    #[getter]
+    fn obs_dim(&self) -> usize {
+        engine::encode::OBS_DIM
+    }
+    #[getter]
+    fn n_actions(&self) -> usize {
+        N_ACTIONS_FLOW
+    }
+    #[getter]
+    fn id_dim(&self) -> usize {
+        engine::encode::ID_DIM
+    }
+
+    /// (N,) i8 phase: 0=Turn, 1=Replace, 2=PivotLanding. Terminal (3) is never observed when
+    /// `step_all` auto-resets.
+    fn phase_all<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {
+        let v: Vec<i8> = self
+            .flows
+            .iter()
+            .map(|f| match f.request() {
+                Request::Turn => 0,
+                Request::Replace { .. } => 1,
+                Request::PivotLanding { .. } => 2,
+                Request::Terminal { .. } => 3,
+            })
+            .collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// (N,) bool: whether `side` must act for the current pending request.
+    fn acting_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray1<bool>> {
+        let sd = sid(side);
+        let v: Vec<bool> = self.flows.iter().map(|f| acting_for(f.request(), sd)).collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// (N, 13) bool phase-aware legal mask for `side`.
+    fn legal_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<bool>> {
+        let sd = sid(side);
+        let n = self.flows.len();
+        let mut flat = vec![false; n * N_ACTIONS_FLOW];
+        for (dst, f) in flat.chunks_mut(N_ACTIONS_FLOW).zip(self.flows.iter()) {
+            dst.copy_from_slice(&flow_legal_mask(&f.state, f.request(), sd));
+        }
+        Array2::from_shape_vec((n, N_ACTIONS_FLOW), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N, OBS_DIM) f32 observations from `side`'s perspective.
+    fn observe_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<f32>> {
+        let n = self.flows.len();
+        let dim = engine::encode::OBS_DIM;
+        let mut flat = vec![0f32; n * dim];
+        py.allow_threads(|| {
+            flat.par_chunks_mut(dim).zip(self.flows.par_iter()).for_each(|(dst, f)| {
+                dst.copy_from_slice(&engine::encode::encode(&f.state, sid(side)));
+            });
+        });
+        Array2::from_shape_vec((n, dim), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N, ID_DIM) i64 categorical IDs from `side`'s perspective (embedding-table inputs).
+    fn observe_ids_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<i64>> {
+        let n = self.flows.len();
+        let dim = engine::encode::ID_DIM;
+        let mut flat = vec![0i64; n * dim];
+        py.allow_threads(|| {
+            flat.par_chunks_mut(dim).zip(self.flows.par_iter()).for_each(|(dst, f)| {
+                dst.copy_from_slice(&engine::encode::encode_ids(&f.state, sid(side)));
+            });
+        });
+        Array2::from_shape_vec((n, dim), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N,) f32 mean team HP fraction for `side` — the reward-shaping potential.
+    fn team_hp_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray1<f32>> {
+        let v: Vec<f32> = self
+            .flows
+            .iter()
+            .map(|f| {
+                let s = f.state.side(sid(side));
+                s.pokemon
+                    .iter()
+                    .filter(|p| p.species != engine::ids::Species::None && p.max_hp > 0)
+                    .map(|p| (p.hp.max(0) as f32) / (p.max_hp as f32))
+                    .sum::<f32>()
+                    / 6.0
+            })
+            .collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// (N,) i64 fainted-mon count for `side` — the other Φ term.
+    fn faints_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray1<i64>> {
+        let v: Vec<i64> = self
+            .flows
+            .iter()
+            .map(|f| {
+                f.state
+                    .side(sid(side))
+                    .pokemon
+                    .iter()
+                    .filter(|p| p.species != engine::ids::Species::None && !p.is_alive())
+                    .count() as i64
+            })
+            .collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// Answer the pending request in every env. A side contributes a choice iff it is acting for
+    /// that env's request (else `None`). Returns `(done, winner)` for the step just taken; envs
+    /// that reached Terminal (or hit `max_requests`, truncation with winner -1) are reset in place
+    /// when `auto_reset`.
+    #[pyo3(signature = (action_red, action_blue, auto_reset = true))]
+    fn step_all<'py>(
+        &mut self,
+        py: Python<'py>,
+        action_red: PyReadonlyArray1<'py, i64>,
+        action_blue: PyReadonlyArray1<'py, i64>,
+        auto_reset: bool,
+    ) -> PyResult<(Bound<'py, PyArray1<bool>>, Bound<'py, PyArray1<i64>>)> {
+        let red = action_red.as_slice()?.to_vec();
+        let blue = action_blue.as_slice()?.to_vec();
+        let n = self.flows.len();
+        if red.len() != n || blue.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "action arrays must have length {n} (got {} / {})",
+                red.len(),
+                blue.len()
+            )));
+        }
+        let max_requests = self.max_requests;
+        let seed = self.seed;
+        let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
+            self.flows
+                .par_iter_mut()
+                .zip(self.reqs.par_iter_mut())
+                .enumerate()
+                .map(|(i, (flow, reqs))| {
+                    let req = flow.request();
+                    let c0 = if acting_for(req, SideId::One) {
+                        Some(flow_choice(&flow.state, SideId::One, red[i] as u8))
+                    } else {
+                        None
+                    };
+                    let c1 = if acting_for(req, SideId::Two) {
+                        Some(flow_choice(&flow.state, SideId::Two, blue[i] as u8))
+                    } else {
+                        None
+                    };
+                    let next = flow.submit([c0, c1]);
+                    *reqs += 1;
+                    let (done, winner) = match next {
+                        Request::Terminal { winner } => (true, winner),
+                        _ if *reqs >= max_requests => (true, -1),
+                        _ => (false, -1),
+                    };
+                    if done && auto_reset {
+                        *flow = FlowVec::fresh_flow(seed, i);
+                        *reqs = 0;
+                    }
+                    (done, winner)
+                })
+                .unzip()
+        });
+        Ok((
+            Array1::from_vec(dones).into_pyarray_bound(py),
+            Array1::from_vec(winners).into_pyarray_bound(py),
+        ))
+    }
+}
+
 #[pymodule]
 fn showdown_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Battle>()?;
     m.add_class::<BattleVec>()?;
+    m.add_class::<FlowVec>()?;
     Ok(())
 }
