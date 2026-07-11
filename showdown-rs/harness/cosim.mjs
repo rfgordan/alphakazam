@@ -352,9 +352,7 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					const requestState = branch.requestState;
 					const midTurn = !!branch.midTurn;
 					const key = JSON.stringify({ requestState, midTurn, state });
-					const prev = outcomes.get(key);
-					if (prev) prev.probability += job.probability;
-					else outcomes.set(key, { probability: job.probability, requestState, midTurn, state });
+					outcomes.set(key, (outcomes.get(key) ?? 0) + job.probability);
 				} else {
 					const next = checkpointJson(State.serializeBattle(branch));
 					const key = next;
@@ -379,9 +377,7 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					const key = JSON.stringify(output);
 					const conditional = job.probability / stage.probability;
 					group.mass += conditional;
-					const prev = group.outcomes.get(key);
-					if (prev) prev.probability += conditional;
-					else group.outcomes.set(key, { probability: conditional, state: output });
+					group.outcomes.set(key, (group.outcomes.get(key) ?? 0) + conditional);
 				}
 			}
 			for (const group of kernelGroups.values()) {
@@ -389,14 +385,20 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					action: group.action,
 					input: group.input,
 					selectionProbability: group.mass,
-					outcomes: [...group.outcomes.values()].map(o => ({ ...o, probability: o.probability / group.mass })),
+					outcomes: [...group.outcomes].map(([state, probability]) => ({
+						probability: probability / group.mass,
+						state: JSON.parse(state),
+					})),
 				});
 			}
 		}
 		frontier = [...nextStages.values()];
 	}
 
-	const distribution = [...outcomes.values()].sort((a, b) => JSON.stringify(a.state).localeCompare(JSON.stringify(b.state)));
+	const distribution = [...outcomes].map(([outcome, probability]) => ({
+		probability,
+		...JSON.parse(outcome),
+	})).sort((a, b) => JSON.stringify(a.state).localeCompare(JSON.stringify(b.state)));
 	const total = distribution.reduce((s, x) => s + x.probability, 0);
 	if (Math.abs(total - 1) > 1e-10) throw new Error(`distribution mass is ${total}, expected 1`);
 	return { paths: replayLeaves, outcomes: distribution, kernels };
