@@ -40,6 +40,8 @@ const FORMAT = arg('format', 'gen9customgame');
 const TEAMSET = arg('teamset', 'ou');
 const MAX_DECISIONS = Number(arg('max-decisions', '600'));
 const OUT = arg('out', path.join(__dirname, 'cosim-traces', `c${SEED_NUM}.json`));
+const DISTRIBUTIONS = argv.includes('--distributions');
+const MAX_DIST_PATHS = Number(arg('max-dist-paths', '250000'));
 
 // ---- teams (packed; unique species per side so idents are unambiguous) -------
 
@@ -160,6 +162,10 @@ const DROP_TOP = new Set([
 const DROP_SIDE = new Set(['foe', 'allySide', 'team', 'choice', 'avatar', 'activeRequest']);
 const DROP_POKEMON = new Set(['m', 'set', 'speciesState', 'moveLastTurnResult']);
 
+function setKey(set) {
+	return JSON.stringify(set);
+}
+
 function snapshot(battle, roster) {
 	const ser = State.serializeBattle(battle);
 	const out = {};
@@ -179,7 +185,11 @@ function snapshot(battle, roster) {
 			// Stable identity across PS's array reordering AND forme changes (Palafin-Hero
 			// changes `details` mid-battle): index into the battle-start roster, keyed by the
 			// live pokemon's immutable `set` object.
-			q.rosterIndex = roster[si].indexOf(battle.sides[si].pokemon[pi].set);
+			// Deserialized distribution branches contain cloned set objects, so object identity
+			// is unavailable. Sets are immutable during battle; structural identity preserves the
+			// battle-start roster index across clones and forme changes.
+			const key = setKey(battle.sides[si].pokemon[pi].set);
+			q.rosterIndex = roster[si].findIndex(s => setKey(s) === key);
 			return q;
 		});
 		// Synthesized: has this side spent its Terastallization? PS deletes `terastallized`
@@ -191,6 +201,105 @@ function snapshot(battle, roster) {
 	});
 	out.winner = battle.winner ?? null;
 	return JSON.parse(JSON.stringify(out)); // deep-copy + drop undefineds
+}
+
+// ---- exact decision-point distribution oracle ---------------------------------
+
+class NeedRandom extends Error {
+	constructor(kind, args, options) {
+		super(`need random outcome ${kind}`);
+		this.kind = kind;
+		this.args = args;
+		this.options = options;
+	}
+}
+
+function installForcedPrng(battle, prefix) {
+	let cursor = 0;
+	const take = (kind, args, options) => {
+		if (cursor < prefix.length) {
+			const forced = prefix[cursor++];
+			if (forced.kind !== kind || JSON.stringify(forced.args) !== JSON.stringify(args)) {
+				throw new Error(`RNG prefix drift at ${cursor - 1}: expected ${forced.kind}${JSON.stringify(forced.args)}, got ${kind}${JSON.stringify(args)}`);
+			}
+			return forced.value;
+		}
+		throw new NeedRandom(kind, args, options);
+	};
+	const prng = battle.prng;
+	prng.random = (from, to) => {
+		let lo, hi;
+		if (from === undefined) {
+			// No current battle mechanic in the corpus uses random() as a float. Keep the
+			// unsupported case explicit instead of pretending a continuous distribution is finite.
+			throw new Error('distribution oracle does not support zero-argument random()');
+		} else if (to === undefined || !to) {
+			lo = 0; hi = Math.floor(from);
+		} else {
+			lo = Math.floor(from); hi = Math.floor(to);
+		}
+		const n = hi - lo;
+		return take('random', [lo, hi], Array.from({ length: n }, (_, i) => ({ value: lo + i, probability: 1 / n })));
+	};
+	prng.randomChance = (numerator, denominator) => take(
+		'randomChance', [numerator, denominator], [
+			{ value: true, probability: numerator / denominator },
+			{ value: false, probability: (denominator - numerator) / denominator },
+		].filter(x => x.probability > 0),
+	);
+	prng.sample = items => {
+		if (!items.length) throw new RangeError('Cannot sample an empty array');
+		const index = take('sample', [items.length], items.map((_, i) => ({ value: i, probability: 1 / items.length })));
+		return items[index];
+	};
+	// Keep PS's shuffle implementation: it calls the forced `random(start, end)` above for
+	// each Fisher-Yates step, yielding the exact permutation distribution.
+}
+
+function enumerateDecisionDistribution(checkpoint, choices, roster) {
+	// Logs are observational noise and can already exceed PS's per-resolution safety window in
+	// a long battle. Branch replays do not send protocol output, so reset the log counters while
+	// preserving every gameplay-relevant field.
+	checkpoint = structuredClone(checkpoint);
+	checkpoint.log = [];
+	checkpoint.messageLog = [];
+	checkpoint.sentLogPos = 0;
+	const work = [{ prefix: [], probability: 1 }];
+	const outcomes = new Map();
+	let completedPaths = 0;
+	while (work.length) {
+		const job = work.pop();
+		// Deserialization resolves reference markers in-place; every replay needs an untouched
+		// serialization tree or later branches alias live objects and eventually loop.
+		const branch = State.deserializeBattle(structuredClone(checkpoint));
+		branch.restart(() => {});
+		installForcedPrng(branch, job.prefix);
+		try {
+			for (const [sideId, c] of Object.entries(choices)) {
+				const ok = branch.choose(sideId, c.choice);
+				if (!ok) throw new Error(`PS rejected distribution choice '${c.choice}' for ${sideId}`);
+			}
+			const state = snapshot(branch, roster);
+			const key = JSON.stringify(state);
+			const prev = outcomes.get(key);
+			if (prev) prev.probability += job.probability;
+			else outcomes.set(key, { probability: job.probability, state });
+			completedPaths++;
+			if (completedPaths > MAX_DIST_PATHS) throw new Error(`distribution path cap ${MAX_DIST_PATHS} exceeded`);
+		} catch (e) {
+			if (!(e instanceof NeedRandom)) throw e;
+			for (const option of e.options) {
+				work.push({
+					prefix: [...job.prefix, { kind: e.kind, args: e.args, value: option.value }],
+					probability: job.probability * option.probability,
+				});
+			}
+		}
+	}
+	const distribution = [...outcomes.values()].sort((a, b) => JSON.stringify(a.state).localeCompare(JSON.stringify(b.state)));
+	const total = distribution.reduce((s, x) => s + x.probability, 0);
+	if (Math.abs(total - 1) > 1e-10) throw new Error(`distribution mass is ${total}, expected 1`);
+	return { paths: completedPaths, outcomes: distribution };
 }
 
 // ---- choice policy ---------------------------------------------------------------
@@ -303,6 +412,8 @@ async function main() {
 		if (!Object.keys(choices).length) {
 			throw new Error(`no side can act at decision ${decisions.length} (requestState=${requestState})`);
 		}
+		const checkpoint = DISTRIBUTIONS ? State.serializeBattle(battle) : null;
+		const distribution = DISTRIBUTIONS ? enumerateDecisionDistribution(checkpoint, choices, roster) : undefined;
 		// Submitting the final needed choice runs the battle forward synchronously.
 		for (const [sideId, c] of Object.entries(choices)) {
 			const ok = battle.choose(sideId, c.choice);
@@ -319,6 +430,7 @@ async function main() {
 			choices,
 			draws: draws.splice(0, draws.length),
 			stateAfter: snapshot(battle, roster),
+			...(distribution ? { distribution } : {}),
 		});
 	}
 

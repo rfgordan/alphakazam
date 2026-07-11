@@ -22,6 +22,7 @@ use crate::trace::{Decision, Trace};
 pub enum Verdict {
     Matched,
     Diverged { closest: Vec<Diff>, branches: usize },
+    DistributionDiverged { detail: String, branches: usize, outcomes: usize },
     Unsupported(Unsupported),
 }
 
@@ -184,6 +185,58 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
     let branches = generate_instructions_ex(&state_before, mc[0], mc[1], pivots, tera);
     if branches.is_empty() {
         return mk(Verdict::Unsupported(Unsupported("engine:no-branches".into())), legality);
+    }
+
+    // Strong mode: compare the complete probability distribution, not sampled-path
+    // membership. Distribution snapshots currently describe one PS request resolution, so
+    // only compare units without separately recorded trailing replacement requests.
+    if let Some(dist) = &dp.distribution {
+        if unit.len() != 1 {
+            return mk(Verdict::Unsupported(Unsupported("distribution:trailing-request-boundary".into())), legality);
+        }
+        let mut ps_clusters: Vec<(State, f64)> = Vec::new();
+        for outcome in &dist.outcomes {
+            let mut state = match convert_state(&outcome.state, canon) {
+                Ok(s) => s,
+                Err(u) => return mk(Verdict::Unsupported(u), legality),
+            };
+            state.sleep_clause = sleep_clause;
+            if let Some((_, mass)) = ps_clusters.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
+                *mass += outcome.probability;
+            } else {
+                ps_clusters.push((state, outcome.probability));
+            }
+        }
+        let mut rust_mass = vec![0.0f64; ps_clusters.len()];
+        let mut unmatched_rust = 0.0f64;
+        for branch in &branches {
+            let mut cand = state_before;
+            cand.apply_instructions(&branch.instructions);
+            let p = branch.percentage as f64 / 100.0;
+            if let Some(i) = ps_clusters.iter().position(|(s, _)| diff_states(&cand, s).is_empty()) {
+                rust_mass[i] += p;
+            } else {
+                unmatched_rust += p;
+            }
+        }
+        const TOL: f64 = 2e-5;
+        let mut errors = Vec::new();
+        if unmatched_rust > TOL {
+            errors.push(format!("Rust-only mass {unmatched_rust:.8}"));
+        }
+        for (i, ((_, ps), rs)) in ps_clusters.iter().zip(&rust_mass).enumerate() {
+            if (ps - rs).abs() > TOL {
+                errors.push(format!("outcome {i}: rust={rs:.8} ps={ps:.8} delta={:.8}", rs - ps));
+            }
+        }
+        if errors.is_empty() {
+            return mk(Verdict::Matched, legality);
+        }
+        return mk(Verdict::DistributionDiverged {
+            detail: errors.into_iter().take(6).collect::<Vec<_>>().join(" | "),
+            branches: branches.len(),
+            outcomes: ps_clusters.len(),
+        }, legality);
     }
     let mut closest: Option<Vec<Diff>> = None;
     let n = branches.len();

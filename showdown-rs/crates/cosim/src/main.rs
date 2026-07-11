@@ -109,6 +109,14 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                Verdict::DistributionDiverged { detail, branches, outcomes } => {
+                    dv += 1;
+                    *totals.divergence_categories.entry("distribution".into()).or_insert(0) += 1;
+                    if verbose {
+                        println!("  [distribution-diverged t{} | {} rust branches, {} PS outcomes] {}| {}",
+                            unit.turn, branches, outcomes, unit.choice_summary, detail);
+                    }
+                }
                 Verdict::Unsupported(u) => {
                     un += 1;
                     *totals.unsupported_reasons.entry(u.0.clone()).or_insert(0) += 1;

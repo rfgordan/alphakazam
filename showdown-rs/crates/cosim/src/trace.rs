@@ -48,6 +48,23 @@ pub struct Decision {
     /// Full serialized battle state after the battle advanced.
     #[serde(rename = "stateAfter")]
     pub state_after: Value,
+    /// Optional exact PS transition distribution produced by `cosim.mjs --distributions`.
+    /// Probabilities are in [0,1]; outcomes with byte-identical normalized PS snapshots are
+    /// already coalesced by the recorder.
+    #[serde(default)]
+    pub distribution: Option<DecisionDistribution>,
+}
+
+#[derive(Deserialize)]
+pub struct DecisionDistribution {
+    pub paths: u64,
+    pub outcomes: Vec<DistributionOutcome>,
+}
+
+#[derive(Deserialize)]
+pub struct DistributionOutcome {
+    pub probability: f64,
+    pub state: Value,
 }
 
 #[derive(Deserialize)]
