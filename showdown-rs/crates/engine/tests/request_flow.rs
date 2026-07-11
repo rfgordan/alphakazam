@@ -168,6 +168,22 @@ fn random_games_terminate_with_wellformed_requests() {
                     choices[side.index()] = Some(c);
                     flow.submit(choices);
                 }
+                Request::Revive { side } => {
+                    // Pick a fainted party member to revive.
+                    let s = flow.state.side(side);
+                    let fainted: Vec<u8> = (0..6u8)
+                        .filter(|&i| {
+                            i != s.active_index
+                                && s.pokemon[i as usize].species != engine::ids::Species::None
+                                && !s.pokemon[i as usize].is_alive()
+                        })
+                        .collect();
+                    assert!(!fainted.is_empty(), "Revive raised with no fainted ally");
+                    let r = next(1 << 30) as usize;
+                    let mut choices = [None, None];
+                    choices[side.index()] = Some(PlayerChoice::Switch { slot: fainted[r % fainted.len()] });
+                    flow.submit(choices);
+                }
             }
         }
     }

@@ -185,6 +185,10 @@ pub enum Instruction {
     /// is deferred to a `PivotLanding` request instead of being applied inline. Emitted only
     /// under `Pivot::Pause` (request-model executor); never on verification paths.
     PivotPending { side: SideId },
+    /// Revival Blessing connected and its user has a fainted ally, but the revive target
+    /// choice is deferred to a `Revive` request instead of being applied inline. Emitted only
+    /// under `Pivot::Pause` (request-model executor); never on verification paths.
+    RevivePending { side: SideId },
 }
 
 impl State {
@@ -361,6 +365,7 @@ impl State {
                 s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
             PivotPending { .. } => {}
+            RevivePending { .. } => {}
         }
     }
 
@@ -525,6 +530,7 @@ impl State {
                 s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
             PivotPending { .. } => {}
+            RevivePending { .. } => {}
         }
     }
 }

@@ -663,6 +663,7 @@ fn acting_for(req: Request, side: SideId) -> bool {
         Request::Turn => true,
         Request::Replace { sides } => sides[side.index()],
         Request::PivotLanding { side: s } => s == side,
+        Request::Revive { side: s } => s == side,
         Request::Terminal { .. } => false,
     }
 }
@@ -735,6 +736,15 @@ fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTION
                 }
             }
         }
+        Request::Revive { .. } => {
+            // Revival Blessing: only a FAINTED party member is a legal revive target.
+            for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
+                if let Some(slot) = slot {
+                    let p = &s.pokemon[slot as usize];
+                    mask[N_MOVES + k] = p.species != engine::ids::Species::None && !p.is_alive();
+                }
+            }
+        }
         Request::Terminal { .. } => {}
     }
     mask
@@ -788,8 +798,8 @@ impl FlowVec {
         engine::encode::ID_DIM
     }
 
-    /// (N,) i8 phase: 0=Turn, 1=Replace, 2=PivotLanding. Terminal (3) is never observed when
-    /// `step_all` auto-resets.
+    /// (N,) i8 phase: 0=Turn, 1=Replace, 2=PivotLanding, 3=Revive (Revival Blessing). Terminal (4)
+    /// is never observed when `step_all` auto-resets.
     fn phase_all<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {
         let v: Vec<i8> = self
             .flows
@@ -798,7 +808,8 @@ impl FlowVec {
                 Request::Turn => 0,
                 Request::Replace { .. } => 1,
                 Request::PivotLanding { .. } => 2,
-                Request::Terminal { .. } => 3,
+                Request::Revive { .. } => 3,
+                Request::Terminal { .. } => 4,
             })
             .collect();
         Array1::from_vec(v).into_pyarray_bound(py)

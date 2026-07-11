@@ -725,14 +725,65 @@ fn reveal(b: &mut Branch, side: SideId, moves: u8, flags: u8) {
 
 // --- switching ---------------------------------------------------------------
 
+/// Does `side` have a non-active party member that is still alive (a legal switch target)?
+pub(crate) fn has_alive_bench(state: &State, side: SideId) -> bool {
+    let s = state.side(side);
+    (0..6u8).any(|i| {
+        i != s.active_index
+            && s.pokemon[i as usize].species != crate::ids::Species::None
+            && s.pokemon[i as usize].is_alive()
+    })
+}
+
+/// Does `side` have a non-active party member that has fainted (a Revival Blessing target)?
+pub(crate) fn has_fainted_bench(state: &State, side: SideId) -> bool {
+    let s = state.side(side);
+    (0..6u8).any(|i| {
+        i != s.active_index
+            && s.pokemon[i as usize].species != crate::ids::Species::None
+            && !s.pokemon[i as usize].is_alive()
+    })
+}
+
+/// Revival Blessing: restore a fainted party member (`slot`) to floor(maxHP/2) HP with healthy
+/// status, keeping it benched. PP is untouched. Reversible (Heal + status clears).
+pub(crate) fn apply_revive(b: &mut Branch, side: SideId, slot: u8) {
+    let (species, alive, max_hp, status, counter) = {
+        let p = &b.state.side(side).pokemon[slot as usize];
+        (p.species, p.is_alive(), p.max_hp, p.status, p.status_counter)
+    };
+    // Only a genuinely fainted party member is a legal target.
+    if species == crate::ids::Species::None || alive || slot == b.state.side(side).active_index {
+        return;
+    }
+    let heal = (max_hp / 2).max(1);
+    push(b, Instruction::Heal { side, slot, amount: heal });
+    // PS sets `status = ''` on the revived mon (a mon that fainted while statused keeps that
+    // status in the serialized pre-state).
+    if status != Status::None {
+        push(b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+    }
+    if counter != 0 {
+        push(b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
+    }
+}
+
 pub(crate) fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
-    apply_switch_inner(b, side, target, true);
+    apply_switch_inner(b, side, target, true, false);
+}
+
+/// Shed Tail's switch: identical to `apply_switch` but the outgoing mon's Substitute (volatile
+/// + HP) is preserved and passed to the incoming mon (PS `copyVolatileFrom(_, 'shedtail')`,
+/// which copies only the substitute — boosts and every other volatile are still cleared).
+pub(crate) fn apply_switch_pass_sub(b: &mut Branch, side: SideId, target: u8) {
+    apply_switch_inner(b, side, target, true, true);
 }
 
 /// `fire_ability: false` defers the incoming mon's switch-in ability (simultaneous entries
 /// run all abilities after every replacement is on the field, in speed order — PS event
-/// semantics; Intimidate must see the other fresh switch-in).
-fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bool) {
+/// semantics; Intimidate must see the other fresh switch-in). `pass_sub` keeps the outgoing
+/// mon's Substitute alive across the switch (Shed Tail).
+fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bool, pass_sub: bool) {
     let s = b.state.side(side);
     let previous = s.active_index;
     let replacing_fainted = !s.active().is_alive();
@@ -806,12 +857,15 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
     let vols = b.state.side(side).volatiles;
     for v in ALL_VOLATILES {
+        if pass_sub && *v == VolatileStatus::Substitute {
+            continue; // Shed Tail passes the Substitute to the incoming mon.
+        }
         if vols.contains(*v) {
             push(b, Instruction::RemoveVolatile { side, volatile: *v });
         }
     }
     let sub = b.state.side(side).substitute_hp;
-    if sub != 0 {
+    if sub != 0 && !pass_sub {
         push(b, Instruction::ChangeSubstituteHp { side, amount: -sub });
     }
     // Natural Cure heals the outgoing Pokémon's non-volatile status as it switches out;
@@ -888,7 +942,7 @@ pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
         order.swap(0, 1);
     }
     for &(side, target) in &order {
-        apply_switch_inner(&mut b, side, target, false);
+        apply_switch_inner(&mut b, side, target, false, false);
     }
     let mut ab_order = [order[0].0, order[1].0];
     if effective_speed(&b.state, ab_order[1]) > effective_speed(&b.state, ab_order[0]) {
@@ -1994,6 +2048,46 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
+        // Shed Tail: put up a Substitute (floor(maxHP/4) HP) at a cost of ceil(maxHP/2) HP, then
+        // pivot out PASSING the Substitute to the incoming mon. Fails (no sub, no pivot) with no
+        // switch target, an existing Substitute, or HP at/below the cost. Self-targeting — the
+        // foe's Protect/Substitute do not apply.
+        if md.id.to_id() == "shedtail" {
+            let mut b = b;
+            let (hp, max_hp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
+            let cost = (max_hp + 1) / 2; // ceil(maxHP/2)
+            let sub_hp = max_hp / 4; // floor(maxHP/4)
+            let has_sub = b.state.side(side).volatiles.contains(VolatileStatus::Substitute);
+            if hp <= cost || has_sub || !has_alive_bench(&b.state, side) {
+                return vec![b]; // fails; PP already paid, no pivot
+            }
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::Damage { side, slot, amount: cost });
+            push(&mut b, Instruction::ChangeSubstituteHp { side, amount: sub_hp });
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Substitute });
+            match pivot {
+                Pivot::Target(t) => apply_switch_pass_sub(&mut b, side, t),
+                Pivot::Pause => push(&mut b, Instruction::PivotPending { side }),
+                Pivot::Stay => {}
+            }
+            return vec![b];
+        }
+        // Revival Blessing: revive a fainted party member at floor(maxHP/2) HP, kept benched (NOT
+        // switched in). Fails (no revive) when the user has no fainted ally. The revive target is
+        // supplied like a pivot landing: `Pivot::Target` on verification paths (recorded choice),
+        // `Pivot::Pause` -> `Revive` request on the sampled request-flow path.
+        if md.id.to_id() == "revivalblessing" {
+            let mut b = b;
+            if !has_fainted_bench(&b.state, side) {
+                return vec![b]; // fails; no target, PP already paid
+            }
+            match pivot {
+                Pivot::Target(t) => apply_revive(&mut b, side, t),
+                Pivot::Pause => push(&mut b, Instruction::RevivePending { side }),
+                Pivot::Stay => {}
+            }
+            return vec![b];
+        }
         // Protect blocks a status move that targets the foe (Thunder Wave, Will-O-Wisp,
         // Toxic, Taunt, Parting Shot, Roar, ...) — but not self/field moves (Swords Dance,
         // recovery, weather, hazards).

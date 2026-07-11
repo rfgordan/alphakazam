@@ -40,15 +40,28 @@ pub enum Request {
     /// A pivot move connected; `side` chooses its landing before the opponent's queued
     /// action executes.
     PivotLanding { side: SideId },
+    /// Revival Blessing connected; `side` chooses a FAINTED party member to revive (answered
+    /// with `PlayerChoice::Switch { slot }` pointing at the fainted slot). The revived mon stays
+    /// benched; the turn then continues before the opponent's queued action executes.
+    Revive { side: SideId },
     /// Battle over: -1 draw, 0 side one, 1 side two.
     Terminal { winner: i64 },
 }
 
 enum Pending {
     Turn,
-    Pivot { side: SideId, second: Option<Action>, switched: [bool; 2] },
+    Pivot { side: SideId, second: Option<Action>, switched: [bool; 2], pass_sub: bool },
+    Revive { side: SideId, second: Option<Action>, switched: [bool; 2] },
     Replace { sides: [bool; 2] },
     Done { winner: i64 },
+}
+
+/// Result of executing one move action in the decomposed (pivot) path: whether its transcript
+/// ended in a deferred landing/revive choice, and for a pivot whether the Substitute is passed.
+enum Pause {
+    None,
+    Pivot { side: SideId, pass_sub: bool },
+    Revive { side: SideId },
 }
 
 /// A battle advanced request-by-request with sampled stochastics.
@@ -87,6 +100,7 @@ impl Flow {
         match &self.pending {
             Pending::Turn => Request::Turn,
             Pending::Pivot { side, .. } => Request::PivotLanding { side: *side },
+            Pending::Revive { side, .. } => Request::Revive { side: *side },
             Pending::Replace { sides } => Request::Replace { sides: *sides },
             Pending::Done { winner } => Request::Terminal { winner: *winner },
         }
@@ -101,7 +115,8 @@ impl Flow {
                 self.pending = Pending::Done { winner };
             }
             Pending::Turn => self.run_turn(choices),
-            Pending::Pivot { side, second, switched } => self.resume_pivot(side, second, switched, choices),
+            Pending::Pivot { side, second, switched, pass_sub } => self.resume_pivot(side, second, switched, pass_sub, choices),
+            Pending::Revive { side, second, switched } => self.resume_revive(side, second, switched, choices),
             Pending::Replace { sides } => self.run_replacements(sides, choices),
         }
         self.request()
@@ -139,12 +154,18 @@ impl Flow {
         let m1 = as_move_choice(c1, SideId::One, &self.state);
         let m2 = as_move_choice(c2, SideId::Two, &self.state);
 
-        // A chosen move pauses for a landing only if it is a self-switch move AND the side has
-        // somewhere to go (PS: U-turn with an empty bench just stays in).
+        // A chosen move pauses for a landing/revive choice. A normal self-switch move (U-turn,
+        // Teleport, Shed Tail, …) pauses only when the side has somewhere to go (PS: U-turn with
+        // an empty bench just stays in). Revival Blessing instead pauses to pick a FAINTED ally to
+        // revive, so it gates on a fainted bench, not an alive one.
         let wants_pause = |side: SideId, mc: MoveChoice| match mc {
             MoveChoice::Move(slot) => {
                 let mv = self.state.side(side).active().moves[slot as usize];
-                move_data(mv.id).self_switch && alive_bench(&self.state, side).is_some()
+                if mv.id.to_id() == "revivalblessing" {
+                    crate::generate::has_fainted_bench(&self.state, side)
+                } else {
+                    move_data(mv.id).self_switch && alive_bench(&self.state, side).is_some()
+                }
             }
             MoveChoice::Switch(_) => false,
         };
@@ -196,11 +217,9 @@ impl Flow {
 
         match (a1, a2) {
             (Some(a), None) | (None, Some(a)) => {
-                let (b, paused_side) = exec_one_move(b, a, &mut exec);
+                let (b, pause) = exec_one_move(b, a, &mut exec);
                 self.rng = exec_state(&exec);
-                if let Some(side) = paused_side {
-                    self.state = b.state;
-                    self.pending = Pending::Pivot { side, second: None, switched };
+                if self.park_if_paused(&b, pause, None, switched) {
                     return;
                 }
                 self.finish_turn(b, switched);
@@ -221,16 +240,32 @@ impl Flow {
                     Some(b.state.side(second.side).active().moves[second.move_idx as usize].id);
                 second.foe_pending_move = None;
 
-                let (b, paused_side) = exec_one_move(b, first, &mut exec);
+                let (b, pause) = exec_one_move(b, first, &mut exec);
                 self.rng = exec_state(&exec);
-                if let Some(side) = paused_side {
-                    self.state = b.state;
-                    self.pending = Pending::Pivot { side, second: Some(second), switched };
+                if self.park_if_paused(&b, pause, Some(second), switched) {
                     return;
                 }
                 self.continue_after_first(b, second, switched);
             }
             (None, None) => unreachable!("decomposed path requires at least one move action"),
+        }
+    }
+
+    /// If the just-executed move paused (pivot landing or revive), store the pending request and
+    /// return true. `second` is the not-yet-run slower move (resumed after the choice).
+    fn park_if_paused(&mut self, b: &Branch, pause: Pause, second: Option<Action>, switched: [bool; 2]) -> bool {
+        match pause {
+            Pause::None => false,
+            Pause::Pivot { side, pass_sub } => {
+                self.state = b.state;
+                self.pending = Pending::Pivot { side, second, switched, pass_sub };
+                true
+            }
+            Pause::Revive { side } => {
+                self.state = b.state;
+                self.pending = Pending::Revive { side, second, switched };
+                true
+            }
         }
     }
 
@@ -244,17 +279,15 @@ impl Flow {
             return;
         }
         let mut exec = Exec::Sample(self.rng);
-        let (b, paused_side) = exec_one_move(b, second, &mut exec);
+        let (b, pause) = exec_one_move(b, second, &mut exec);
         self.rng = exec_state(&exec);
-        if let Some(side) = paused_side {
-            self.state = b.state;
-            self.pending = Pending::Pivot { side, second: None, switched };
+        if self.park_if_paused(&b, pause, None, switched) {
             return;
         }
         self.finish_turn(b, switched);
     }
 
-    fn resume_pivot(&mut self, side: SideId, second: Option<Action>, mut switched: [bool; 2], choices: [Option<PlayerChoice>; 2]) {
+    fn resume_pivot(&mut self, side: SideId, second: Option<Action>, mut switched: [bool; 2], pass_sub: bool, choices: [Option<PlayerChoice>; 2]) {
         let slot = match choices[side.index()] {
             Some(PlayerChoice::Switch { slot }) => slot,
             _ => alive_bench(&self.state, side).expect("PivotLanding issued with no bench"),
@@ -269,8 +302,38 @@ impl Flow {
             }
         };
         let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new() };
-        apply_switch(&mut b, side, slot);
+        // Shed Tail passes its Substitute to the lander; every other pivot clears it.
+        if pass_sub {
+            crate::generate::apply_switch_pass_sub(&mut b, side, slot);
+        } else {
+            apply_switch(&mut b, side, slot);
+        }
         switched[side.index()] = true;
+        match second {
+            Some(a) => self.continue_after_first(b, a, switched),
+            None => self.finish_turn(b, switched),
+        }
+    }
+
+    /// Resume after a `Revive` request: revive the chosen (or coerced) fainted party member,
+    /// keeping it benched. The active is unchanged, so the turn continues normally.
+    fn resume_revive(&mut self, side: SideId, second: Option<Action>, switched: [bool; 2], choices: [Option<PlayerChoice>; 2]) {
+        let wanted = match choices[side.index()] {
+            Some(PlayerChoice::Switch { slot }) => Some(slot),
+            _ => None,
+        };
+        let valid = |slot: u8| {
+            let s = self.state.side(side);
+            slot != s.active_index
+                && s.pokemon[slot as usize].species != crate::ids::Species::None
+                && !s.pokemon[slot as usize].is_alive()
+        };
+        let slot = match wanted {
+            Some(slot) if valid(slot) => slot,
+            _ => fainted_bench(&self.state, side).expect("Revive issued with no fainted ally"),
+        };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new() };
+        crate::generate::apply_revive(&mut b, side, slot);
         match second {
             Some(a) => self.continue_after_first(b, a, switched),
             None => self.finish_turn(b, switched),
@@ -363,19 +426,38 @@ impl Flow {
     }
 }
 
-/// Execute one move action with sampling, returning the surviving branch and, if its
-/// transcript ends in a pending pivot, the side awaiting a landing choice.
-fn exec_one_move(b: Branch, a: Action, exec: &mut Exec) -> (Branch, Option<SideId>) {
+/// Execute one move action with sampling, returning the surviving branch and, if its transcript
+/// ends in a deferred choice, the pause it raised (pivot landing or Revival Blessing revive).
+fn exec_one_move(b: Branch, a: Action, exec: &mut Exec) -> (Branch, Pause) {
     let before = b.ins.len();
     let out = exec.prune(execute_move(b, a));
     let b = out.into_iter().next().expect("move produced no branches");
-    let paused = b.ins[before..]
-        .iter()
-        .find_map(|i| match i {
-            Instruction::PivotPending { side } => Some(*side),
-            _ => None,
-        });
-    (b, paused)
+    let mut pause = Pause::None;
+    for i in &b.ins[before..] {
+        match i {
+            Instruction::PivotPending { side } => {
+                // Only Shed Tail passes its Substitute across the pivot; the actor is still
+                // the pivot user here (it has not switched yet).
+                let pass_sub = b.state.side(a.side).active().moves[a.move_idx as usize].id.to_id() == "shedtail";
+                pause = Pause::Pivot { side: *side, pass_sub };
+            }
+            Instruction::RevivePending { side } => {
+                pause = Pause::Revive { side: *side };
+            }
+            _ => {}
+        }
+    }
+    (b, pause)
+}
+
+/// First non-active party slot that has fainted (a Revival Blessing target).
+fn fainted_bench(state: &State, side: SideId) -> Option<u8> {
+    let s = state.side(side);
+    (0..6u8).find(|&i| {
+        i != s.active_index
+            && s.pokemon[i as usize].species != crate::ids::Species::None
+            && !s.pokemon[i as usize].is_alive()
+    })
 }
 
 fn exec_state(exec: &Exec) -> u64 {

@@ -148,6 +148,45 @@ const TEAM_TRAP = {
 	]],
 };
 
+// Request-phase mechanics coverage (`c*.json.gz`, `--teamset revive` / `pivot`): moves that
+// pause the battle mid-turn for a special switch-like choice, exercised on their real randbats
+// carriers (from harness/coverage-worklist.json) with realistic movesets so games flow naturally.
+// `revive` carries Revival Blessing (Pawmot/Rabsca) + Shed Tail (Cyclizar/Orthworm) against hard
+// hitters, so teammates faint (a Revival Blessing target) and the sub-passing pivot triggers.
+// `pivot` carries Chilly Reception (Slowking-Galar/Slowking) + Teleport (Deoxys-D/Solgaleo).
+const TEAM_COVERAGE = {
+	revive: [[
+		'Pawmot||lifeorb|ironfist|closecombat,icepunch,knockoff,revivalblessing|Jolly|,252,,,4,252|||||,,,,,Electric',
+		'Rabsca||leftovers|synchronize|psychic,earthpower,recover,revivalblessing|Modest|252,,,252,4,|||||,,,,,Steel',
+		'Cyclizar||heavydutyboots|regenerator|dracometeor,knockoff,rapidspin,shedtail|Timid|,,,252,4,252|||||,,,,,Dragon',
+		'Orthworm||leftovers|eartheater|bodypress,heavyslam,stealthrock,shedtail|Impish|252,,252,,4,|||||,,,,,Ghost',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,uturn|Impish|248,,168,,92,|||||,,,,,Flying',
+	], [
+		'Great Tusk||heavydutyboots|protosynthesis|headlongrush,closecombat,icespinner,rapidspin|Jolly|,252,,,4,252|||||,,,,,Ground',
+		'Iron Valiant||leftovers|quarkdrive|moonblast,closecombat,thunderbolt,knockoff|Naive|,252,,4,,252|||||,,,,,Fairy',
+		'Roaring Moon||heavydutyboots|protosynthesis|knockoff,earthquake,dragondance,acrobatics|Jolly|,252,,,4,252|||||,,,,,Flying',
+		'Gholdengo||choicescarf|goodasgold|makeitrain,shadowball,thunderbolt,focusblast|Timid|,,,252,4,252|||||,,,,,Steel',
+		'Kingambit||leftovers|supremeoverlord|kowtowcleave,suckerpunch,ironhead,swordsdance|Adamant|232,252,,,,24|||||,,,,,Dark',
+		'Dragapult||choicespecs|clearbody|dragondarts,shadowball,dracometeor,flamethrower|Timid|,,,252,4,252|||||,,,,,Dragon',
+	]],
+	pivot: [[
+		'Slowking-Galar||heavydutyboots|regenerator|chillyreception,sludgebomb,fireblast,psyshock|Calm|252,,16,,240,|||||,,,,,Dark',
+		'Deoxys-Defense||leftovers|pressure|teleport,knockoff,psychicnoise,stealthrock|Bold|252,252,4,,,|||||,,,,,Steel',
+		'Solgaleo||leftovers|fullmetalbody|teleport,sunsteelstrike,closecombat,flareblitz|Adamant|252,252,,,4,|||||,,,,,Steel',
+		'Slowking||leftovers|regenerator|chillyreception,psychic,sludgebomb,slackoff|Bold|252,,252,,4,|||||,,,,,Water',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,teleport|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,uturn|Impish|248,,168,,92,|||||,,,,,Flying',
+	], [
+		'Great Tusk||heavydutyboots|protosynthesis|headlongrush,closecombat,icespinner,rapidspin|Jolly|,252,,,4,252|||||,,,,,Ground',
+		'Iron Valiant||leftovers|quarkdrive|moonblast,closecombat,thunderbolt,knockoff|Naive|,252,,4,,252|||||,,,,,Fairy',
+		'Roaring Moon||heavydutyboots|protosynthesis|knockoff,earthquake,dragondance,acrobatics|Jolly|,252,,,4,252|||||,,,,,Flying',
+		'Gholdengo||choicescarf|goodasgold|makeitrain,shadowball,thunderbolt,focusblast|Timid|,,,252,4,252|||||,,,,,Steel',
+		'Kingambit||leftovers|supremeoverlord|kowtowcleave,suckerpunch,ironhead,swordsdance|Adamant|232,252,,,,24|||||,,,,,Dark',
+		'Dragapult||choicespecs|clearbody|dragondarts,shadowball,dracometeor,flamethrower|Timid|,,,252,4,252|||||,,,,,Dragon',
+	]],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -478,11 +517,14 @@ function chooseFor(request, rand) {
 
 	if (request.forceSwitch) {
 		const mons = request.side.pokemon;
+		// Revival Blessing raises a switch request whose target must be a FAINTED party member
+		// (PS marks the active entry `reviving: true`); a normal forced switch wants a live mon.
+		const reviving = mons.some(m => m.reviving);
+		const isFainted = (m) => m.condition.endsWith(' fnt') || m.condition === '0 fnt';
 		const options = [];
 		for (let i = 0; i < mons.length; i++) {
-			if (!mons[i].active && !mons[i].condition.endsWith(' fnt') && mons[i].condition !== '0 fnt') {
-				options.push(i);
-			}
+			if (mons[i].active) continue;
+			if (reviving ? isFainted(mons[i]) : !isFainted(mons[i])) options.push(i);
 		}
 		if (!options.length) return { choice: 'pass', resolved: { action: 'pass' } };
 		const k = options[rand(options.length)];
@@ -541,6 +583,8 @@ async function main() {
 	} else {
 		const [t1, t2] = TEAM_TRAP[TEAMSET]
 			? TEAM_TRAP[TEAMSET].map(t => t.join(']'))
+			: TEAM_COVERAGE[TEAMSET]
+			? TEAM_COVERAGE[TEAMSET].map(t => t.join(']'))
 			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
 		team1 = Teams.pack(Teams.import(t1));
 		team2 = Teams.pack(Teams.import(t2));

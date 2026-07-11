@@ -473,6 +473,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "endure" => { side.volatiles.insert(VolatileStatus::Endure); }
             "flinch" => { side.volatiles.insert(VolatileStatus::Flinch); }
             "charge" => { side.volatiles.insert(VolatileStatus::Charge); }
+            // Chilly Reception's priority-charge marker: a duration-1 volatile that only drives
+            // the "[premajor]" -prepare message, carrying no cross-turn state (the user switches
+            // out the same turn, clearing it). No engine field to set.
+            "chillyreception" => {}
             other => return Err(unsup(format!("volatile:{other}"))),
         }
     }
@@ -618,7 +622,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
     "flinch", "charge", "focusenergy", "dragoncheer", "unburden", "throatchop", "healblock",
-    "trapped", "trapper", "ingrain", "noretreat", "octolock",
+    "trapped", "trapper", "ingrain", "noretreat", "octolock", "chillyreception",
 ];
 
 const KNOWN_SIDE_CONDITIONS: &[&str] = &[
