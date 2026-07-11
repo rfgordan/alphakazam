@@ -5,7 +5,7 @@
 //! This is the standing guarantee that the training fast path plays the same game as the
 //! verification path certified against Pokémon Showdown.
 
-use engine::generate::{generate_instructions, generate_instructions_sampled, MoveChoice};
+use engine::generate::{generate_instructions, generate_instructions_sampled, MoveChoice, Pivot};
 use engine::instruction::Instruction;
 use engine::team;
 
@@ -25,7 +25,7 @@ fn check(a1: MoveChoice, a2: MoveChoice, samples: usize, rng: &mut u64) {
 
     let mut counts = vec![0usize; groups.len()];
     for _ in 0..samples {
-        let s = generate_instructions_sampled(&state, a1, a2, [None, None], [false, false], rng);
+        let s = generate_instructions_sampled(&state, a1, a2, [Pivot::Stay; 2], [false, false], rng);
         let idx = groups
             .iter()
             .position(|(ins, _)| *ins == s.instructions)

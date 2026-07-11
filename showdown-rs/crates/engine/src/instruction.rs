@@ -177,6 +177,12 @@ pub enum Instruction {
     ChangeItem { side: SideId, slot: u8, previous: Item, new: Item },
     ChangeAbility { side: SideId, slot: u8, previous: Ability, new: Ability },
     ToggleTerastallized { side: SideId, slot: u8 },
+
+    // --- decision-point markers (state no-ops; consumed by the request-flow driver) ---
+    /// A pivot move (U-turn/Teleport/…) connected and its user survived, but the landing choice
+    /// is deferred to a `PivotLanding` request instead of being applied inline. Emitted only
+    /// under `Pivot::Pause` (request-model executor); never on verification paths.
+    PivotPending { side: SideId },
 }
 
 impl State {
@@ -347,6 +353,7 @@ impl State {
                 // the generator gates tera on !tera_used (a side toggles at most once).
                 s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
+            PivotPending { .. } => {}
         }
     }
 
@@ -505,6 +512,7 @@ impl State {
                 // the generator gates tera on !tera_used (a side toggles at most once).
                 s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
             }
+            PivotPending { .. } => {}
         }
     }
 }

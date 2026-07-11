@@ -30,10 +30,10 @@ pub enum MoveChoice {
 /// One node of the outcome tree: a probability, the resulting state, and the
 /// instructions that produced it (relative to the input state).
 #[derive(Clone)]
-struct Branch {
-    prob: f32,
-    state: State,
-    ins: Vec<Instruction>,
+pub(crate) struct Branch {
+    pub(crate) prob: f32,
+    pub(crate) state: State,
+    pub(crate) ins: Vec<Instruction>,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -139,7 +139,7 @@ fn proto_stat(p: &crate::state::Pokemon) -> crate::ids::StatIndex {
 
 /// The battle is over once either side has no living Pokémon; PS then stops the turn
 /// before end-of-turn residuals.
-fn battle_over(state: &State) -> bool {
+pub(crate) fn battle_over(state: &State) -> bool {
     [SideId::One, SideId::Two].into_iter().any(|side| {
         !state.side(side).pokemon.iter().any(|p| p.species != crate::ids::Species::None && p.is_alive())
     })
@@ -441,14 +441,14 @@ impl Exec {
     }
 
     /// 50/50 coin for symmetric forks (speed ties). None when enumerating.
-    fn coin(&mut self) -> Option<bool> {
+    pub(crate) fn coin(&mut self) -> Option<bool> {
         self.next_unit().map(|u| u < 0.5)
     }
 
     /// In `Sample` mode, reduce `branches` to one survivor drawn ∝ `prob`, re-weighted to the
     /// stage's total incoming mass (so overall mass is conserved and the final sampled branch
     /// comes out at the parent's weight). Identity in `Enumerate` mode.
-    fn prune(&mut self, mut branches: Vec<Branch>) -> Vec<Branch> {
+    pub(crate) fn prune(&mut self, mut branches: Vec<Branch>) -> Vec<Branch> {
         if branches.len() <= 1 {
             return branches;
         }
@@ -476,7 +476,7 @@ pub fn generate_instructions_sampled(
     state: &State,
     s1: MoveChoice,
     s2: MoveChoice,
-    pivot: [Option<u8>; 2],
+    pivot: [Pivot; 2],
     tera: [bool; 2],
     rng: &mut u64,
 ) -> StateInstructions {
@@ -509,16 +509,21 @@ pub fn generate_move_action(
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
         return vec![StateInstructions { percentage: 100.0, instructions: Vec::new() }];
     }
-    execute_move(start, Action { side, move_idx, pivot, foe_pending_move })
-        .into_iter()
-        .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
-        .collect()
+    execute_move(start, Action {
+        side,
+        move_idx,
+        pivot: pivot.map_or(Pivot::Stay, Pivot::Target),
+        foe_pending_move,
+    })
+    .into_iter()
+    .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
+    .collect()
 }
 
 /// Apply Terastallization to a side's active at turn start: its types become its tera type
 /// (Stellar keeps the original types) and the terastallized flag flips. Done before moves so
 /// the new typing affects both its own STAB and the damage it takes this turn.
-fn apply_tera(b: &mut Branch, side: SideId) {
+pub(crate) fn apply_tera(b: &mut Branch, side: SideId) {
     let (already, tera_type, prev, slot) = {
         let s = b.state.side(side);
         let p = s.active();
@@ -540,10 +545,11 @@ fn apply_tera(b: &mut Branch, side: SideId) {
 /// mid-turn — so a faster pivot's switch happens *before* the opponent's move. Used by
 /// the differential harness, which knows the recorded replacement target.
 pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2]) -> Vec<StateInstructions> {
-    generate_instructions_ctx(state, s1, s2, pivot, tera, &mut Exec::Enumerate)
+    let pv = [pivot[0].map_or(Pivot::Stay, Pivot::Target), pivot[1].map_or(Pivot::Stay, Pivot::Target)];
+    generate_instructions_ctx(state, s1, s2, pv, tera, &mut Exec::Enumerate)
 }
 
-fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<StateInstructions> {
+pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<StateInstructions> {
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     let mut branches = vec![start];
 
@@ -600,14 +606,18 @@ fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivo
             MoveChoice::Switch(_) => None,
         })
         .collect();
+    debug_assert!(
+        !(matches!(exec, Exec::Enumerate) && pivot.contains(&Pivot::Pause)),
+        "Pivot::Pause is a request-flow (sampled) construct; enumeration paths must pass Stay/Target"
+    );
 
     branches = resolve_moves(branches, &move_actions, exec);
 
     // A side's active was switched in this turn (chose to switch, or used a pivot move) — it
     // hasn't earned an end-of-turn Speed Boost yet.
     let switched = [
-        matches!(s1, MoveChoice::Switch(_)) || pivot[0].is_some(),
-        matches!(s2, MoveChoice::Switch(_)) || pivot[1].is_some(),
+        matches!(s1, MoveChoice::Switch(_)) || pivot[0] != Pivot::Stay,
+        matches!(s2, MoveChoice::Switch(_)) || pivot[1] != Pivot::Stay,
     ];
 
     // 3) End-of-turn residuals (deterministic) — skipped if the battle has ended (a side
@@ -660,7 +670,7 @@ fn reveal(b: &mut Branch, side: SideId, moves: u8, flags: u8) {
 
 // --- switching ---------------------------------------------------------------
 
-fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
+pub(crate) fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
     apply_switch_inner(b, side, target, true);
 }
 
@@ -1119,17 +1129,29 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
 
 // --- moves -------------------------------------------------------------------
 
+/// What to do when a self-switch move (U-turn/Teleport/…) connects and its user survives.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Pivot {
+    /// Stay in (legacy bridge behavior; also what a pivot with an empty bench does).
+    Stay,
+    /// Switch to this party slot inline (verification paths — the recorded target is known).
+    Target(u8),
+    /// Emit `Instruction::PivotPending` and leave the user in: the request-flow driver pauses
+    /// for a `PivotLanding` choice. Never used on verification/enumeration paths.
+    Pause,
+}
+
 /// A move action: which side, which move slot, and (for a pivot move) the switch-in
 /// target to use after it connects.
 #[derive(Clone, Copy)]
-struct Action {
-    side: SideId,
-    move_idx: u8,
-    pivot: Option<u8>,
+pub(crate) struct Action {
+    pub(crate) side: SideId,
+    pub(crate) move_idx: u8,
+    pub(crate) pivot: Pivot,
     /// The move the foe will use *after* this action this turn (None if the foe already
     /// moved, switched, or there is no second move). Lets Sucker Punch / Thunderclap know
     /// whether the target is about to attack.
-    foe_pending_move: Option<crate::ids::MoveId>,
+    pub(crate) foe_pending_move: Option<crate::ids::MoveId>,
 }
 
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action], exec: &mut Exec) -> Vec<Branch> {
@@ -1203,7 +1225,8 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
     exec.prune(out)
 }
 
-enum Order {
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Order {
     First(SideId),
     Tie,
 }
@@ -1261,7 +1284,7 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     pri
 }
 
-fn move_order(state: &State, sa: SideId, ma: u8, sb: SideId, mb: u8) -> Order {
+pub(crate) fn move_order(state: &State, sa: SideId, ma: u8, sb: SideId, mb: u8) -> Order {
     let pa = effective_priority(state, sa, ma);
     let pb = effective_priority(state, sb, mb);
     if pa != pb {
@@ -1354,7 +1377,7 @@ struct DamageCalc {
 /// Execute one move, first splitting on confusion: a confused, awake mon has a 1/3 chance to
 /// hit itself instead of acting. The 2/3 "acts normally" branch is identical to no-confusion
 /// behavior, so this only *adds* the self-hit outcomes (no regression on the common path).
-fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
+pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let side = action.side;
     let (alive, status, confused) = {
         let p = b.state.side(side).active();
@@ -1924,12 +1947,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         let mut branches = execute_status_move(b, side, &md, foe_pending_move.is_some());
         // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
-        if let Some(t) = pivot {
-            for sb in &mut branches {
-                if sb.state.side(side).active().is_alive() {
-                    apply_switch(sb, side, t);
+        match pivot {
+            Pivot::Target(t) => {
+                for sb in &mut branches {
+                    if sb.state.side(side).active().is_alive() {
+                        apply_switch(sb, side, t);
+                    }
                 }
             }
+            Pivot::Pause => {
+                for sb in &mut branches {
+                    if sb.state.side(side).active().is_alive() {
+                        push(sb, Instruction::PivotPending { side });
+                    }
+                }
+            }
+            Pivot::Stay => {}
         }
         return branches;
     }
@@ -2148,10 +2181,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         };
         for mut sb in branches {
             // Pivot move (U-turn): switch the user out now that it connected.
-            if let Some(t) = pivot {
-                if sb.state.side(side).active().is_alive() {
-                    apply_switch(&mut sb, side, t);
+            match pivot {
+                Pivot::Target(t) => {
+                    if sb.state.side(side).active().is_alive() {
+                        apply_switch(&mut sb, side, t);
+                    }
                 }
+                Pivot::Pause => {
+                    if sb.state.side(side).active().is_alive() {
+                        push(&mut sb, Instruction::PivotPending { side });
+                    }
+                }
+                Pivot::Stay => {}
             }
             out.push(sb);
         }
@@ -4748,7 +4789,7 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
 
 // --- end of turn -------------------------------------------------------------
 
-fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
+pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     let b = &mut branch;
     // PS decrements a residual effect's duration FIRST and, if it hits 0, ends the effect and
     // SKIPS its onResidual that turn (battle.ts residual loop). The SANDSTORM/snow CHIP and the

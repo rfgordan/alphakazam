@@ -18,6 +18,7 @@ pub mod ids;
 pub mod instruction;
 pub mod names;
 pub mod narrate;
+pub mod request;
 pub mod state;
 pub mod team;
 pub mod volatile;

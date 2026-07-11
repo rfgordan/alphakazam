@@ -5,7 +5,7 @@
 //!
 //!     cargo run --release -p engine --example bench_steps [seconds-per-phase]
 
-use engine::generate::{generate_instructions, MoveChoice};
+use engine::generate::{generate_instructions, MoveChoice, Pivot};
 use engine::instruction::StateInstructions;
 use engine::state::{SideId, State};
 use engine::team;
@@ -116,7 +116,7 @@ fn run_phase_sampled(seconds: u64) -> (u64, u64) {
             let c1 = choice_for(&state, SideId::One, a1);
             let c2 = choice_for(&state, SideId::Two, a2);
             let si = engine::generate::generate_instructions_sampled(
-                &state, c1, c2, [None, None], [false, false], &mut gen_rng,
+                &state, c1, c2, [Pivot::Stay; 2], [false, false], &mut gen_rng,
             );
             state.apply_instructions(&si.instructions);
             state.turn += 1;

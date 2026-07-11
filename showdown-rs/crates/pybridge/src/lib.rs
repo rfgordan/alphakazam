@@ -465,7 +465,7 @@ fn step_of(state: &mut State, rng: &mut Rng, action_red: u8, action_blue: u8) {
     let c1 = resolve_of(state, SideId::One, action_red);
     let c2 = resolve_of(state, SideId::Two, action_blue);
     let si = engine::generate::generate_instructions_sampled(
-        state, c1, c2, [None, None], [false, false], &mut rng.0,
+        state, c1, c2, [engine::generate::Pivot::Stay; 2], [false, false], &mut rng.0,
     );
     state.apply_instructions(&si.instructions);
     state.turn += 1;
