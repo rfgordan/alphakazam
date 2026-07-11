@@ -191,9 +191,6 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
     // membership. Distribution snapshots currently describe one PS request resolution, so
     // only compare units without separately recorded trailing replacement requests.
     if let Some(dist) = &dp.distribution {
-        if unit.len() != 1 {
-            return mk(Verdict::Unsupported(Unsupported("distribution:trailing-request-boundary".into())), legality);
-        }
         for kernel in dist.kernels.iter().filter(|k| k.action.choice == "move") {
             let Some(side_key) = kernel.action.side.as_deref() else { continue };
             let Some(move_id) = kernel.action.move_id.as_deref() else { continue };
@@ -229,6 +226,64 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                     detail: format!("action {side_key}:{move_id}: {detail}"),
                     branches: action_branches.len(),
                     outcomes: kernel.outcomes.len(),
+                }, legality),
+                Err(u) => return mk(Verdict::Unsupported(u), legality),
+            }
+        }
+        if unit.len() != 1 {
+            // A first-action pivot pauses before its replacement is selected. We can certify
+            // that policy-neutral endpoint when the oracle contains exactly one move kernel
+            // and its output distribution is exactly the terminal switch-request
+            // distribution. Requiring a single kernel deliberately excludes slower pivots
+            // (whose reach probability depends on an earlier action), and requiring every
+            // outcome to stop at the request excludes miss/non-pivot continuation mixtures.
+            let move_kernels = dist.kernels.iter()
+                .filter(|k| k.action.choice == "move")
+                .collect::<Vec<_>>();
+            let immediate_pivot = pivots.iter().any(Option::is_some)
+                && move_kernels.len() == 1
+                && !dist.outcomes.is_empty()
+                && dist.outcomes.iter().all(|o| o.request_state == "switch");
+            if immediate_pivot {
+                match compare_ps_distributions(
+                    &move_kernels[0].outcomes,
+                    &dist.outcomes,
+                    canon,
+                    sleep_clause,
+                ) {
+                    Ok(None) => return mk(Verdict::Matched, legality),
+                    Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
+                        detail: format!("immediate pivot endpoint: {detail}"),
+                        branches: move_kernels[0].outcomes.len(),
+                        outcomes: dist.outcomes.len(),
+                    }, legality),
+                    Err(u) => return mk(Verdict::Unsupported(u), legality),
+                }
+            }
+            return mk(Verdict::Unsupported(Unsupported("distribution:trailing-request-boundary".into())), legality);
+        }
+        // With a decision cap the trace may end at the switch request, before recording the
+        // eventual switch choice as a trailing decision. The request is still certifiable when
+        // it is exactly the output of the sole move kernel. This criterion covers both pivots
+        // and faints and does not need to infer which kind of switch PS requested.
+        let move_kernels = dist.kernels.iter()
+            .filter(|k| k.action.choice == "move")
+            .collect::<Vec<_>>();
+        if move_kernels.len() == 1
+            && !dist.outcomes.is_empty()
+            && dist.outcomes.iter().all(|o| o.request_state == "switch")
+        {
+            match compare_ps_distributions(
+                &move_kernels[0].outcomes,
+                &dist.outcomes,
+                canon,
+                sleep_clause,
+            ) {
+                Ok(None) => return mk(Verdict::Matched, legality),
+                Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
+                    detail: format!("immediate request endpoint: {detail}"),
+                    branches: move_kernels[0].outcomes.len(),
+                    outcomes: dist.outcomes.len(),
                 }, legality),
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             }
@@ -374,6 +429,52 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         Verdict::Diverged { closest: closest.unwrap_or_default(), branches: n },
         legality,
     )
+}
+
+/// Compare two Showdown-projected distributions. Used to prove that an action kernel itself
+/// is the terminal request endpoint, without selecting or simulating the requested switch.
+fn compare_ps_distributions(
+    left: &[crate::trace::DistributionOutcome],
+    right: &[crate::trace::DistributionOutcome],
+    canon: &Canonical,
+    sleep_clause: bool,
+) -> Result<Option<String>, Unsupported> {
+    fn clusters(
+        outcomes: &[crate::trace::DistributionOutcome],
+        canon: &Canonical,
+        sleep_clause: bool,
+    ) -> Result<Vec<(State, f64)>, Unsupported> {
+        let mut out: Vec<(State, f64)> = Vec::new();
+        for outcome in outcomes {
+            let mut state = convert_state(&outcome.state, canon)?;
+            state.sleep_clause = sleep_clause;
+            if let Some((_, mass)) = out.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
+                *mass += outcome.probability;
+            } else {
+                out.push((state, outcome.probability));
+            }
+        }
+        Ok(out)
+    }
+
+    let left = clusters(left, canon, sleep_clause)?;
+    let right = clusters(right, canon, sleep_clause)?;
+    const TOL: f64 = 2e-5;
+    let mut errors = Vec::new();
+    for (i, (state, mass)) in left.iter().enumerate() {
+        let other = right.iter()
+            .find(|(candidate, _)| diff_states(state, candidate).is_empty())
+            .map_or(0.0, |(_, p)| *p);
+        if (mass - other).abs() > TOL {
+            errors.push(format!("kernel outcome {i}: kernel={mass:.8} terminal={other:.8}"));
+        }
+    }
+    for (i, (state, mass)) in right.iter().enumerate() {
+        if !left.iter().any(|(candidate, _)| diff_states(state, candidate).is_empty()) && *mass > TOL {
+            errors.push(format!("terminal-only outcome {i}: mass={mass:.8}"));
+        }
+    }
+    Ok((!errors.is_empty()).then(|| errors.into_iter().take(6).collect::<Vec<_>>().join(" | ")))
 }
 
 /// Compare a Rust conditional branch set with a PS action kernel after canonical projection.
