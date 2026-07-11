@@ -1986,6 +1986,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             && target_hp == calc.def_maxhp && dealt >= target_hp
         {
             dealt = target_hp - 1;
+            if calc.def_item == Item::FocusSash {
+                let slot = hb.state.side(foe).active_index;
+                push(&mut hb, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+            }
         }
         if dealt > 0 {
             let slot = hb.state.side(foe).active_index;
@@ -2643,6 +2647,10 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             && target_hp == def_maxhp && dmg >= target_hp
         {
             dmg = target_hp - 1;
+            if def_item == Item::FocusSash {
+                let slot = b.state.side(foe).active_index;
+                push(b, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+            }
         }
         if dmg > 0 {
             let slot = b.state.side(foe).active_index;
@@ -2694,6 +2702,10 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             && target_hp == def_maxhp && dmg >= target_hp
         {
             dmg = target_hp - 1;
+            if def_item == Item::FocusSash {
+                let slot = b.state.side(foe).active_index;
+                push(b, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+            }
         }
         if dmg > 0 {
             let slot = b.state.side(foe).active_index;
