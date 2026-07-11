@@ -158,22 +158,7 @@ impl Battle {
 
     /// Boolean legal-action mask of length 9 for `side`.
     fn legal_actions(&self, side: u8) -> Vec<bool> {
-        let s = self.state.side(sid(side));
-        let active = s.active();
-        let mut mask = vec![false; N_ACTIONS];
-        if active.is_alive() {
-            for i in 0..N_MOVES {
-                let m = active.moves[i];
-                mask[i] = m.id != engine::ids::MoveId::None && m.pp > 0;
-            }
-        }
-        for (k, slot) in self.bench(sid(side)).into_iter().enumerate() {
-            if let Some(slot) = slot {
-                let p = &s.pokemon[slot as usize];
-                mask[N_MOVES + k] = p.is_alive();
-            }
-        }
-        mask
+        legal_mask_of(&self.state, sid(side)).to_vec()
     }
 
     /// True once either side has no Pokémon left.
@@ -331,69 +316,21 @@ impl Battle {
 impl Battle {
     /// The five non-active party slots, in slot order (index k -> switch action 4+k).
     fn bench(&self, side: SideId) -> Vec<Option<u8>> {
-        let s = self.state.side(side);
-        let mut out = Vec::with_capacity(5);
-        for i in 0..6u8 {
-            if i != s.active_index {
-                out.push(if s.pokemon[i as usize].species != engine::ids::Species::None { Some(i) } else { None });
-            }
-        }
-        out
+        bench_slots(&self.state, side).to_vec()
     }
 
     /// Map an action index to a `MoveChoice`, coercing anything illegal to the first legal action.
     fn resolve(&self, side: SideId, action: u8) -> MoveChoice {
-        let legal = {
-            let mask = self.legal_actions(side.index() as u8);
-            mask
-        };
-        let a = action as usize;
-        if a < N_ACTIONS && legal[a] {
-            return self.choice_for(side, action);
-        }
-        // Fallback: first legal action (forced switches etc.).
-        for (i, ok) in legal.iter().enumerate() {
-            if *ok {
-                return self.choice_for(side, i as u8);
-            }
-        }
-        // No legal action (side already lost) — return a harmless move; the turn won't matter.
-        MoveChoice::Move(0)
-    }
-
-    fn choice_for(&self, side: SideId, action: u8) -> MoveChoice {
-        let a = action as usize;
-        if a < N_MOVES {
-            MoveChoice::Move(action)
-        } else {
-            let k = a - N_MOVES;
-            match self.bench(side).get(k).copied().flatten() {
-                Some(slot) => MoveChoice::Switch(slot),
-                None => MoveChoice::Move(0),
-            }
-        }
+        resolve_of(&self.state, side, action)
     }
 
     fn side_lost(&self, side: SideId) -> bool {
-        !self
-            .state
-            .side(side)
-            .pokemon
-            .iter()
-            .any(|p| p.species != engine::ids::Species::None && p.is_alive())
+        lost_of(&self.state, side)
     }
 
     /// Sample one outcome branch by its percentage weight.
     fn sample(&mut self, branches: &[StateInstructions]) -> usize {
-        let total: f32 = branches.iter().map(|b| b.percentage).sum::<f32>().max(1e-6);
-        let mut r = self.rng.next_unit() * total;
-        for (i, b) in branches.iter().enumerate() {
-            r -= b.percentage;
-            if r <= 0.0 {
-                return i;
-            }
-        }
-        branches.len() - 1
+        sample_of(&mut self.rng, branches)
     }
 }
 
@@ -439,8 +376,282 @@ fn cap(id: &str) -> String {
     }
 }
 
+// ---- shared state-level helpers (used by both Battle and BattleVec) ------------------------
+
+/// The five non-active party slots in slot order (switch action 4+k -> k-th entry).
+fn bench_slots(state: &State, side: SideId) -> [Option<u8>; 5] {
+    let s = state.side(side);
+    let mut out = [None; 5];
+    let mut k = 0;
+    for i in 0..6u8 {
+        if i != s.active_index {
+            if s.pokemon[i as usize].species != engine::ids::Species::None {
+                out[k] = Some(i);
+            }
+            k += 1;
+        }
+    }
+    out
+}
+
+fn legal_mask_of(state: &State, side: SideId) -> [bool; N_ACTIONS] {
+    let s = state.side(side);
+    let active = s.active();
+    let mut mask = [false; N_ACTIONS];
+    if active.is_alive() {
+        for i in 0..N_MOVES {
+            let m = active.moves[i];
+            mask[i] = m.id != engine::ids::MoveId::None && m.pp > 0;
+        }
+    }
+    for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
+        if let Some(slot) = slot {
+            mask[N_MOVES + k] = state.side(side).pokemon[slot as usize].is_alive();
+        }
+    }
+    mask
+}
+
+fn choice_of(state: &State, side: SideId, action: u8) -> MoveChoice {
+    let a = action as usize;
+    if a < N_MOVES {
+        MoveChoice::Move(action)
+    } else {
+        match bench_slots(state, side).get(a - N_MOVES).copied().flatten() {
+            Some(slot) => MoveChoice::Switch(slot),
+            None => MoveChoice::Move(0),
+        }
+    }
+}
+
+/// Action index -> MoveChoice, coercing anything illegal to the first legal action.
+fn resolve_of(state: &State, side: SideId, action: u8) -> MoveChoice {
+    let legal = legal_mask_of(state, side);
+    let a = action as usize;
+    if a < N_ACTIONS && legal[a] {
+        return choice_of(state, side, action);
+    }
+    for (i, ok) in legal.iter().enumerate() {
+        if *ok {
+            return choice_of(state, side, i as u8);
+        }
+    }
+    MoveChoice::Move(0)
+}
+
+fn lost_of(state: &State, side: SideId) -> bool {
+    !state
+        .side(side)
+        .pokemon
+        .iter()
+        .any(|p| p.species != engine::ids::Species::None && p.is_alive())
+}
+
+fn sample_of(rng: &mut Rng, branches: &[StateInstructions]) -> usize {
+    let total: f32 = branches.iter().map(|b| b.percentage).sum::<f32>().max(1e-6);
+    let mut r = rng.next_unit() * total;
+    for (i, b) in branches.iter().enumerate() {
+        r -= b.percentage;
+        if r <= 0.0 {
+            return i;
+        }
+    }
+    branches.len() - 1
+}
+
+/// Advance one turn in place via the sampled executor (single weighted path — no branch
+/// enumeration; distribution-pinned to the enumerate path by the engine's test suite).
+fn step_of(state: &mut State, rng: &mut Rng, action_red: u8, action_blue: u8) {
+    let c1 = resolve_of(state, SideId::One, action_red);
+    let c2 = resolve_of(state, SideId::Two, action_blue);
+    let si = engine::generate::generate_instructions_sampled(
+        state, c1, c2, [None, None], [false, false], &mut rng.0,
+    );
+    state.apply_instructions(&si.instructions);
+    state.turn += 1;
+}
+
+fn winner_of(state: &State) -> i64 {
+    match (lost_of(state, SideId::One), lost_of(state, SideId::Two)) {
+        (false, true) => 0,
+        (true, false) => 1,
+        _ => -1,
+    }
+}
+
+// ---- vectorized bridge ----------------------------------------------------------------------
+
+use numpy::ndarray::{Array1, Array2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
+use rayon::prelude::*;
+
+/// A batch of independent battles stepped/encoded in parallel in Rust, exchanged with Python as
+/// numpy arrays in a single GIL crossing per call — the throughput path for vectorized PPO.
+/// Same MDP and 9-action space as `Battle` (self-play: both sides act every call).
+#[pyclass]
+pub struct BattleVec {
+    states: Vec<State>,
+    rngs: Vec<Rng>,
+    /// Episode turn counters; battles hitting `max_turns` are truncated (done, winner -1).
+    steps: Vec<u32>,
+    max_turns: u32,
+}
+
+#[pymethods]
+impl BattleVec {
+    #[new]
+    #[pyo3(signature = (num_envs, seed = 0, max_turns = 500))]
+    fn new(num_envs: usize, seed: u64, max_turns: u32) -> Self {
+        BattleVec {
+            states: (0..num_envs).map(|_| team::default_matchup()).collect(),
+            rngs: (0..num_envs)
+                .map(|i| Rng(seed.wrapping_add(1).wrapping_add((i as u64) << 32)))
+                .collect(),
+            steps: vec![0; num_envs],
+            max_turns,
+        }
+    }
+
+    #[getter]
+    fn num_envs(&self) -> usize {
+        self.states.len()
+    }
+    #[getter]
+    fn obs_dim(&self) -> usize {
+        engine::encode::OBS_DIM
+    }
+    #[getter]
+    fn n_actions(&self) -> usize {
+        N_ACTIONS
+    }
+    #[getter]
+    fn id_dim(&self) -> usize {
+        engine::encode::ID_DIM
+    }
+
+    /// (N, OBS_DIM) f32 observations from `side`'s perspective.
+    fn observe_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<f32>> {
+        let n = self.states.len();
+        let dim = engine::encode::OBS_DIM;
+        let mut flat = vec![0f32; n * dim];
+        py.allow_threads(|| {
+            flat.par_chunks_mut(dim).zip(self.states.par_iter()).for_each(|(dst, st)| {
+                dst.copy_from_slice(&engine::encode::encode(st, sid(side)));
+            });
+        });
+        Array2::from_shape_vec((n, dim), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N, ID_DIM) i64 categorical IDs from `side`'s perspective (embedding-table inputs).
+    fn observe_ids_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<i64>> {
+        let n = self.states.len();
+        let dim = engine::encode::ID_DIM;
+        let mut flat = vec![0i64; n * dim];
+        py.allow_threads(|| {
+            flat.par_chunks_mut(dim).zip(self.states.par_iter()).for_each(|(dst, st)| {
+                dst.copy_from_slice(&engine::encode::encode_ids(st, sid(side)));
+            });
+        });
+        Array2::from_shape_vec((n, dim), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N, 9) bool legal-action masks for `side`.
+    fn legal_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<bool>> {
+        let n = self.states.len();
+        let mut flat = vec![false; n * N_ACTIONS];
+        for (dst, st) in flat.chunks_mut(N_ACTIONS).zip(self.states.iter()) {
+            dst.copy_from_slice(&legal_mask_of(st, sid(side)));
+        }
+        Array2::from_shape_vec((n, N_ACTIONS), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N,) f32 mean team HP fraction for `side` — the reward-shaping potential.
+    fn team_hp_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray1<f32>> {
+        let v: Vec<f32> = self
+            .states
+            .iter()
+            .map(|st| {
+                let s = st.side(sid(side));
+                s.pokemon
+                    .iter()
+                    .filter(|p| p.species != engine::ids::Species::None && p.max_hp > 0)
+                    .map(|p| (p.hp.max(0) as f32) / (p.max_hp as f32))
+                    .sum::<f32>()
+                    / 6.0
+            })
+            .collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// (N,) i64 fainted-mon count for `side` — the other Φ term.
+    fn faints_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray1<i64>> {
+        let v: Vec<i64> = self
+            .states
+            .iter()
+            .map(|st| {
+                st.side(sid(side))
+                    .pokemon
+                    .iter()
+                    .filter(|p| p.species != engine::ids::Species::None && !p.is_alive())
+                    .count() as i64
+            })
+            .collect();
+        Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// Step every battle one turn. Returns `(done, winner)` as (N,) arrays describing the step
+    /// just taken; battles that finished (or hit `max_turns`) are reset in place when
+    /// `auto_reset` (their next observation is the fresh battle).
+    #[pyo3(signature = (action_red, action_blue, auto_reset = true))]
+    fn step_all<'py>(
+        &mut self,
+        py: Python<'py>,
+        action_red: PyReadonlyArray1<'py, i64>,
+        action_blue: PyReadonlyArray1<'py, i64>,
+        auto_reset: bool,
+    ) -> PyResult<(Bound<'py, PyArray1<bool>>, Bound<'py, PyArray1<i64>>)> {
+        let red = action_red.as_slice()?.to_vec();
+        let blue = action_blue.as_slice()?.to_vec();
+        let n = self.states.len();
+        if red.len() != n || blue.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "action arrays must have length {n} (got {} / {})",
+                red.len(),
+                blue.len()
+            )));
+        }
+        let max_turns = self.max_turns;
+        let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
+            self.states
+                .par_iter_mut()
+                .zip(self.rngs.par_iter_mut())
+                .zip(self.steps.par_iter_mut())
+                .enumerate()
+                .map(|(i, ((st, rng), steps))| {
+                    step_of(st, rng, red[i] as u8, blue[i] as u8);
+                    *steps += 1;
+                    let over = lost_of(st, SideId::One) || lost_of(st, SideId::Two);
+                    let truncated = *steps >= max_turns;
+                    let done = over || truncated;
+                    let winner = if over { winner_of(st) } else { -1 };
+                    if done && auto_reset {
+                        *st = team::default_matchup();
+                        *steps = 0;
+                    }
+                    (done, winner)
+                })
+                .unzip()
+        });
+        Ok((
+            Array1::from_vec(dones).into_pyarray_bound(py),
+            Array1::from_vec(winners).into_pyarray_bound(py),
+        ))
+    }
+}
+
 #[pymodule]
 fn showdown_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Battle>()?;
+    m.add_class::<BattleVec>()?;
     Ok(())
 }

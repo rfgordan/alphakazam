@@ -411,6 +411,84 @@ pub fn generate_instructions(state: &State, s1: MoveChoice, s2: MoveChoice) -> V
     generate_instructions_ex(state, s1, s2, [None, None], [false, false])
 }
 
+/// Execution mode for the turn resolver.
+///
+/// `Enumerate` expands every stochastic fork with exact probabilities (verification, search).
+/// `Sample` follows ONE weighted path: at each stage seam the branch set is pruned to a single
+/// survivor drawn ∝ probability, carrying the stage's total incoming mass. This is *exact
+/// ancestral sampling* over the same probability tree — certified against `Enumerate` by
+/// `tests/sampled_distribution.rs` — and is the training-throughput path: it avoids the
+/// cross-product of both movers' damage/crit/secondary branches (the dominant step cost).
+pub enum Exec {
+    Enumerate,
+    /// splitmix64 state; advanced on every draw.
+    Sample(u64),
+}
+
+impl Exec {
+    fn next_unit(&mut self) -> Option<f32> {
+        match self {
+            Exec::Enumerate => None,
+            Exec::Sample(s) => {
+                *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = *s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                Some((z >> 40) as f32 / (1u64 << 24) as f32)
+            }
+        }
+    }
+
+    /// 50/50 coin for symmetric forks (speed ties). None when enumerating.
+    fn coin(&mut self) -> Option<bool> {
+        self.next_unit().map(|u| u < 0.5)
+    }
+
+    /// In `Sample` mode, reduce `branches` to one survivor drawn ∝ `prob`, re-weighted to the
+    /// stage's total incoming mass (so overall mass is conserved and the final sampled branch
+    /// comes out at the parent's weight). Identity in `Enumerate` mode.
+    fn prune(&mut self, mut branches: Vec<Branch>) -> Vec<Branch> {
+        if branches.len() <= 1 {
+            return branches;
+        }
+        let Some(u) = self.next_unit() else { return branches };
+        let total: f32 = branches.iter().map(|b| b.prob).sum();
+        let mut r = u * total;
+        let mut idx = branches.len() - 1;
+        for (i, b) in branches.iter().enumerate() {
+            r -= b.prob;
+            if r <= 0.0 {
+                idx = i;
+                break;
+            }
+        }
+        let mut survivor = branches.swap_remove(idx);
+        survivor.prob = total;
+        vec![survivor]
+    }
+}
+
+/// Sampled single-path turn resolution: same rules, same probability tree as
+/// [`generate_instructions_ex`], but follows one weighted trajectory and returns it alone.
+/// `rng` is splitmix64 state, advanced in place. ~10-30× cheaper than full enumeration.
+pub fn generate_instructions_sampled(
+    state: &State,
+    s1: MoveChoice,
+    s2: MoveChoice,
+    pivot: [Option<u8>; 2],
+    tera: [bool; 2],
+    rng: &mut u64,
+) -> StateInstructions {
+    let mut exec = Exec::Sample(*rng);
+    let mut out = generate_instructions_ctx(state, s1, s2, pivot, tera, &mut exec);
+    if let Exec::Sample(s) = exec {
+        *rng = s;
+    }
+    debug_assert_eq!(out.len(), 1);
+    out.pop().unwrap_or(StateInstructions { percentage: 100.0, instructions: Vec::new() })
+}
+
 /// Generate the conditional stochastic kernel for one queued move action only.
 ///
 /// Unlike [`generate_instructions_ex`], this does not resolve ordering, execute the other
@@ -462,6 +540,10 @@ fn apply_tera(b: &mut Branch, side: SideId) {
 /// mid-turn — so a faster pivot's switch happens *before* the opponent's move. Used by
 /// the differential harness, which knows the recorded replacement target.
 pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2]) -> Vec<StateInstructions> {
+    generate_instructions_ctx(state, s1, s2, pivot, tera, &mut Exec::Enumerate)
+}
+
+fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<StateInstructions> {
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     let mut branches = vec![start];
 
@@ -519,7 +601,7 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
         })
         .collect();
 
-    branches = resolve_moves(branches, &move_actions);
+    branches = resolve_moves(branches, &move_actions, exec);
 
     // A side's active was switched in this turn (chose to switch, or used a pivot move) — it
     // hasn't earned an end-of-turn Speed Boost yet.
@@ -540,6 +622,7 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
             }
         })
         .collect();
+    branches = exec.prune(branches);
 
     branches
         .into_iter()
@@ -1049,32 +1132,43 @@ struct Action {
     foe_pending_move: Option<crate::ids::MoveId>,
 }
 
-fn resolve_moves(branches: Vec<Branch>, actions: &[Action]) -> Vec<Branch> {
+fn resolve_moves(branches: Vec<Branch>, actions: &[Action], exec: &mut Exec) -> Vec<Branch> {
     let mut out = Vec::new();
     for b in branches {
-        out.extend(resolve_moves_for_branch(b, actions));
+        out.extend(resolve_moves_for_branch(b, actions, exec));
     }
     out
 }
 
-fn resolve_moves_for_branch(b: Branch, actions: &[Action]) -> Vec<Branch> {
+fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> Vec<Branch> {
     match actions.len() {
         0 => vec![b],
-        1 => execute_move(b, actions[0]),
+        1 => {
+            let out = execute_move(b, actions[0]);
+            exec.prune(out)
+        }
         _ => {
             let (a, b_act) = (actions[0], actions[1]);
             let order = move_order(&b.state, a.side, a.move_idx, b_act.side, b_act.move_idx);
             match order {
                 Order::First(first) => {
                     let (f, s) = if first == a.side { (a, b_act) } else { (b_act, a) };
-                    sequence_two_moves(b, f, s)
+                    sequence_two_moves(b, f, s, exec)
                 }
-                Order::Tie => {
-                    // 50/50 over the two orderings.
-                    let mut res = sequence_two_moves(scaled(&b, 0.5), a, b_act);
-                    res.extend(sequence_two_moves(scaled(&b, 0.5), b_act, a));
-                    res
-                }
+                Order::Tie => match exec.coin() {
+                    // Sampled: resolve the tie with one coin flip; the branch keeps its full
+                    // mass (the flip is the sampled event, not a reweighting).
+                    Some(a_first) => {
+                        let (f, s) = if a_first { (a, b_act) } else { (b_act, a) };
+                        sequence_two_moves(b, f, s, exec)
+                    }
+                    // Enumerated: 50/50 over the two orderings.
+                    None => {
+                        let mut res = sequence_two_moves(scaled(&b, 0.5), a, b_act, exec);
+                        res.extend(sequence_two_moves(scaled(&b, 0.5), b_act, a, exec));
+                        res
+                    }
+                },
             }
         }
     }
@@ -1084,13 +1178,15 @@ fn scaled(b: &Branch, f: f32) -> Branch {
     Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone() }
 }
 
-fn sequence_two_moves(b: Branch, mut first: Action, second: Action) -> Vec<Branch> {
+fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut Exec) -> Vec<Branch> {
     // Tell the first mover what the (not-yet-moved) second mover is about to do, so Sucker
     // Punch / Thunderclap can tell whether the target is attacking. The second mover's foe
     // (the first) has already acted, so it stays None.
     first.foe_pending_move = Some(b.state.side(second.side).active().moves[second.move_idx as usize].id);
     let mut out = Vec::new();
-    for fb in execute_move(b, first) {
+    // The prune between the movers is what kills the branch cross-product in Sample mode:
+    // the second mover executes on one sampled first-move outcome instead of all of them.
+    for fb in exec.prune(execute_move(b, first)) {
         // The second mover acts only if its active is alive and wasn't flinched by the first.
         let flinched = fb.state.side(second.side).volatiles.contains(VolatileStatus::Flinch);
         // Once the first action ends the battle (for example Life Orb recoil KOs that side's
@@ -1104,7 +1200,7 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action) -> Vec<Branc
             out.push(fb);
         }
     }
-    out
+    exec.prune(out)
 }
 
 enum Order {
