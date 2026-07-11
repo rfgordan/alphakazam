@@ -84,6 +84,70 @@ const TEAM_DIVERSE_2 = [
 	'Toxtricity||throatspray|punkrock|boomburst,overdrive,toxic,shiftgear|Modest|,,,252,4,252|||||,,,,,Normal',
 ].join(']');
 
+// Trapping-coverage team pairs (t*.json.gz traces, `--teamset trapA`..`trapF`): exercise every
+// switch-prevention source and every exemption — trapping abilities (Arena Trap / Shadow Tag /
+// Magnet Pull), partial-trap moves with Binding Band / Grip Claw, Mean Look / Block / Jaw Lock /
+// Octolock / Ingrain / No Retreat, against grounded, Flying, Ghost, Air Balloon and Shed Shell
+// escapes. Victims are deliberately tanky so trapped positions persist across many decision
+// points, and no team carries burn/toxic against a trapper (the engine's per-side residual loop
+// would order a cross-side poison-death vs partial-trap chip differently than PS's global queue).
+const TEAM_TRAP = {
+	// Arena Trap vs grounded / Flying / Ghost / Air Balloon.
+	trapA: [[
+		'Dugtrio||focussash|arenatrap|earthquake,rockslide,suckerpunch,protect|Jolly|,252,,,4,252|||||,,,,,Ground',
+		'Golurk||leftovers|shellarmor|earthquake,shadowpunch,icepunch,protect|Adamant|252,252,,,4,|||||,,,,,Ground',
+	], [
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Talonflame||heavydutyboots|flamebody|bravebird,roost,tailwind,protect|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Gengar||leftovers|cursedbody|shadowball,thunderbolt,psychic,protect|Timid|,,,252,4,252|||||,,,,,Ghost',
+		'Chansey||airballoon|naturalcure|seismictoss,softboiled,thunderwave,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	]],
+	// Shadow Tag mirror (mutual immunity) + a trapped bystander.
+	trapB: [[
+		'Gothitelle||leftovers|shadowtag|psychic,thunderbolt,calmmind,protect|Bold|252,,252,,4,|||||,,,,,Psychic',
+		'Skarmory||rockyhelmet|sturdy|bodypress,roost,spikes,whirlwind|Impish|252,,252,,4,|||||,,,,,Steel',
+	], [
+		'Gothitelle||leftovers|shadowtag|psychic,shadowball,calmmind,protect|Bold|252,,252,,4,|||||,,,,,Psychic',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	]],
+	// Magnet Pull vs Steel / non-Steel / Steel-with-Shed-Shell.
+	trapC: [[
+		'Magnezone||leftovers|magnetpull|thunderbolt,flashcannon,thunderwave,protect|Modest|252,,,252,4,|||||,,,,,Electric',
+		'Probopass||leftovers|magnetpull|block,flashcannon,thunderwave,protect|Calm|252,,4,,252,|||||,,,,,Rock',
+	], [
+		'Empoleon||shedshell|torrent|surf,flashcannon,icebeam,protect|Modest|252,,,252,4,|||||,,,,,Water',
+		'Scizor||leftovers|technician|bulletpunch,knockoff,swordsdance,protect|Adamant|252,252,,,4,|||||,,,,,Steel',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	]],
+	// Partial traps: Binding Band Shuckle, Grip Claw Araquanid; Shed Shell / Ghost escapes across.
+	trapD: [[
+		'Torkoal||bindingband|shellarmor|infestation,sandtomb,rest,protect|Bold|252,,252,,4,|||||,,,,,Fire',
+		'Araquanid||gripclaw|waterbubble|whirlpool,bind,liquidation,protect|Adamant|252,252,,,4,|||||,,,,,Water',
+	], [
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,calmmind,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Corviknight||shedshell|pressure|bodypress,roost,bravebird,protect|Impish|252,,252,,4,|||||,,,,,Flying',
+		'Gengar||leftovers|cursedbody|shadowball,psychic,thunderbolt,protect|Timid|,,,252,4,252|||||,,,,,Ghost',
+	]],
+	// Mean Look / Block, incl. a Ghost target and a Shed Shell holder using Mean Look itself.
+	trapE: [[
+		'Probopass||leftovers|sturdy|block,flashcannon,thunderwave,protect|Calm|252,,4,,252,|||||,,,,,Rock',
+		'Gothitelle||leftovers|competitive|meanlook,psychic,calmmind,protect|Bold|252,,252,,4,|||||,,,,,Psychic',
+	], [
+		'Blissey||shedshell|naturalcure|meanlook,seismictoss,softboiled,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Gengar||leftovers|cursedbody|shadowball,thunderbolt,psychic,protect|Timid|,,,252,4,252|||||,,,,,Ghost',
+		'Chansey||leftovers|naturalcure|seismictoss,softboiled,thunderwave,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	]],
+	// Jaw Lock (traps BOTH) / Octolock residual drops / Ingrain / No Retreat self-traps.
+	trapF: [[
+		'Drednaw||leftovers|shellarmor|jawlock,liquidation,crunch,protect|Adamant|252,252,,,4,|||||,,,,,Water',
+		'Torkoal||leftovers|shellarmor|octolock,infestation,rest,protect|Bold|252,,252,,4,|||||,,,,,Fire',
+	], [
+		'Skarmory||rockyhelmet|sturdy|noretreat,bodypress,roost,spikes|Impish|252,,252,,4,|||||,,,,,Steel',
+		'Blissey||leftovers|naturalcure|ingrain,seismictoss,softboiled,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Gengar||leftovers|cursedbody|shadowball,psychic,thunderbolt,protect|Timid|,,,252,4,252|||||,,,,,Ghost',
+	]],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -436,7 +500,10 @@ function chooseFor(request, rand) {
 			if (!m.disabled && (m.pp === undefined || m.pp > 0)) moves.push({ slot: i + 1, id: m.id });
 		}
 		const switches = [];
-		if (!act.trapped) {
+		// In singles PS reports volatile/locked traps as `trapped` but ability traps (Arena Trap /
+		// Shadow Tag / Magnet Pull, discovered via tryTrap(true)) as `maybeTrapped` — attempting a
+		// switch under either gets the choice rejected (pokemon.trapped is truthy).
+		if (!act.trapped && !act.maybeTrapped) {
 			const mons = request.side.pokemon;
 			for (let i = 0; i < mons.length; i++) {
 				if (!mons[i].active && !mons[i].condition.endsWith(' fnt') && mons[i].condition !== '0 fnt') {
@@ -472,7 +539,9 @@ async function main() {
 		team1 = Teams.pack(Teams.generate(FORMAT, { seed: [0, 0, 0, SEED_NUM * 2 + 1] }));
 		team2 = Teams.pack(Teams.generate(FORMAT, { seed: [0, 0, 0, SEED_NUM * 2 + 2] }));
 	} else {
-		const [t1, t2] = TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
+		const [t1, t2] = TEAM_TRAP[TEAMSET]
+			? TEAM_TRAP[TEAMSET].map(t => t.join(']'))
+			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
 		team1 = Teams.pack(Teams.import(t1));
 		team2 = Teams.pack(Teams.import(t2));
 	}

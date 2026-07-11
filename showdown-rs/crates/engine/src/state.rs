@@ -219,6 +219,13 @@ pub struct Side {
     pub volatiles: Volatiles,
     pub substitute_hp: i16,
 
+    /// Partial-trap (Fire Spin / Bind / Infestation / …) payload for the active mon, paired with
+    /// the `PartiallyTrapped` volatile bit. `partial_trap_turns` is PS's remaining `duration`
+    /// (ticked down each end of turn; 0 = inactive). `partial_trap_div` is the snapshotted
+    /// `boundDivisor` (8 normally, 6 with the trapper holding Binding Band).
+    pub partial_trap_turns: u8,
+    pub partial_trap_div: u8,
+
     // --- multi-turn state of the active Pokémon (all reset on switch) ---
     /// The multi-turn move the active is locked into, if any (see [`PendingMove`]).
     pub pending_move: PendingMove,
@@ -275,6 +282,8 @@ impl Side {
         boosts: [0; BoostIndex::COUNT],
         volatiles: Volatiles::empty(),
         substitute_hp: 0,
+        partial_trap_turns: 0,
+        partial_trap_div: 0,
         pending_move: PendingMove::None,
         encore: (MoveId::None, 0),
         disable: (MoveId::None, 0),

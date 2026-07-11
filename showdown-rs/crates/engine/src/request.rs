@@ -117,6 +117,13 @@ impl Flow {
             PlayerChoice::Move { slot, .. } => MoveChoice::Move(slot),
             PlayerChoice::Switch { slot } => {
                 let s = state.side(side);
+                // A trapped active cannot switch out (Arena Trap / Shadow Tag / Magnet Pull /
+                // partial-trap / Mean Look / …). Coerce a stray switch choice into a move so the
+                // Flow never forces a trapped mon out — the legal mask already suppresses it.
+                if crate::generate::is_trapped(state, side) {
+                    let m = s.active().moves.iter().position(|m| m.id != crate::ids::MoveId::None && m.pp > 0);
+                    return MoveChoice::Move(m.unwrap_or(0) as u8);
+                }
                 let p = &s.pokemon[slot as usize];
                 if slot != s.active_index && p.species != crate::ids::Species::None && p.is_alive() {
                     MoveChoice::Switch(slot)

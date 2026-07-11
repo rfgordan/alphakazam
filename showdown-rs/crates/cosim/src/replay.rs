@@ -635,12 +635,22 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             out.push(format!("moves[{side_key}]: ps={ps_moves:?} engine={eng_moves:?}"));
         }
 
-        // PS also reports `trapped` while a Pokémon is committed to a rampage/charge. That
-        // restriction is already represented by PendingMove and the locked move set above;
-        // only surface trapping that the engine has not otherwise modeled.
+        // Trapping legality is a CERTIFIED property: PS's request switch-lock must equal the
+        // engine's `is_trapped(...) || committed`. In singles PS reports volatile/locked traps as
+        // `trapped: true` and ability traps (hidden `tryTrap(true)`: Arena Trap / Shadow Tag /
+        // Magnet Pull) as `maybeTrapped: true` — with types public both mean "switch rejected".
+        // PS omits both flags when the side has no one to switch to (`canSwitchIn == 0`), so the
+        // comparison is gated on a live bench. `committed` covers the rampage/charge/recharge
+        // lock (PendingMove), which PS also reports as trapped.
         let committed = !matches!(side.pending_move, engine::state::PendingMove::None);
-        if matches!(act.get("trapped"), Some(Value::Bool(true))) && !committed {
-            out.push(format!("trapped[{side_key}]"));
+        let ps_trapped = matches!(act.get("trapped"), Some(Value::Bool(true)))
+            || matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
+        let engine_trapped = committed || engine::generate::is_trapped(state, crate::convert::side_id(si));
+        let has_bench = side.pokemon.iter().enumerate().any(|(i, p)| {
+            i as u8 != side.active_index && p.species != engine::ids::Species::None && p.is_alive()
+        });
+        if has_bench && ps_trapped != engine_trapped {
+            out.push(format!("trapped[{side_key}]: ps={ps_trapped} engine={engine_trapped}"));
         }
 
         // Tera availability.

@@ -432,7 +432,20 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "torment" => { side.volatiles.insert(VolatileStatus::Torment); }
             "destinybond" => { side.volatiles.insert(VolatileStatus::DestinyBond); }
             "glaiverush" => { side.volatiles.insert(VolatileStatus::GlaiveRush); }
-            "partiallytrapped" => { side.volatiles.insert(VolatileStatus::PartiallyTrapped); }
+            "partiallytrapped" => {
+                side.volatiles.insert(VolatileStatus::PartiallyTrapped);
+                // `duration` = remaining turns (ticked each end of turn); `boundDivisor` = 6 with
+                // Binding Band else 8 (snapshotted at application).
+                side.partial_trap_turns = dur;
+                side.partial_trap_div = i(vv, "boundDivisor").max(1) as u8;
+            }
+            "trapped" => { side.volatiles.insert(VolatileStatus::Trapped); }
+            // `trapper` is PS's linkage marker on the mon DOING the trapping (Mean Look family); it
+            // carries no engine-modeled state (the trap lives as `trapped` on the victim).
+            "trapper" => {}
+            "ingrain" => { side.volatiles.insert(VolatileStatus::Ingrain); }
+            "noretreat" => { side.volatiles.insert(VolatileStatus::NoRetreat); }
+            "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
             "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
             "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }
@@ -605,6 +618,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
     "flinch", "charge", "focusenergy", "dragoncheer", "unburden", "throatchop", "healblock",
+    "trapped", "trapper", "ingrain", "noretreat", "octolock",
 ];
 
 const KNOWN_SIDE_CONDITIONS: &[&str] = &[

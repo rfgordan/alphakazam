@@ -144,4 +144,8 @@ id_map!(VolatileStatus {
     ThroatChop => "throatchop",
     HealBlock => "healblock",
     TypeShifted => "typeshifted",
+    Trapped => "trapped",
+    Ingrain => "ingrain",
+    NoRetreat => "noretreat",
+    Octolock => "octolock",
 });

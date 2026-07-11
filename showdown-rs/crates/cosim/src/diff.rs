@@ -86,6 +86,13 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
         }
         cmp!(out, s("volatiles"), normalized_volatiles(a.volatiles), normalized_volatiles(b.volatiles));
         cmp!(out, s("substitute_hp"), a.substitute_hp, b.substitute_hp);
+        // Partial-trap countdown + Binding Band divisor (pairs with the PartiallyTrapped bit).
+        if a.volatiles.contains(VolatileStatus::PartiallyTrapped)
+            && b.volatiles.contains(VolatileStatus::PartiallyTrapped)
+        {
+            cmp!(out, s("partial_trap_turns"), a.partial_trap_turns, b.partial_trap_turns);
+            cmp!(out, s("partial_trap_div"), a.partial_trap_div, b.partial_trap_div);
+        }
         cmp!(out, s("taunt_turns"), a.taunt_turns, b.taunt_turns);
         cmp!(out, s("confusion_turns"), a.confusion_turns, b.confusion_turns);
         cmp!(out, s("perish_turns"), a.perish_turns, b.perish_turns);

@@ -126,6 +126,8 @@ pub enum Instruction {
     ApplyVolatile { side: SideId, volatile: VolatileStatus },
     RemoveVolatile { side: SideId, volatile: VolatileStatus },
     ChangeSubstituteHp { side: SideId, amount: i16 },
+    /// Partial-trap payload `(turns, divisor)` for the active mon (pairs with `PartiallyTrapped`).
+    SetPartialTrap { side: SideId, previous: (u8, u8), new: (u8, u8) },
 
     // --- side conditions (hazards / screens) ---
     SetSideCondition { side: SideId, condition: SideConditionId, previous: u8, new: u8 },
@@ -268,6 +270,11 @@ impl State {
             }
             ChangeSubstituteHp { side, amount } => {
                 self.side_mut(side).substitute_hp += amount;
+            }
+            SetPartialTrap { side, new, .. } => {
+                let s = self.side_mut(side);
+                s.partial_trap_turns = new.0;
+                s.partial_trap_div = new.1;
             }
             SetSideCondition { side, condition, new, .. } => {
                 set_side_condition(self, side, condition, new);
@@ -422,6 +429,11 @@ impl State {
             }
             ChangeSubstituteHp { side, amount } => {
                 self.side_mut(side).substitute_hp -= amount;
+            }
+            SetPartialTrap { side, previous, .. } => {
+                let s = self.side_mut(side);
+                s.partial_trap_turns = previous.0;
+                s.partial_trap_div = previous.1;
             }
             SetSideCondition { side, condition, previous, .. } => {
                 set_side_condition(self, side, condition, previous);

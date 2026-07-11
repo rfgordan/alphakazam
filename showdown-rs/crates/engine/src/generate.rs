@@ -373,6 +373,61 @@ fn is_grounded(state: &State, side: SideId) -> bool {
         || p.item == Item::AirBalloon)
 }
 
+/// Whether `side`'s active Pokémon is prevented from switching out (gen9 trapping). Fainted
+/// actives are never trapped — they resolve through the always-legal faint-replacement phase.
+///
+/// Escape hatches checked first (they beat every trap, PS `onTrapPokemon` priority -10 Shed Shell
+/// and the Ghost `trapped` type immunity that fails `tryTrap`): Ghost-types (including tera-Ghost)
+/// and Shed Shell holders can always switch. Then self/foe trap volatiles, then the opposing
+/// active's trapping abilities. Mirrors `Pokemon.tryTrap` + the ability `onFoeTrapPokemon` guards.
+pub fn is_trapped(state: &State, side: SideId) -> bool {
+    use crate::ids::Ability as Ab;
+    let me = state.side(side).active();
+    if !me.is_alive() {
+        return false;
+    }
+    if me.types.contains(&Type::Ghost) || me.item == Item::ShedShell {
+        return false;
+    }
+    let vols = state.side(side).volatiles;
+    if vols.contains(VolatileStatus::PartiallyTrapped)
+        || vols.contains(VolatileStatus::Trapped)
+        || vols.contains(VolatileStatus::Octolock)
+        || vols.contains(VolatileStatus::Ingrain)
+        || vols.contains(VolatileStatus::NoRetreat)
+    {
+        return true;
+    }
+    let foe = state.side(side.other()).active();
+    if foe.is_alive() {
+        match foe.ability {
+            // Arena Trap holds only grounded foes.
+            Ab::ArenaTrap => return is_grounded(state, side),
+            // Magnet Pull holds only Steel-types.
+            Ab::MagnetPull => return me.types.contains(&Type::Steel),
+            // Shadow Tag holds everyone except other Shadow Tag holders.
+            Ab::ShadowTag => return me.ability != Ab::ShadowTag,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Clear the foe-sourced traps (partial trap / Mean Look-family / Octolock) on `victim`'s active
+/// when the trapper leaves the field. In singles the trapper is always the current opposing
+/// active, so any switch-out of it ends these; self-traps (Ingrain / No Retreat) are untouched.
+fn clear_foe_sourced_traps(b: &mut Branch, victim: SideId) {
+    for v in [VolatileStatus::PartiallyTrapped, VolatileStatus::Trapped, VolatileStatus::Octolock] {
+        if b.state.side(victim).volatiles.contains(v) {
+            push(b, Instruction::RemoveVolatile { side: victim, volatile: v });
+        }
+    }
+    let pt = (b.state.side(victim).partial_trap_turns, b.state.side(victim).partial_trap_div);
+    if pt != (0, 0) {
+        push(b, Instruction::SetPartialTrap { side: victim, previous: pt, new: (0, 0) });
+    }
+}
+
 /// Move accuracy as a hit probability, with the modifiers that change it: No Guard (either
 /// side) and weather-perfect moves -> always hit; Compound Eyes ×1.3, Wide Lens ×1.1,
 /// Hustle ×0.8 on physical.
@@ -684,6 +739,11 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     if previous == target {
         return;
     }
+    // The outgoing mon is the current opposing active from the foe's perspective, so its exit ends
+    // any foe-sourced trap (partial trap / Mean Look / Octolock / Jaw Lock) it was holding the foe
+    // in — PS clears the linked `trapped`/`partiallytrapped` when the trapper's `clearVolatile`
+    // runs. The leaving mon's own trapping volatiles are cleared below via `ALL_VOLATILES`.
+    clear_foe_sourced_traps(b, side.other());
     // A traced / copied ability reverts on switch-out (Transform handles its own below).
     {
         let p = b.state.side(side).active();
@@ -877,6 +937,10 @@ fn reset_move_tracking(b: &mut Branch, side: SideId) {
     }
     if disable.1 != 0 {
         push(b, Instruction::SetDisable { side, previous: disable, new: (MoveId::None, 0) });
+    }
+    let pt = (b.state.side(side).partial_trap_turns, b.state.side(side).partial_trap_div);
+    if pt != (0, 0) {
+        push(b, Instruction::SetPartialTrap { side, previous: pt, new: (0, 0) });
     }
     for (which, cur) in [(Taunt, taunt), (Confusion, conf), (Perish, perish), (Yawn, yawn), (ActiveTurns, active)] {
         if cur != 0 {
@@ -1315,6 +1379,10 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // engine retaining it across switches.
     VolatileStatus::ChoiceLock,
     VolatileStatus::ThroatChop, VolatileStatus::HealBlock, VolatileStatus::TypeShifted,
+    // Trapping volatiles clear when their holder leaves the field (self-traps and the trapped
+    // mon's own copy). Foe-sourced traps additionally end when the TRAPPER leaves — handled by
+    // `clear_foe_sourced_traps` in `apply_switch_inner`.
+    VolatileStatus::Trapped, VolatileStatus::Ingrain, VolatileStatus::NoRetreat, VolatileStatus::Octolock,
     // Note: Protosynthesis / QuarkDrive are not cleared here yet; their re-application on
     // switch-in isn't modeled, so clearing would lose the boost for the common stay-in case.
     // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
@@ -2174,6 +2242,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         } else {
             apply_target_secondary(hb, side, &md)
                 .into_iter()
+                .flat_map(|sb| apply_partial_trap(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
                 .flat_map(|sb| apply_cursed_body(sb, side, &md))
@@ -3112,11 +3181,20 @@ fn apply_post_damage(
 
     // A transformed mon that fainted this hit (the target, or the attacker via a contact
     // punisher / recoil) reverts to its own identity — PS runs clearVolatile on faint.
+    // A fainting mon also releases the Mean-Look-family `trapped` it was holding the OTHER
+    // side in — PS's `trapped` is linked to the trapper's `trapper` volatile, and linked
+    // volatiles are removed the moment their partner clears on faint (before residuals).
     if !b.state.side(foe).active().is_alive() {
         revert_transform(b, foe);
+        if b.state.side(side).volatiles.contains(VolatileStatus::Trapped) {
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Trapped });
+        }
     }
     if !b.state.side(side).active().is_alive() {
         revert_transform(b, side);
+        if b.state.side(foe).volatiles.contains(VolatileStatus::Trapped) {
+            push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Trapped });
+        }
     }
 }
 
@@ -3907,6 +3985,39 @@ fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec
 }
 
 /// Split a hit branch on a move's chance-based target secondary (proc vs no-proc).
+/// Fire Spin / Bind / Infestation / … apply the `PartiallyTrapped` volatile with a duration rolled
+/// 5-or-6 (PS `this.random(5,7)`, or a fixed 8 with Grip Claw) and a `boundDivisor` snapshotted
+/// from the trapper's item (6 with Binding Band, else 8). Blocked by a Substitute. The residual
+/// chip and the duration countdown are applied at end of turn (`apply_end_of_turn`).
+fn apply_partial_trap(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    if md.target_volatile != Some(VolatileStatus::PartiallyTrapped) {
+        return vec![b];
+    }
+    let foe = side.other();
+    if !b.state.side(foe).active().is_alive()
+        || b.state.side(foe).volatiles.contains(VolatileStatus::PartiallyTrapped)
+    {
+        return vec![b];
+    }
+    let item = b.state.side(side).active().item;
+    let div = if item == Item::BindingBand { 6 } else { 8 };
+    let durations: Vec<(u8, f32)> = if item == Item::GripClaw {
+        vec![(8, 1.0)]
+    } else {
+        vec![(5, 0.5), (6, 0.5)]
+    };
+    durations
+        .into_iter()
+        .map(|(turns, p)| {
+            let mut nb = scaled(&b, p);
+            push(&mut nb, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::PartiallyTrapped });
+            let prev = (nb.state.side(foe).partial_trap_turns, nb.state.side(foe).partial_trap_div);
+            push(&mut nb, Instruction::SetPartialTrap { side: foe, previous: prev, new: (turns, div) });
+            nb
+        })
+        .collect()
+}
+
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     if md.secondary_chance == 0 {
         return vec![b];
@@ -4065,12 +4176,28 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
             push(b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::ThroatChop, previous: prev, new: 2 });
         }
     }
-    // A target volatile (Salt Cure, ...) is blocked by a Substitute.
+    // A target volatile (Salt Cure, ...) is blocked by a Substitute. The partial-trap volatile
+    // (Fire Spin / Bind / Infestation / …) is applied in the branching `apply_partial_trap` stage
+    // instead — it rolls a 5-vs-6-turn duration and snapshots the Binding Band divisor.
     if !hit_sub {
         if let Some(v) = md.target_volatile {
             let foe = side.other();
-            if !b.state.side(foe).volatiles.contains(v) {
+            if v != VolatileStatus::PartiallyTrapped && !b.state.side(foe).volatiles.contains(v) {
                 push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            }
+        }
+        // Jaw Lock traps BOTH the user and the target (PS `onHit` adds `trapped` to each). Neither
+        // trap ends until one of the two leaves the field.
+        if md.id.to_id() == "jawlock" {
+            let foe = side.other();
+            for s in [side, foe] {
+                let p = b.state.side(s).active();
+                if p.is_alive()
+                    && !p.types.contains(&Type::Ghost)
+                    && !b.state.side(s).volatiles.contains(VolatileStatus::Trapped)
+                {
+                    push(b, Instruction::ApplyVolatile { side: s, volatile: VolatileStatus::Trapped });
+                }
             }
         }
         // Clear Smog resets the target's stat stages to 0 on hit.
@@ -4134,6 +4261,67 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
             out.push(fb);
         }
         return out;
+    }
+
+    // Mean Look / Block / Spider Web: trap the foe (PS `onHit` adds the `trapped` volatile). Ghost
+    // types are immune to the `trapped` status, so the volatile is not added to them (they can
+    // still switch); Shed Shell does NOT stop the volatile from being applied, only the switch-lock.
+    if matches!(md.id.to_id(), "meanlook" | "block" | "spiderweb") {
+        let mut b = b;
+        let t = b.state.side(foe).active();
+        if t.is_alive()
+            && !t.types.contains(&Type::Ghost)
+            && !b.state.side(foe).volatiles.contains(VolatileStatus::Trapped)
+        {
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Trapped });
+        }
+        return vec![b];
+    }
+
+    // Ingrain: root the user — cannot switch (Ghost exempt at legality time), heals 1/16 at each
+    // end of turn (residual order 7, before Leech Seed). Fails if already rooted.
+    if md.id.to_id() == "ingrain" {
+        let mut b = b;
+        if !b.state.side(side).volatiles.contains(VolatileStatus::Ingrain) {
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Ingrain });
+        }
+        return vec![b];
+    }
+
+    // No Retreat: +1 to every attacking/defensive stat and Speed, self-trap. PS `onTry`: fails
+    // outright when the user already has `noretreat` (no boosts); a user already held by the
+    // Mean-Look-family `trapped` volatile still gets the boosts but not a second trap volatile.
+    if md.id.to_id() == "noretreat" {
+        let mut b = b;
+        if b.state.side(side).volatiles.contains(VolatileStatus::NoRetreat) {
+            return vec![b];
+        }
+        for stat in [
+            BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+            BoostIndex::SpecialDefense, BoostIndex::Speed,
+        ] {
+            apply_self_boost(&mut b, side, stat, 1);
+        }
+        apply_white_herb(&mut b, side);
+        if !b.state.side(side).volatiles.contains(VolatileStatus::Trapped) {
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::NoRetreat });
+        }
+        return vec![b];
+    }
+
+    // Octolock: trap the foe and grind Def/SpD down by 1 each end of turn while the user stays
+    // in. PS `onTryImmunity` runs the `trapped` type immunity, so it fails entirely against
+    // Ghost-types; fails if the target already has it.
+    if md.id.to_id() == "octolock" {
+        let mut b = b;
+        let t = b.state.side(foe).active();
+        if t.is_alive()
+            && !t.types.contains(&Type::Ghost)
+            && !b.state.side(foe).volatiles.contains(VolatileStatus::Octolock)
+        {
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Octolock });
+        }
+        return vec![b];
     }
 
     // Haze: reset every stat stage on both actives to 0.
@@ -4722,12 +4910,21 @@ fn apply_spin_clear(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
             push(b, Instruction::RemoveVolatile { side, volatile: v });
         }
     }
+    let pt = (b.state.side(side).partial_trap_turns, b.state.side(side).partial_trap_div);
+    if pt != (0, 0) {
+        push(b, Instruction::SetPartialTrap { side, previous: pt, new: (0, 0) });
+    }
 }
 
 /// Whirlwind / Roar / Dragon Tail / Circle Throw: drag the foe into a uniformly-random alive
 /// bench mon (each target is its own branch). No-op if the foe has no bench or fainted.
 fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
     if !b.state.side(dragged).active().is_alive() {
+        return vec![b];
+    }
+    // Ingrain blocks forced switching (`onDragOut`). Note the Mean-Look-family `trapped` and
+    // partial traps do NOT block dragging — forced switches bypass ordinary trapping.
+    if b.state.side(dragged).volatiles.contains(VolatileStatus::Ingrain) {
         return vec![b];
     }
     let sd = b.state.side(dragged);
@@ -4876,6 +5073,17 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
 
+        // Ingrain heals the rooted mon 1/16 max HP (PS residual order 7, before Leech Seed).
+        let p = b.state.side(side).active();
+        if p.is_alive()
+            && b.state.side(side).volatiles.contains(VolatileStatus::Ingrain)
+            && p.hp < p.max_hp
+            && !heal_blocked(b, side)
+        {
+            let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+            push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+
         // Leech Seed has residual order 8 in PS, before burn/poison (order 9).  This matters
         // when the seeded mon is also in range to faint from status: the drain and heal happen
         // first, then status damage KOs it.
@@ -4953,11 +5161,46 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::Damage { side, slot, amount: dmg });
         }
 
-        // Partially-trapped (Fire Spin / Whirlpool / Magma Storm / Infestation / ...): 1/8.
-        let p = b.state.side(side).active();
-        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::PartiallyTrapped) {
-            let dmg = (maxhp / 8).max(1).min(p.hp);
-            push(b, Instruction::Damage { side, slot, amount: dmg });
+        // Partially-trapped (Fire Spin / Bind / Whirlpool / Magma Storm / Infestation / …). PS
+        // (battle.ts residual loop) decrements the `duration` FIRST; if it hits 0 the trap ends and
+        // its onResidual is skipped (no chip). Otherwise the onResidual ends it with no chip if the
+        // trapper is no longer active (fainted here; the switch-out case is cleared eagerly on
+        // switch), else deals 1/divisor damage (6 with Binding Band, else 8). Magic Guard blocks
+        // only the chip, not the countdown.
+        if b.state.side(side).volatiles.contains(VolatileStatus::PartiallyTrapped) {
+            let turns = b.state.side(side).partial_trap_turns;
+            let div = b.state.side(side).partial_trap_div.max(1);
+            let new_turns = turns.saturating_sub(1);
+            let trapper_gone = !b.state.side(side.other()).active().is_alive();
+            if new_turns == 0 || trapper_gone {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::PartiallyTrapped });
+                push(b, Instruction::SetPartialTrap { side, previous: (turns, div), new: (0, 0) });
+            } else {
+                push(b, Instruction::SetPartialTrap { side, previous: (turns, div), new: (new_turns, div) });
+                let p = b.state.side(side).active();
+                if p.is_alive() && !magic_guard {
+                    let dmg = (maxhp / div as i16).max(1).min(p.hp);
+                    push(b, Instruction::Damage { side, slot, amount: dmg });
+                }
+            }
+        }
+
+        // Octolock (PS residual order 14, after partiallytrapped): ends silently if the trapper
+        // is gone (switch-out case is cleared eagerly), else lowers the victim's Def and SpD by 1
+        // (a foe-sourced drop: Clear Body blocks it, Defiant/Competitive react to it).
+        if b.state.side(side).volatiles.contains(VolatileStatus::Octolock) {
+            if !b.state.side(side.other()).active().is_alive() {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Octolock });
+            } else if b.state.side(side).active().is_alive() {
+                let mut lowered = false;
+                for stat in [BoostIndex::Defense, BoostIndex::SpecialDefense] {
+                    lowered |= apply_boost_clamped(b, side, stat, -1) < 0;
+                }
+                if lowered {
+                    react_to_stat_drop(b, side);
+                    apply_white_herb(b, side);
+                }
+            }
         }
 
         // Curse (Ghost): the cursed mon loses 1/4 max HP each turn.
@@ -5024,6 +5267,34 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 previous: cur,
                 new: cur + 1,
             });
+        }
+    }
+
+    // Safety net for the linked `trapped` release: a trap source that died to a RESIDUAL (burn,
+    // its own partial trap, …) rather than a hit also frees the foe before the decision boundary.
+    for side in [SideId::One, SideId::Two] {
+        if b.state.side(side).volatiles.contains(VolatileStatus::Trapped)
+            && !b.state.side(side.other()).active().is_alive()
+        {
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Trapped });
+        }
+    }
+
+    // The Protect stall chain expires at end of turn unless it was refreshed by a successful
+    // Protect-family use THIS turn (PS `stall` volatile: duration 2, `onRestart` re-arms it; a
+    // turn where the holder did anything else — or never acted at all: full paralysis, sleep,
+    // flinch — lets the duration run out). The Protect volatile is exactly the this-turn marker.
+    // Then clear the single-turn volatiles themselves (PS removes duration-1 volatiles in the
+    // same residual pass).
+    for side in [SideId::One, SideId::Two] {
+        let stall = b.state.side(side).stall_counter;
+        if stall != 0 && !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
+            push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
+        }
+        for v in [VolatileStatus::Protect, VolatileStatus::Endure, VolatileStatus::Flinch] {
+            if b.state.side(side).volatiles.contains(v) {
+                push(b, Instruction::RemoveVolatile { side, volatile: v });
+            }
         }
     }
 

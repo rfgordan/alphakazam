@@ -714,9 +714,13 @@ fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTION
                     }
                 }
             }
+            // Trapping (Arena Trap / Shadow Tag / Magnet Pull / partial-trap / Mean Look / …)
+            // forbids a voluntary switch on a Turn request. Faint-replacement and pivot-landing
+            // phases are never trapped (PS always lets you pick a replacement / landing).
+            let trapped = engine::generate::is_trapped(state, side);
             for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
                 if let Some(slot) = slot {
-                    mask[N_MOVES + k] = s.pokemon[slot as usize].is_alive();
+                    mask[N_MOVES + k] = !trapped && s.pokemon[slot as usize].is_alive();
                 }
             }
             // PP-stalled active with nowhere to go: expose move 0 so the engine Struggle-detects it.

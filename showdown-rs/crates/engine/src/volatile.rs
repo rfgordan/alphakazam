@@ -46,6 +46,11 @@ pub enum VolatileStatus {
     ThroatChop,
     HealBlock,
     TypeShifted,        // lost/consumed its item: Speed ×2 until switch-out
+    // --- trapping (switch-out prevention) ---
+    Trapped,            // Mean Look / Block / Spider Web / Jaw Lock — foe-sourced, ends when trapper leaves
+    Ingrain,            // self-rooted: cannot switch (also grounded + 1/16 heal)
+    NoRetreat,          // self-trap after the +1-all-stats boost
+    Octolock,           // foe-sourced trap + end-of-turn Def/SpD drop
 }
 
 /// A packed set of active-Pokémon volatile statuses.
