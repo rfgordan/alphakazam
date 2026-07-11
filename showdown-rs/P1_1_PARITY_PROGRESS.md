@@ -95,9 +95,29 @@ The discrepancy campaign has implemented or corrected, among others:
 - Previously capped seeds 161, 166, 170, 179, 182, 185, 192, 203, 208, 209, and 217 subsequently
   matched under safe sequential caps. Seed 190 also matches after immediate pivot endpoint
   certification. Seed 182 was the heaviest completed case at 91,455 paths and about 759 MiB RSS.
-- Fresh seeds 221–240 produced 18 exact matches and no discrepancy. Seeds 228 and 235 exceeded the
-  conservative campaign cap; seed 228 also exceeded 50,000 paths and was left unverified rather
-  than risking a near-gigabyte oracle run.
+- Fresh seeds 221–240 produced 18 exact matches and no discrepancy. Previously capped seeds 228
+  and 235 are now certified **EXACT MATCH**: under the staged coalescing enumerator they complete
+  at 3,380 and 37 paths respectively (431 MiB / 226 MiB oracle RSS), far below a 100,000-path cap.
+  No seed in the 221–240 range remains unverified.
+- Campaign extension 241–320 (80 seeds, 20,000-path first pass, sequential escalation of every
+  capped seed to 100k/250k caps): **71 EXACT MATCH, 9 DIVERGENCE, zero unverified**. All 13
+  conservative-cap seeds certified on escalation except 287 (which diverged once enumerable).
+  Heaviest completed case: seed 255 at 190,917 paths and ~1.03 GiB oracle RSS at the 250,000-path
+  cap; peak observed oracle RSS was ~1.26 GiB (seed 268 first pass). No seed required the 600k cap.
+- Seed 244 exposed an oracle harness bug, not an engine issue: the forced-PRNG shim emitted
+  unclamped `randomChance(130, 100)` branch probabilities (boosted accuracy), inflating total
+  distribution mass to 1.3 and tripping the mass check. PS semantics are `random(d) < n`, i.e.
+  certainty for n >= d; after clamping the shim, seed 244 is **EXACT MATCH** at 5,671 paths. The
+  clamp is a no-op for every seed whose mass check already passed.
+- Campaign 241–320 divergences (traces + `VERBOSE=1 DRAWS=1` logs preserved; engine fixes owned
+  elsewhere): seeds 268/292 — Outrage lock counter `Rampaging(589, 1)` vs PS `Rampaging(589, 3)`
+  on the 3-turn draw branch (Rust-only mass 0.5); seed 279 — Iron Head vs Samurott-Hisui switch-in,
+  defender hp 186 vs 220 on a 1/24 (crit) branch; seed 287 — Dragon Ascent target hp 135 vs 210 on
+  ~all mass; seed 293 — Sucker Punch vs Draining Kiss, engine routes ~1.0 mass to a request
+  boundary where PS has none; seed 298 — U-turn pivot resolves species 495/hp 184 vs PS 496/168;
+  seed 316 — Tri Attack missing secondary branches (Rust masses = PS × 1.25 on shared outcomes);
+  seed 318 — Dragon Tail phazes on the 10% miss branch (`active_index` 1 vs 0); seed 320 —
+  Psyshock mirror, defender hp 197 vs 166 on ~0.98 mass.
 - Seed campaign 181–220: all 32 tractable seeds matched; 8 exceeded the conservative 20,000-path
   campaign cap; no behavioral discrepancy was found.
 - Earlier campaigns through seed 180 exposed and drove the Wish, Take Heart, confusion, Payback,

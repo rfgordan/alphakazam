@@ -241,12 +241,16 @@ function installForcedPrng(battle, prefix) {
 		const n = hi - lo;
 		return take('random', [lo, hi], Array.from({ length: n }, (_, i) => ({ value: lo + i, probability: 1 / n })));
 	};
-	prng.randomChance = (numerator, denominator) => take(
-		'randomChance', [numerator, denominator], [
-			{ value: true, probability: numerator / denominator },
-			{ value: false, probability: (denominator - numerator) / denominator },
-		].filter(x => x.probability > 0),
-	);
+	prng.randomChance = (numerator, denominator) => {
+		// PS semantics: randomChance(n, d) is random(d) < n, so n >= d (e.g. boosted
+		// accuracy 130/100) is certainty. Clamp before turning the draw into branch
+		// probabilities or the enumeration emits mass > 1 and trips the mass check.
+		const clamped = Math.min(Math.max(numerator, 0), denominator);
+		return take('randomChance', [numerator, denominator], [
+			{ value: true, probability: clamped / denominator },
+			{ value: false, probability: (denominator - clamped) / denominator },
+		].filter(x => x.probability > 0));
+	};
 	prng.sample = items => {
 		if (!items.length) throw new RangeError('Cannot sample an empty array');
 		const index = take('sample', [items.length], items.map((_, i) => ({ value: i, probability: 1 / items.length })));
