@@ -92,8 +92,12 @@ The discrepancy campaign has implemented or corrected, among others:
 - Previously reported sampled legality discrepancies: **eliminated**.
 - Exact distribution smoke: **18 / 18 matched**, including forced-switch seed 90.
 - Full-cap heavy seeds 145 and 147 matched after the memory changes.
-- Previously capped seeds 161, 166, 170, 179, 182, 185, and 192 subsequently matched at the
-  100,000-path cap. Seed 190 reached a policy-dependent pivot boundary without a Rust divergence.
+- Previously capped seeds 161, 166, 170, 179, 182, 185, 192, 203, 208, 209, and 217 subsequently
+  matched under safe sequential caps. Seed 190 also matches after immediate pivot endpoint
+  certification. Seed 182 was the heaviest completed case at 91,455 paths and about 759 MiB RSS.
+- Fresh seeds 221–240 produced 18 exact matches and no discrepancy. Seeds 228 and 235 exceeded the
+  conservative campaign cap; seed 228 also exceeded 50,000 paths and was left unverified rather
+  than risking a near-gigabyte oracle run.
 - Seed campaign 181–220: all 32 tractable seeds matched; 8 exceeded the conservative 20,000-path
   campaign cap; no behavioral discrepancy was found.
 - Earlier campaigns through seed 180 exposed and drove the Wish, Take Heart, confusion, Payback,
@@ -135,6 +139,9 @@ mathematical proof over every possible supported battle state.
 - `354e7e6` — exact multi-hit Ice Face with focused tests.
 - `8f587fb` — bounded-memory exact oracle checkpoints.
 - `2300c70` — forced-switch distribution boundary certification.
+- `0cf7266` — bounded variable/high-hit Sturdy and Focus Sash behavior.
+- `4d01125` — immediate policy-neutral pivot endpoint certification.
+- `c2534ea` — deduplicated retained oracle outcome state.
 
 ## Token usage
 
