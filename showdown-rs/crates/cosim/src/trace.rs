@@ -64,6 +64,10 @@ pub struct DecisionDistribution {
 #[derive(Deserialize)]
 pub struct DistributionOutcome {
     pub probability: f64,
+    #[serde(rename = "requestState", default)]
+    pub request_state: String,
+    #[serde(rename = "midTurn", default)]
+    pub mid_turn: bool,
     pub state: Value,
 }
 

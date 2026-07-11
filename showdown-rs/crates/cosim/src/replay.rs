@@ -194,6 +194,9 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         if unit.len() != 1 {
             return mk(Verdict::Unsupported(Unsupported("distribution:trailing-request-boundary".into())), legality);
         }
+        if dist.outcomes.iter().any(|o| o.request_state == "switch" || o.mid_turn) {
+            return mk(Verdict::Unsupported(Unsupported("distribution:request-phase-boundary".into())), legality);
+        }
         let mut ps_clusters: Vec<(State, f64)> = Vec::new();
         for outcome in &dist.outcomes {
             let mut state = match convert_state(&outcome.state, canon) {

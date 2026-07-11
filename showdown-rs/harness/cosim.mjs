@@ -256,50 +256,90 @@ function installForcedPrng(battle, prefix) {
 	// each Fisher-Yates step, yielding the exact permutation distribution.
 }
 
-function enumerateDecisionDistribution(checkpoint, choices, roster) {
-	// Logs are observational noise and can already exceed PS's per-resolution safety window in
-	// a long battle. Branch replays do not send protocol output, so reset the log counters while
-	// preserving every gameplay-relevant field.
-	checkpoint = structuredClone(checkpoint);
+class ActionComplete extends Error {}
+
+function cleanCheckpoint(state) {
+	const checkpoint = structuredClone(state);
 	checkpoint.log = [];
 	checkpoint.messageLog = [];
 	checkpoint.sentLogPos = 0;
-	const work = [{ prefix: [], probability: 1 }];
+	return checkpoint;
+}
+
+function enumerateDecisionDistribution(checkpoint, choices, roster) {
+	// Expand one queued Showdown action at a time and coalesce identical serialized states
+	// between actions. This computes the same exact distribution as whole-turn prefix replay,
+	// but avoids multiplying independent damage/crit/secondary paths across both moves.
+	let replayLeaves = 0;
+	let frontier = [{ checkpoint: cleanCheckpoint(checkpoint), probability: 1, initial: true }];
 	const outcomes = new Map();
-	let completedPaths = 0;
-	while (work.length) {
-		const job = work.pop();
-		// Deserialization resolves reference markers in-place; every replay needs an untouched
-		// serialization tree or later branches alias live objects and eventually loop.
-		const branch = State.deserializeBattle(structuredClone(checkpoint));
-		branch.restart(() => {});
-		installForcedPrng(branch, job.prefix);
-		try {
-			for (const [sideId, c] of Object.entries(choices)) {
-				const ok = branch.choose(sideId, c.choice);
-				if (!ok) throw new Error(`PS rejected distribution choice '${c.choice}' for ${sideId}`);
-			}
-			const state = snapshot(branch, roster);
-			const key = JSON.stringify(state);
-			const prev = outcomes.get(key);
-			if (prev) prev.probability += job.probability;
-			else outcomes.set(key, { probability: job.probability, state });
-			completedPaths++;
-			if (completedPaths > MAX_DIST_PATHS) throw new Error(`distribution path cap ${MAX_DIST_PATHS} exceeded`);
-		} catch (e) {
-			if (!(e instanceof NeedRandom)) throw e;
-			for (const option of e.options) {
-				work.push({
-					prefix: [...job.prefix, { kind: e.kind, args: e.args, value: option.value }],
-					probability: job.probability * option.probability,
-				});
+
+	while (frontier.length) {
+		const nextStages = new Map();
+		for (const stage of frontier) {
+			const work = [{ prefix: [], probability: stage.probability }];
+			while (work.length) {
+				const job = work.pop();
+				const branch = State.deserializeBattle(structuredClone(stage.checkpoint));
+				branch.restart(() => {});
+				installForcedPrng(branch, job.prefix);
+				const originalRunAction = branch.runAction.bind(branch);
+				branch.runAction = action => {
+					originalRunAction(action);
+					throw new ActionComplete();
+				};
+				let paused = false;
+				try {
+					if (stage.initial) {
+						for (const [sideId, c] of Object.entries(choices)) {
+							const ok = branch.choose(sideId, c.choice);
+							if (!ok) throw new Error(`PS rejected distribution choice '${c.choice}' for ${sideId}`);
+						}
+					} else {
+						branch.turnLoop();
+					}
+				} catch (e) {
+					if (e instanceof NeedRandom) {
+						for (const option of e.options) {
+							work.push({
+								prefix: [...job.prefix, { kind: e.kind, args: e.args, value: option.value }],
+								probability: job.probability * option.probability,
+							});
+						}
+						continue;
+					}
+					if (!(e instanceof ActionComplete)) throw e;
+					paused = true;
+				}
+
+				replayLeaves++;
+				if (replayLeaves > MAX_DIST_PATHS) throw new Error(`distribution path cap ${MAX_DIST_PATHS} exceeded`);
+				// A request/terminal boundary is an observable endpoint even if it arose within an
+				// action. Otherwise serialize the remaining queue and resume at the next action.
+				if (branch.requestState || branch.ended || !paused) {
+					const state = snapshot(branch, roster);
+					const requestState = branch.requestState;
+					const midTurn = !!branch.midTurn;
+					const key = JSON.stringify({ requestState, midTurn, state });
+					const prev = outcomes.get(key);
+					if (prev) prev.probability += job.probability;
+					else outcomes.set(key, { probability: job.probability, requestState, midTurn, state });
+				} else {
+					const next = cleanCheckpoint(State.serializeBattle(branch));
+					const key = JSON.stringify(next);
+					const prev = nextStages.get(key);
+					if (prev) prev.probability += job.probability;
+					else nextStages.set(key, { checkpoint: next, probability: job.probability, initial: false });
+				}
 			}
 		}
+		frontier = [...nextStages.values()];
 	}
+
 	const distribution = [...outcomes.values()].sort((a, b) => JSON.stringify(a.state).localeCompare(JSON.stringify(b.state)));
 	const total = distribution.reduce((s, x) => s + x.probability, 0);
 	if (Math.abs(total - 1) > 1e-10) throw new Error(`distribution mass is ${total}, expected 1`);
-	return { paths: completedPaths, outcomes: distribution };
+	return { paths: replayLeaves, outcomes: distribution };
 }
 
 // ---- choice policy ---------------------------------------------------------------
@@ -412,8 +452,12 @@ async function main() {
 		if (!Object.keys(choices).length) {
 			throw new Error(`no side can act at decision ${decisions.length} (requestState=${requestState})`);
 		}
-		const checkpoint = DISTRIBUTIONS ? State.serializeBattle(battle) : null;
-		const distribution = DISTRIBUTIONS ? enumerateDecisionDistribution(checkpoint, choices, roster) : undefined;
+		// Team-preview queue actions temporarily assemble side.pokemon and are not restartable
+		// one action at a time through State.deserializeBattle. They are deterministic setup, not
+		// part of the battle transition kernel we need to certify.
+		const enumerate = DISTRIBUTIONS && requestState !== 'teampreview';
+		const checkpoint = enumerate ? State.serializeBattle(battle) : null;
+		const distribution = enumerate ? enumerateDecisionDistribution(checkpoint, choices, roster) : undefined;
 		// Submitting the final needed choice runs the battle forward synchronously.
 		for (const [sideId, c] of Object.entries(choices)) {
 			const ok = battle.choose(sideId, c.choice);
