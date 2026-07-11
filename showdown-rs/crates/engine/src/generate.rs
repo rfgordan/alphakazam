@@ -1646,6 +1646,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         md.category = if atk > spa { MoveCategory::Physical } else { MoveCategory::Special };
     }
 
+    // Charge (including the volatile granted by Electromorphosis) doubles the next Electric
+    // attack and is consumed by any non-Charge Electric move. PS also consumes it when that
+    // move subsequently misses or is aborted, so remove it before the move's early exits.
+    if md.typ == Type::Electric
+        && md.id.to_id() != "charge"
+        && b.state.side(side).volatiles.contains(VolatileStatus::Charge)
+    {
+        if md.category != MoveCategory::Status {
+            md.base_power = md.base_power.saturating_mul(2);
+        }
+        push(&mut b, Instruction::RemoveVolatile {
+            side,
+            volatile: VolatileStatus::Charge,
+        });
+    }
+
     // Disable: the disabled move fails outright; Taunt: status moves fail.
     if !struggling {
         let dis = b.state.side(side).disable;
@@ -1909,6 +1925,42 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
         // confusion) — route through the rampage/recoil tail rather than returning bare.
         let out = apply_rampage_state(out, side, move_id);
+        return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
+    }
+
+    // Ice Face nullifies one physical hit and changes Eiscue into its Noice forme. Handle the
+    // single-hit kernel here; multi-hit moves need to break the face on hit one and continue.
+    if def_ab == crate::ids::Ability::IceFace
+        && md.category == MoveCategory::Physical
+        && md.hits_max == 1
+        && defender.species == crate::ids::Species::from_id("eiscue").unwrap_or(crate::ids::Species::None)
+    {
+        let mut hb = scaled(&b, hit_prob);
+        if let Some(noice) = crate::ids::Species::from_id("eiscuenoice") {
+            let p = hb.state.side(foe).active();
+            let level = p.level;
+            let base = crate::data::base_stats(noice);
+            let mut stats = p.stats;
+            for (si, stat) in [
+                crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
+                crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
+                crate::ids::StatIndex::Speed,
+            ].into_iter().enumerate() {
+                stats[si + 1] = crate::damage::compute_stat(base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat);
+            }
+            let previous = transform_data_of(&hb.state, foe);
+            let mut new = previous;
+            new.species = noice;
+            new.stats = stats;
+            let slot = hb.state.side(foe).active_index;
+            let previous_base_moves = hb.state.side(foe).active().base_moves;
+            push(&mut hb, Instruction::Transform { side: foe, slot, previous, new, previous_base_moves });
+            // Ice Face nullifies damage, but the connected hit still increments Rage Fist's
+            // per-Pokémon hit counter.
+            let cur = hb.state.side(foe).active().times_hit;
+            push(&mut hb, Instruction::SetTimesHit { side: foe, slot, previous: cur, new: cur.saturating_add(1) });
+        }
+        out.push(hb);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -2725,6 +2777,15 @@ fn apply_post_damage(
                     push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
                 }
             }
+        }
+        // Electromorphosis charges the holder after any damaging hit. The Charge volatile
+        // doubles its next Electric move and is consumed by that move.
+        if !hit_sub
+            && def_ability == Ab::Electromorphosis
+            && b.state.side(foe).active().is_alive()
+            && !b.state.side(foe).volatiles.contains(VolatileStatus::Charge)
+        {
+            push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Charge });
         }
     }
 
