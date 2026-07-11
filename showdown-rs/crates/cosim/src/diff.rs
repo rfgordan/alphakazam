@@ -76,7 +76,8 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
         cmp!(out, s("active_index"), a.active_index, b.active_index);
     }
 
-    let active_alive = b.active_index != u8::MAX
+    let active_alive = a.active_index != u8::MAX
+        && b.active_index != u8::MAX
         && a.pokemon[a.active_index as usize].is_alive()
         && b.pokemon[b.active_index as usize].is_alive();
     if active_alive && a.active_index == b.active_index {

@@ -233,20 +233,53 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             }
         }
-        if dist.outcomes.iter().any(|o| o.request_state == "switch" || o.mid_turn) {
-            return mk(Verdict::Unsupported(Unsupported("distribution:request-phase-boundary".into())), legality);
+        // A forced-switch request is a valid, policy-neutral endpoint: no replacement has
+        // been chosen yet. `convert_state` represents PS's empty active slot with a sentinel,
+        // and `diff_states` consequently compares the fainted roster member plus all shared
+        // side/field state while omitting active-only fields. Do not continue through the
+        // request (that would require assigning a switch policy); compare its exact support
+        // and probability mass at the boundary instead.
+        let mut boundary_kernel_states = Vec::new();
+        for kernel in dist.kernels.iter().filter(|k| k.action.choice == "move") {
+            for outcome in &kernel.outcomes {
+                let mut state = match convert_state(&outcome.state, canon) {
+                    Ok(s) => s,
+                    Err(u) => return mk(Verdict::Unsupported(u), legality),
+                };
+                state.sleep_clause = sleep_clause;
+                if state.sides.iter().any(|side| side.active_index == u8::MAX) {
+                    boundary_kernel_states.push(state);
+                }
+            }
         }
-        let mut ps_clusters: Vec<(State, f64)> = Vec::new();
+        let mut ps_clusters: Vec<(State, f64, bool)> = Vec::new();
         for outcome in &dist.outcomes {
             let mut state = match convert_state(&outcome.state, canon) {
                 Ok(s) => s,
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             };
             state.sleep_clause = sleep_clause;
-            if let Some((_, mass)) = ps_clusters.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
+            if outcome.request_state == "switch"
+                && state.sides.iter().all(|side| side.active_index != u8::MAX)
+            {
+                // An alive active at a switch request is a pivot-style decision. Its endpoint
+                // depends on a replacement choice, unlike a forced replacement after faint.
+                return mk(Verdict::Unsupported(Unsupported(
+                    "distribution:pivot-request-boundary".into(),
+                )), legality);
+            }
+            let boundary = outcome.request_state == "switch";
+            if boundary && !boundary_kernel_states.iter().any(|s| diff_states(s, &state).is_empty()) {
+                return mk(Verdict::Unsupported(Unsupported(
+                    "distribution:uncovered-forced-switch-boundary".into(),
+                )), legality);
+            }
+            if let Some((_, mass, _)) = ps_clusters.iter_mut()
+                .find(|(s, _, b)| *b == boundary && diff_states(s, &state).is_empty())
+            {
                 *mass += outcome.probability;
             } else {
-                ps_clusters.push((state, outcome.probability));
+                ps_clusters.push((state, outcome.probability, boundary));
             }
         }
         let mut rust_mass = vec![0.0f64; ps_clusters.len()];
@@ -255,7 +288,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
             let mut cand = state_before;
             cand.apply_instructions(&branch.instructions);
             let p = branch.percentage as f64 / 100.0;
-            if let Some(i) = ps_clusters.iter().position(|(s, _)| diff_states(&cand, s).is_empty()) {
+            if let Some(i) = ps_clusters.iter().position(|(s, _, _)| diff_states(&cand, s).is_empty()) {
                 rust_mass[i] += p;
             } else {
                 unmatched_rust += p;
@@ -263,10 +296,19 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         }
         const TOL: f64 = 2e-5;
         let mut errors = Vec::new();
-        if unmatched_rust > TOL {
-            errors.push(format!("Rust-only mass {unmatched_rust:.8}"));
+        let ps_boundary_mass: f64 = ps_clusters.iter()
+            .filter(|(_, _, boundary)| *boundary)
+            .map(|(_, mass, _)| mass)
+            .sum();
+        let rust_boundary_mass = unmatched_rust + ps_clusters.iter().zip(&rust_mass)
+            .filter(|((_, _, boundary), _)| *boundary)
+            .map(|(_, mass)| *mass)
+            .sum::<f64>();
+        if (ps_boundary_mass - rust_boundary_mass).abs() > TOL {
+            errors.push(format!("request-boundary mass: rust={rust_boundary_mass:.8} ps={ps_boundary_mass:.8} delta={:.8}", rust_boundary_mass - ps_boundary_mass));
         }
-        for (i, ((_, ps), rs)) in ps_clusters.iter().zip(&rust_mass).enumerate() {
+        for (i, ((_, ps, boundary), rs)) in ps_clusters.iter().zip(&rust_mass).enumerate() {
+            if *boundary { continue; }
             if (ps - rs).abs() > TOL {
                 errors.push(format!("outcome {i}: rust={rs:.8} ps={ps:.8} delta={:.8}", rs - ps));
             }
@@ -492,15 +534,19 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             out.push(format!("moves[{side_key}]: ps={ps_moves:?} engine={eng_moves:?}"));
         }
 
-        // Trapping: the engine doesn't model it; surface when PS traps a side.
-        if matches!(act.get("trapped"), Some(Value::Bool(true))) {
+        // PS also reports `trapped` while a Pokémon is committed to a rampage/charge. That
+        // restriction is already represented by PendingMove and the locked move set above;
+        // only surface trapping that the engine has not otherwise modeled.
+        let committed = !matches!(side.pending_move, engine::state::PendingMove::None);
+        if matches!(act.get("trapped"), Some(Value::Bool(true))) && !committed {
             out.push(format!("trapped[{side_key}]"));
         }
 
         // Tera availability.
         let ps_tera = act.get("canTerastallize").and_then(Value::as_str).is_some_and(|t| !t.is_empty())
             || matches!(act.get("canTerastallize"), Some(Value::Bool(true)));
-        let eng_tera = !side.tera_used;
+        // A committed multi-turn action cannot newly Terastallize on its continuation turn.
+        let eng_tera = !side.tera_used && !committed;
         if ps_tera != eng_tera {
             out.push(format!("tera[{side_key}]: ps={ps_tera} engine={eng_tera}"));
         }
