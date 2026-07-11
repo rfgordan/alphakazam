@@ -51,7 +51,10 @@ def bench(envs: int, seconds: float, mode: str) -> tuple[float, int]:
             obs = torch.from_numpy(vec.observe_all(side))
             mask = torch.from_numpy(vec.legal_all(side))
             logits = model(obs).masked_fill(~mask, float("-inf"))
-            return logits.argmax(dim=-1).numpy()
+            # Sample (Gumbel argmax), not greedy: an untrained greedy policy stalls games into
+            # cheap no-op turns and inflates steps/s ~3x. Sampling matches training reality.
+            gumbel = -torch.log(-torch.log(torch.rand_like(logits)))
+            return (logits + gumbel).argmax(dim=-1).numpy()
 
     steps = 0
     episodes = 0
