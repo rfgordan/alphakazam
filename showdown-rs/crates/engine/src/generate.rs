@@ -1301,8 +1301,9 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let mut out = Vec::new();
     let mut act = 1.0f32;
     if confused {
-        out.extend(confusion_self_hit(scaled(&b, act * (1.0 / 3.0)), side));
-        act *= 2.0 / 3.0;
+        // PS uses randomChance(33, 100), not an exact one-third check.
+        out.extend(confusion_self_hit(scaled(&b, act * 0.33), side));
+        act *= 0.67;
     }
     if status == Status::Paralysis {
         out.push(scaled(&b, act * 0.25)); // fully paralyzed: no move
@@ -1545,6 +1546,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if attacker.stat(crate::ids::StatIndex::Attack) > attacker.stat(crate::ids::StatIndex::SpecialAttack) {
             md.category = MoveCategory::Physical;
         }
+    }
+    // Payback doubles only after the target has already acted. A queued opposing move means
+    // it has not; a freshly switched target (`active_turns == 0`) is also explicitly exempt.
+    if md.id.to_id() == "payback"
+        && foe_pending_move.is_none()
+        && b.state.side(side.other()).active_turns > 0
+    {
+        md.base_power = md.base_power.saturating_mul(2);
     }
     // -ate abilities (Pixilate/Refrigerate/Aerilate/Galvanize): a Normal-type move becomes the
     // ability's type and gains ×1.2 base power (PS onModifyType + onBasePower). Excludes moves
@@ -2401,6 +2410,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             | (Item::SoftSand, Type::Ground)
             | (Item::SharpBeak, Type::Flying)
             | (Item::TwistedSpoon, Type::Psychic)
+            | (Item::MindPlate, Type::Psychic)
             | (Item::SilverPowder, Type::Bug)
             | (Item::HardStone, Type::Rock)
             | (Item::SpellTag, Type::Ghost)
@@ -3690,6 +3700,24 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
                 }
             }
         }
+        return vec![b];
+    }
+
+    // Take Heart is callback-only in PS data: cure the user's status and raise SpA/SpD by 1.
+    if md.id.to_id() == "takeheart" {
+        let mut b = b;
+        let (status, counter, slot) = {
+            let p = b.state.side(side).active();
+            (p.status, p.status_counter, b.state.side(side).active_index)
+        };
+        if status != Status::None {
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+            if counter != 0 {
+                push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
+            }
+        }
+        apply_self_boost(&mut b, side, BoostIndex::SpecialAttack, 1);
+        apply_self_boost(&mut b, side, BoostIndex::SpecialDefense, 1);
         return vec![b];
     }
 

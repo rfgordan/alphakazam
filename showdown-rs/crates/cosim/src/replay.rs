@@ -204,6 +204,18 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             };
             input.sleep_clause = sleep_clause;
+            if input.side(side).active_index == u8::MAX {
+                let no_op = vec![engine::instruction::StateInstructions { percentage: 100.0, instructions: Vec::new() }];
+                match compare_distribution(&input, &no_op, &kernel.outcomes, canon, sleep_clause) {
+                    Ok(None) => continue,
+                    Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
+                        detail: format!("action {side_key}:{move_id} (no active): {detail}"),
+                        branches: 1,
+                        outcomes: kernel.outcomes.len(),
+                    }, legality),
+                    Err(u) => return mk(Verdict::Unsupported(u), legality),
+                }
+            }
             let Some(move_idx) = input.side(side).active().moves.iter().position(|m| m.id.to_id() == move_id) else {
                 return mk(Verdict::Unsupported(Unsupported(format!("distribution:kernel-move-not-found:{move_id}"))), legality);
             };

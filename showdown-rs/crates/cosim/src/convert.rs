@@ -140,17 +140,15 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
     // drops `terastallized` from fainted mons, so the snapshot alone can't recover it).
     side.tera_used = b(v, "teraUsed") || side.pokemon.iter().any(|p| p.terastallized);
 
-    // A finished battle has no active on the losing side (PS drops the fainted active);
-    // mark with a sentinel and let the differ skip active-only comparisons. Side-level state
+    // At a terminal or mid-turn faint/request boundary PS can have no active in the slot.
+    // Mark it with a sentinel and let the differ skip active-only comparisons. Side-level state
     // (hazards/screens/slot conditions) still exists and must still be converted.
     let Some((active_slot, active_v)) = active else {
-        if ended {
-            side.active_index = u8::MAX;
-            convert_side_conditions(&v["sideConditions"], &mut side)?;
-            convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon, turn)?;
-            return Ok(side);
-        }
-        return Err(unsup("side:no-active"));
+        let _ = ended;
+        side.active_index = u8::MAX;
+        convert_side_conditions(&v["sideConditions"], &mut side)?;
+        convert_slot_conditions(v.get("slotConditions"), &mut side, si, canon, turn)?;
+        return Ok(side);
     };
     side.active_index = active_slot;
 
@@ -501,14 +499,14 @@ fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon:
         for (k, cv) in conds {
             match k.as_str() {
                 "wish" => {
-                    // No duration field (turn arithmetic via startingTurn). A wish present
-                    // in a post-turn snapshot always heals at the next end-of-turn with a
-                    // live occupant — fresh (made this turn) and lingering (slot was empty
-                    // at its maturity residual) both map to remaining = 1.
-                    let _ = turn;
+                    // PS stores startingTurn rather than duration. Immediately after the Wish
+                    // action `turn == startingTurn + 1` and two residual phases remain; at the
+                    // next decision boundary turn has advanced again and one remains. Matured
+                    // wishes that linger over an empty slot also map to one.
+                    let starting = cv.get("startingTurn").and_then(Value::as_u64).unwrap_or(0) as u32;
                     // hp can be fractional (maxhp/2 of an odd max); PS truncates on heal.
                     let hp = cv.get("hp").and_then(Value::as_f64).unwrap_or(0.0) as i16;
-                    side.wish = (1, hp);
+                    side.wish = (if turn <= starting + 1 { 2 } else { 1 }, hp);
                 }
                 "futuremove" => {
                     // source pokemon decides the attack's stats; map to a canonical slot
