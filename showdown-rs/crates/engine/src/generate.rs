@@ -2916,7 +2916,10 @@ fn apply_post_damage(
     // Track times the target has been hit (Rage Fist). PS counts each hit of a multi-hit
     // move separately (cosim caught the engine counting once per move). A hit absorbed by a
     // Substitute doesn't count.
-    if any_damage && !hit_sub && hits_landed > 0 && b.state.side(foe).active().is_alive() {
+    // Showdown records the connecting hit before faint processing, so a lethal hit still
+    // contributes to Rage Fist's per-Pokémon counter. Nominal later hits are excluded by the
+    // sequential hit generators before this function is called.
+    if any_damage && !hit_sub && hits_landed > 0 {
         let fslot = b.state.side(foe).active_index;
         let cur = b.state.side(foe).active().times_hit;
         let new = cur.saturating_add(hits_landed).min(250);
@@ -3278,9 +3281,8 @@ fn apply_multihit_dp_ice_face_sub(
 /// `max` times, clamping every running total at the target's current HP (overkill collapses
 /// to a single "faint" outcome), and after the kᵗʰ convolution fold in `P(hit count = k)` —
 /// so a variable [2,5] move's full range of totals is covered. Runs in O(max · HP · 32) time
-/// and O(HP) branches. Substitute routing and Sturdy/Focus Sash are not modeled on this path:
-/// both are one-hit effects (a Sash/Sturdy is broken by the second hit) and don't apply to
-/// the ≥2-hit moves that reach here.
+/// and O(HP) branches. The convolution remains sequential so Sturdy/Focus Sash activation,
+/// early fainting, and the number of hits that actually reach the Pokémon stay observable.
 fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: usize, max: usize, hit_prob: f32) -> Vec<(Branch, bool)> {
     use std::collections::HashMap;
     let foe = side.other();
@@ -3314,36 +3316,52 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
     // Convolve the per-hit distribution up to `max` times, clamping cumulative damage at the
     // target's HP (all overkill collapses to one faint outcome, bounding the support size).
     // After the kᵗʰ convolution, mix in the branch for "exactly k hits" weighted by P(k).
-    // The distribution is keyed by (total damage, hit count): hit count is itself observable
-    // state (Rage Fist's times-hit counts every hit), so merging across it would be lossy.
+    // State is (total damage, hits that actually reached the Pokémon, Focus Sash activated).
+    // Nominal hits after a faint do not connect and therefore do not increment Rage Fist.
     let cap = b.state.side(foe).active().hp.max(0) as i32;
-    let mut conv: HashMap<i32, f32> = HashMap::new();
-    conv.insert(0, 1.0);
-    let mut dist: HashMap<(i32, usize), f32> = HashMap::new();
+    let survival = calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash;
+    let mut conv: HashMap<(i32, u8, bool), f32> = HashMap::new();
+    conv.insert((0, 0, false), 1.0);
+    let mut dist: HashMap<(i32, u8, bool), f32> = HashMap::new();
     for k in 1..=max {
-        let mut next: HashMap<i32, f32> = HashMap::with_capacity(conv.len() + 32);
-        for (&t, &pt) in &conv {
+        let mut next: HashMap<(i32, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(t, landed, sash_used), &pt) in &conv {
             for &(v, pv) in &per_hit {
-                *next.entry((t + v).min(cap)).or_insert(0.0) += pt * pv;
+                let key = if t >= cap {
+                    (t, landed, sash_used)
+                } else {
+                    let hp = cap - t;
+                    let mut dealt = v.min(hp);
+                    let activates = t == 0 && survival && dealt >= hp;
+                    if activates { dealt = hp - 1; }
+                    (t + dealt, landed.saturating_add(1),
+                        sash_used || (activates && calc.def_item == Item::FocusSash))
+                };
+                *next.entry(key).or_insert(0.0) += pt * pv;
             }
         }
         conv = next;
         if let Some(&(_, pk)) = counts.iter().find(|(c, _)| *c == k) {
-            for (&t, &p) in &conv {
-                *dist.entry((t, k)).or_insert(0.0) += pk * p;
+            for (&key, &p) in &conv {
+                *dist.entry(key).or_insert(0.0) += pk * p;
             }
         }
     }
 
-    // One branch per distinct (total damage, hit count).
+    // One branch per distinct observable state.
     let mut out = Vec::with_capacity(dist.len());
-    for ((total, hits), p) in dist {
+    for ((total, hits, sash_used), p) in dist {
         let mut hb = scaled(b, hit_prob * p);
+        let slot = hb.state.side(foe).active_index;
+        if sash_used {
+            push(&mut hb, Instruction::ChangeItem {
+                side: foe, slot, previous: Item::FocusSash, new: Item::None,
+            });
+        }
         if total > 0 {
-            let slot = hb.state.side(foe).active_index;
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: total as i16 });
         }
-        apply_post_damage(&mut hb, side, md, total, total > 0, false, hits as u8, calc.life_orb, calc.def_item, calc.def_ability);
+        apply_post_damage(&mut hb, side, md, total, total > 0, false, hits, calc.life_orb, calc.def_item, calc.def_ability);
         out.push((hb, false));
     }
     out
@@ -3361,33 +3379,44 @@ fn apply_multihit_dp_sub(
     use std::collections::HashMap;
     let foe = side.other();
     let cap = b.state.side(foe).active().hp.max(0) as i32;
-    // Key: (sub_remaining, mon_damage). While the sub stands mon_damage == 0; once it breaks
-    // (sub_remaining == 0) it absorbs no more and the overflow of the breaking hit is discarded.
-    let mut conv: HashMap<(i32, i32), f32> = HashMap::new();
-    conv.insert((sub_hp0, 0), 1.0);
-    let mut dist: HashMap<(i32, i32, usize), f32> = HashMap::new();
+    // Key: (sub remaining, mon damage, mon-connected hits, Focus Sash activated).
+    let survival = calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash;
+    let mut conv: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
+    conv.insert((sub_hp0, 0, 0, false), 1.0);
+    let mut dist: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
     for k in 1..=max {
-        let mut next: HashMap<(i32, i32), f32> = HashMap::with_capacity(conv.len() + 32);
-        for (&(sub_rem, mon), &pt) in &conv {
+        let mut next: HashMap<(i32, i32, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(sub_rem, mon, mon_hits, sash_used), &pt) in &conv {
             for &(v, pv) in per_hit {
                 let key = if sub_rem > 0 {
-                    if v < sub_rem { (sub_rem - v, mon) } else { (0, mon) }
+                    if v < sub_rem {
+                        (sub_rem - v, mon, mon_hits, sash_used)
+                    } else {
+                        (0, mon, mon_hits, sash_used)
+                    }
+                } else if mon >= cap {
+                    (0, mon, mon_hits, sash_used)
                 } else {
-                    (0, (mon + v).min(cap))
+                    let hp = cap - mon;
+                    let mut dealt = v.min(hp);
+                    let activates = mon == 0 && survival && dealt >= hp;
+                    if activates { dealt = hp - 1; }
+                    (0, mon + dealt, mon_hits.saturating_add(1),
+                        sash_used || (activates && calc.def_item == Item::FocusSash))
                 };
                 *next.entry(key).or_insert(0.0) += pt * pv;
             }
         }
         conv = next;
         if let Some(&(_, pk)) = counts.iter().find(|(c, _)| *c == k) {
-            for (&(sub_rem, mon), &p) in &conv {
-                *dist.entry((sub_rem, mon, k)).or_insert(0.0) += pk * p;
+            for (&key, &p) in &conv {
+                *dist.entry(key).or_insert(0.0) += pk * p;
             }
         }
     }
 
     let mut out = Vec::with_capacity(dist.len());
-    for ((sub_rem, mon, hits), p) in dist {
+    for ((sub_rem, mon, mon_hits, sash_used), p) in dist {
         let mut hb = scaled(b, hit_prob * p);
         let sub_dmg = sub_hp0 - sub_rem;
         if sub_dmg > 0 {
@@ -3396,12 +3425,19 @@ fn apply_multihit_dp_sub(
         if sub_rem == 0 {
             push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
         }
+        let slot = hb.state.side(foe).active_index;
+        if sash_used {
+            push(&mut hb, Instruction::ChangeItem {
+                side: foe, slot, previous: Item::FocusSash, new: Item::None,
+            });
+        }
         if mon > 0 {
-            let slot = hb.state.side(foe).active_index;
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
         }
-        apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0, true, hits as u8, calc.life_orb, calc.def_item, calc.def_ability);
-        out.push((hb, true));
+        let only_hit_substitute = mon_hits == 0;
+        apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0,
+            only_hit_substitute, mon_hits, calc.life_orb, calc.def_item, calc.def_ability);
+        out.push((hb, only_hit_substitute));
     }
     out
 }
