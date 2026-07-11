@@ -108,6 +108,10 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
     if p.ability == QuickFeet && p.status != Status::None {
         spe *= 1.5;
     }
+    // Slow Start halves Speed for the first five active turns after each switch-in.
+    if p.ability == SlowStart && s.active_turns <= 5 {
+        spe *= 0.5;
+    }
     spe as i32
 }
 
@@ -405,6 +409,27 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
 /// Public entry point. `s1`/`s2` are side one's and side two's chosen actions.
 pub fn generate_instructions(state: &State, s1: MoveChoice, s2: MoveChoice) -> Vec<StateInstructions> {
     generate_instructions_ex(state, s1, s2, [None, None], [false, false])
+}
+
+/// Generate the conditional stochastic kernel for one queued move action only.
+///
+/// Unlike [`generate_instructions_ex`], this does not resolve ordering, execute the other
+/// side's action, or run end-of-turn residuals. It exists both for the request-model state
+/// machine and for factorized co-simulation: equality of each queued action's conditional
+/// distribution proves equality of their composition without materializing the Cartesian
+/// product of both moves' damage/crit/secondary branches.
+pub fn generate_move_action(
+    state: &State,
+    side: SideId,
+    move_idx: u8,
+    pivot: Option<u8>,
+    foe_pending_move: Option<crate::ids::MoveId>,
+) -> Vec<StateInstructions> {
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    execute_move(start, Action { side, move_idx, pivot, foe_pending_move })
+        .into_iter()
+        .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
+        .collect()
 }
 
 /// Apply Terastallization to a side's active at turn start: its types become its tera type
@@ -2111,6 +2136,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             (Item::ChoiceSpecs, MoveCategory::Special) => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             _ => {}
         }
+        // Light Ball doubles both offensive stats for every Pikachu forme. PS keys this on
+        // `baseSpecies.baseSpecies === Pikachu`; all generated forme ids share the prefix.
+        if attacker.item == Item::LightBall && attacker.species.to_id().starts_with("pikachu") {
+            atk_stat = crate::damage::modify(atk_stat, 2, 1);
+        }
         // Purifying Salt halves the attacker's offensive stat vs Ghost moves (onSourceModify
         // Atk/SpA chainModify(0.5)) — NOT the final damage, so the rounding point matters.
         if def_ab == Ab::PurifyingSalt && md.typ == Type::Ghost {
@@ -2137,6 +2167,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         match attacker.ability {
             Ab::HugePower | Ab::PurePower => atk_stat = crate::damage::modify(atk_stat, 2, 1),
             Ab::Guts if attacker.status != Status::None => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            Ab::SlowStart if md.category == MoveCategory::Physical && b.state.side(side).active_turns <= 5 => {
+                atk_stat = crate::damage::modify(atk_stat, 1, 2)
+            }
             Ab::Overgrow if md.typ == Type::Grass && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Blaze if md.typ == Type::Fire && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Torrent if md.typ == Type::Water && pinch => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -2147,7 +2180,6 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
             Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
             Ab::IronFist if md.flag_punch => atk_stat = crate::damage::modify(atk_stat, 4915, 4096), // ×1.2
-            Ab::StrongJaw if md.flag_bite => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             // Punk Rock is handled as a base-power modifier below (PS `onBasePower`), not here.
@@ -2384,6 +2416,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // for variable-power moves such as Triple Axel, whose 20/40/60-power hits are evaluated
     // independently.  Applying it to Attack produces a different damage support.
     if attacker.ability == Ab::Technician && base_power <= 60 {
+        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
+    }
+    // Strong Jaw is an onBasePower modifier in PS. Applying it to Attack changes rounding
+    // support (caught by the exact Crunch kernel on Strong Jaw Bruxish).
+    if attacker.ability == Ab::StrongJaw && md.flag_bite {
         base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
     }
     // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
@@ -3416,13 +3453,13 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         return vec![b];
     }
     let foe = side.other();
-    if !b.state.side(foe).active().is_alive() {
-        return vec![b];
-    }
-    // Shield Dust / Covert Cloak block chance-based secondaries against the holder.
-    if b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
-        || b.state.side(foe).active().item == Item::CovertCloak
-    {
+    let has_self = md.secondary_self_boosts.iter().any(|&x| x != 0);
+    let target_eligible = b.state.side(foe).active().is_alive()
+        && b.state.side(foe).active().ability != crate::ids::Ability::ShieldDust
+        && b.state.side(foe).active().item != Item::CovertCloak;
+    // Shield Dust / Covert Cloak remove target-facing secondaries, but PS preserves a
+    // secondary's `self` payload (Fiery Dance can still boost its user, including on a KO).
+    if !target_eligible && !has_self {
         return vec![b];
     }
     // Serene Grace doubles the secondary chance.
@@ -3434,10 +3471,19 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     let chance = pct as f32 / 100.0;
     let mut proc = scaled(&b, chance);
     let noproc = scaled(&b, 1.0 - chance);
+    if has_self && proc.state.side(side).active().is_alive() {
+        for (i, &delta) in md.secondary_self_boosts.iter().enumerate() {
+            if delta != 0 {
+                apply_self_boost(&mut proc, side, BOOST_ORDER[i], delta);
+            }
+        }
+    }
     let mut lowered = false;
-    for (i, &delta) in md.secondary_boosts.iter().enumerate() {
-        if delta != 0 {
-            lowered |= apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0;
+    if target_eligible {
+        for (i, &delta) in md.secondary_boosts.iter().enumerate() {
+            if delta != 0 {
+                lowered |= apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0;
+            }
         }
     }
     if lowered {
@@ -3446,7 +3492,8 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     let mut applied_sleep = false;
     let mut applied_status_now = false;
-    if md.secondary_status != Status::None
+    if target_eligible
+        && md.secondary_status != Status::None
         && status_applies(proc.state.side(foe).active(), md.secondary_status)
         && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
         && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
@@ -3487,7 +3534,8 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     // Chance-based volatile secondaries (Hurricane / Dynamic Punch confusion, Dire Claw ...).
     use crate::instruction::ActiveCounter;
-    if let Some(v) = md.secondary_volatile {
+    if target_eligible {
+      if let Some(v) = md.secondary_volatile {
         procs = procs
             .into_iter()
             .flat_map(|mut x| {
@@ -3509,6 +3557,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
                 vec![x]
             })
             .collect();
+      }
     }
     procs.push(noproc);
     procs
@@ -3527,7 +3576,7 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     // Force removes them (in exchange for the ×1.3 base power it already applied).
     let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce
         && md.secondary_self_boosts.iter().any(|&x| x != 0);
-    if !sheer_force {
+    if !sheer_force && md.secondary_chance == 0 {
         for (i, &delta) in md.secondary_self_boosts.iter().enumerate() {
             if delta != 0 {
                 apply_self_boost(b, side, BOOST_ORDER[i], delta);

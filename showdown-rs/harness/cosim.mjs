@@ -256,7 +256,25 @@ function installForcedPrng(battle, prefix) {
 	// each Fisher-Yates step, yielding the exact permutation distribution.
 }
 
-class ActionComplete extends Error {}
+class ActionComplete extends Error {
+	constructor(action, inputState) {
+		super(`action complete: ${action.choice}`);
+		this.action = action;
+		this.inputState = inputState;
+	}
+}
+
+function summarizeAction(action, battle) {
+	const foePending = action.pokemon ? battle.queue.list.find(a =>
+		a.choice === 'move' && a.pokemon?.side !== action.pokemon.side
+	) : null;
+	return {
+		choice: action.choice,
+		side: action.pokemon?.side?.id ?? null,
+		moveId: action.move?.id ?? null,
+		foePendingMoveId: foePending?.move?.id ?? null,
+	};
+}
 
 function cleanCheckpoint(state) {
 	const checkpoint = structuredClone(state);
@@ -273,11 +291,13 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 	let replayLeaves = 0;
 	let frontier = [{ checkpoint: cleanCheckpoint(checkpoint), probability: 1, initial: true }];
 	const outcomes = new Map();
+	const kernels = [];
 
 	while (frontier.length) {
 		const nextStages = new Map();
 		for (const stage of frontier) {
 			const work = [{ prefix: [], probability: stage.probability }];
+			const kernelGroups = new Map();
 			while (work.length) {
 				const job = work.pop();
 				const branch = State.deserializeBattle(structuredClone(stage.checkpoint));
@@ -285,10 +305,12 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 				installForcedPrng(branch, job.prefix);
 				const originalRunAction = branch.runAction.bind(branch);
 				branch.runAction = action => {
+					const inputState = snapshot(branch, roster);
 					originalRunAction(action);
-					throw new ActionComplete();
+					throw new ActionComplete(summarizeAction(action, branch), inputState);
 				};
 				let paused = false;
+				let completedAction = null;
 				try {
 					if (stage.initial) {
 						for (const [sideId, c] of Object.entries(choices)) {
@@ -310,6 +332,7 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					}
 					if (!(e instanceof ActionComplete)) throw e;
 					paused = true;
+					completedAction = e;
 				}
 
 				replayLeaves++;
@@ -331,6 +354,29 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 					if (prev) prev.probability += job.probability;
 					else nextStages.set(key, { checkpoint: next, probability: job.probability, initial: false });
 				}
+				if (completedAction) {
+					const groupKey = JSON.stringify({ action: completedAction.action, input: completedAction.inputState });
+					let group = kernelGroups.get(groupKey);
+					if (!group) {
+						group = { action: completedAction.action, input: completedAction.inputState, outcomes: new Map(), mass: 0 };
+						kernelGroups.set(groupKey, group);
+					}
+					const output = snapshot(branch, roster);
+					const key = JSON.stringify(output);
+					const conditional = job.probability / stage.probability;
+					group.mass += conditional;
+					const prev = group.outcomes.get(key);
+					if (prev) prev.probability += conditional;
+					else group.outcomes.set(key, { probability: conditional, state: output });
+				}
+			}
+			for (const group of kernelGroups.values()) {
+				kernels.push({
+					action: group.action,
+					input: group.input,
+					selectionProbability: group.mass,
+					outcomes: [...group.outcomes.values()].map(o => ({ ...o, probability: o.probability / group.mass })),
+				});
 			}
 		}
 		frontier = [...nextStages.values()];
@@ -339,7 +385,7 @@ function enumerateDecisionDistribution(checkpoint, choices, roster) {
 	const distribution = [...outcomes.values()].sort((a, b) => JSON.stringify(a.state).localeCompare(JSON.stringify(b.state)));
 	const total = distribution.reduce((s, x) => s + x.probability, 0);
 	if (Math.abs(total - 1) > 1e-10) throw new Error(`distribution mass is ${total}, expected 1`);
-	return { paths: replayLeaves, outcomes: distribution };
+	return { paths: replayLeaves, outcomes: distribution, kernels };
 }
 
 // ---- choice policy ---------------------------------------------------------------

@@ -59,6 +59,25 @@ pub struct Decision {
 pub struct DecisionDistribution {
     pub paths: u64,
     pub outcomes: Vec<DistributionOutcome>,
+    #[serde(default)]
+    pub kernels: Vec<ActionKernel>,
+}
+
+#[derive(Deserialize)]
+pub struct ActionKernel {
+    pub action: KernelAction,
+    pub input: Value,
+    pub outcomes: Vec<DistributionOutcome>,
+}
+
+#[derive(Deserialize)]
+pub struct KernelAction {
+    pub choice: String,
+    pub side: Option<String>,
+    #[serde(rename = "moveId")]
+    pub move_id: Option<String>,
+    #[serde(rename = "foePendingMoveId")]
+    pub foe_pending_move_id: Option<String>,
 }
 
 #[derive(Deserialize)]

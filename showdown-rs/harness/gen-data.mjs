@@ -72,7 +72,8 @@ moves.forEach((m, i) => {
 	const drain = Array.isArray(m.drain) ? `(${m.drain[0]},${m.drain[1]})` : '(0,1)';
 	// A boost/status secondary is probabilistic; a pure-volatile secondary (e.g. Salt
 	// Cure: 100% volatileStatus) is folded into `target_volatile` instead.
-	const secHasBoostOrStatus = !!(sec && (sec.boosts || sec.status));
+	const probabilisticSelf = !!(sec && sec.self && sec.self.boosts && sec.chance !== undefined && sec.chance < 100);
+	const secHasBoostOrStatus = !!(sec && (sec.boosts || sec.status)) || probabilisticSelf;
 	// A chance-based volatile secondary (Hurricane 30% confusion, Dire Claw, ...) — flinch is
 	// handled separately; 100%-chance volatiles fold into target_volatile below.
 	const secVol = sec && sec.volatileStatus && sec.volatileStatus !== 'flinch'
@@ -92,7 +93,7 @@ moves.forEach((m, i) => {
 	const selfTarget = m.target === 'self';
 	// Some moves boost the user via a 100%-chance self-secondary (Rapid Spin, Trailblaze,
 	// Meteor Mash, ...) — fold those into the deterministic self-boosts too.
-	const secSelfBoosts = sec && sec.self && (sec.chance === 100 || sec.chance === undefined) ? sec.self.boosts : null;
+	const secSelfBoosts = sec && sec.self ? sec.self.boosts : null;
 	// `self.boosts` (most), `selfBoost.boosts` (Scale Shot's post-hit +Spe/−Def), and top-level
 	// boosts when target is self feed the user's PRIMARY boosts (Close Combat, Leaf Storm — these
 	// survive Sheer Force). A 100%-chance self-SECONDARY (Trailblaze spe, Power-Up Punch atk) is a

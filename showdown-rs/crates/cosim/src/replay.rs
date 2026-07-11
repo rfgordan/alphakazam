@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use engine::generate::{generate_instructions_ex, switch_into, switch_into_pair, MoveChoice};
+use engine::generate::{generate_instructions_ex, generate_move_action, switch_into, switch_into_pair, MoveChoice};
 use engine::state::State;
 use serde_json::Value;
 
@@ -194,6 +194,33 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         if unit.len() != 1 {
             return mk(Verdict::Unsupported(Unsupported("distribution:trailing-request-boundary".into())), legality);
         }
+        for kernel in dist.kernels.iter().filter(|k| k.action.choice == "move") {
+            let Some(side_key) = kernel.action.side.as_deref() else { continue };
+            let Some(move_id) = kernel.action.move_id.as_deref() else { continue };
+            let side_idx = if side_key == "p1" { 0 } else if side_key == "p2" { 1 } else { continue };
+            let side = crate::convert::side_id(side_idx);
+            let mut input = match convert_state(&kernel.input, canon) {
+                Ok(s) => s,
+                Err(u) => return mk(Verdict::Unsupported(u), legality),
+            };
+            input.sleep_clause = sleep_clause;
+            let Some(move_idx) = input.side(side).active().moves.iter().position(|m| m.id.to_id() == move_id) else {
+                return mk(Verdict::Unsupported(Unsupported(format!("distribution:kernel-move-not-found:{move_id}"))), legality);
+            };
+            let foe_pending = kernel.action.foe_pending_move_id.as_deref().and_then(|id| {
+                input.side(side.other()).active().moves.iter().find(|m| m.id.to_id() == id).map(|m| m.id)
+            });
+            let action_branches = generate_move_action(&input, side, move_idx as u8, None, foe_pending);
+            match compare_distribution(&input, &action_branches, &kernel.outcomes, canon, sleep_clause) {
+                Ok(None) => {}
+                Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
+                    detail: format!("action {side_key}:{move_id}: {detail}"),
+                    branches: action_branches.len(),
+                    outcomes: kernel.outcomes.len(),
+                }, legality),
+                Err(u) => return mk(Verdict::Unsupported(u), legality),
+            }
+        }
         if dist.outcomes.iter().any(|o| o.request_state == "switch" || o.mid_turn) {
             return mk(Verdict::Unsupported(Unsupported("distribution:request-phase-boundary".into())), legality);
         }
@@ -293,6 +320,60 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
         Verdict::Diverged { closest: closest.unwrap_or_default(), branches: n },
         legality,
     )
+}
+
+/// Compare a Rust conditional branch set with a PS action kernel after canonical projection.
+/// Returns `Ok(None)` on exact support+mass equality, or a compact mismatch description.
+fn compare_distribution(
+    input: &State,
+    branches: &[engine::instruction::StateInstructions],
+    outcomes: &[crate::trace::DistributionOutcome],
+    canon: &Canonical,
+    sleep_clause: bool,
+) -> Result<Option<String>, Unsupported> {
+    let mut ps_clusters: Vec<(State, f64)> = Vec::new();
+    for outcome in outcomes {
+        let mut state = convert_state(&outcome.state, canon)?;
+        state.sleep_clause = sleep_clause;
+        if let Some((_, mass)) = ps_clusters.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
+            *mass += outcome.probability;
+        } else {
+            ps_clusters.push((state, outcome.probability));
+        }
+    }
+    let mut rust_mass = vec![0.0f64; ps_clusters.len()];
+    let mut unmatched_rust = 0.0f64;
+    let mut closest_unmatched: Option<Vec<Diff>> = None;
+    for branch in branches {
+        let mut cand = *input;
+        cand.apply_instructions(&branch.instructions);
+        let p = branch.percentage as f64 / 100.0;
+        if let Some(i) = ps_clusters.iter().position(|(s, _)| diff_states(&cand, s).is_empty()) {
+            rust_mass[i] += p;
+        } else {
+            unmatched_rust += p;
+            for (state, _) in &ps_clusters {
+                let diffs = diff_states(&cand, state);
+                if closest_unmatched.as_ref().is_none_or(|old| diffs.len() < old.len()) {
+                    closest_unmatched = Some(diffs);
+                }
+            }
+        }
+    }
+    const TOL: f64 = 2e-5;
+    let mut errors = Vec::new();
+    if unmatched_rust > TOL {
+        errors.push(format!("Rust-only mass {unmatched_rust:.8}"));
+        if let Some(diffs) = &closest_unmatched {
+            errors.extend(diffs.iter().take(3).map(|d| d.detail.clone()));
+        }
+    }
+    for (i, ((_, ps), rs)) in ps_clusters.iter().zip(&rust_mass).enumerate() {
+        if (ps - rs).abs() > TOL {
+            errors.push(format!("outcome {i}: rust={rs:.8} ps={ps:.8} delta={:.8}", rs - ps));
+        }
+    }
+    Ok((!errors.is_empty()).then(|| errors.into_iter().take(6).collect::<Vec<_>>().join(" | ")))
 }
 
 /// Did `side_key`'s active faint (making its pending switch request a faint replacement
