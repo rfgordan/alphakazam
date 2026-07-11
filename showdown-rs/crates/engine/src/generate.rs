@@ -1928,38 +1928,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
-    // Ice Face nullifies one physical hit and changes Eiscue into its Noice forme. Handle the
-    // single-hit kernel here; multi-hit moves need to break the face on hit one and continue.
+    // Ice Face nullifies one physical hit and changes Eiscue into its Noice forme.
     if def_ab == crate::ids::Ability::IceFace
         && md.category == MoveCategory::Physical
-        && md.hits_max == 1
         && defender.species == crate::ids::Species::from_id("eiscue").unwrap_or(crate::ids::Species::None)
+        && md.hits_max == 1
     {
         let mut hb = scaled(&b, hit_prob);
-        if let Some(noice) = crate::ids::Species::from_id("eiscuenoice") {
-            let p = hb.state.side(foe).active();
-            let level = p.level;
-            let base = crate::data::base_stats(noice);
-            let mut stats = p.stats;
-            for (si, stat) in [
-                crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
-                crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
-                crate::ids::StatIndex::Speed,
-            ].into_iter().enumerate() {
-                stats[si + 1] = crate::damage::compute_stat(base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat);
-            }
-            let previous = transform_data_of(&hb.state, foe);
-            let mut new = previous;
-            new.species = noice;
-            new.stats = stats;
-            let slot = hb.state.side(foe).active_index;
-            let previous_base_moves = hb.state.side(foe).active().base_moves;
-            push(&mut hb, Instruction::Transform { side: foe, slot, previous, new, previous_base_moves });
-            // Ice Face nullifies damage, but the connected hit still increments Rage Fist's
-            // per-Pokémon hit counter.
-            let cur = hb.state.side(foe).active().times_hit;
-            push(&mut hb, Instruction::SetTimesHit { side: foe, slot, previous: cur, new: cur.saturating_add(1) });
-        }
+        break_ice_face(&mut hb, foe);
         out.push(hb);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
@@ -2044,6 +2020,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             v.push((hb, hit_sub));
         }
         v
+    } else if ice_face_is_intact(&b, foe, &md) {
+        apply_multihit_dp_ice_face(&b, side, &md, hits_min, hits_max, hit_prob)
     } else {
         apply_multihit_dp(&b, side, &md, hits_min, hits_max, hit_prob)
     };
@@ -2607,11 +2585,50 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 /// Applies a damaging move's hits sequentially (each its own roll and crit), clamped to HP
 /// and routed through any Substitute; returns true if a Substitute absorbed the damage (so
 /// the target's own secondaries/volatiles are blocked).
+fn ice_face_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bool {
+    let p = b.state.side(foe).active();
+    md.category == MoveCategory::Physical
+        && p.ability == crate::ids::Ability::IceFace
+        && p.species == crate::ids::Species::from_id("eiscue").unwrap_or(crate::ids::Species::None)
+}
+
+/// Breaks an intact Ice Face and records the blocked hit. Transform instructions carry the
+/// complete previous forme data, so reversing a generated branch restores Eiscue exactly.
+fn break_ice_face(b: &mut Branch, foe: SideId) {
+    let Some(noice) = crate::ids::Species::from_id("eiscuenoice") else { return };
+    let p = b.state.side(foe).active();
+    let level = p.level;
+    let base = crate::data::base_stats(noice);
+    let mut stats = p.stats;
+    for (si, stat) in [
+        crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
+        crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
+        crate::ids::StatIndex::Speed,
+    ].into_iter().enumerate() {
+        stats[si + 1] = crate::damage::compute_stat(
+            base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat,
+        );
+    }
+    let previous = transform_data_of(&b.state, foe);
+    let mut new = previous;
+    new.species = noice;
+    new.stats = stats;
+    let slot = b.state.side(foe).active_index;
+    let previous_base_moves = b.state.side(foe).active().base_moves;
+    push(b, Instruction::Transform { side: foe, slot, previous, new, previous_base_moves });
+    let cur = b.state.side(foe).active().times_hit;
+    push(b, Instruction::SetTimesHit {
+        side: foe, slot, previous: cur, new: cur.saturating_add(1).min(250),
+    });
+}
+
 fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) -> bool {
     use crate::ids::Ability as Ab;
     let foe = side.other();
-    let DamageCalc { rolls_nocrit, rolls_crit, def_ability, def_item, def_maxhp, life_orb } =
-        compute_damage(b, side, md);
+    let initial_calc = compute_damage(b, side, md);
+    let (def_ability, def_item, def_maxhp, life_orb) =
+        (initial_calc.def_ability, initial_calc.def_item, initial_calc.def_maxhp, initial_calc.life_orb);
+    let mut calc = initial_calc;
     // Apply each hit's damage independently (own roll and crit), clamped to current HP
     // (a hit that faints the target ends the sequence; remaining hits add nothing).
     let mut any_damage = false;
@@ -2619,7 +2636,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
     for &(roll, crit) in hits {
-        let rolls = if crit { &rolls_crit } else { &rolls_nocrit };
+        let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
         let raw = rolls[roll as usize];
         // Route to the Substitute if the target has one up (it absorbs the whole hit).
         // Sound moves and Infiltrator users go straight through it.
@@ -2635,6 +2652,12 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             total_dealt += sub_dmg as i32;
             any_damage = true;
             hit_sub = true;
+            continue;
+        }
+        if ice_face_is_intact(b, foe, md) {
+            break_ice_face(b, foe);
+            // Forme change is immediate: later hits use Noice Form's Defense.
+            calc = compute_damage(b, side, md);
             continue;
         }
         let target_hp = b.state.side(foe).active().hp;
@@ -2676,16 +2699,16 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
     for (i, &(roll, crit)) in hits.iter().enumerate() {
-        let calc = &calcs[i.min(calcs.len() - 1)];
-        let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
-        let raw = rolls[roll as usize];
+        let indexed_calc = &calcs[i.min(calcs.len() - 1)];
+        let initial_rolls = if crit { &indexed_calc.rolls_crit } else { &indexed_calc.rolls_nocrit };
+        let initial_raw = initial_rolls[roll as usize];
         let bypass_sub = md.flag_sound
             || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
         let sub_hp = b.state.side(foe).substitute_hp;
         if sub_hp > 0 && !bypass_sub && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
-            let sub_dmg = raw.min(sub_hp);
+            let sub_dmg = initial_raw.min(sub_hp);
             push(b, Instruction::DamageSubstitute { side: foe, amount: sub_dmg });
-            if raw >= sub_hp {
+            if initial_raw >= sub_hp {
                 push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
             }
             total_dealt += sub_dmg as i32;
@@ -2693,6 +2716,19 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             hit_sub = true;
             continue;
         }
+        if ice_face_is_intact(b, foe, md) {
+            break_ice_face(b, foe);
+            continue;
+        }
+        // Indexed moves change power each hit, and Ice Face can change Defense between hits.
+        let noice_calc = if b.state.side(foe).active().species == crate::ids::Species::from_id("eiscuenoice").unwrap_or(crate::ids::Species::None) {
+            Some(compute_damage(b, side, &{ let mut m = *md; m.base_power *= (i + 1) as u16; m }))
+        } else {
+            None
+        };
+        let calc = noice_calc.as_ref().unwrap_or(&calcs[i.min(calcs.len() - 1)]);
+        let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
+        let raw = rolls[roll as usize];
         let target_hp = b.state.side(foe).active().hp;
         if target_hp <= 0 {
             break;
@@ -3067,6 +3103,171 @@ fn multihit_bounds(b: &Branch, side: SideId, md: &crate::data::MoveData) -> (usi
         }
     }
     (min, max)
+}
+
+/// Bounded multi-hit convolution for an intact Ice Face. Hit one has deterministic zero
+/// damage and transforms the target; hits 2..k use Noice Form's Defense and normal rolls.
+fn apply_multihit_dp_ice_face(
+    b: &Branch, side: SideId, md: &crate::data::MoveData,
+    min: usize, max: usize, hit_prob: f32,
+) -> Vec<(Branch, bool)> {
+    use std::collections::HashMap;
+    let foe = side.other();
+    let bypass_sub = md.flag_sound
+        || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
+    let sub_hp = b.state.side(foe).substitute_hp;
+    if sub_hp > 0
+        && !bypass_sub
+        && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute)
+    {
+        return apply_multihit_dp_ice_face_sub(b, side, md, min, max, hit_prob, sub_hp);
+    }
+    let mut template = b.clone();
+    break_ice_face(&mut template, foe);
+    let calc = compute_damage(&template, side, md);
+    let counts = hit_count_probs(min, max);
+    let crit_p = crit_chance(&template, side, md);
+    let mut per_hit = Vec::with_capacity(32);
+    for i in 0..16 {
+        if crit_p < 1.0 {
+            per_hit.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - crit_p)));
+        }
+        if crit_p > 0.0 {
+            per_hit.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * crit_p));
+        }
+    }
+
+    let cap = template.state.side(foe).active().hp.max(0) as i32;
+    let mut conv: HashMap<i32, f32> = HashMap::new();
+    conv.insert(0, 1.0);
+    let mut dist: HashMap<(i32, usize), f32> = HashMap::new();
+    for k in 1..=max {
+        // k == 1 is the blocked hit. Each later hit adds one Noice-form damage roll.
+        if k > 1 {
+            let mut next = HashMap::with_capacity(conv.len() + 32);
+            for (&total, &pt) in &conv {
+                for &(damage, pd) in &per_hit {
+                    *next.entry((total + damage).min(cap)).or_insert(0.0) += pt * pd;
+                }
+            }
+            conv = next;
+        }
+        if let Some(&(_, pk)) = counts.iter().find(|(count, _)| *count == k) {
+            for (&total, &p) in &conv {
+                *dist.entry((total, k)).or_insert(0.0) += pk * p;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(dist.len());
+    for ((total, hits), p) in dist {
+        let mut hb = scaled(&template, hit_prob * p);
+        if total > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: total as i16 });
+        }
+        apply_post_damage(
+            &mut hb, side, md, total, total > 0, false, hits.saturating_sub(1) as u8,
+            calc.life_orb, calc.def_item, calc.def_ability,
+        );
+        out.push((hb, false));
+    }
+    out
+}
+
+/// Ice Face + Substitute convolution. State stays bounded by
+/// `(sub HP + 1) * 2 face states * (target HP + 1) * (max hits + 1)` and is aggressively
+/// merged after every hit. A hit first damages Substitute; once it is gone the next hit
+/// breaks Ice Face; only later hits damage Noice Form.
+fn apply_multihit_dp_ice_face_sub(
+    b: &Branch, side: SideId, md: &crate::data::MoveData,
+    min: usize, max: usize, hit_prob: f32, sub_hp0: i16,
+) -> Vec<(Branch, bool)> {
+    use std::collections::HashMap;
+    let foe = side.other();
+    let intact_calc = compute_damage(b, side, md);
+    let mut noice_template = b.clone();
+    break_ice_face(&mut noice_template, foe);
+    let noice_calc = compute_damage(&noice_template, side, md);
+    let crit_p = crit_chance(b, side, md);
+    let roll_dist = |calc: &DamageCalc| {
+        let mut values = Vec::with_capacity(32);
+        for i in 0..16 {
+            if crit_p < 1.0 {
+                values.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - crit_p)));
+            }
+            if crit_p > 0.0 {
+                values.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * crit_p));
+            }
+        }
+        values
+    };
+    let intact_rolls = roll_dist(&intact_calc);
+    let noice_rolls = roll_dist(&noice_calc);
+    let counts = hit_count_probs(min, max);
+    let hp_cap = b.state.side(foe).active().hp.max(0) as i32;
+
+    // (sub remaining, face broken, mon damage, hits that connected with the Pokémon).
+    let mut conv: HashMap<(i32, bool, i32, u8), f32> = HashMap::new();
+    conv.insert((sub_hp0 as i32, false, 0, 0), 1.0);
+    let mut dist: HashMap<(i32, bool, i32, u8, usize), f32> = HashMap::new();
+    for k in 1..=max {
+        let mut next = HashMap::new();
+        for (&(sub, broken, mon, mon_hits), &state_p) in &conv {
+            // Once fainted, later nominal hits do not connect or increment Rage Fist.
+            if mon >= hp_cap {
+                *next.entry((sub, broken, mon, mon_hits)).or_insert(0.0) += state_p;
+                continue;
+            }
+            let rolls = if broken { &noice_rolls } else { &intact_rolls };
+            for &(damage, roll_p) in rolls {
+                let state = if sub > 0 {
+                    // Overflow from the hit that breaks Substitute is discarded.
+                    ((sub - damage).max(0), broken, mon, mon_hits)
+                } else if !broken {
+                    // This hit is consumed by Ice Face.
+                    (0, true, mon, mon_hits.saturating_add(1))
+                } else {
+                    (0, true, (mon + damage).min(hp_cap), mon_hits.saturating_add(1))
+                };
+                *next.entry(state).or_insert(0.0) += state_p * roll_p;
+            }
+        }
+        conv = next;
+        if let Some(&(_, count_p)) = counts.iter().find(|(count, _)| *count == k) {
+            for (&(sub, broken, mon, mon_hits), &p) in &conv {
+                *dist.entry((sub, broken, mon, mon_hits, k)).or_insert(0.0) += count_p * p;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(dist.len());
+    for ((sub, broken, mon, mon_hits, _), p) in dist {
+        let mut hb = scaled(b, hit_prob * p);
+        let sub_damage = sub_hp0 as i32 - sub;
+        if sub_damage > 0 {
+            push(&mut hb, Instruction::DamageSubstitute { side: foe, amount: sub_damage as i16 });
+        }
+        if sub == 0 {
+            push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
+        }
+        if broken {
+            break_ice_face(&mut hb, foe);
+        }
+        if mon > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
+        }
+        let damaging_hits = mon_hits.saturating_sub(u8::from(broken));
+        // A Substitute hit does not suppress later hits that connect with the Pokémon.
+        let only_hit_substitute = mon_hits == 0;
+        apply_post_damage(
+            &mut hb, side, md, sub_damage + mon, sub_damage + mon > 0, only_hit_substitute,
+            damaging_hits, noice_calc.life_orb, noice_calc.def_item, noice_calc.def_ability,
+        );
+        out.push((hb, only_hit_substitute));
+    }
+    out
 }
 
 /// The sumset-DP multi-hit path: enumerate the distinct *total* damage a multi-hit move can
