@@ -691,6 +691,21 @@ pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveC
                 vec![b]
             } else {
                 apply_end_of_turn(b, switched)
+                    .into_iter()
+                    .map(|mut nb| {
+                        // PS `endTurn` resets `statsRaisedThisTurn` on every active after the
+                        // residuals run (battle.ts) — drop the volatile at the same boundary.
+                        for s in [SideId::One, SideId::Two] {
+                            if nb.state.side(s).volatiles.contains(VolatileStatus::StatsRaisedThisTurn) {
+                                push(&mut nb, Instruction::RemoveVolatile {
+                                    side: s,
+                                    volatile: VolatileStatus::StatsRaisedThisTurn,
+                                });
+                            }
+                        }
+                        nb
+                    })
+                    .collect()
             }
         })
         .collect();
@@ -708,7 +723,18 @@ pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveC
 pub fn switch_into(state: &mut State, side: SideId, target: u8) {
     let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     apply_switch(&mut b, side, target);
+    clear_stats_raised_markers(&mut b.state);
     *state = b.state;
+}
+
+/// Faint replacements resolve inside a pseudo-turn of their own in PS: after the switch-in
+/// (and its abilities — Download, Intimidate reactions, ...) another `endTurn` runs, whose
+/// per-mon bookkeeping resets `statsRaisedThisTurn` on every active. The replacement entry
+/// APIs (`switch_into` / `switch_into_pair`) therefore never leave the marker set.
+fn clear_stats_raised_markers(state: &mut State) {
+    for side in [SideId::One, SideId::Two] {
+        state.side_mut(side).volatiles.remove(VolatileStatus::StatsRaisedThisTurn);
+    }
 }
 
 /// Push an instruction onto a branch and apply it to that branch's state.
@@ -960,6 +986,7 @@ pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
             apply_switch_in_ability(&mut b, side);
         }
     }
+    clear_stats_raised_markers(&mut b.state);
     *state = b.state;
 }
 
@@ -1167,6 +1194,12 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             if apply_boost_clamped(b, foe, BoostIndex::Attack, -1) < 0 {
                 react_to_stat_drop(b, foe);
             }
+            // Rattled: +1 Spe when Intimidated (PS `onAfterBoost` keyed on the Intimidate
+            // effect). AfterBoost receives the *attempted* boost object, so this fires even
+            // when the Atk drop was clamped at −6 — any unblocked Intimidate suffices.
+            if b.state.side(foe).active().ability == crate::ids::Ability::Rattled {
+                raise_boost(b, foe, BoostIndex::Speed, 1);
+            }
         }
     }
     // Intrepid Sword (Zacian) / Dauntless Shield (Zamazenta): +1 Atk / +1 Def — but only
@@ -1353,6 +1386,69 @@ fn scaled(b: &Branch, f: f32) -> Branch {
     Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone() }
 }
 
+/// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
+/// removes it and loafs (returns `true` — no move this attempt); otherwise the marker is set
+/// for the next attempt and the move proceeds. Callers are responsible for only invoking this
+/// where PS's handler would run (after mustrecharge/slp/frz cancels, before flinch/confusion/
+/// paralysis ones).
+fn truant_gate(b: &mut Branch, side: SideId) -> bool {
+    if b.state.side(side).active().ability != crate::ids::Ability::Truant {
+        return false;
+    }
+    if b.state.side(side).volatiles.contains(VolatileStatus::Truant) {
+        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Truant });
+        return true;
+    }
+    push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Truant });
+    false
+}
+
+/// A flinched mon still runs the BeforeMove handlers ABOVE flinch's priority 8 before the
+/// flinch cancels its move: mustrecharge (11) consumes the recharge turn, slp/frz (10) tick
+/// the sleep counter / roll the 20% thaw, and Truant (9) toggles its loaf marker. The engine
+/// skips move execution for flinched mons wholesale, so those higher-priority effects are
+/// replayed here (PS runs handlers in descending priority until one returns false).
+fn flinch_cancel_chain(mut b: Branch, side: SideId) -> Vec<Branch> {
+    let (status, counter) = {
+        let p = b.state.side(side).active();
+        (p.status, p.status_counter)
+    };
+    let slot = b.state.side(side).active_index;
+    let pending = b.state.side(side).pending_move;
+    if matches!(pending, crate::state::PendingMove::Recharging) {
+        // mustrecharge (11) removes itself and cancels before slp/frz/Truant/flinch run.
+        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: crate::state::PendingMove::None });
+        return vec![b];
+    }
+    match status {
+        Status::Sleep => {
+            if counter > 1 {
+                // Still asleep: slp (10) cancels first; flinch never runs, Truant untouched.
+                push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - 1 });
+                return vec![b];
+            }
+            // Wakes, Truant (9) toggles, then flinch (8) cancels the move.
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+            truant_gate(&mut b, side);
+            vec![b]
+        }
+        Status::Freeze => {
+            // frz (10): 80% stay frozen (cancelled before flinch); 20% thaw, then Truant
+            // toggles, then the flinch cancels the move anyway.
+            let mut out = vec![scaled(&b, 0.80)];
+            let mut thawed = scaled(&b, 0.20);
+            push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
+            truant_gate(&mut thawed, side);
+            out.push(thawed);
+            out
+        }
+        _ => {
+            truant_gate(&mut b, side);
+            vec![b]
+        }
+    }
+}
+
 fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut Exec) -> Vec<Branch> {
     // Tell the first mover what the (not-yet-moved) second mover is about to do, so Sucker
     // Punch / Thunderclap can tell whether the target is attacking. The second mover's foe
@@ -1369,8 +1465,14 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
         // it.  Do not use merely `first mover is alive` here: if it has a replacement available
         // PS can continue the queue, and that broader condition regresses valid Memento/status
         // cases.
-        if fb.state.side(second.side).active().is_alive() && !flinched && !battle_over(&fb.state) {
-            out.extend(execute_move(fb, second));
+        if fb.state.side(second.side).active().is_alive() && !battle_over(&fb.state) {
+            if flinched {
+                // The move is cancelled, but the BeforeMove handlers above flinch's priority
+                // still run (sleep tick / thaw roll / Truant toggle / recharge consumption).
+                out.extend(flinch_cancel_chain(fb, second.side));
+            } else {
+                out.extend(execute_move(fb, second));
+            }
         } else {
             out.push(fb);
         }
@@ -1407,7 +1509,7 @@ fn fixed_damage_amount(md: &crate::data::MoveData, state: &State, side: SideId) 
         "sonicboom" => 20,
         // Super Fang halves the target's *current* HP (min 1); Endeavor brings it down to the
         // attacker's current HP (0 if the target is already at or below it).
-        "superfang" => (defender.hp / 2).max(1),
+        "superfang" | "ruination" => (defender.hp / 2).max(1),
         "endeavor" => (defender.hp - attacker.hp).max(0),
         // Mirror Coat returns 2× the special damage its user took from the foe this turn (PS
         // `damageCallback`). With no such hit recorded it deals nothing (PS `onTry` fails).
@@ -1486,6 +1588,10 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive,
     // Flash Fire's activation ends on switch-out (PS ability `onEnd` removes the volatile).
     VolatileStatus::FlashFire,
+    // Truant's loaf marker is a PS volatile — cleared on switch-out; the mon acts on its
+    // first attempt after re-entering. `statsRaisedThisTurn` is a per-Pokémon PS field, but
+    // only the active can have raised a stat this turn, so the volatile model is exact.
+    VolatileStatus::Truant, VolatileStatus::StatsRaisedThisTurn,
 ];
 
 /// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
@@ -1556,6 +1662,8 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // the move doesn't execute. The remaining "acts normally" branch equals prior behavior, so
     // these only *add* outcomes (no regression on the common path).
     if !alive || status == Status::Sleep {
+        // The sleep-wake attempt toggles Truant inside `execute_move_inner` (slp's
+        // BeforeMove handler at priority 10 runs before Truant's 9).
         return execute_move_inner(b, action);
     }
     // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
@@ -1564,8 +1672,24 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         let mut thawed = scaled(&b, 0.20);
         let slot = thawed.state.side(side).active_index;
         push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
-        out.extend(execute_move_inner(thawed, action));
+        // frz (priority 10) ran; Truant (9) is next — a thawed loafer stays put this turn.
+        if truant_gate(&mut thawed, side) {
+            out.push(thawed);
+        } else {
+            out.extend(execute_move_inner(thawed, action));
+        }
         return out;
+    }
+    // Truant: PS onBeforeMove priority 9 — below mustrecharge (11) and slp/frz (10), above
+    // flinch (8), Disable, confusion (3) and paralysis (1). The volatile marks "loaf on this
+    // attempt"; the toggle fires on every attempt that reaches this point, including ones a
+    // later handler (confusion self-hit, full paralysis) cancels. Recharge turns are resolved
+    // in `execute_move_inner` and leave the toggle untouched (mustrecharge preempts Truant).
+    let mut b = b;
+    if !matches!(b.state.side(side).pending_move, crate::state::PendingMove::Recharging)
+        && truant_gate(&mut b, side)
+    {
+        return vec![b];
     }
     // Confusion counts down on each move attempt and ends ("snapped out") at 0, in which
     // case the mon acts normally this turn (PS decrements before the 1/3 roll).
@@ -1985,6 +2109,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             return vec![b];
         }
         push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+        // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
+        // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
+        if truant_gate(&mut b, side) {
+            return vec![b];
+        }
     }
     // Freeze: a frozen mon can't move (the 20% thaw + act is left unmodeled for now).
     if b.state.side(side).active().status == Status::Freeze {
@@ -2233,8 +2362,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Protect: a protected target blocks the incoming damaging move (Protect moves +4
     // priority, so the protector has already set the volatile this turn).
     if b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
-        // High Jump Kick / Jump Kick still crash into the protector (1/2 max HP).
-        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick") {
+        // High Jump Kick / Jump Kick / Supercell Slam still crash into the protector (1/2
+        // max HP — PS `onMoveFail` fires on a protected target too).
+        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
             let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
             let crash = (maxhp / 2).min(hp);
             if crash > 0 && b.state.side(side).active().ability != crate::ids::Ability::MagicGuard {
@@ -2269,8 +2399,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     if miss_prob > 0.0 {
         let mut mb = scaled(&b, miss_prob);
-        // High Jump Kick / Jump Kick: missing costs the user 1/2 of its max HP (crash).
-        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick") {
+        // High Jump Kick / Jump Kick / Supercell Slam: missing costs the user 1/2 of its
+        // max HP (crash; PS `onMoveFail` → `damage(source.baseMaxhp / 2)`).
+        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
             let (hp, maxhp) = { let p = mb.state.side(side).active(); (p.hp, p.max_hp) };
             let crash = (maxhp / 2).min(hp);
             if crash > 0 {
@@ -2464,6 +2595,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
         apply_weakness_policy(&mut hb, foe, &md);
         apply_justified(&mut hb, foe, &md);
+        // Rattled (onDamagingHit) and Bug Bite's berry steal (move onHit) don't fire when a
+        // Substitute took the hit.
+        if !hit_sub {
+            apply_rattled(&mut hb, foe, &md);
+            apply_bug_bite(&mut hb, side, &md);
+        }
         apply_weak_armor(&mut hb, foe, &md);
         apply_throat_spray(&mut hb, side, &md);
         apply_spin_clear(&mut hb, side, &md);
@@ -2476,6 +2613,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let branches = if hit_sub {
             vec![hb]
         } else {
+            apply_burning_jealousy(&mut hb, side, &md);
             apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
@@ -2675,7 +2813,6 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
             Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
             Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
-            Ab::IronFist if md.flag_punch => atk_stat = crate::damage::modify(atk_stat, 4915, 4096), // ×1.2
             Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             // Punk Rock is handled as a base-power modifier below (PS `onBasePower`), not here.
@@ -2962,6 +3099,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if attacker.ability == Ab::StrongJaw && md.flag_bite {
         base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
     }
+    // Iron Fist: ×1.2 base power for punch moves (PS `onBasePower`). Moved off the attack
+    // stat when a cosim Ice Hammer unit exposed the rounding difference.
+    if attacker.ability == Ab::IronFist && md.flag_punch {
+        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
+    }
     // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
     // rather than the attack stat so the floor lands where PS's does.
     if attacker.ability == Ab::PunkRock && md.flag_sound {
@@ -3151,6 +3293,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let mut hit_sub = false;
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
+    let mut hits_executed: u8 = 0;
     for &(roll, crit) in hits {
         let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
         let raw = rolls[roll as usize];
@@ -3168,6 +3311,7 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             total_dealt += sub_dmg as i32;
             any_damage = true;
             hit_sub = true;
+            hits_executed += 1;
             continue;
         }
         if ice_face_is_intact(b, foe, md) {
@@ -3197,9 +3341,15 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             any_damage = true;
             total_dealt += dmg as i32;
             hits_landed += 1;
+            hits_executed += 1;
         }
     }
-    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, hits_landed, life_orb, def_item, def_ability);
+    // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
+    // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
+    // one hit connected with the Pokémon itself (a fully sub-absorbed move records nothing:
+    // its per-target damage entry stays `false`). Verified against the pin empirically.
+    let times_count = if hits_landed > 0 { hits_executed } else { 0 };
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
     hit_sub
 }
 
@@ -3214,6 +3364,7 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
     let mut hit_sub = false;
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
+    let mut hits_executed: u8 = 0;
     for (i, &(roll, crit)) in hits.iter().enumerate() {
         let indexed_calc = &calcs[i.min(calcs.len() - 1)];
         let initial_rolls = if crit { &indexed_calc.rolls_crit } else { &indexed_calc.rolls_nocrit };
@@ -3230,6 +3381,7 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             total_dealt += sub_dmg as i32;
             any_damage = true;
             hit_sub = true;
+            hits_executed += 1;
             continue;
         }
         if ice_face_is_intact(b, foe, md) {
@@ -3265,9 +3417,15 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             any_damage = true;
             total_dealt += dmg as i32;
             hits_landed += 1;
+            hits_executed += 1;
         }
     }
-    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, hits_landed, life_orb, def_item, def_ability);
+    // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
+    // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
+    // one hit connected with the Pokémon itself (a fully sub-absorbed move records nothing:
+    // its per-target damage entry stays `false`). Verified against the pin empirically.
+    let times_count = if hits_landed > 0 { hits_executed } else { 0 };
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
     hit_sub
 }
 
@@ -3429,13 +3587,13 @@ fn apply_post_damage(
         }
     }
 
-    // Track times the target has been hit (Rage Fist). PS counts each hit of a multi-hit
-    // move separately (cosim caught the engine counting once per move). A hit absorbed by a
-    // Substitute doesn't count.
-    // Showdown records the connecting hit before faint processing, so a lethal hit still
-    // contributes to Rage Fist's per-Pokémon counter. Nominal later hits are excluded by the
-    // sequential hit generators before this function is called.
-    if any_damage && !hit_sub && hits_landed > 0 {
+    // Track times the target has been hit (Rage Fist). `hits_landed` here is the PS
+    // `timesAttacked` increment the caller computed: every EXECUTED hit counts, including
+    // hits a Substitute absorbed, but ONLY if at least one hit connected with the Pokémon
+    // itself (fully sub-absorbed moves record nothing — PS keeps their per-target damage
+    // entry `false`), and nothing executes after a KO. Verified against the pin empirically
+    // (skill-link Icicle Spear through a Substitute counts all 5 hits).
+    if any_damage && hits_landed > 0 {
         let fslot = b.state.side(foe).active_index;
         let cur = b.state.side(foe).active().times_hit;
         let new = cur.saturating_add(hits_landed).min(250);
@@ -3577,6 +3735,60 @@ fn apply_justified(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
     {
         raise_boost(b, foe, BoostIndex::Attack, 1);
     }
+}
+
+/// Rattled: +1 Spe when the holder is hit by a damaging Bug/Dark/Ghost-type move
+/// (PS `onDamagingHit`). The Intimidate reaction lives in `apply_switch_in_ability`.
+fn apply_rattled(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    let d = b.state.side(foe).active();
+    if d.is_alive()
+        && d.ability == crate::ids::Ability::Rattled
+        && matches!(md.typ, Type::Bug | Type::Dark | Type::Ghost)
+        && md.category != MoveCategory::Status
+    {
+        raise_boost(b, foe, BoostIndex::Speed, 1);
+    }
+}
+
+/// Bug Bite / Pluck: after the hit connects (not through a Substitute), the attacker steals
+/// and immediately eats the target's berry — BEFORE the target's own pinch/Sitrus check runs
+/// (verified against the pin: the -enditem [from] stealeat lands even when the damage left
+/// the holder in Sitrus range). The eat effect applies to the ATTACKER; neither side's
+/// `lastItem`/`last_berry` records it (PS `takeItem` sets no `lastItem`, and the attacker
+/// never held the berry — only its `ateBerry` flag is set, which the engine doesn't track
+/// separately). Sticky Hold on a living target blocks the steal.
+fn apply_bug_bite(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if !matches!(md.id.to_id(), "bugbite" | "pluck") {
+        return;
+    }
+    let foe = side.other();
+    if !b.state.side(side).active().is_alive() {
+        return; // PS: `source.hp &&` — a rocky-helmet-KO'd attacker eats nothing
+    }
+    let target = b.state.side(foe).active();
+    let berry = target.item;
+    if !is_berry(berry) {
+        return;
+    }
+    if target.is_alive() && target.ability == crate::ids::Ability::StickyHold {
+        return;
+    }
+    let tslot = b.state.side(foe).active_index;
+    push(b, Instruction::ChangeItem { side: foe, slot: tslot, previous: berry, new: Item::None });
+    on_item_lost(b, foe);
+    apply_berry_eat_effect(b, side, berry);
+}
+
+/// The berries the engine models an on-eat effect for, plus the pinch berries randbats
+/// carries (whose effects Bug Bite also consumes on steal — a pinch berry eaten by the
+/// thief has no effect at high HP, but the item is gone either way).
+fn is_berry(item: Item) -> bool {
+    matches!(
+        item,
+        Item::SitrusBerry | Item::LumBerry | Item::ChestoBerry | Item::PechaBerry
+            | Item::RawstBerry | Item::CheriBerry | Item::AspearBerry | Item::PersimBerry
+            | Item::LeppaBerry | Item::OranBerry
+    )
 }
 
 /// Weak Armor: when the holder is hit by a physical move, −1 Def and +2 Spe.
@@ -3915,29 +4127,32 @@ fn apply_multihit_dp_sub(
     use std::collections::HashMap;
     let foe = side.other();
     let cap = b.state.side(foe).active().hp.max(0) as i32;
-    // Key: (sub remaining, mon damage, mon-connected hits, Focus Sash activated).
+    // Key: (sub remaining, mon damage, mon-connected hits, executed hits, Focus Sash used).
+    // `executed` counts every hit that ran — sub-absorbed included — and freezes once the
+    // Pokémon fainted (PS breaks the hit loop); it feeds Rage Fist's `timesAttacked`, which
+    // PS bumps by the executed-hit count whenever at least one hit connected with the mon.
     let survival = calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash;
-    let mut conv: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
-    conv.insert((sub_hp0, 0, 0, false), 1.0);
-    let mut dist: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
+    let mut conv: HashMap<(i32, i32, u8, u8, bool), f32> = HashMap::new();
+    conv.insert((sub_hp0, 0, 0, 0, false), 1.0);
+    let mut dist: HashMap<(i32, i32, u8, u8, bool), f32> = HashMap::new();
     for k in 1..=max {
-        let mut next: HashMap<(i32, i32, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
-        for (&(sub_rem, mon, mon_hits, sash_used), &pt) in &conv {
+        let mut next: HashMap<(i32, i32, u8, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(sub_rem, mon, mon_hits, executed, sash_used), &pt) in &conv {
             for &(v, pv) in per_hit {
                 let key = if sub_rem > 0 {
                     if v < sub_rem {
-                        (sub_rem - v, mon, mon_hits, sash_used)
+                        (sub_rem - v, mon, mon_hits, executed.saturating_add(1), sash_used)
                     } else {
-                        (0, mon, mon_hits, sash_used)
+                        (0, mon, mon_hits, executed.saturating_add(1), sash_used)
                     }
                 } else if mon >= cap {
-                    (0, mon, mon_hits, sash_used)
+                    (0, mon, mon_hits, executed, sash_used)
                 } else {
                     let hp = cap - mon;
                     let mut dealt = v.min(hp);
                     let activates = mon == 0 && survival && dealt >= hp;
                     if activates { dealt = hp - 1; }
-                    (0, mon + dealt, mon_hits.saturating_add(1),
+                    (0, mon + dealt, mon_hits.saturating_add(1), executed.saturating_add(1),
                         sash_used || (activates && calc.def_item == Item::FocusSash))
                 };
                 *next.entry(key).or_insert(0.0) += pt * pv;
@@ -3952,7 +4167,7 @@ fn apply_multihit_dp_sub(
     }
 
     let mut out = Vec::with_capacity(dist.len());
-    for ((sub_rem, mon, mon_hits, sash_used), p) in dist {
+    for ((sub_rem, mon, mon_hits, executed, sash_used), p) in dist {
         let mut hb = scaled(b, hit_prob * p);
         let sub_dmg = sub_hp0 - sub_rem;
         if sub_dmg > 0 {
@@ -3971,8 +4186,9 @@ fn apply_multihit_dp_sub(
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
         }
         let only_hit_substitute = mon_hits == 0;
+        let times_count = if mon_hits > 0 { executed } else { 0 };
         apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0,
-            only_hit_substitute, mon_hits, calc.life_orb, calc.def_item, calc.def_ability);
+            only_hit_substitute, times_count, calc.life_orb, calc.def_item, calc.def_ability);
         out.push((hb, only_hit_substitute));
     }
     out
@@ -4036,18 +4252,20 @@ fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: 
     let cap = b.state.side(foe).active().hp.max(0) as i32;
     let survival = calcs[0].def_ability == crate::ids::Ability::Sturdy || calcs[0].def_item == Item::FocusSash;
 
-    // Key: (sub remaining, mon damage, mon-connected hits, Focus Sash activated).
-    let mut conv: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
-    conv.insert((sub_hp0, 0, 0, false), 1.0);
+    // Key: (sub remaining, mon damage, mon-connected hits, executed hits, Focus Sash used).
+    // `executed` mirrors PS's timesAttacked bump: every hit that ran counts (sub-absorbed
+    // included), frozen once the mon fainted, credited only if some hit connected.
+    let mut conv: HashMap<(i32, i32, u8, u8, bool), f32> = HashMap::new();
+    conv.insert((sub_hp0, 0, 0, 0, false), 1.0);
     for calc in &calcs {
         let per_hit = per_hit_of(calc);
-        let mut next: HashMap<(i32, i32, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
-        for (&(sub_rem, mon, mon_hits, sash_used), &pt) in &conv {
+        let mut next: HashMap<(i32, i32, u8, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(sub_rem, mon, mon_hits, executed, sash_used), &pt) in &conv {
             for &(v, pv) in &per_hit {
                 let key = if sub_rem > 0 {
-                    ((sub_rem - v).max(0), mon, mon_hits, sash_used)
+                    ((sub_rem - v).max(0), mon, mon_hits, executed.saturating_add(1), sash_used)
                 } else if mon >= cap {
-                    (0, mon, mon_hits, sash_used)
+                    (0, mon, mon_hits, executed, sash_used)
                 } else {
                     let hp = cap - mon;
                     let mut dealt = v.min(hp);
@@ -4055,7 +4273,7 @@ fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: 
                     if activates {
                         dealt = hp - 1;
                     }
-                    (0, mon + dealt, mon_hits.saturating_add(1),
+                    (0, mon + dealt, mon_hits.saturating_add(1), executed.saturating_add(1),
                         sash_used || (activates && calcs[0].def_item == Item::FocusSash))
                 };
                 *next.entry(key).or_insert(0.0) += pt * pv;
@@ -4065,7 +4283,7 @@ fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: 
     }
 
     let mut out = Vec::with_capacity(conv.len());
-    for ((sub_rem, mon, mon_hits, sash_used), p) in conv {
+    for ((sub_rem, mon, mon_hits, executed, sash_used), p) in conv {
         let mut hb = scaled(b, hit_prob * p);
         let sub_dmg = sub_hp0 - sub_rem;
         if sub_dmg > 0 {
@@ -4082,8 +4300,9 @@ fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: 
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
         }
         let only_hit_substitute = mon_hits == 0 && sub_dmg > 0;
+        let times_count = if mon_hits > 0 { executed } else { 0 };
         apply_post_damage(&mut hb, side, md, sub_dmg + mon, mon > 0,
-            only_hit_substitute, mon_hits, calcs[0].life_orb, calcs[0].def_item, calcs[0].def_ability);
+            only_hit_substitute, times_count, calcs[0].life_orb, calcs[0].def_item, calcs[0].def_ability);
         out.push((hb, only_hit_substitute));
     }
     out
@@ -4291,8 +4510,21 @@ fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: 
     let eff = (cur + delta).clamp(-6, 6) - cur;
     if eff != 0 {
         push(b, Instruction::Boost { side: target, stat, amount: eff });
+        if eff > 0 {
+            mark_stats_raised(b, target);
+        }
     }
     eff
+}
+
+/// PS sets `pokemon.statsRaisedThisTurn` whenever a boost event actually raised a stat
+/// (battle.ts `boost()`); it is reset for all actives at the end of every turn. Burning
+/// Jealousy's burn is gated on it. Modeled as a volatile on the active (only the active can
+/// have raised a stat this turn), cleared on switch-out and at end of turn.
+fn mark_stats_raised(b: &mut Branch, side: SideId) {
+    if !b.state.side(side).volatiles.contains(VolatileStatus::StatsRaisedThisTurn) {
+        push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::StatsRaisedThisTurn });
+    }
 }
 
 /// Apply a *self*-boost (Swords Dance, Leaf Storm's −2 SpA, ...). Self-boosts ignore Clear
@@ -4303,6 +4535,9 @@ fn apply_self_boost(b: &mut Branch, side: SideId, stat: BoostIndex, delta: i8) {
     let eff = (cur + delta).clamp(-6, 6) - cur;
     if eff != 0 {
         push(b, Instruction::Boost { side, stat, amount: eff });
+        if eff > 0 {
+            mark_stats_raised(b, side);
+        }
     }
 }
 
@@ -4313,6 +4548,9 @@ fn raise_boost(b: &mut Branch, side: SideId, stat: BoostIndex, amount: i8) {
     let eff = (cur + amount).clamp(-6, 6) - cur;
     if eff != 0 {
         push(b, Instruction::Boost { side, stat, amount: eff });
+        if eff > 0 {
+            mark_stats_raised(b, side);
+        }
     }
 }
 
@@ -4448,6 +4686,38 @@ fn apply_partial_trap(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
             nb
         })
         .collect()
+}
+
+/// Burning Jealousy: its 100% "secondary" burns only targets whose stats were raised this
+/// turn (PS secondary `onHit` gated on `statsRaisedThisTurn` — invisible to the codegen, so
+/// the move carries `secondary_chance: 0` and is special-cased here). Ordinary secondary
+/// rules apply: blocked by a Substitute (caller), Shield Dust and Covert Cloak; removed by
+/// Sheer Force; respects status/type immunities and field blocks.
+fn apply_burning_jealousy(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if md.id.to_id() != "burningjealousy" {
+        return;
+    }
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return;
+    }
+    let foe = side.other();
+    let eligible = {
+        let d = b.state.side(foe).active();
+        d.is_alive()
+            && d.ability != crate::ids::Ability::ShieldDust
+            && d.item != Item::CovertCloak
+            && status_applies(d, Status::Burn)
+    };
+    if !eligible
+        || !b.state.side(foe).volatiles.contains(VolatileStatus::StatsRaisedThisTurn)
+        || status_blocked_by_field(&b.state, foe, Status::Burn)
+    {
+        return;
+    }
+    let slot = b.state.side(foe).active_index;
+    push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: Status::Burn });
+    apply_synchronize(b, foe, Status::Burn);
+    consume_lum_if_statused(b, foe);
 }
 
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
@@ -4827,6 +5097,40 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         apply_self_boost(&mut b, side, BoostIndex::SpecialAttack, 1);
         apply_self_boost(&mut b, side, BoostIndex::SpecialDefense, 1);
+        return vec![b];
+    }
+
+    // Heal Bell: cure every party member's status, benched included (PS `onHit` walks
+    // `side.pokemon`). Soundproof / Good as Gold ALLIES are immune — but not the user
+    // itself (PS skips the immunity checks when `ally === source`). Fainted mons keep
+    // their serialized status untouched (PS `cureStatus` bails on 0 HP).
+    if md.id.to_id() == "healbell" {
+        let mut b = b;
+        let active_idx = b.state.side(side).active_index;
+        for slot in 0..6u8 {
+            let (species, alive, status, counter, ability) = {
+                let p = &b.state.side(side).pokemon[slot as usize];
+                (p.species, p.is_alive(), p.status, p.status_counter, p.ability)
+            };
+            if species == crate::ids::Species::None || !alive || status == Status::None {
+                continue;
+            }
+            if slot != active_idx
+                && matches!(ability, crate::ids::Ability::Soundproof | crate::ids::Ability::GoodAsGold)
+            {
+                continue;
+            }
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
+            if counter != 0 {
+                push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
+            }
+            if slot == active_idx
+                && status == Status::Sleep
+                && b.state.side(side).volatiles.contains(VolatileStatus::Nightmare)
+            {
+                push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Nightmare });
+            }
+        }
         return vec![b];
     }
 

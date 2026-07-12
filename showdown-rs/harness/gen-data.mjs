@@ -28,8 +28,14 @@ const statusRs = (s) => s && STATUS[s] ? `Status::${STATUS[s]}` : 'Status::None'
 const SIDECOND = { stealthrock:'StealthRock', spikes:'Spikes', toxicspikes:'ToxicSpikes', stickyweb:'StickyWeb', reflect:'Reflect', lightscreen:'LightScreen', auroraveil:'AuroraVeil', tailwind:'Tailwind' };
 const sideCondRs = (s) => s && SIDECOND[s] ? `Some(SideConditionId::${SIDECOND[s]})` : 'None';
 
+// PS's move `weather` field is inconsistently cased ('sunnyday' but 'RainDance'/'Sandstorm')
+// — normalize to an id before the lookup (the raw-key version silently dropped Rain Dance and
+// Sandstorm to Weather::None; cosim caught it via a failed Rain Dance).
 const WEATHER = { sunnyday:'Sun', raindance:'Rain', sandstorm:'Sand', snow:'Snow', snowscape:'Snow', hail:'Snow' };
-const weatherRs = (s) => s && WEATHER[s] ? `Weather::${WEATHER[s]}` : 'Weather::None';
+const weatherRs = (s) => {
+	const id = String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+	return id && WEATHER[id] ? `Weather::${WEATHER[id]}` : 'Weather::None';
+};
 
 // Boost effects PS implements via onHit callbacks (invisible to field extraction).
 const MANUAL_TARGET_BOOSTS = { partingshot: { atk: -1, spa: -1 } };
@@ -81,7 +87,12 @@ moves.forEach((m, i) => {
 	const secChance = (secHasBoostOrStatus || secVol) ? (sec.chance || 0) : 0;
 	// Flinch is its own chance-based secondary (Iron Head 30%, Fake Out 100%), handled
 	// separately so it can interrupt a not-yet-moved target rather than being a plain volatile.
-	const flinchChance = (sec && sec.volatileStatus === 'flinch') ? (sec.chance || 100)
+	// Dual-secondary moves (Fire/Ice/Thunder Fang: 10% status + 10% flinch, Triple Arrows:
+	// 50% -Def + 30% flinch) keep the non-flinch entry in `sec` (secondaries[0]) and surface
+	// the flinch entry here — PS rolls each secondary independently, as does the engine.
+	const flinchSec = (sec && sec.volatileStatus === 'flinch') ? sec
+		: (m.secondaries || []).find(s => s.volatileStatus === 'flinch');
+	const flinchChance = flinchSec ? (flinchSec.chance || 100)
 		: (m.volatileStatus === 'flinch' ? 100 : 0);
 	let targetVol = m.volatileStatus === 'flinch' ? undefined : m.volatileStatus;
 	// Confusion stays a *secondary* even at 100% so the engine branches its duration.

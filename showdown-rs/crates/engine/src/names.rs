@@ -177,4 +177,6 @@ id_map!(VolatileStatus {
     NoRetreat => "noretreat",
     Octolock => "octolock",
     FlashFire => "flashfire",
+    Truant => "truant",
+    StatsRaisedThisTurn => "statsraisedthisturn",
 });

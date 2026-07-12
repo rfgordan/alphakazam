@@ -52,6 +52,8 @@ pub enum VolatileStatus {
     NoRetreat,          // self-trap after the +1-all-stats boost
     Octolock,           // foe-sourced trap + end-of-turn Def/SpD drop
     FlashFire,          // absorbed a Fire move: ×1.5 own Fire moves until switch-out
+    Truant,             // Slaking: loaf on the next move attempt (toggles every attempt)
+    StatsRaisedThisTurn, // PS `pokemon.statsRaisedThisTurn` (Burning Jealousy's burn gate)
 }
 
 /// A packed set of active-Pokémon volatile statuses.

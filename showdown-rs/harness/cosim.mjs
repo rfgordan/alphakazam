@@ -225,6 +225,64 @@ const TEAM_SM = {
 	]],
 };
 
+// Final coverage tranche (`c3*.json.gz`, `--teamset c3a1`..): directed games whose movesets are
+// dominated by the remaining unexercised randbats-eligible moves (harness/coverage-worklist.json
+// carriers), so the harness's uniform choice policy exercises them quickly. Fillers are
+// already-exercised moves; defensive anchors keep games long enough for full moveset coverage.
+const TEAM_C3 = {
+	// Mechanics: Fake Out first-turn-only, Bug Bite berry steal (Sitrus Dunsparce), Heal Bell
+	// party cure, Switcheroo, Rage Fist, Rattled (+1 Spe on Bug/Dark/Ghost hit or Intimidate,
+	// on its real trigger web: bugbite/knockoff/ragefist + Incineroar Intimidate), Payback,
+	// Hex + status spreaders, Burning Jealousy vs the bulk-up/swords-dance side, dual-secondary
+	// fangs, Supercell Slam crash, Ruination, Coil, Ice Hammer, Torch Song, Hypnosis (no sleep
+	// clause in customgame — the engine keys the clause off the format).
+	c3a1: [[
+		'Incineroar||heavydutyboots|intimidate|fakeout,flareblitz,knockoff,uturn|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Scizor||leftovers|technician|bugbite,bulletpunch,swordsdance,roost|Adamant|252,252,,,4,|||||,,,,,Bug',
+		'Blissey||leftovers|naturalcure|healbell,seismictoss,softboiled,icebeam|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Annihilape||leftovers|defiant|ragefist,drainpunch,bulkup,taunt|Adamant|252,252,,,4,|||||,,,,,Fighting',
+		'Persian||silkscarf|technician|switcheroo,fakeout,knockoff,doubleedge|Jolly|,252,,,4,252|||||,,,,,Normal',
+		'Garchomp||leftovers|roughskin|firefang,earthquake,swordsdance,dragonclaw|Jolly|,252,,,4,252|||||,,,,,Ground',
+	], [
+		'Dunsparce||sitrusberry|rattled|coil,headbutt,earthquake,roost|Careful|252,,252,,4,|||||,,,,,Normal',
+		'Ting-Lu||leftovers|vesselofruin|payback,ruination,earthquake,whirlwind|Careful|252,,4,,252,|||||,,,,,Dark',
+		'Skeledirge||heavydutyboots|unaware|hex,torchsong,willowisp,slackoff|Bold|248,,252,,8,|||||,,,,,Fire',
+		'Luxray||leftovers|intimidate|supercellslam,icefang,crunch,thunderwave|Adamant|252,252,,,4,|||||,,,,,Electric',
+		'Crabominable||leftovers|ironfist|icehammer,closecombat,earthquake,bulletpunch|Adamant|252,252,,,4,|||||,,,,,Ice',
+		'Persian-Alola||leftovers|furcoat|burningjealousy,darkpulse,nastyplot,hypnosis|Timid|,,,252,4,252|||||,,,,,Dark',
+	]],
+	// Mechanics: Truant Giga Impact (attack/recharge/loaf cycle), Skill Link Icicle Spear +
+	// Drill Run, priority Accelerock, Bitter Blade drain, Blue Flare / Bolt Strike (the two
+	// fusion counterparts stay in SEPARATE games so `lastSuccessfulMoveThisTurn` never
+	// matters), Circle Throw phazing + Rain Dance, Berserk Fiery Wrath + Agility, Sheer Force
+	// Esper Wing, Illusion Bitter Malice, Iron Tail, Poison Fang toxic.
+	c3a2: [[
+		'Lycanroc||lifeorb|sandrush|accelerock,closecombat,crunch,stoneedge|Jolly|,252,,,4,252|||||,,,,,Rock',
+		'Ceruledge||heavydutyboots|weakarmor|bitterblade,shadowsneak,swordsdance,closecombat|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Reshiram||heavydutyboots|turboblaze|blueflare,dracometeor,flamethrower,earthpower|Timid|,,,252,4,252|||||,,,,,Fire',
+		'Poliwrath||leftovers|waterabsorb|circlethrow,raindance,waterfall,drainpunch|Adamant|252,252,,,4,|||||,,,,,Water',
+		'Cloyster||leftovers|skilllink|iciclespear,drillrun,shellsmash,surf|Jolly|,252,,,4,252|||||,,,,,Ice',
+		'Slaking||leftovers|truant|gigaimpact,doubleedge,earthquake,nightslash|Adamant|252,252,,,4,|||||,,,,,Normal',
+	], [
+		'Zekrom||leftovers|teravolt|boltstrike,outrage,dragondance,substitute|Adamant|252,252,,,4,|||||,,,,,Electric',
+		'Zoroark-Hisui||heavydutyboots|illusion|bittermalice,shadowball,nastyplot,focusblast|Timid|,,,252,4,252|||||,,,,,Ghost',
+		'Moltres-Galar||heavydutyboots|berserk|fierywrath,agility,hurricane,rest|Bold|248,,252,,8,|||||,,,,,Dark',
+		'Braviary-Hisui||leftovers|sheerforce|esperwing,bravebird,closecombat,agility|Jolly|,252,,,4,252|||||,,,,,Psychic',
+		'Orthworm||leftovers|eartheater|irontail,bodypress,stealthrock,rest|Impish|252,,252,,4,|||||,,,,,Steel',
+		'Mightyena||leftovers|intimidate|poisonfang,crunch,suckerpunch,playrough|Adamant|252,252,,,4,|||||,,,,,Dark',
+	]],
+	// Mop-up: First Impression (first-turn-only legality — used later it FAILS, exercising the
+	// activeMoveActions gate) and Poison Fang's 50% toxic, against poisonable tanks so games
+	// run long enough for both.
+	c3a3: [[
+		'Lokix||heavydutyboots|swarm|firstimpression,uturn,suckerpunch,leechlife|Adamant|,252,,,4,252|||||,,,,,Bug',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	], [
+		'Mightyena||leftovers|intimidate|poisonfang,crunch,suckerpunch,taunt|Adamant|252,252,,,4,|||||,,,,,Dark',
+		'Milotic||leftovers|marvelscale|scald,recover,haze,icebeam|Bold|252,,252,,4,|||||,,,,,Water',
+	]],
+};
+
 // Ability coverage (`d*.json.gz`, `--teamset flashfire`): a Flash Fire carrier (Heatran) faces
 // Fire attackers so the ability's immunity + `flashfire` activation volatile fires, and the
 // carrier's own Fire moves then get the ×1.5 boost. Includes a Fire status move (Will-O-Wisp)
@@ -648,6 +706,8 @@ async function main() {
 	} else {
 		const [t1, t2] = TEAM_TRAP[TEAMSET]
 			? TEAM_TRAP[TEAMSET].map(t => t.join(']'))
+			: TEAM_C3[TEAMSET]
+			? TEAM_C3[TEAMSET].map(t => t.join(']'))
 			: TEAM_COVERAGE[TEAMSET]
 			? TEAM_COVERAGE[TEAMSET].map(t => t.join(']'))
 			: TEAM_SM[TEAMSET]

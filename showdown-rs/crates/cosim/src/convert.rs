@@ -213,6 +213,12 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
             .is_some_and(|t| t.is_empty());
     }
     convert_volatiles(active_v, &mut side)?;
+    // `statsRaisedThisTurn` is a per-Pokemon field (not a PS volatile): only the active can
+    // have raised a stat this turn, so it maps onto the engine's active-only volatile. Reset
+    // by PS at every `endTurn`, so it is only ever set on mid-turn snapshots.
+    if b(active_v, "statsRaisedThisTurn") {
+        side.volatiles.insert(VolatileStatus::StatsRaisedThisTurn);
+    }
     // Protean/Libero once-per-switch-in marker lives in abilityState, not volatiles.
     let ast = &active_v["abilityState"];
     if b(ast, "libero") || b(ast, "protean") {
@@ -491,6 +497,7 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "noretreat" => { side.volatiles.insert(VolatileStatus::NoRetreat); }
             "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
             "flashfire" => { side.volatiles.insert(VolatileStatus::FlashFire); }
+            "truant" => { side.volatiles.insert(VolatileStatus::Truant); }
             "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
             "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }
