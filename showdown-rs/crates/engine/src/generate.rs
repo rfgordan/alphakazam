@@ -1180,6 +1180,34 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             raise_boost(b, side, stat, 1);
         }
     }
+    // Protosynthesis / Quark Drive re-derive on switch-in (PS `onSwitchIn` priority -2, plus the
+    // Booster Energy item's own `onSwitchIn`): the volatile activates under Sun / Electric Terrain,
+    // otherwise the held Booster Energy is consumed once to grant it. The switch already cleared any
+    // stale volatile (see ALL_VOLATILES), so this is the sole re-application on entry.
+    if ability == Protosynthesis {
+        let slot = b.state.side(side).active_index;
+        if effective_weather(&b.state) == Weather::Sun {
+            if !b.state.side(side).volatiles.contains(VolatileStatus::Protosynthesis) {
+                push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protosynthesis });
+            }
+        } else if b.state.side(side).active().item == Item::BoosterEnergy {
+            push(b, Instruction::ChangeItem { side, slot, previous: Item::BoosterEnergy, new: Item::None });
+            on_item_lost(b, side);
+            push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protosynthesis });
+        }
+    }
+    if ability == QuarkDrive {
+        let slot = b.state.side(side).active_index;
+        if b.state.terrain == crate::ids::Terrain::Electric {
+            if !b.state.side(side).volatiles.contains(VolatileStatus::QuarkDrive) {
+                push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::QuarkDrive });
+            }
+        } else if b.state.side(side).active().item == Item::BoosterEnergy {
+            push(b, Instruction::ChangeItem { side, slot, previous: Item::BoosterEnergy, new: Item::None });
+            on_item_lost(b, side);
+            push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::QuarkDrive });
+        }
+    }
 }
 
 /// Apply the switching side's own hazards to the incoming Pokémon.
@@ -1374,6 +1402,9 @@ fn fixed_damage_amount(md: &crate::data::MoveData, state: &State, side: SideId) 
         // attacker's current HP (0 if the target is already at or below it).
         "superfang" => (defender.hp / 2).max(1),
         "endeavor" => (defender.hp - attacker.hp).max(0),
+        // Mirror Coat returns 2× the special damage its user took from the foe this turn (PS
+        // `damageCallback`). With no such hit recorded it deals nothing (PS `onTry` fails).
+        "mirrorcoat" => (state.side(side).special_damage_taken * 2).max(0),
         _ => return None,
     })
 }
@@ -1437,9 +1468,10 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // mon's own copy). Foe-sourced traps additionally end when the TRAPPER leaves — handled by
     // `clear_foe_sourced_traps` in `apply_switch_inner`.
     VolatileStatus::Trapped, VolatileStatus::Ingrain, VolatileStatus::NoRetreat, VolatileStatus::Octolock,
-    // Note: Protosynthesis / QuarkDrive are not cleared here yet; their re-application on
-    // switch-in isn't modeled, so clearing would lose the boost for the common stay-in case.
-    // ability-driven volatiles incorrectly; they're re-derived on switch-in (TODO).
+    // Protosynthesis / Quark Drive end on switch-out (PS ability `onEnd` deletes the volatile);
+    // they are re-derived on switch-in in `apply_switch_in_ability` (weather/terrain, else the
+    // one-shot Booster Energy). A mon that stays in never reaches this path, so its boost persists.
+    VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive,
 ];
 
 /// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
@@ -1987,6 +2019,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // A two-turn move spends this turn charging (no attack) unless it strikes instantly.
     // Power Herb is consumed to skip the charge turn entirely.
     if !executing_charge && is_two_turn_move(move_id) && !charges_instantly(move_id, effective_weather(&b.state)) {
+        // Meteor Beam / Electro Shot raise the user's SpA on the charge turn (PS `onTryMove`
+        // `this.boost`), before committing to (or, with Power Herb, skipping) the charge.
+        if let Some((stat, amt)) = charge_self_boost(move_id) {
+            apply_self_boost(&mut b, side, stat, amt);
+        }
         if b.state.side(side).active().item == Item::PowerHerb {
             push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::PowerHerb, new: Item::None });
             on_item_lost(&mut b, side);
@@ -2002,6 +2039,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Fake Out / First Impression only work on the user's first turn out (active_turns ≤ 1);
     // after that they fail outright.
     if matches!(move_id.to_id(), "fakeout" | "firstimpression") && b.state.side(side).active_turns > 1 {
+        return vec![b];
+    }
+
+    // Double Shock fails outright (PS `onTryMove` `-fail`) unless the user is currently an
+    // Electric type — so a second use after the first stripped the Electric type fails.
+    if move_id.to_id() == "doubleshock" && !b.state.side(side).active().types.contains(&Type::Electric) {
         return vec![b];
     }
 
@@ -2044,6 +2087,35 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             return vec![b];
         }
+    }
+
+    // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
+    // user BEFORE the hit is attempted — PS gen9 queues `battle.faint(pokemon)` in `useMove`
+    // ahead of `tryMoveHit`. So the user faints even against a type-immune target, through
+    // Protect, or on a miss. (Damp already cancelled the move above, so no faint there.) The
+    // hit-branch self-destruct in `apply_post_damage` is a no-op once the user is already down.
+    if matches!(move_id.to_id(), "explosion" | "selfdestruct" | "mistyexplosion") {
+        let (alive, hp, aslot) = {
+            let p = b.state.side(side).active();
+            (p.is_alive(), p.hp, b.state.side(side).active_index)
+        };
+        if alive {
+            push(&mut b, Instruction::Damage { side, slot: aslot, amount: hp });
+        }
+    }
+
+    // Future Sight / Doom Desire are category Special, so they don't reach the status-move path —
+    // but they deal NO damage this turn. They schedule a delayed strike (2 turns out) on the target
+    // side, computed at land time from the caster's stats. PS `onTry` adds a slot condition and
+    // fails outright while one is already pending. (`ignoreImmunity`, so Protect/typing don't gate.)
+    if matches!(move_id.to_id(), "futuresight" | "doomdesire") {
+        let target = side.other();
+        if b.state.side(target).future_sight.0 == 0 {
+            let caster_slot = b.state.side(side).active_index;
+            let prev = b.state.side(target).future_sight;
+            push(&mut b, Instruction::SetFutureSight { side: target, previous: prev, new: (3, caster_slot) });
+        }
+        return vec![b];
     }
 
     // Status moves handled specially.
@@ -2242,7 +2314,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
     // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
     // take the sumset-DP path, which also folds in the distribution over the hit count.
-    let damaged: Vec<(Branch, bool)> = if let Some(fixed) = fixed_damage_amount(&md, &b.state, side) {
+    let damaged: Vec<(Branch, bool)> = if md.id.to_id() == "beatup" {
+        // Beat Up: one hit per eligible party member with per-member base power.
+        apply_beatup(&b, side, &md, hit_prob)
+    } else if let Some(fixed) = fixed_damage_amount(&md, &b.state, side) {
         // Fixed-damage moves (Night Shade / Seismic Toss = level, Dragon Rage = 40, ...) skip
         // the damage formula entirely: one deterministic outcome, no rolls or crit.
         let mut hb = scaled(&b, hit_prob);
@@ -2318,6 +2393,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     };
     for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
+        // Double Shock: the connecting hit strips the user's Electric type (PS `self.onHit`
+        // `setType`, mapping Electric -> "???" typeless). A pure-Electric user becomes fully
+        // typeless; Pawmot (Electric/Fighting) keeps only Fighting. Modeled as Type::None in the
+        // stripped slot (the engine's typeless).
+        if md.id.to_id() == "doubleshock" && hb.state.side(side).active().is_alive() {
+            let p = hb.state.side(side).active();
+            if p.types.contains(&Type::Electric) {
+                let prev = p.types;
+                let new = [
+                    if prev[0] == Type::Electric { Type::None } else { prev[0] },
+                    if prev[1] == Type::Electric { Type::None } else { prev[1] },
+                ];
+                let slot = hb.state.side(side).active_index;
+                push(&mut hb, Instruction::ChangeTypes { side, slot, previous: prev, new });
+            }
+        }
         // Weakness Policy on the target (super-effective hit), then White Herb if the user's
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
         apply_weakness_policy(&mut hb, foe, &md);
@@ -3228,6 +3319,17 @@ fn apply_post_damage(
         }
     }
 
+    // Record the special-move damage the target (foe) just took, so a later Mirror Coat from that
+    // side can reflect 2× it this turn (PS `mirrorcoat` volatile `onDamagingHit`). Substitute hits
+    // don't touch the mon, so they don't count. Overwrites within the turn (PS keeps the last hit).
+    if any_damage && !hit_sub && md.category == MoveCategory::Special {
+        let prev = b.state.side(foe).special_damage_taken;
+        let new = total_dealt as i16;
+        if prev != new {
+            push(b, Instruction::SetSpecialDamageTaken { side: foe, previous: prev, new });
+        }
+    }
+
     // Defender on-hit reaction abilities (only when the hit connected with the mon itself).
     if any_damage && !hit_sub {
         maybe_eat_sitrus(b, foe);
@@ -3746,6 +3848,117 @@ fn apply_multihit_dp_sub(
         let only_hit_substitute = mon_hits == 0;
         apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0,
             only_hit_substitute, mon_hits, calc.life_orb, calc.def_item, calc.def_ability);
+        out.push((hb, only_hit_substitute));
+    }
+    out
+}
+
+/// Beat Up: one hit per eligible party member (PS `onModifyMove` filter: the user always, plus
+/// any ally that is neither fainted nor statused), in party order. Each hit's base power is
+/// `5 + floor(species base Atk / 10)` of that member, but the damage otherwise uses the USER's
+/// Attack vs the target's Defense (Dark, physical, no contact). We convolve the per-hit damage
+/// distributions (each 16 rolls × crit) in order, tracking `(sub_remaining, mon_damage, landed
+/// hits, sash_used)` so Substitute break, early faint, and Sturdy/Focus Sash stay exact.
+fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32) -> Vec<(Branch, bool)> {
+    use std::collections::HashMap;
+    let foe = side.other();
+    // Participating party members (party order): the user always, plus alive, status-free allies.
+    let mut calcs: Vec<DamageCalc> = Vec::new();
+    {
+        let s = b.state.side(side);
+        for i in 0..6usize {
+            let p = &s.pokemon[i];
+            if p.species == crate::ids::Species::None {
+                continue;
+            }
+            let included = i as u8 == s.active_index || (p.is_alive() && p.status == Status::None);
+            if !included {
+                continue;
+            }
+            let base_atk = crate::data::base_stats(p.species)[1];
+            let bp = (5 + (base_atk / 10)).max(1) as u16;
+            let mut m = *md;
+            m.base_power = bp;
+            calcs.push(compute_damage(b, side, &m));
+        }
+    }
+    if calcs.is_empty() {
+        // No participants is impossible (the user is always eligible), but stay total.
+        return vec![(scaled(b, hit_prob), false)];
+    }
+    let crit_p = crit_chance(b, side, md);
+    // Per-hit (damage, prob) for a given calc (16 non-crit + 16 crit rolls).
+    let per_hit_of = |calc: &DamageCalc| -> Vec<(i32, f32)> {
+        let mut v = Vec::with_capacity(32);
+        for i in 0..16 {
+            if crit_p < 1.0 {
+                v.push((calc.rolls_nocrit[i] as i32, (1.0 / 16.0) * (1.0 - crit_p)));
+            }
+            if crit_p > 0.0 {
+                v.push((calc.rolls_crit[i] as i32, (1.0 / 16.0) * crit_p));
+            }
+        }
+        v
+    };
+
+    let bypass_sub = md.flag_sound
+        || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
+    let sub_hp0 = if b.state.side(foe).volatiles.contains(VolatileStatus::Substitute) && !bypass_sub {
+        b.state.side(foe).substitute_hp as i32
+    } else {
+        0
+    };
+    let cap = b.state.side(foe).active().hp.max(0) as i32;
+    let survival = calcs[0].def_ability == crate::ids::Ability::Sturdy || calcs[0].def_item == Item::FocusSash;
+
+    // Key: (sub remaining, mon damage, mon-connected hits, Focus Sash activated).
+    let mut conv: HashMap<(i32, i32, u8, bool), f32> = HashMap::new();
+    conv.insert((sub_hp0, 0, 0, false), 1.0);
+    for calc in &calcs {
+        let per_hit = per_hit_of(calc);
+        let mut next: HashMap<(i32, i32, u8, bool), f32> = HashMap::with_capacity(conv.len() + 32);
+        for (&(sub_rem, mon, mon_hits, sash_used), &pt) in &conv {
+            for &(v, pv) in &per_hit {
+                let key = if sub_rem > 0 {
+                    ((sub_rem - v).max(0), mon, mon_hits, sash_used)
+                } else if mon >= cap {
+                    (0, mon, mon_hits, sash_used)
+                } else {
+                    let hp = cap - mon;
+                    let mut dealt = v.min(hp);
+                    let activates = mon == 0 && survival && dealt >= hp;
+                    if activates {
+                        dealt = hp - 1;
+                    }
+                    (0, mon + dealt, mon_hits.saturating_add(1),
+                        sash_used || (activates && calcs[0].def_item == Item::FocusSash))
+                };
+                *next.entry(key).or_insert(0.0) += pt * pv;
+            }
+        }
+        conv = next;
+    }
+
+    let mut out = Vec::with_capacity(conv.len());
+    for ((sub_rem, mon, mon_hits, sash_used), p) in conv {
+        let mut hb = scaled(b, hit_prob * p);
+        let sub_dmg = sub_hp0 - sub_rem;
+        if sub_dmg > 0 {
+            push(&mut hb, Instruction::DamageSubstitute { side: foe, amount: sub_dmg as i16 });
+        }
+        if sub_hp0 > 0 && sub_rem == 0 {
+            push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
+        }
+        let slot = hb.state.side(foe).active_index;
+        if sash_used {
+            push(&mut hb, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+        }
+        if mon > 0 {
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: mon as i16 });
+        }
+        let only_hit_substitute = mon_hits == 0 && sub_dmg > 0;
+        apply_post_damage(&mut hb, side, md, sub_dmg + mon, mon > 0,
+            only_hit_substitute, mon_hits, calcs[0].life_orb, calcs[0].def_item, calcs[0].def_ability);
         out.push((hb, only_hit_substitute));
     }
     out
@@ -4571,6 +4784,78 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         return vec![b];
     }
+    // Belly Drum: pay 1/2 max HP (via directDamage) to max Attack (+6). PS `onHit` fails
+    // outright — no HP cost — when HP is already at/below 1/2 max, Attack is already +6, or the
+    // user is Shedinja (maxhp == 1). The boost is `{atk: 12}`, clamped to the +6 cap.
+    if md.id.to_id() == "bellydrum" {
+        let mut b = b;
+        let (hp, maxhp, atk) = {
+            let p = b.state.side(side).active();
+            (p.hp, p.max_hp, b.state.side(side).boost(BoostIndex::Attack))
+        };
+        if hp <= maxhp / 2 || atk >= 6 || maxhp == 1 {
+            return vec![b]; // fails; PP already paid, no HP cost
+        }
+        let slot = b.state.side(side).active_index;
+        push(&mut b, Instruction::Damage { side, slot, amount: maxhp / 2 });
+        apply_self_boost(&mut b, side, BoostIndex::Attack, 12);
+        return vec![b];
+    }
+    // Clangorous Soul: pay floor(maxHP·33/100) HP for +1 to all five stats. PS `onTry` fails
+    // (no cost) when HP is at/below that cost or the user is Shedinja; `onTryHit` fails when the
+    // boost would change nothing (all five already +6), leaving HP untouched. The boost is
+    // applied BEFORE the HP cost (directDamage in `onHit`).
+    if md.id.to_id() == "clangoroussoul" {
+        let mut b = b;
+        let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
+        let cost = (maxhp as i32 * 33 / 100) as i16;
+        if hp <= cost || maxhp == 1 {
+            return vec![b]; // onTry fail; PP already paid, no cost
+        }
+        let boostable = [
+            BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+            BoostIndex::SpecialDefense, BoostIndex::Speed,
+        ]
+        .iter()
+        .any(|&s| b.state.side(side).boost(s) < 6);
+        if !boostable {
+            return vec![b]; // onTryHit fail: all five already maxed, no HP paid
+        }
+        for stat in [
+            BoostIndex::Attack, BoostIndex::Defense, BoostIndex::SpecialAttack,
+            BoostIndex::SpecialDefense, BoostIndex::Speed,
+        ] {
+            apply_self_boost(&mut b, side, stat, 1);
+        }
+        let slot = b.state.side(side).active_index;
+        push(&mut b, Instruction::Damage { side, slot, amount: cost });
+        return vec![b];
+    }
+    // Court Change: swap BOTH sides' entry-hazard / screen / Tailwind side conditions wholesale
+    // (PS's full `sideConditions` list, intersected with what the engine models).
+    if md.id.to_id() == "courtchange" {
+        let mut b = b;
+        let a = b.state.side(side).side_conditions;
+        let c = b.state.side(foe).side_conditions;
+        use SideConditionId::*;
+        let pairs = [
+            (StealthRock, a.stealth_rock as u8, c.stealth_rock as u8),
+            (Spikes, a.spikes, c.spikes),
+            (ToxicSpikes, a.toxic_spikes, c.toxic_spikes),
+            (StickyWeb, a.sticky_web as u8, c.sticky_web as u8),
+            (Reflect, a.reflect, c.reflect),
+            (LightScreen, a.light_screen, c.light_screen),
+            (AuroraVeil, a.aurora_veil, c.aurora_veil),
+            (Tailwind, a.tailwind, c.tailwind),
+        ];
+        for (cond, av, cv) in pairs {
+            if av != cv {
+                push(&mut b, Instruction::SetSideCondition { side, condition: cond, previous: av, new: cv });
+                push(&mut b, Instruction::SetSideCondition { side: foe, condition: cond, previous: cv, new: av });
+            }
+        }
+        return vec![b];
+    }
     // Healing Wish / Lunar Dance: the user faints (self_destruct) leaving a healing wish
     // for the next damaged replacement. Fails if there is nothing to switch to.
     if matches!(md.id.to_id(), "healingwish" | "lunardance") {
@@ -4639,18 +4924,8 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         }
         return vec![b];
     }
-    // Future Sight / Doom Desire: schedules an attack on the TARGET side that lands at the
-    // end of the second turn from now, computed from the caster's stats at hit time.
-    if matches!(md.id.to_id(), "futuresight" | "doomdesire") {
-        let mut b = b;
-        let target = side.other();
-        if b.state.side(target).future_sight.0 == 0 {
-            let caster_slot = b.state.side(side).active_index;
-            let prev = b.state.side(target).future_sight;
-            push(&mut b, Instruction::SetFutureSight { side: target, previous: prev, new: (3, caster_slot) });
-        }
-        return vec![b];
-    }
+    // (Future Sight / Doom Desire are category Special and are intercepted in the damaging-move
+    // path before reaching here — they schedule a delayed strike rather than acting this turn.)
     if md.id.to_id() == "rest" {
         let mut b = b;
         let (hp, maxhp, status, item) = {
@@ -4872,6 +5147,28 @@ fn is_charge_move(id: crate::ids::MoveId) -> bool {
     )
 }
 
+/// Charge moves that raise a stat of the user on the charge turn (PS `onTryMove` `this.boost`):
+/// Meteor Beam / Electro Shot both give +1 SpA. Applied on the charge turn and, when Power Herb
+/// skips the charge, on the strike turn — never on the second turn of a normally-charged use.
+fn charge_self_boost(id: crate::ids::MoveId) -> Option<(BoostIndex, i8)> {
+    match id.to_id() {
+        "meteorbeam" | "electroshot" => Some((BoostIndex::SpecialAttack, 1)),
+        _ => None,
+    }
+}
+
+/// Moves flagged `cantusetwice` (PS): they cannot be re-selected the turn after a use (PS
+/// disables the slot when `lastMove?.id === moveSlot.id`). Gen9 has exactly these two.
+pub fn is_cantusetwice_move(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "gigatonhammer" | "bloodmoon")
+}
+
+/// Whether `move_id` is a `cantusetwice` move currently locked out of selection for `side`'s
+/// active because it was that mon's last executed move (PS's `DisableMove` for the flag).
+pub fn cantusetwice_locked(state: &State, side: SideId, move_id: crate::ids::MoveId) -> bool {
+    is_cantusetwice_move(move_id) && state.side(side).last_used_move == move_id
+}
+
 /// Two-turn moves whose user is untargetable during the charge turn.
 fn is_semi_invuln_move(id: crate::ids::MoveId) -> bool {
     matches!(
@@ -4880,7 +5177,7 @@ fn is_semi_invuln_move(id: crate::ids::MoveId) -> bool {
     )
 }
 
-fn is_two_turn_move(id: crate::ids::MoveId) -> bool {
+pub fn is_two_turn_move(id: crate::ids::MoveId) -> bool {
     is_charge_move(id) || is_semi_invuln_move(id)
 }
 
@@ -5082,6 +5379,14 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
 
 pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     let b = &mut branch;
+    // Mirror Coat's per-turn special-damage record (PS's duration-1 `mirrorcoat` volatile) does
+    // not survive to the next turn — clear it so it never leaks into a later Mirror Coat.
+    for side in [SideId::One, SideId::Two] {
+        let prev = b.state.side(side).special_damage_taken;
+        if prev != 0 {
+            push(b, Instruction::SetSpecialDamageTaken { side, previous: prev, new: 0 });
+        }
+    }
     // PS decrements a residual effect's duration FIRST and, if it hits 0, ends the effect and
     // SKIPS its onResidual that turn (battle.ts residual loop). The SANDSTORM/snow CHIP and the
     // weather-tied ability heals (Rain Dish, Ice Body) are part of the weather's own residual, so
@@ -5648,6 +5953,10 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                         let dmg = r.min(hp).max(0);
                         if dmg > 0 {
                             push(&mut nb, Instruction::Damage { side, slot, amount: dmg });
+                            // The delayed strike counts as a hit for Rage Fist (PS `timesAttacked`).
+                            let cur = nb.state.side(side).active().times_hit;
+                            let new = cur.saturating_add(1).min(250);
+                            push(&mut nb, Instruction::SetTimesHit { side, slot, previous: cur, new });
                         }
                         nb
                     })

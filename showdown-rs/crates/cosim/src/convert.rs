@@ -86,9 +86,46 @@ pub fn convert_state(v: &Value, canon: &Canonical) -> Res<State> {
     for (si, side_v) in sides.iter().enumerate() {
         state.sides[si] = convert_side(side_v, si, canon, ended, turn)?;
     }
+    // Resolve each pending Future Sight's caster to its canonical party slot. PS serializes the
+    // slotCondition's `source` as a position ref `[Pokemon:p{N}{letter}]` (the caster's CURRENT
+    // position — PS tracks the specific mon across switches). The caster's canonical slot is the
+    // `rosterIndex` of the mon at that position, which is what `future_sight_rolls` indexes.
+    for si in 0..sides.len().min(2) {
+        if state.sides[si].future_sight.0 == 0 {
+            continue;
+        }
+        if let Some(slot) = resolve_future_caster(sides, si) {
+            state.sides[si].future_sight.1 = slot;
+        }
+    }
     convert_field(&v["field"], &mut state)?;
     state.turn = turn;
     Ok(state)
+}
+
+/// Resolve the caster slot for the Future Sight pending on target side `target_si`. Returns the
+/// caster's `rosterIndex` (canonical party slot), or `None` if it can't be located.
+fn resolve_future_caster(sides: &[Value], target_si: usize) -> Option<u8> {
+    let entries: Vec<&Value> = match sides.get(target_si)?.get("slotConditions") {
+        Some(Value::Array(a)) => a.iter().collect(),
+        Some(Value::Object(o)) => o.values().collect(),
+        _ => return None,
+    };
+    for conds in entries {
+        let Some(fm) = conds.get("futuremove") else { continue };
+        let src = fm.get("source").and_then(Value::as_str)?;
+        // "[Pokemon:p1a]" -> side digit + position letter.
+        let inner = src.trim_start_matches("[Pokemon:").trim_end_matches(']');
+        let bytes = inner.as_bytes();
+        if bytes.len() < 3 || bytes[0] != b'p' {
+            return None;
+        }
+        let src_side = (bytes[1] as char).to_digit(10)? as usize - 1;
+        let pos = (bytes[bytes.len() - 1] - b'a') as usize;
+        let caster = sides.get(src_side)?.get("pokemon")?.as_array()?.get(pos)?;
+        return caster.get("rosterIndex").and_then(Value::as_i64).map(|r| r as u8);
+    }
+    None
 }
 
 fn convert_field(f: &Value, state: &mut State) -> Res<()> {
@@ -217,15 +254,22 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         .find_map(|part| part.strip_prefix('L').and_then(|l| l.parse::<u8>().ok()))
         .unwrap_or(100);
 
+    // PS's typeless "???" (Double Shock removing Electric, Burn Up, ...) has no alphanumerics, so
+    // `to_id` yields "" — map that to the engine's `Type::None` (typeless slot).
+    let parse_type = |t: &Value| -> Result<Type, Unsupported> {
+        let tid = to_id(t.as_str().unwrap_or(""));
+        if tid.is_empty() {
+            return Ok(Type::None);
+        }
+        Type::from_id(&tid).ok_or_else(|| unsup(format!("type:{tid}")))
+    };
     let mut types = [Type::None; 2];
     for (ti, t) in p["types"].as_array().into_iter().flatten().take(2).enumerate() {
-        let tid = to_id(t.as_str().unwrap_or(""));
-        types[ti] = Type::from_id(&tid).ok_or_else(|| unsup(format!("type:{tid}")))?;
+        types[ti] = parse_type(t)?;
     }
     let mut base_types = types;
     for (ti, t) in p["baseTypes"].as_array().into_iter().flatten().take(2).enumerate() {
-        let tid = to_id(t.as_str().unwrap_or(""));
-        base_types[ti] = Type::from_id(&tid).ok_or_else(|| unsup(format!("type:{tid}")))?;
+        base_types[ti] = parse_type(t)?;
     }
     if p.get("addedType").and_then(Value::as_str).is_some_and(|t| !t.is_empty()) {
         return Err(unsup("pokemon:addedType"));
@@ -477,6 +521,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             // the "[premajor]" -prepare message, carrying no cross-turn state (the user switches
             // out the same turn, clearing it). No engine field to set.
             "chillyreception" => {}
+            // Two-turn charge / semi-invulnerable moves add BOTH a `twoturnmove` volatile (which
+            // sets PendingMove::Charging above) AND a move-specific marker volatile (`meteorbeam`,
+            // `fly`, ...). The latter carries no extra cross-turn state — skip it.
+            other if MoveId::from_id(other).is_some_and(engine::generate::is_two_turn_move) => {}
             other => return Err(unsup(format!("volatile:{other}"))),
         }
     }
@@ -526,14 +574,14 @@ fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon:
                     side.wish = (if turn <= starting + 1 { 2 } else { 1 }, hp);
                 }
                 "futuremove" => {
-                    // source pokemon decides the attack's stats; map to a canonical slot
-                    let src = cv
-                        .get("source")
-                        .and_then(Value::as_str)
-                        .map(|r| to_id(r.split(": ").last().unwrap_or("")))
-                        .unwrap_or_default();
-                    let slot = canon.slot(si, &src).unwrap_or(0);
-                    side.future_sight = (i(cv, "duration") as u8, slot);
+                    // PS stores `endingTurn` (not a live duration): the strike lands 2 turns after
+                    // `endingTurn`, so the engine's remaining-tick count is `endingTurn + 2 - turn`
+                    // (matching its own end-of-turn countdown, which fires when it reaches 1). The
+                    // caster slot (`future_sight.1`) is re-resolved from the source ref in
+                    // `convert_state`; a placeholder 0 here is overwritten there.
+                    let ending = i(cv, "endingTurn");
+                    let remaining = (ending + 2 - turn as i64).max(1) as u8;
+                    side.future_sight = (remaining, 0);
                 }
                 "healingwish" | "lunardance" => {
                     side.healing_wish = true;
@@ -578,6 +626,11 @@ pub fn scan_frontier(v: &Value, out: &mut std::collections::BTreeSet<String>) {
                 }
             }
             for (k, _) in p["volatiles"].as_object().into_iter().flatten() {
+                // Two-turn moves add a per-move marker volatile next to `twoturnmove`
+                // (meteorbeam, fly, ...) that `convert_volatiles` skips — keep in sync here.
+                if MoveId::from_id(k).is_some_and(engine::generate::is_two_turn_move) {
+                    continue;
+                }
                 if !KNOWN_VOLATILES.contains(&k.as_str()) {
                     out.insert(format!("volatile:{k}"));
                 }

@@ -273,6 +273,11 @@ pub struct Side {
     pub wish: (u8, i16),
     /// Future Sight: (turns remaining, source party slot). turns == 0 means inactive.
     pub future_sight: (u8, u8),
+    /// Damage the active took from the FOE's most recent Special-category damaging hit THIS
+    /// turn (Mirror Coat reflects 2×). Transient within a turn — set when a special move damages
+    /// this side's active, read by Mirror Coat (priority -5, so it moves after the hit), and
+    /// cleared at end of turn. Not part of the diffed manifest (mirrors PS's duration-1 volatile).
+    pub special_damage_taken: i16,
 }
 
 impl Side {
@@ -312,6 +317,7 @@ impl Side {
         healing_wish: false,
         wish: (0, 0),
         future_sight: (0, 0),
+        special_damage_taken: 0,
     };
 
     #[inline]

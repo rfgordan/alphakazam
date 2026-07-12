@@ -614,7 +614,13 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
         let mut eng_moves: Vec<String> = active
             .moves
             .iter()
-            .filter(|m| m.id != engine::ids::MoveId::None && m.pp > 0 && !m.disabled)
+            .filter(|m| {
+                m.id != engine::ids::MoveId::None
+                    && m.pp > 0
+                    && !m.disabled
+                    // Gigaton Hammer / Blood Moon (cantusetwice) are locked out the turn after use.
+                    && !engine::generate::cantusetwice_locked(state, crate::convert::side_id(si), m.id)
+            })
             .map(|m| m.id.to_id().to_string())
             .collect();
         // A locked mon (mid-rampage Outrage/Thrash, charging a two-turn move, recharging, or

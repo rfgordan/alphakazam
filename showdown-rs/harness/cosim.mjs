@@ -187,6 +187,44 @@ const TEAM_COVERAGE = {
 	]],
 };
 
+// State-machine move coverage (`c2*.json.gz`, `--teamset smA` / `smB`): the "state-machine"
+// batch from coverage-worklist.json — Belly Drum, Clangorous Soul, Court Change, Meteor Beam
+// (charge + Power-Herb skip), Future Sight, Endeavor, Mirror Coat, Beat Up, Double Shock, Explosion,
+// Gigaton Hammer / Blood Moon (cantusetwice), and Booster Energy Quark Drive / Protosynthesis
+// (consumed once, volatile cleared on switch). Carriers are the worklist's real gen9 carriers.
+const TEAM_SM = {
+	smA: [[
+		'Azumarill||sitrusberry|hugepower|bellydrum,aquajet,playrough,liquidation|Adamant|,252,,,4,252|||||,,,,,Water',
+		'Kommo-o||leftovers|bulletproof|clangoroussoul,drainpunch,closecombat,poisonjab|Adamant|,252,,,4,252|||||,,,,,Fighting',
+		'Slowking||leftovers|regenerator|futuresight,scald,slackoff,sludgebomb|Calm|252,,16,,240,|||||,,,,,Water',
+		'Cinderace||heavydutyboots|blaze|courtchange,pyroball,uturn,suckerpunch|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Tinkaton||airballoon|moldbreaker|gigatonhammer,playrough,stealthrock,encore|Jolly|,252,,,4,252|||||,,,,,Steel',
+		'Pawmot||lifeorb|ironfist|doubleshock,closecombat,machpunch,nuzzle|Jolly|,252,,,4,252|||||,,,,,Electric',
+	], [
+		'Glimmora||leftovers|toxicdebris|meteorbeam,powergem,earthpower,mortalspin|Modest|,,,252,4,252|||||,,,,,Rock',
+		'Armarouge||powerherb|weakarmor|meteorbeam,armorcannon,psychic,aurasphere|Modest|,,,252,4,252|||||,,,,,Fire',
+		'Ursaluna-Bloodmoon||leftovers|mindseye|bloodmoon,earthpower,hypervoice,calmmind|Modest|248,,,252,8,|||||,,,,,Normal',
+		'Magnezone||leftovers|sturdy|mirrorcoat,thunderbolt,flashcannon,bodypress|Modest|252,,,252,4,|||||,,,,,Electric',
+		'Fezandipiti||blackglasses|technician|beatup,gunkshot,uturn,roost|Jolly|,252,,,4,252|||||,,,,,Poison',
+		'Regieleki||leftovers|transistor|explosion,thunderbolt,voltswitch,thunder|Timid|,,,252,4,252|||||,,,,,Electric',
+	]],
+	smB: [[
+		'Iron Valiant||boosterenergy|quarkdrive|moonblast,closecombat,knockoff,thunderbolt|Naive|,252,,4,,252|||||,,,,,Fairy',
+		'Great Tusk||boosterenergy|protosynthesis|headlongrush,closecombat,rapidspin,icespinner|Jolly|,252,,,4,252|||||,,,,,Ground',
+		'Luvdisc||focussash|hydration|endeavor,whirlpool,protect,sweetkiss|Timid|,,,252,4,252|||||,,,,,Water',
+		'Araquanid||leftovers|waterbubble|mirrorcoat,liquidation,leechlife,bugbuzz|Adamant|248,252,,,8,|||||,,,,,Water',
+		'Iron Jugulis||boosterenergy|quarkdrive|meteorbeam,darkpulse,airslash,earthpower|Timid|,,,252,4,252|||||,,,,,Dark',
+		'Electrode||leftovers|aftermath|explosion,thunderbolt,voltswitch,thunder|Timid|,,,252,4,252|||||,,,,,Electric',
+	], [
+		'Roaring Moon||boosterenergy|protosynthesis|knockoff,earthquake,dragondance,acrobatics|Jolly|,252,,,4,252|||||,,,,,Flying',
+		'Raging Bolt||boosterenergy|protosynthesis|thunderbolt,dracometeor,thunderclap,calmmind|Modest|64,,,252,,192|||||,,,,,Electric',
+		'Iron Hands||boosterenergy|quarkdrive|drainpunch,thunderpunch,swordsdance,closecombat|Adamant|,252,,,4,252|||||,,,,,Fighting',
+		'Slowking-Galar||leftovers|regenerator|futuresight,sludgebomb,flamethrower,slackoff|Calm|252,,16,,240,|||||,,,,,Water',
+		'Gholdengo||choicespecs|goodasgold|makeitrain,shadowball,thunderbolt,focusblast|Timid|,,,252,4,252|||||,,,,,Steel',
+		'Kingambit||leftovers|supremeoverlord|kowtowcleave,suckerpunch,ironhead,swordsdance|Adamant|232,252,,,,24|||||,,,,,Dark',
+	]],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -589,6 +627,8 @@ async function main() {
 			? TEAM_TRAP[TEAMSET].map(t => t.join(']'))
 			: TEAM_COVERAGE[TEAMSET]
 			? TEAM_COVERAGE[TEAMSET].map(t => t.join(']'))
+			: TEAM_SM[TEAMSET]
+			? TEAM_SM[TEAMSET].map(t => t.join(']'))
 			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
 		team1 = Teams.pack(Teams.import(t1));
 		team2 = Teams.pack(Teams.import(t2));

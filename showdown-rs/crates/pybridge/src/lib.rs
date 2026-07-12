@@ -401,7 +401,9 @@ fn legal_mask_of(state: &State, side: SideId) -> [bool; N_ACTIONS] {
     if active.is_alive() {
         for i in 0..N_MOVES {
             let m = active.moves[i];
-            mask[i] = m.id != engine::ids::MoveId::None && m.pp > 0;
+            mask[i] = m.id != engine::ids::MoveId::None
+                && m.pp > 0
+                && !engine::generate::cantusetwice_locked(state, side, m.id);
         }
     }
     for (k, slot) in bench_slots(state, side).into_iter().enumerate() {
@@ -708,7 +710,9 @@ fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTION
                 let active = s.active();
                 for i in 0..N_MOVES {
                     let m = active.moves[i];
-                    let ok = m.id != engine::ids::MoveId::None && m.pp > 0;
+                    let ok = m.id != engine::ids::MoveId::None
+                        && m.pp > 0
+                        && !engine::generate::cantusetwice_locked(state, side, m.id);
                     mask[i] = ok;
                     if ok && !s.tera_used {
                         mask[9 + i] = true;
