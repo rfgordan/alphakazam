@@ -6,7 +6,7 @@
 //! PS's data files as coverage grows. `from_id` returns `None` for ids outside the
 //! slice so the differential runner can *report* what's unmapped rather than guess.
 
-use crate::ids::{MoveId, Species, Status, Terrain, Type, Weather};
+use crate::ids::{MoveId, Nature, Species, Status, Terrain, Type, Weather};
 use crate::volatile::VolatileStatus;
 
 macro_rules! id_map {
@@ -79,6 +79,34 @@ id_map!(Terrain {
     Grassy => "grassyterrain",
     Misty => "mistyterrain",
     Psychic => "psychicterrain",
+});
+
+id_map!(Nature {
+    Hardy => "hardy",
+    Lonely => "lonely",
+    Brave => "brave",
+    Adamant => "adamant",
+    Naughty => "naughty",
+    Bold => "bold",
+    Docile => "docile",
+    Relaxed => "relaxed",
+    Impish => "impish",
+    Lax => "lax",
+    Timid => "timid",
+    Hasty => "hasty",
+    Serious => "serious",
+    Jolly => "jolly",
+    Naive => "naive",
+    Modest => "modest",
+    Mild => "mild",
+    Quiet => "quiet",
+    Bashful => "bashful",
+    Rash => "rash",
+    Calm => "calm",
+    Gentle => "gentle",
+    Sassy => "sassy",
+    Careful => "careful",
+    Quirky => "quirky",
 });
 
 /// Binary-search a sorted `(name, id)` table.

@@ -84,6 +84,95 @@ pub fn build_member(spec: &MemberSpec, level: u8) -> Pokemon {
     }
 }
 
+// --- Pool-loaded teams (real PS random-battle sets) -----------------------------------------
+//
+// Unlike [`MemberSpec`] (whose ids are `&'static str` compile-time literals for the hand-written
+// default matchup), a `ResolvedMember` carries fully-resolved enum ids, a per-member level, and
+// per-stat IVs. It is the shape a runtime team loader (see `pybridge`, which owns the JSON parse
+// and the loud unknown-id checks) hands back. All effect modelling is identical to
+// [`build_member`]; the only differences are honouring the sampled level and IV spread.
+
+/// A team member with runtime-resolved ids, per-member level, and per-stat IVs.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedMember {
+    pub species: Species,
+    pub level: u8,
+    pub ability: Ability,
+    pub item: Item,
+    pub tera: Type,
+    pub nature: Nature,
+    pub evs: [u8; StatIndex::COUNT],
+    pub ivs: [u8; StatIndex::COUNT],
+    pub moves: [MoveId; 4],
+}
+
+/// Construct a fully-statted Pokémon from a resolved pool member (honours its level + IV spread).
+pub fn build_member_resolved(m: &ResolvedMember) -> Pokemon {
+    let base = base_stats(m.species);
+    let types = species_types(m.species);
+
+    let mut stats = [0i16; StatIndex::COUNT];
+    stats[StatIndex::Hp as usize] = compute_hp(base[0], m.ivs[0], m.evs[0], m.level);
+    for (si, stat) in [
+        StatIndex::Attack,
+        StatIndex::Defense,
+        StatIndex::SpecialAttack,
+        StatIndex::SpecialDefense,
+        StatIndex::Speed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let idx = si + 1;
+        stats[idx] = compute_stat(base[idx], m.ivs[idx], m.evs[idx], m.level, m.nature, stat);
+    }
+    let hp = stats[StatIndex::Hp as usize];
+
+    let mut moves = [MoveSlot::EMPTY; 4];
+    for (i, id) in m.moves.iter().enumerate() {
+        if *id != MoveId::None {
+            let pp = (crate::data::move_data(*id).pp as u16 * 8 / 5) as u8;
+            moves[i] = MoveSlot { id: *id, pp, max_pp: pp, disabled: false };
+        }
+    }
+
+    Pokemon {
+        species: m.species,
+        level: m.level,
+        types,
+        base_types: types,
+        base_species: m.species,
+        base_stats: stats,
+        base_moves: moves,
+        hp,
+        max_hp: hp,
+        stats,
+        ability: m.ability,
+        base_ability: m.ability,
+        item: m.item,
+        nature: m.nature,
+        evs: m.evs,
+        moves,
+        tera_type: m.tera,
+        ..Pokemon::EMPTY
+    }
+}
+
+/// Build a full battle `State` from two resolved pool teams (up to 6 each), both active on slot 0.
+pub fn build_state_resolved(team1: &[ResolvedMember], team2: &[ResolvedMember]) -> State {
+    let make_side = |team: &[ResolvedMember]| -> Side {
+        let mut pokemon = [Pokemon::EMPTY; 6];
+        for (i, m) in team.iter().take(6).enumerate() {
+            pokemon[i] = build_member_resolved(m);
+        }
+        Side { pokemon, ..Side::EMPTY }
+    };
+    State {
+        sides: [make_side(team1), make_side(team2)],
+        ..State::EMPTY
+    }
+}
+
 /// Build a full battle `State` from two teams (up to 6 each), both active on slot 0.
 pub fn build_state(team1: &[MemberSpec], team2: &[MemberSpec], level: u8) -> State {
     let make_side = |team: &[MemberSpec]| -> Side {

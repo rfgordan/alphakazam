@@ -1,0 +1,4 @@
+# The full 100k pool is heavy (~16 MB) and reproducible from gen-team-pool.mjs — not committed.
+# Only the 2k sample (gen9randombattle-2k.jsonl.gz) and stats.json are tracked.
+gen9randombattle-100k.jsonl.gz
+*.jsonl

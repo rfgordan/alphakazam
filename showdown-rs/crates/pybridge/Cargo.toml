@@ -15,10 +15,19 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 engine = { path = "../engine" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# `extension-module` is intentionally NOT enabled unconditionally: that feature tells pyo3 not to
+# link libpython, which makes a plain `cargo test` bin fail to link (no interpreter to supply the
+# symbols). maturin sets `PYO3_BUILD_EXTENSION_MODULE=1` for the real wheel build, so the shipped
+# `.so` still gets extension-module linkage; `cargo test -p pybridge` links libpython normally.
+pyo3 = { version = "0.22" }
 serde_json = "1"
 numpy = "0.22"
 rayon = "1.10"
+flate2 = "1"
+
+[features]
+# Opt-in extension-module linkage for anyone building the cdylib directly with cargo.
+extension-module = ["pyo3/extension-module"]
 
 [profile.release]
 opt-level = 3

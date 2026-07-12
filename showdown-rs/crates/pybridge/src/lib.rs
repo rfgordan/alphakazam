@@ -494,6 +494,10 @@ use rayon::prelude::*;
 pub struct BattleVec {
     states: Vec<State>,
     rngs: Vec<Rng>,
+    /// Per-env team-draw RNG (separate stream from outcome sampling, so drawing a fresh matchup
+    /// never perturbs battle outcomes). `None` (no pool) leaves battles on the default matchup.
+    draw_rngs: Vec<Rng>,
+    pool: Option<Arc<Vec<PoolTeam>>>,
     /// Episode turn counters; battles hitting `max_turns` are truncated (done, winner -1).
     steps: Vec<u32>,
     max_turns: u32,
@@ -501,17 +505,32 @@ pub struct BattleVec {
 
 #[pymethods]
 impl BattleVec {
+    /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
+    /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_turns = 500))]
-    fn new(num_envs: usize, seed: u64, max_turns: u32) -> Self {
-        BattleVec {
-            states: (0..num_envs).map(|_| team::default_matchup()).collect(),
+    #[pyo3(signature = (num_envs, seed = 0, max_turns = 500, team_pool = None))]
+    fn new(num_envs: usize, seed: u64, max_turns: u32, team_pool: Option<String>) -> PyResult<Self> {
+        let pool = load_pool_opt(team_pool)?;
+        let mut draw_rngs: Vec<Rng> = (0..num_envs)
+            .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
+            .collect();
+        let states = (0..num_envs).map(|i| draw_state(&pool, &mut draw_rngs[i])).collect();
+        Ok(BattleVec {
+            states,
             rngs: (0..num_envs)
                 .map(|i| Rng(seed.wrapping_add(1).wrapping_add((i as u64) << 32)))
                 .collect(),
+            draw_rngs,
+            pool,
             steps: vec![0; num_envs],
             max_turns,
-        }
+        })
+    }
+
+    /// Number of teams in the loaded pool (0 when running the fixed default matchup).
+    #[getter]
+    fn pool_size(&self) -> usize {
+        self.pool.as_ref().map(|p| p.len()).unwrap_or(0)
     }
 
     #[getter]
@@ -623,13 +642,15 @@ impl BattleVec {
             )));
         }
         let max_turns = self.max_turns;
+        let pool = &self.pool;
         let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
             self.states
                 .par_iter_mut()
                 .zip(self.rngs.par_iter_mut())
+                .zip(self.draw_rngs.par_iter_mut())
                 .zip(self.steps.par_iter_mut())
                 .enumerate()
-                .map(|(i, ((st, rng), steps))| {
+                .map(|(i, (((st, rng), draw_rng), steps))| {
                     step_of(st, rng, red[i] as u8, blue[i] as u8);
                     *steps += 1;
                     let over = lost_of(st, SideId::One) || lost_of(st, SideId::Two);
@@ -637,7 +658,7 @@ impl BattleVec {
                     let done = over || truncated;
                     let winner = if over { winner_of(st) } else { -1 };
                     if done && auto_reset {
-                        *st = team::default_matchup();
+                        *st = draw_state(pool, draw_rng);
                         *steps = 0;
                     }
                     (done, winner)
@@ -648,6 +669,148 @@ impl BattleVec {
             Array1::from_vec(dones).into_pyarray_bound(py),
             Array1::from_vec(winners).into_pyarray_bound(py),
         ))
+    }
+}
+
+// ---- real-PS team pool loader ---------------------------------------------------------------
+//
+// We do NOT reimplement PS's random-team generator; harness/gen-team-pool.mjs *drives* the pinned
+// PS generator and serializes each team as MemberSpec-compatible JSON (toID ids). Here we parse a
+// gzipped JSONL pool into resolved engine teams. Every id is resolved through the engine's tables
+// and an unknown id is a LOUD error — never a silent default — so a pool that outran the engine's
+// coverage fails fast and visibly rather than training on corrupted teams.
+
+use std::sync::Arc;
+
+use engine::ids::{Ability, Item, MoveId, Nature, Species, Type};
+use engine::team::ResolvedMember;
+
+/// One resolved 6-mon pool team.
+type PoolTeam = [ResolvedMember; 6];
+
+fn resolve_species(s: &str) -> Result<Species, String> {
+    Species::from_id(s).ok_or_else(|| format!("unknown species id {s:?}"))
+}
+fn resolve_ability(s: &str) -> Result<Ability, String> {
+    Ability::from_id(s).ok_or_else(|| format!("unknown ability id {s:?}"))
+}
+/// Empty / "none" item id means the set holds no item (legitimate, e.g. Acrobatics users).
+fn resolve_item(s: &str) -> Result<Item, String> {
+    if s.is_empty() || s == "none" {
+        return Ok(Item::None);
+    }
+    Item::from_id(s).ok_or_else(|| format!("unknown item id {s:?}"))
+}
+fn resolve_type(s: &str) -> Result<Type, String> {
+    Type::from_id(s).ok_or_else(|| format!("unknown type id {s:?}"))
+}
+fn resolve_nature(s: &str) -> Result<Nature, String> {
+    Nature::from_id(s).ok_or_else(|| format!("unknown nature id {s:?}"))
+}
+/// Empty / "none" move id means an empty move slot.
+fn resolve_move(s: &str) -> Result<MoveId, String> {
+    if s.is_empty() || s == "none" {
+        return Ok(MoveId::None);
+    }
+    MoveId::from_id(s).ok_or_else(|| format!("unknown move id {s:?}"))
+}
+
+fn stat_array(v: &serde_json::Value, field: &str) -> Result<[u8; 6], String> {
+    let arr = v.get(field).and_then(|x| x.as_array()).ok_or_else(|| format!("missing {field}[] array"))?;
+    if arr.len() != 6 {
+        return Err(format!("{field} must have 6 entries, got {}", arr.len()));
+    }
+    let mut out = [0u8; 6];
+    for (i, x) in arr.iter().enumerate() {
+        out[i] = x.as_u64().ok_or_else(|| format!("{field}[{i}] not an integer"))? as u8;
+    }
+    Ok(out)
+}
+
+fn resolve_member(m: &serde_json::Value) -> Result<ResolvedMember, String> {
+    let species = resolve_species(m.get("species").and_then(|x| x.as_str()).ok_or("member missing species")?)?;
+    let level = m.get("level").and_then(|x| x.as_u64()).ok_or("member missing level")? as u8;
+    let ability = resolve_ability(m.get("ability").and_then(|x| x.as_str()).ok_or("member missing ability")?)?;
+    let item = resolve_item(m.get("item").and_then(|x| x.as_str()).unwrap_or(""))?;
+    let tera = resolve_type(m.get("tera").and_then(|x| x.as_str()).ok_or("member missing tera")?)?;
+    let nature = resolve_nature(m.get("nature").and_then(|x| x.as_str()).ok_or("member missing nature")?)?;
+    let evs = stat_array(m, "evs")?;
+    let ivs = stat_array(m, "ivs")?;
+
+    let moves_json = m.get("moves").and_then(|x| x.as_array()).ok_or("member missing moves[]")?;
+    let mut moves = [MoveId::None; 4];
+    for (i, mv) in moves_json.iter().take(4).enumerate() {
+        moves[i] = resolve_move(mv.as_str().ok_or("move not a string")?)?;
+    }
+
+    Ok(ResolvedMember { species, level, ability, item, tera, nature, evs, ivs, moves })
+}
+
+/// Parse one JSONL pool line (a `{"team":[6 members]}` object) into a resolved 6-mon team.
+/// Any unknown species/ability/item/move/type/nature id is a loud error.
+pub fn team_from_pool_line(json: &str) -> Result<PoolTeam, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let team = v.get("team").and_then(|x| x.as_array()).ok_or("line missing team[] array")?;
+    if team.len() != 6 {
+        return Err(format!("team must have 6 members, got {}", team.len()));
+    }
+    let mut out = [ResolvedMember {
+        species: Species::None,
+        level: 0,
+        ability: Ability::None,
+        item: Item::None,
+        tera: Type::None,
+        nature: Nature::Serious,
+        evs: [0; 6],
+        ivs: [31; 6],
+        moves: [MoveId::None; 4],
+    }; 6];
+    for (i, m) in team.iter().enumerate() {
+        out[i] = resolve_member(m).map_err(|e| format!("member {i}: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Load a gzipped JSONL pool file into resolved teams. Errors carry the offending line number.
+fn load_pool(path: &str) -> Result<Vec<PoolTeam>, String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).map_err(|e| format!("open pool {path}: {e}"))?;
+    let gz = flate2::read::GzDecoder::new(f);
+    let reader = std::io::BufReader::new(gz);
+    let mut out = Vec::new();
+    for (ln, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("read {path} line {ln}: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(team_from_pool_line(&line).map_err(|e| format!("{path} line {ln}: {e}"))?);
+    }
+    if out.is_empty() {
+        return Err(format!("pool {path} contained no teams"));
+    }
+    Ok(out)
+}
+
+/// Optionally load a pool from an `Option<path>`, mapping errors to a Python `ValueError`.
+fn load_pool_opt(team_pool: Option<String>) -> PyResult<Option<Arc<Vec<PoolTeam>>>> {
+    match team_pool {
+        None => Ok(None),
+        Some(path) => load_pool(&path)
+            .map(|v| Some(Arc::new(v)))
+            .map_err(pyo3::exceptions::PyValueError::new_err),
+    }
+}
+
+/// Draw two distinct-index pool teams with `rng` and assemble a fresh battle `State`. Falls back to
+/// the fixed default matchup when there is no pool.
+fn draw_state(pool: &Option<Arc<Vec<PoolTeam>>>, rng: &mut Rng) -> State {
+    match pool {
+        None => team::default_matchup(),
+        Some(p) => {
+            let a = (rng.next_u64() % p.len() as u64) as usize;
+            let b = (rng.next_u64() % p.len() as u64) as usize;
+            team::build_state_resolved(&p[a], &p[b])
+        }
     }
 }
 
@@ -764,25 +927,55 @@ pub struct FlowVec {
     reqs: Vec<u32>,
     max_requests: u32,
     seed: u64,
+    /// Per-env team-draw RNG (separate stream from Flow's internal outcome sampling).
+    draw_rngs: Vec<Rng>,
+    pool: Option<Arc<Vec<PoolTeam>>>,
 }
 
-impl FlowVec {
-    fn fresh_flow(seed: u64, i: usize) -> Flow {
-        Flow::new(engine::team::default_matchup(), seed.wrapping_add(1).wrapping_add((i as u64) << 32))
-    }
+/// The reproducible outcome-sampling seed for env `i` (matches the pre-pool behaviour).
+fn flow_seed(seed: u64, i: usize) -> u64 {
+    seed.wrapping_add(1).wrapping_add((i as u64) << 32)
+}
+
+/// A fresh `Flow`: pool teams drawn with `draw_rng` (or the fixed matchup when there is no pool),
+/// seeded for outcome sampling by `outcome_seed`.
+fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64) -> Flow {
+    Flow::new(draw_state(pool, draw_rng), outcome_seed)
 }
 
 #[pymethods]
 impl FlowVec {
+    /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
+    /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000))]
-    fn new(num_envs: usize, seed: u64, max_requests_per_episode: u32) -> Self {
-        FlowVec {
-            flows: (0..num_envs).map(|i| FlowVec::fresh_flow(seed, i)).collect(),
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None))]
+    fn new(
+        num_envs: usize,
+        seed: u64,
+        max_requests_per_episode: u32,
+        team_pool: Option<String>,
+    ) -> PyResult<Self> {
+        let pool = load_pool_opt(team_pool)?;
+        let mut draw_rngs: Vec<Rng> = (0..num_envs)
+            .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
+            .collect();
+        let flows = (0..num_envs)
+            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i)))
+            .collect();
+        Ok(FlowVec {
+            flows,
             reqs: vec![0; num_envs],
             max_requests: max_requests_per_episode,
             seed,
-        }
+            draw_rngs,
+            pool,
+        })
+    }
+
+    /// Number of teams in the loaded pool (0 when running the fixed default matchup).
+    #[getter]
+    fn pool_size(&self) -> usize {
+        self.pool.as_ref().map(|p| p.len()).unwrap_or(0)
     }
 
     #[getter]
@@ -922,12 +1115,14 @@ impl FlowVec {
         }
         let max_requests = self.max_requests;
         let seed = self.seed;
+        let pool = &self.pool;
         let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
             self.flows
                 .par_iter_mut()
                 .zip(self.reqs.par_iter_mut())
+                .zip(self.draw_rngs.par_iter_mut())
                 .enumerate()
-                .map(|(i, (flow, reqs))| {
+                .map(|(i, ((flow, reqs), draw_rng))| {
                     let req = flow.request();
                     let c0 = if acting_for(req, SideId::One) {
                         Some(flow_choice(&flow.state, SideId::One, red[i] as u8))
@@ -947,7 +1142,7 @@ impl FlowVec {
                         _ => (false, -1),
                     };
                     if done && auto_reset {
-                        *flow = FlowVec::fresh_flow(seed, i);
+                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i));
                         *reqs = 0;
                     }
                     (done, winner)
@@ -967,4 +1162,78 @@ fn showdown_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BattleVec>()?;
     m.add_class::<FlowVec>()?;
     Ok(())
+}
+
+// ---- pool loader validation (equivalence-relevant) ------------------------------------------
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use engine::request::{Flow, PlayerChoice, Request};
+
+    fn pool_path() -> String {
+        format!(
+            "{}/../../harness/team-pool/gen9randombattle-2k.jsonl.gz",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    /// Every committed pool team must resolve (no unknown ids), build with real stats, and carry
+    /// 6 real mons with moves. `load_pool` already resolves every id loudly — a single unknown
+    /// species/move/ability/item/type/nature id fails the load here.
+    #[test]
+    fn every_committed_pool_team_builds_and_resolves() {
+        let pool = load_pool(&pool_path()).expect("2k pool loads and every id resolves");
+        assert!(pool.len() >= 2000, "expected >= 2000 teams, got {}", pool.len());
+        for (ti, team) in pool.iter().enumerate() {
+            for (mi, m) in team.iter().enumerate() {
+                assert_ne!(m.species, Species::None, "team {ti} member {mi}: empty species");
+                assert!(m.level > 0, "team {ti} member {mi}: zero level");
+                let p = engine::team::build_member_resolved(m);
+                assert!(
+                    p.max_hp > 0,
+                    "team {ti} member {mi} ({}): computed 0 HP",
+                    m.species.to_id()
+                );
+                assert!(
+                    p.moves.iter().any(|mv| mv.id != MoveId::None),
+                    "team {ti} member {mi} ({}): no moves",
+                    m.species.to_id()
+                );
+            }
+        }
+    }
+
+    /// Pool teams must be playable: assemble a battle and drive several decision points with the
+    /// first legal action for each acting side, without panicking.
+    #[test]
+    fn pool_teams_are_playable() {
+        let pool = load_pool(&pool_path()).unwrap();
+        for pair in pool.chunks(2).take(300) {
+            if pair.len() < 2 {
+                break;
+            }
+            let state = engine::team::build_state_resolved(&pair[0], &pair[1]);
+            let mut flow = Flow::new(state, 0x1234_5678);
+            for _ in 0..16 {
+                let req = flow.request();
+                if let Request::Terminal { .. } = req {
+                    break;
+                }
+                let c0 = first_legal_choice(&flow.state, req, SideId::One);
+                let c1 = first_legal_choice(&flow.state, req, SideId::Two);
+                flow.submit([c0, c1]);
+            }
+        }
+    }
+
+    fn first_legal_choice(state: &State, req: Request, side: SideId) -> Option<PlayerChoice> {
+        if !acting_for(req, side) {
+            return None;
+        }
+        let mask = flow_legal_mask(state, req, side);
+        mask.iter()
+            .position(|&ok| ok)
+            .map(|a| flow_choice(state, side, a as u8))
+    }
 }
