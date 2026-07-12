@@ -490,6 +490,7 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "ingrain" => { side.volatiles.insert(VolatileStatus::Ingrain); }
             "noretreat" => { side.volatiles.insert(VolatileStatus::NoRetreat); }
             "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
+            "flashfire" => { side.volatiles.insert(VolatileStatus::FlashFire); }
             "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
             "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }

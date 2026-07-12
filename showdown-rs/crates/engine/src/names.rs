@@ -148,4 +148,5 @@ id_map!(VolatileStatus {
     Ingrain => "ingrain",
     NoRetreat => "noretreat",
     Octolock => "octolock",
+    FlashFire => "flashfire",
 });

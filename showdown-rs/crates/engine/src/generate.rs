@@ -321,11 +321,15 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
             let pending = b.state.side(side).pending_move;
             match pending {
                 PendingMove::Rampaging(m, n) if m == move_id => {
-                    if n > 1 {
-                        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Rampaging(m, n - 1) });
+                    if n >= 2 {
+                        // Continuation with turns still to come: this is a mid-turn (kernel)
+                        // snapshot, so `trueDuration` keeps its start-of-turn value here — the
+                        // per-use decrement is PS's end-of-turn `onResidual` (applied in
+                        // `apply_end_of_turn`), so the move action leaves it unchanged.
                         vec![b]
                     } else {
-                        // Natural end: the user becomes confused.
+                        // n == 1: the final locked turn. PS removes the volatile in `onAfterMove`
+                        // (duration hit 1) and `onEnd` confuses — both move-time (kernel) effects.
                         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
                         if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
                             push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
@@ -342,8 +346,11 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                     }
                 }
                 PendingMove::None => {
-                    // Starting a rampage: total 2 or 3 turns -> 1 or 2 remaining (uniform).
-                    [1u8, 2]
+                    // Starting a rampage: PS's lockedmove `onStart` sets `trueDuration =
+                    // this.random(2,4)` (2 or 3), which is the mid-turn (kernel) value; the
+                    // end-of-turn `onResidual` then decrements it, so the terminal snapshot is
+                    // {1,2}. The engine stores the kernel value here and decrements at end of turn.
+                    [2u8, 3]
                         .into_iter()
                         .map(|rem| {
                             let mut nb = scaled(&b, 0.5);
@@ -1430,6 +1437,11 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     {
         pri += 1;
     }
+    // Triage: +3 priority to moves with the heal flag (drain moves like Draining Kiss, and
+    // recovery moves). PS `onModifyPriority`.
+    if md.flag_heal && state.side(side).active().ability == crate::ids::Ability::Triage {
+        pri += 3;
+    }
     pri
 }
 
@@ -1472,6 +1484,8 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // they are re-derived on switch-in in `apply_switch_in_ability` (weather/terrain, else the
     // one-shot Booster Energy). A mon that stays in never reaches this path, so its boost persists.
     VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive,
+    // Flash Fire's activation ends on switch-out (PS ability `onEnd` removes the volatile).
+    VolatileStatus::FlashFire,
 ];
 
 /// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
@@ -2087,6 +2101,21 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             return vec![b];
         }
+        // Flash Fire: a Fire move targeting the holder is nullified (PS `onTryHit` `return null`)
+        // and activates the `flashfire` volatile, which grants ×1.5 to the holder's own Fire moves
+        // until it switches out. Applies to damaging and status Fire moves alike; Mold Breaker
+        // bypasses.
+        if affects_foe_mon
+            && md.typ == Type::Fire
+            && fa == A::FlashFire
+            && !mb
+            && b.state.side(foe).active().is_alive()
+        {
+            if !b.state.side(foe).volatiles.contains(VolatileStatus::FlashFire) {
+                push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::FlashFire });
+            }
+            return vec![b];
+        }
     }
 
     // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
@@ -2303,6 +2332,28 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
+    // Disguise: the first damaging hit on an un-busted Mimikyu is nullified (0 damage), busts it
+    // into Mimikyu-Busted, and chips 1/8 of its max HP (PS `onDamage`+`onUpdate`). The move still
+    // "connected", so a pivot user (U-turn) leaves and the move's PP was paid — but no damage,
+    // secondary, or contact ability fires. Single-hit only (multi-hit busts on the first hit then
+    // damages, unmodeled — no such matchup in the corpus).
+    if def_ab == crate::ids::Ability::Disguise
+        && matches!(md.category, MoveCategory::Physical | MoveCategory::Special)
+        && defender.species == crate::ids::Species::from_id("mimikyu").unwrap_or(crate::ids::Species::None)
+        && !defender.transformed
+        && md.hits_max == 1
+    {
+        let mut hb = scaled(&b, hit_prob);
+        bust_disguise(&mut hb, foe);
+        match pivot {
+            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { apply_switch(&mut hb, side, t); },
+            Pivot::Pause => if hb.state.side(side).active().is_alive() { push(&mut hb, Instruction::PivotPending { side }); },
+            Pivot::Stay => {}
+        }
+        out.push(hb);
+        return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
+    }
+
     // Each hit rolls damage (16) and crit independently. For small hit counts we enumerate
     // the full per-hit product (exact, and preserves Substitute/Sturdy interleaving). For
     // large counts (Population Bomb's 10 hits → 32¹⁰ branches) that explodes the allocator
@@ -2427,6 +2478,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         } else {
             apply_target_secondary(hb, side, &md)
                 .into_iter()
+                .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
@@ -2448,15 +2500,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 }
                 Pivot::Stay => {}
             }
-            out.push(sb);
+            // Dragon Tail / Circle Throw: the survivor is dragged out (uniform over the bench).
+            // Only a connecting hit drags — a MISS (which sits in `out` from the accuracy split
+            // above) must leave the target in place, so the drag lives on the hit branches here.
+            if md.force_switch {
+                out.extend(apply_drag(sb, foe));
+            } else {
+                out.push(sb);
+            }
         }
     }
-    let out = if md.force_switch {
-        // Dragon Tail / Circle Throw: the survivor is dragged out (uniform over the bench).
-        out.into_iter().flat_map(|x| apply_drag(x, foe)).collect()
-    } else {
-        out
-    };
     let out = apply_rampage_state(out, side, move_id);
     apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling)
 }
@@ -2519,7 +2572,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         crate::ids::StatIndex::SpecialAttack => BoostIndex::SpecialAttack,
         _ => BoostIndex::Attack,
     };
-    let (def_idx, def_boost_idx) = if md.category == MoveCategory::Physical {
+    // A few special moves have `overrideDefensiveStat: 'def'` (Psyshock, Psystrike, Secret
+    // Sword): they are category Special (so Light Screen, not Reflect, halves them and the
+    // attacker's SpA is used) but they hit the target's physical Defense stat and its Def boost.
+    let overrides_def = matches!(md.id.to_id(), "psyshock" | "psystrike" | "secretsword");
+    let (def_idx, def_boost_idx) = if md.category == MoveCategory::Physical || overrides_def {
         (crate::ids::StatIndex::Defense, BoostIndex::Defense)
     } else {
         (crate::ids::StatIndex::SpecialDefense, BoostIndex::SpecialDefense)
@@ -2640,6 +2697,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::DragonsMaw if md.typ == Type::Dragon => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::RockyPayload if md.typ == Type::Rock => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             Ab::Steelworker if md.typ == Type::Steel => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            // Flash Fire: ×1.5 to the holder's Fire moves once activated (the `flashfire`
+            // volatile is present). PS `onModifyAtk`/`onModifySpA` in the ability's condition.
+            Ab::FlashFire
+                if md.typ == Type::Fire
+                    && b.state.side(side).volatiles.contains(VolatileStatus::FlashFire) =>
+            {
+                atk_stat = crate::damage::modify(atk_stat, 3, 2)
+            }
             _ => {}
         }
         // Thick Fat (defender) halves the attack of Fire/Ice moves; Water Bubble (defender)
@@ -2654,13 +2719,17 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     };
     let finalize_def = |boost: i8| -> i64 {
         let mut def_stat = boosted_stat(defender.stat(def_idx) as i64, boost);
-        if sword && md.category == MoveCategory::Physical {
+        // Ruin abilities and Assault Vest key on the defensive STAT actually used (Def vs SpD),
+        // not the move category — so an overrideDefensiveStat move (Psyshock) is treated by its
+        // physical Defense: Sword of Ruin / Fur Coat / Snow / Marvel Scale apply, while Beads of
+        // Ruin / Assault Vest (SpD modifiers) do not.
+        if sword && def_idx == crate::ids::StatIndex::Defense {
             def_stat = crate::damage::modify(def_stat, 3, 4);
         }
-        if beads && md.category == MoveCategory::Special {
+        if beads && def_idx == crate::ids::StatIndex::SpecialDefense {
             def_stat = crate::damage::modify(def_stat, 3, 4);
         }
-        if defender.item == Item::AssaultVest && md.category == MoveCategory::Special {
+        if defender.item == Item::AssaultVest && def_idx == crate::ids::StatIndex::SpecialDefense {
             def_stat = crate::damage::modify(def_stat, 3, 2);
         }
         // Eviolite: ×1.5 to the defensive stat (Def and SpD) of a not-fully-evolved Pokémon.
@@ -2724,6 +2793,16 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if def_ab == Ab::PunkRock && md.flag_sound {
         fmod = chain_final(fmod, 2048);
     }
+    // Fluffy (defender, breakable): ×2 damage from Fire moves, ÷2 from contact moves. Both
+    // may apply at once (a Fire contact move nets ×1). PS `onSourceModifyDamage`.
+    if def_ab == Ab::Fluffy {
+        if md.typ == Type::Fire {
+            fmod = chain_final(fmod, 8192);
+        }
+        if md.flag_contact {
+            fmod = chain_final(fmod, 2048);
+        }
+    }
     // Attacker final-damage modifiers keyed on effectiveness / item.
     if attacker.ability == Ab::TintedLens && type_mult < 1.0 {
         fmod = chain_final(fmod, 8192);
@@ -2752,7 +2831,10 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let def_maxhp = defender.max_hp;
     let sheer_force_active = attacker.ability == Ab::SheerForce
         && (md.secondary_chance > 0 || md.flinch_chance > 0
-            || md.secondary_self_boosts.iter().any(|&x| x != 0));
+            || md.secondary_self_boosts.iter().any(|&x| x != 0)
+            // Tri Attack's secondary is a sample-based onHit that the move table can't encode,
+            // so it isn't reflected in `secondary_chance`.
+            || md.id.to_id() == "triattack");
     // Life Orb's ×1.3 DAMAGE (onModifyDamage) always applies while held; Sheer Force only
     // suppresses the RECOIL (onAfterMoveSecondarySelf). Keep the two flags separate.
     let life_orb = attacker.item == Item::LifeOrb;
@@ -2793,6 +2875,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             let hp = attacker.hp.max(0) as u32;
             let max = attacker.max_hp.max(1) as u32;
             base_power = ((150 * hp / max).max(1)) as u16;
+        }
+        // Flail / Reversal: power rises as the user's HP falls (PS `basePowerCallback`, using the
+        // 48ths ratio). Without this the move keeps its table BP of 0 → deals no damage and never
+        // registers the hit for Rage Fist's `times_hit`.
+        "flail" | "reversal" => {
+            let ratio = (attacker.hp as i64 * 48 / (attacker.max_hp.max(1) as i64)).max(1);
+            base_power = if ratio < 2 { 200 } else if ratio < 5 { 150 } else if ratio < 10 { 100 }
+                else if ratio < 17 { 80 } else if ratio < 33 { 40 } else { 20 };
         }
         // Fury Cutter: doubles each consecutive use (40 → 80 → 160 cap). move_streak is the
         // count including this use, already advanced by record_move_use.
@@ -2846,6 +2936,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             | (Item::FairyFeather, Type::Fairy)
     );
     if type_item_boost {
+        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
+    }
+    // Soul Dew: ×1.2 base power for Latias/Latios Psychic- and Dragon-type moves (PS `onBasePower`).
+    if attacker.item == Item::SoulDew
+        && matches!(attacker.species, sp if sp == crate::ids::Species::from_id("latias").unwrap_or(crate::ids::Species::None)
+            || sp == crate::ids::Species::from_id("latios").unwrap_or(crate::ids::Species::None))
+        && matches!(md.typ, Type::Psychic | Type::Dragon)
+    {
         base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
     }
 
@@ -2955,6 +3053,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     input_crit.is_crit = true;
     input_crit.attack_stat = atk_stat_crit as i16;
     input_crit.defense_stat = (def_stat_crit.max(1)) as i16;
+    // Sniper: ×1.5 damage on a critical hit (stacks with the 1.5 crit → 2.25× overall). PS
+    // `onModifyDamage` runs in the same final chain, so fold it into the crit final modifier.
+    if attacker.ability == Ab::Sniper {
+        input_crit.final_num = chain_final(input_crit.final_num, 6144);
+    }
     let rolls_crit = damage_rolls(&input_crit);
     // Screens halve non-crit damage in singles (Reflect: physical, Light Screen: special,
     // Aurora Veil: both), unless the attacker has Infiltrator. ×0.5 = modifier 2048/4096.
@@ -2985,6 +3088,28 @@ fn ice_face_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bo
 
 /// Breaks an intact Ice Face and records the blocked hit. Transform instructions carry the
 /// complete previous forme data, so reversing a generated branch restores Eiscue exactly.
+/// Disguise busts: Mimikyu forme-changes to Mimikyu-Busted (identical stats/types/ability, so
+/// only the species id changes) and takes 1/8-max-HP recoil (PS `formeChange` + `damage`).
+fn bust_disguise(b: &mut Branch, foe: SideId) {
+    let Some(busted) = crate::ids::Species::from_id("mimikyubusted") else { return };
+    let previous = transform_data_of(&b.state, foe);
+    let mut new = previous;
+    new.species = busted;
+    let slot = b.state.side(foe).active_index;
+    let previous_base_moves = b.state.side(foe).active().base_moves;
+    push(b, Instruction::Transform { side: foe, slot, previous, new, previous_base_moves });
+    let (hp, maxhp) = { let p = b.state.side(foe).active(); (p.hp, p.max_hp) };
+    let chip = (maxhp / 8).min(hp);
+    if chip > 0 {
+        push(b, Instruction::Damage { side: foe, slot, amount: chip });
+    }
+    // PS records the disguise-blocked strike as a hit (Rage Fist's `timesAttacked`).
+    let cur = b.state.side(foe).active().times_hit;
+    push(b, Instruction::SetTimesHit {
+        side: foe, slot, previous: cur, new: cur.saturating_add(1).min(250),
+    });
+}
+
 fn break_ice_face(b: &mut Branch, foe: SideId) {
     let Some(noice) = crate::ids::Species::from_id("eiscuenoice") else { return };
     let p = b.state.side(foe).active();
@@ -4444,6 +4569,48 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     procs
 }
 
+/// Tri Attack's secondary: PS runs a single 20% roll (doubled by Serene Grace), then on proc
+/// `this.sample(['brn','par','frz'])` picks one uniformly and `trySetStatus` applies it. Each
+/// pick respects the target's existing status / type / field immunities; a pick that can't land
+/// simply fails (its 1/3 share collapses back into the no-status outcome). Shield Dust / Covert
+/// Cloak remove the whole secondary; Sheer Force does too (the ×1.3 base power is applied in
+/// `compute_damage`).
+fn apply_triattack_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    use crate::ids::Ability as Ab;
+    if md.id.to_id() != "triattack" {
+        return vec![b];
+    }
+    let foe = side.other();
+    if b.state.side(side).active().ability == Ab::SheerForce {
+        return vec![b];
+    }
+    let target_eligible = b.state.side(foe).active().is_alive()
+        && b.state.side(foe).active().ability != Ab::ShieldDust
+        && b.state.side(foe).active().item != Item::CovertCloak;
+    if !target_eligible {
+        return vec![b];
+    }
+    let pct: u16 = if b.state.side(side).active().ability == Ab::SereneGrace { 40 } else { 20 };
+    let chance = pct as f32 / 100.0;
+    let sun = effective_weather(&b.state) == Weather::Sun;
+    let mut out = vec![scaled(&b, 1.0 - chance)];
+    for status in [Status::Burn, Status::Paralysis, Status::Freeze] {
+        let mut pb = scaled(&b, chance / 3.0);
+        // Freeze additionally fails in harsh sunlight (PS `trySetStatus` weather guard).
+        let can_apply = status_applies(pb.state.side(foe).active(), status)
+            && !status_blocked_by_field(&pb.state, foe, status)
+            && !(status == Status::Freeze && sun);
+        if can_apply {
+            let slot = pb.state.side(foe).active_index;
+            push(&mut pb, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: status });
+            apply_synchronize(&mut pb, foe, status);
+            consume_lum_if_statused(&mut pb, foe);
+        }
+        out.push(pb);
+    }
+    out
+}
+
 /// A damaging move's deterministic on-hit effects: user self-boosts and any target
 /// volatile (Salt Cure, etc.).
 fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
@@ -5385,6 +5552,21 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
         let prev = b.state.side(side).special_damage_taken;
         if prev != 0 {
             push(b, Instruction::SetSpecialDamageTaken { side, previous: prev, new: 0 });
+        }
+    }
+    // Rampage (lockedmove) `onResidual`: decrement `trueDuration` each end of turn. The move
+    // action stored the mid-turn (kernel) value {2,3 on start, s on continuation}; this ticks it
+    // to the terminal value {1,2, s-1}. The final locked turn (n==1) already ended and confused
+    // at move time, so a live Rampaging here always has n>=2 → stays >=1.
+    for side in [SideId::One, SideId::Two] {
+        if let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move {
+            if n >= 2 {
+                push(b, Instruction::SetPendingMove {
+                    side,
+                    previous: crate::state::PendingMove::Rampaging(m, n),
+                    new: crate::state::PendingMove::Rampaging(m, n - 1),
+                });
+            }
         }
     }
     // PS decrements a residual effect's duration FIRST and, if it hits 0, ends the effect and

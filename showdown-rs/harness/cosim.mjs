@@ -225,6 +225,29 @@ const TEAM_SM = {
 	]],
 };
 
+// Ability coverage (`d*.json.gz`, `--teamset flashfire`): a Flash Fire carrier (Heatran) faces
+// Fire attackers so the ability's immunity + `flashfire` activation volatile fires, and the
+// carrier's own Fire moves then get the ×1.5 boost. Includes a Fire status move (Will-O-Wisp)
+// to exercise the status-move immunity path too.
+const TEAM_DIRECTED = {
+	flashfire: [[
+		'Heatran||leftovers|flashfire|magmastorm,lavaplume,earthpower,flashcannon|Modest|252,,,252,4,|||||,,,,,Fire',
+		'Amoonguss||leftovers|regenerator|gigadrain,sludgebomb,clearsmog,synthesis|Bold|252,,252,,4,|||||,,,,,Grass',
+	], [
+		'Arcanine||heavydutyboots|justified|flareblitz,willowisp,extremespeed,morningsun|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Volcarona||heavydutyboots|swarm|flamethrower,fierydance,bugbuzz,roost|Timid|,,,252,4,252|||||,,,,,Bug',
+	]],
+	// U-turn with a fully-fainted bench (the frail lead faints, then the survivor U-turns and
+	// stays), while the foe carries Scald and a Rage Fist counter — probes `times_hit` accounting.
+	uturnbench: [[
+		'Magikarp||focussash|rattled|splash,tackle,flail,bounce|Jolly|,252,,,4,252|||||,,,,,Water',
+		'Scizor||choiceband|technician|uturn,bulletpunch,closecombat,knockoff|Adamant|,252,,,4,252|||||,,,,,Bug',
+	], [
+		'Annihilape||leftovers|defiant|ragefist,uturn,drainpunch,bulkup|Adamant|,252,,,4,252|||||,,,,,Fighting',
+		'Toxapex||blacksludge|regenerator|scald,recover,toxic,haze|Bold|252,,252,,4,|||||,,,,,Poison',
+	]],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -629,6 +652,8 @@ async function main() {
 			? TEAM_COVERAGE[TEAMSET].map(t => t.join(']'))
 			: TEAM_SM[TEAMSET]
 			? TEAM_SM[TEAMSET].map(t => t.join(']'))
+			: TEAM_DIRECTED[TEAMSET]
+			? TEAM_DIRECTED[TEAMSET].map(t => t.join(']'))
 			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];
 		team1 = Teams.pack(Teams.import(t1));
 		team2 = Teams.pack(Teams.import(t2));

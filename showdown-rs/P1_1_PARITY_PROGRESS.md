@@ -163,6 +163,59 @@ mathematical proof over every possible supported battle state.
 - `4d01125` — immediate policy-neutral pivot endpoint certification.
 - `c2534ea` — deduplicated retained oracle outcome state.
 
+## Exact-distribution divergence burn-down — 9 seeds + 2 edges
+
+The exact-distribution seed campaign surfaced nine real engine divergences (plus two dodged edges).
+Each was root-caused against the pinned PS source, fixed as a general mechanic, and re-verified
+against its regenerated exact-distribution oracle (`--distributions`, per-kernel support+mass
+equality). Sampled regression fixtures were recorded into `harness/cosim-traces/` (`rd*.json.gz`,
+`dflashfire.json.gz`, `duturnbench.json.gz`); the corpus stays exact at 2423/2423, 0 unsupported.
+
+- **Seeds 268, 292 — Outrage/rampage remaining-turn accounting.** `lockedmove.trueDuration` is the
+  mid-turn (kernel) value `this.random(2,4)` = {2,3}; PS's end-of-turn `onResidual` then decrements
+  it to the terminal {1,2}. The engine stored the terminal value at move time and never ticked it,
+  so its per-kernel (mid-turn) snapshot was one short. Fix: store {2,3} at the start / keep the
+  start-of-turn value on continuation, and decrement in `apply_end_of_turn`. Terminal states (and
+  the sampled corpus) are byte-identical to before. **EXACT re-verify: yes.**
+- **Seed 279 — Iron Head crit vs Kingdra (Sniper).** Sniper's `onModifyDamage` multiplies a crit by
+  ×1.5 (stacking with the 1.5 crit → 2.25× overall); it was unmodeled. Fix: fold ×1.5 into the crit
+  final-modifier chain. **EXACT re-verify: yes.**
+- **Seed 287 — Dragon Ascent vs Houndstone (Fluffy).** Fluffy (`onSourceModifyDamage`) halves
+  contact-move damage (and doubles Fire); the contact halving was unmodeled. Fix: fold into the
+  final-modifier chain. **EXACT re-verify: yes.**
+- **Seed 293 — Sucker Punch vs Draining Kiss (Triage).** Triage gives +3 priority to heal-flag
+  moves, so Comfey's Draining Kiss moves first; Sucker Punch then fails (target already moved). The
+  engine lacked Triage, ordered Sucker Punch first, and let it hit. Fix: add Triage to
+  `effective_priority`. **EXACT re-verify: yes.**
+- **Seed 298 — U-turn vs Mimikyu (Disguise).** Disguise was unmodeled: the first damaging hit is
+  nullified, busts Mimikyu → Mimikyu-Busted, chips 1/8 max HP, and records the hit for `times_hit`.
+  Fix: `bust_disguise` + a block mirroring Ice Face, with pivot handling so U-turn still leaves. The
+  p2:uturn move kernel matches EXACTLY; the aggregate distribution verdict is
+  `pivot-request-boundary` (harness can't certify a two-kernel pivot endpoint whose replacement is
+  unrecorded). End-to-end EXACT via the sampled `rd298` fixture. **EXACT re-verify: yes (kernel + sampled).**
+- **Seed 316 — Tri Attack three-way secondary.** The table can't encode `sample(['brn','par','frz'])`,
+  so the 20% secondary was dropped (masses ran 1.25× high). Fix: `apply_triattack_secondary` — one
+  20% roll (×2 Serene Grace) split uniformly three ways, each respecting status/type/field/sun
+  immunities; Shield Dust / Covert Cloak / Sheer Force suppress. **EXACT re-verify: yes.**
+- **Seed 318 — Dragon Tail drags on a miss.** The force-switch drag was applied to every branch
+  including the accuracy miss. Fix: drag only the connecting (hit) branches. **EXACT re-verify: yes.**
+- **Seed 320 — Psyshock defensive stat + Soul Dew.** Psyshock (`overrideDefensiveStat: 'def'`) hits
+  the target's physical Defense while staying category Special (SpD modifiers — Assault Vest / Beads
+  of Ruin — do not apply, Def modifiers do). Fix: route `def_idx` to Defense for Psyshock/Psystrike/
+  Secret Sword and key Assault Vest / Ruin abilities on the actual stat. The residual 1 HP was Soul
+  Dew's ×1.2 Latias/Latios Psychic/Dragon base-power boost, also unmodeled — added. **EXACT re-verify: yes.**
+- **Edge (a) — `times_hit` off-by-one via Flail/Reversal.** Flail/Reversal use `basePowerCallback`
+  and were left at table BP 0, so they dealt no damage and never registered the hit for Rage Fist's
+  `times_hit` (reproduced with a U-turn/Scald/Rage-Fist directed teamset). Fix: implement the HP-ratio
+  base power. **Verified: yes (`duturnbench` fixture, 12/12).**
+- **Edge (b) — Flash Fire.** Added the `FlashFire` volatile (Fire-move immunity that activates it,
+  ×1.5 to the holder's own Fire moves until switch-out), the activation on any Fire move hitting the
+  carrier, the ×1.5 offensive modifier, switch-out clearing, and the converter mapping. **Verified:
+  yes (directed `dflashfire` fixture, 10/10, exercises activation + boost).**
+
+Gates after the batch: engine tests green; full corpus 2423/2423 exact, 0 unsupported; distribution
+smoke 18/18.
+
 ## Token usage
 
 The persistent goal tracker reports **177,996 tokens used** and **2,559 seconds of tracked goal

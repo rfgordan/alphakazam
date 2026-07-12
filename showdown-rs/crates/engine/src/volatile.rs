@@ -51,6 +51,7 @@ pub enum VolatileStatus {
     Ingrain,            // self-rooted: cannot switch (also grounded + 1/16 heal)
     NoRetreat,          // self-trap after the +1-all-stats boost
     Octolock,           // foe-sourced trap + end-of-turn Def/SpD drop
+    FlashFire,          // absorbed a Fire move: ×1.5 own Fire moves until switch-out
 }
 
 /// A packed set of active-Pokémon volatile statuses.
