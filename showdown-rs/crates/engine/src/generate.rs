@@ -75,6 +75,69 @@ fn item_removable(species: crate::ids::Species, item: Item) -> bool {
     }
 }
 
+/// Moves with the `dance` flag at the pin (Dancer copies them).
+fn is_dance_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "aquastep" | "clangoroussoul" | "dragondance" | "featherdance" | "fierydance"
+            | "lunardance" | "petaldance" | "quiverdance" | "revelationdance" | "swordsdance"
+            | "teeterdance" | "victorydance"
+    )
+}
+
+/// Moves with the `reflectable` flag at the pin (Magic Bounce / Magic Coat targets).
+fn is_reflectable_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "attract" | "babydolleyes" | "block" | "captivate" | "charm" | "confide"
+            | "confuseray" | "corrosivegas" | "cottonspore" | "darkvoid" | "defog"
+            | "disable" | "eerieimpulse" | "embargo" | "encore" | "entrainment"
+            | "faketears" | "featherdance" | "flash" | "flatter" | "floralhealing"
+            | "foresight" | "forestscurse" | "gastroacid" | "glare" | "grasswhistle"
+            | "growl" | "healblock" | "healpulse" | "hypnosis" | "kinesis" | "leechseed"
+            | "leer" | "lovelykiss" | "magicpowder" | "meanlook" | "metalsound"
+            | "miracleeye" | "nobleroar" | "odorsleuth" | "partingshot" | "playnice"
+            | "poisongas" | "poisonpowder" | "powder" | "purify" | "roar" | "sandattack"
+            | "sappyseed" | "scaryface" | "screech" | "simplebeam" | "sing" | "sleeppowder"
+            | "smokescreen" | "soak" | "spicyextract" | "spiderweb" | "spikes" | "spite"
+            | "spore" | "spotlight" | "stealthrock" | "stickyweb" | "strengthsap"
+            | "stringshot" | "stunspore" | "supersonic" | "swagger" | "sweetkiss"
+            | "sweetscent" | "tailwhip" | "tarshot" | "taunt" | "tearfullook"
+            | "telekinesis" | "thunderwave" | "tickle" | "topsyturvy" | "torment" | "toxic"
+            | "toxicspikes" | "toxicthread" | "trickortreat" | "venomdrench" | "whirlwind"
+            | "willowisp" | "worryseed" | "yawn"
+    )
+}
+
+/// Dancer: after `side` successfully used a dance move, the opposing active with Dancer
+/// immediately uses the same move (PS runMove with `externalMove: true`, targeting the
+/// original user; self-targeting dances boost the Dancer itself). The copy goes through
+/// the full before-move gauntlet (sleep tick, attract, confusion, paralysis) like PS's
+/// BeforeMove event, but pays no PP and does none of the move-use bookkeeping.
+fn apply_dancer_copies(out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
+    let foe = side.other();
+    out.into_iter()
+        .flat_map(|b| {
+            let d = b.state.side(foe).active();
+            let ok = d.is_alive()
+                && d.ability == crate::ids::Ability::Dancer
+                && !b.state.side(foe).volatiles.contains(VolatileStatus::Flinch)
+                && !matches!(b.state.side(foe).pending_move, crate::state::PendingMove::Charging(m) if is_semi_invuln_move(m));
+            if !ok {
+                return vec![b];
+            }
+            execute_move(b, Action {
+                side: foe,
+                move_idx: 0,
+                pivot: None,
+                foe_pending_move: None,
+                custap: false,
+                external_move: Some(move_id),
+            })
+        })
+        .collect()
+}
+
 /// Damaging moves with the `wind` flag (Wind Rider / Wind Power triggers). Non-damaging wind
 /// moves (Whirlwind, Tailwind, Sandstorm) route through the status path and are not covered.
 fn is_wind_move(id: crate::ids::MoveId) -> bool {
@@ -467,7 +530,7 @@ pub fn generate_move_action(
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
         return vec![StateInstructions { percentage: 100.0, instructions: Vec::new() }];
     }
-    execute_move(start, Action { side, move_idx, pivot, foe_pending_move, custap: false })
+    execute_move(start, Action { side, move_idx, pivot, foe_pending_move, custap: false, external_move: None })
         .into_iter()
         .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
         .collect()
@@ -574,7 +637,7 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
     let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0], custap[0]), (SideId::Two, s2, pivot[1], custap[1])]
         .into_iter()
         .filter_map(|(side, c, pv, cu)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, custap: cu }),
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, custap: cu, external_move: None }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -1116,6 +1179,11 @@ struct Action {
     /// Custap Berry fired at queue time (+0.1 fractional priority for this action). The
     /// berry was already consumed at turn start, so the flag must ride on the action.
     custap: bool,
+    /// A Dancer-invoked copy of `Some(move)` (PS `externalMove`): the move executes from
+    /// this side without a move slot — no PP cost, no Encore/rampage override, no move-use
+    /// bookkeeping, no rampage lock (the "Dancer Petal Dance hack"), and no re-trigger of
+    /// Dancer. The full BeforeMove gauntlet (sleep/attract/confusion/paralysis) still runs.
+    external_move: Option<crate::ids::MoveId>,
 }
 
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action]) -> Vec<Branch> {
@@ -1648,16 +1716,18 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
 
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
-    let Action { side, move_idx, pivot, foe_pending_move, .. } = action;
+    let Action { side, move_idx, pivot, foe_pending_move, external_move, .. } = action;
+    let external = external_move.is_some();
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
         return vec![b];
     }
-    let move_id = attacker.moves[move_idx as usize].id;
+    // A Dancer-invoked copy carries its move directly (it need not be on the user's set).
+    let move_id = external_move.unwrap_or(attacker.moves[move_idx as usize].id);
     // Struggle: a mon forced to act with no usable moves (the chosen slot is out of PP) uses
     // Struggle instead — a typeless 50-BP physical hit that connects on everything and recoils
     // 1/4 of the user's max HP.
-    let struggling = attacker.moves[move_idx as usize].pp == 0;
+    let struggling = !external && attacker.moves[move_idx as usize].pp == 0;
     let mut md = if struggling {
         let mut m = crate::data::MoveData::none();
         m.typ = Type::None;
@@ -1709,6 +1779,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if attacker.ability == crate::ids::Ability::LiquidVoice && md.flag_sound {
         md.typ = Type::Water;
     }
+    // Revelation Dance takes the user's primary type (PS onModifyType; a terastallized
+    // user's current first type is its tera type, matching PS).
+    if md.id.to_id() == "revelationdance" && attacker.types[0] != Type::None {
+        md.typ = attacker.types[0];
+    }
     // Analytic: ×1.3 base power when no other active will still move this turn (PS
     // onBasePower chainModify([5325, 4096]); queue.willMove is falsy for a foe that already
     // moved, chose a switch, or is fainted — exactly foe_pending_move == None here).
@@ -1732,6 +1807,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let enc = b.state.side(side).encore;
     if enc.0 != crate::ids::MoveId::None
         && !struggling
+        && !external
         && b.state.side(side).pending_move == crate::state::PendingMove::None
     {
         if let Some(enc_slot) = b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0) {
@@ -1745,7 +1821,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // continuation turns.
     let rampaging_now = matches!(b.state.side(side).pending_move, crate::state::PendingMove::Rampaging(..));
     if let crate::state::PendingMove::Rampaging(m, _) = b.state.side(side).pending_move {
-        if !struggling {
+        if !struggling && !external {
             if let Some(slot_i) = b.state.side(side).active().moves.iter().position(|ms| ms.id == m) {
                 if slot_i as u8 != move_idx {
                     move_idx = slot_i as u8;
@@ -1754,7 +1830,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
         }
     }
-    let move_id = if struggling { move_id } else { b.state.side(side).active().moves[move_idx as usize].id };
+    let move_id = if struggling || external { move_id } else { b.state.side(side).active().moves[move_idx as usize].id };
 
     // Destiny Bond lasts until the user's next move: moving again drops it.
     if b.state.side(side).volatiles.contains(VolatileStatus::DestinyBond) {
@@ -1864,7 +1940,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // PP is paid on the charge turn, not the strike turn. Pressure on the opposing active
     // costs one extra PP for any move that targets it (PS onDeductPP; cosim caught this).
-    if !executing_charge && !rampaging_now {
+    if !executing_charge && !rampaging_now && !external {
         let pp = b.state.side(side).active().moves[move_idx as usize].pp;
         if pp > 0 {
             let foe_active = b.state.side(side.other()).active();
@@ -1877,8 +1953,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     }
 
     // Record the move use for consecutive-use mechanics (streak / Protect stall chain). The
-    // mon has passed sleep/freeze, so it is actually acting this turn.
-    record_move_use(&mut b, side, move_id);
+    // mon has passed sleep/freeze, so it is actually acting this turn. A Dancer copy is
+    // `isExternal` in PS: no lastMove/streak bookkeeping and no Choice lock.
+    if !external {
+        record_move_use(&mut b, side, move_id);
+    }
 
     // Prankster-boosted status moves fail against Dark-type targets (after PP is paid).
     if md.category == MoveCategory::Status
@@ -1964,6 +2043,24 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
             return vec![b];
         }
+        // Magic Bounce (breakable): a reflectable status move aimed at the holder (or its
+        // side — hazards) is used BY the holder against the original user instead. Runs
+        // after Protect (onTryHitPriority 3 vs 1) and before the Substitute check (the
+        // sub's block is a later event step in PS). The bounced move re-resolves fully
+        // from the bouncer: its own accuracy, the original user's immunities, hazards
+        // onto the original user's side, Roar dragging the original user, etc. Calling
+        // execute_status_move directly means a bounced move can never re-bounce.
+        if is_reflectable_move(md.id)
+            && b.state.side(foe).active().is_alive()
+            && b.state.side(foe).active().ability == crate::ids::Ability::MagicBounce
+            && !matches!(
+                b.state.side(side).active().ability,
+                crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+            )
+            && !matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m))
+        {
+            return execute_status_move(b, foe, &md, false);
+        }
         // A Substitute blocks foe-targeting status moves unless they bypass it (sound
         // moves, Taunt, Encore, ...) or the user has Infiltrator.
         if targets_foe
@@ -1981,6 +2078,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     apply_switch(sb, side, t);
                 }
             }
+        }
+        // Dancer: the foe immediately copies a successfully used dance move (see
+        // apply_dancer_copies). Only from a real (non-external) use.
+        if !external && is_dance_move(move_id) {
+            branches = apply_dancer_copies(branches, side, move_id);
         }
         return branches;
     }
@@ -2108,7 +2210,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         out.push(ib);
         // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
         // confusion) — route through the rampage/recoil tail rather than returning bare.
-        let out = apply_rampage_state(out, side, move_id);
+        let out = if external { out } else { apply_rampage_state(out, side, move_id) };
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -2250,8 +2352,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         out
     };
-    let out = apply_rampage_state(out, side, move_id);
-    apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling)
+    let out = if external { out } else { apply_rampage_state(out, side, move_id) };
+    let out = apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
+    // Dancer: the foe immediately copies a successfully used dance move (miss branches for
+    // dance moves don't exist — all are 100/-- accuracy — and failure paths return earlier).
+    if !external && is_dance_move(move_id) {
+        apply_dancer_copies(out, side, move_id)
+    } else {
+        out
+    }
 }
 
 /// Iterator over all per-hit (roll 0..16, crit bool) combinations for `hits` hits.
