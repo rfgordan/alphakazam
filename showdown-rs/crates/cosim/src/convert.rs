@@ -243,13 +243,13 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
 }
 
 fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
-    // A transformed mon keeps its original `details` but its working species is the copied
-    // one (serialized as a "[Species:x]" ref).
+    // The working species is the "[Species:x]" ref whenever present: `details` lags behind
+    // for transformed mons AND for non-permanent forme changes (Relic Song's Pirouette,
+    // Hunger Switch's Morpeko-Hangry keep base-forme details — cosim caught the engine and
+    // PS disagreeing one full forme cycle apart when this read `details`).
     let mut species_id = species_id.to_string();
-    if b(p, "transformed") {
-        if let Some(r) = p.get("species").and_then(Value::as_str) {
-            species_id = r.trim_start_matches("[Species:").trim_end_matches(']').to_string();
-        }
+    if let Some(r) = p.get("species").and_then(Value::as_str) {
+        species_id = r.trim_start_matches("[Species:").trim_end_matches(']').to_string();
     }
     let species_id = species_id.as_str();
     let species = Species::from_id(species_id).ok_or_else(|| unsup(format!("species:{species_id}")))?;

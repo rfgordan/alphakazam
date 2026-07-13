@@ -208,6 +208,7 @@ impl Flow {
                 move_idx: slot,
                 pivot: if paused { Pivot::Pause } else { Pivot::Stay },
                 foe_pending_move: None,
+                shell_phys: None,
             }),
             MoveChoice::Switch(_) => None,
         };

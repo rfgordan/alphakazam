@@ -281,6 +281,58 @@ const TEAM_C3 = {
 		'Mightyena||leftovers|intimidate|poisonfang,crunch,suckerpunch,taunt|Adamant|252,252,,,4,|||||,,,,,Dark',
 		'Milotic||leftovers|marvelscale|scald,recover,haze,icebeam|Bold|252,,252,,4,|||||,,,,,Water',
 	]],
+	// Forme + on-hit mechanics: Relic Song forme swap (Meloetta MUST run the randbats spread —
+	// 85 EVs / 31 IVs / neutral nature — the engine's forme stat recompute assumes it), Aura
+	// Wheel + Hunger Switch forme toggle, Shell Side Arm category pick, Hydro Steam boosted in
+	// drought sun, Flash Fire Eruption, Stone Axe SR-on-hit, Spirit Shackle trapping, Unseen
+	// Fist Wicked Blow vs Protect, Protean Flower Trick, Thermal Exchange Glaive Rush
+	// Baxcalibur, Dynamax Cannon.
+	c3b1: [[
+		'Meloetta||leftovers|serenegrace|relicsong,psychic,closecombat,uturn|Serious|85,85,85,85,85,85|||||,,,,,Psychic',
+		'Morpeko||leftovers|hungerswitch|aurawheel,crunch,rapidspin,protect|Jolly|,252,,,4,252|||||,,,,,Electric',
+		'Slowbro-Galar||leftovers|regenerator|shellsidearm,slackoff,psychic,icebeam|Calm|252,,16,,240,|||||,,,,,Water',
+		'Walking Wake||leftovers|protosynthesis|hydrosteam,dracometeor,flamethrower,knockoff|Timid|,,,252,4,252|||||,,,,,Water',
+		'Torkoal||heatrock|drought|lavaplume,rapidspin,bodypress,yawn|Bold|248,,252,,8,|||||,,,,,Fire',
+		'Typhlosion||heavydutyboots|flashfire|eruption,flamethrower,focusblast,shadowball|Timid|,,,252,4,252|||||,,,,,Fire',
+	], [
+		'Kleavor||heavydutyboots|sharpness|stoneaxe,xscissor,closecombat,uturn|Jolly|,252,,,4,252|||||,,,,,Bug',
+		'Decidueye||heavydutyboots|overgrow|spiritshackle,leafblade,shadowsneak,roost|Adamant|252,252,,,4,|||||,,,,,Ghost',
+		'Urshifu||leftovers|unseenfist|wickedblow,closecombat,suckerpunch,uturn|Jolly|,252,,,4,252|||||,,,,,Dark',
+		'Meowscarada||heavydutyboots|protean|flowertrick,knockoff,uturn,playrough|Jolly|,252,,,4,252|||||,,,,,Grass',
+		'Baxcalibur||heavydutyboots|thermalexchange|glaiverush,earthquake,iciclecrash,dragondance|Adamant|,252,,,4,252|||||,,,,,Dragon',
+		'Eternatus||heavydutyboots|pressure|dynamaxcannon,flamethrower,sludgebomb,recover|Timid|,,,252,4,252|||||,,,,,Poison',
+	]],
+	// Setup/utility + stat mechanics: Multiscale Aeroblast, Moxie Aqua Step, Clanging Scales,
+	// Psychic Surge Expanding Force (terrain boost + priority block vs Vacuum Wave / Sucker
+	// Punch), Behemoth Blade, Sap Sipper Milk Drink Gogoat vs Matcha Gotcha (absorb + drain +
+	// thaw move), Heatproof Sinistcha, Soul Dew Luster Purge, Justified Meteor Mash + Vacuum
+	// Wave Lucario, Hustle Grav Apple, Quark Drive Mighty Cleave, Fusion Flare (its Bolt
+	// counterpart lives in a different game so `lastSuccessfulMoveThisTurn` never matters).
+	c3b2: [[
+		'Lugia||leftovers|multiscale|aeroblast,calmmind,recover,psyshock|Timid|,,,252,4,252|||||,,,,,Psychic',
+		'Quaquaval||leftovers|moxie|aquastep,closecombat,rapidspin,roost|Jolly|,252,,,4,252|||||,,,,,Water',
+		'Kommo-o||leftovers|bulletproof|clangingscales,drainpunch,closecombat,poisonjab|Adamant|,252,,,4,252|||||,,,,,Fighting',
+		'Indeedee||leftovers|psychicsurge|expandingforce,hypervoice,calmmind,healingwish|Timid|,,,252,4,252|||||,,,,,Psychic',
+		'Zacian-Crowned||rustedsword|intrepidsword|behemothblade,playrough,closecombat,swordsdance|Jolly|,252,,,4,252|||||,,,,,Steel',
+		'Gogoat||leftovers|sapsipper|milkdrink,hornleech,earthquake,bulkup|Adamant|248,252,,,8,|||||,,,,,Grass',
+	], [
+		'Kyurem-White||heavydutyboots|turboblaze|fusionflare,dracometeor,icebeam,focusblast|Timid|,,,252,4,252|||||,,,,,Ice',
+		'Iron Boulder||boosterenergy|quarkdrive|mightycleave,closecombat,zenheadbutt,swordsdance|Jolly|,252,,,4,252|||||,,,,,Rock',
+		'Sinistcha||leftovers|heatproof|matchagotcha,shadowball,calmmind,strengthsap|Bold|248,,252,,8,|||||,,,,,Grass',
+		'Latios||souldew|levitate|lusterpurge,dracometeor,recover,calmmind|Timid|,,,252,4,252|||||,,,,,Dragon',
+		'Lucario||lifeorb|justified|meteormash,vacuumwave,closecombat,swordsdance|Jolly|,252,,,4,252|||||,,,,,Fighting',
+		'Flapple||leftovers|hustle|gravapple,outrage,suckerpunch,dragondance|Jolly|,252,,,4,252|||||,,,,,Dragon',
+	]],
+	// Mop-up 2v2: Kleavor's Stone Axe (SR on hit) and Indeedee's Expanding Force (Psychic
+	// Surge terrain ×1.5) as leads with guaranteed field time — both drowned on the bench in
+	// the full c3b games.
+	c3b3: [[
+		'Kleavor||heavydutyboots|sharpness|stoneaxe,xscissor,closecombat,quickattack|Jolly|,252,,,4,252|||||,,,,,Bug',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+	], [
+		'Indeedee||leftovers|psychicsurge|expandingforce,hypervoice,calmmind,protect|Timid|,,,252,4,252|||||,,,,,Psychic',
+		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,irondefense|Impish|248,,168,,92,|||||,,,,,Flying',
+	]],
 };
 
 // Ability coverage (`d*.json.gz`, `--teamset flashfire`): a Flash Fire carrier (Heatran) faces
