@@ -28,6 +28,10 @@ struct Totals {
     legality: BTreeMap<String, u32>,
     /// move id -> (times in matched units, times in non-matched units)
     move_coverage: BTreeMap<String, (u32, u32)>,
+    /// Ability/item ids present in the serialized states of FULLY-matched traces
+    /// (presence-in-exact-games accounting for the equivalence campaign).
+    abilities_present: std::collections::BTreeSet<String>,
+    items_present: std::collections::BTreeSet<String>,
     /// frontier id -> number of traces it appears in (the work queue, ranked by blockage)
     frontier_traces: BTreeMap<String, u32>,
 }
@@ -127,6 +131,11 @@ fn main() -> ExitCode {
             }
         }
         totals.matched += m;
+        if dv == 0 && un == 0 {
+            for d in &t.decisions {
+                collect_ability_items(&d.state_after, &mut totals);
+            }
+        }
         totals.diverged += dv;
         totals.unsupported += un;
         println!("=== {path} === units: {} | matched {m} | diverged {dv} | unsupported {un}", units.len());
@@ -178,6 +187,10 @@ fn main() -> ExitCode {
             .map(|(k, _)| k.as_str())
             .collect();
         println!("EXERCISED: {}", ids.join(" "));
+        let ab: Vec<&str> = totals.abilities_present.iter().map(|s| s.as_str()).collect();
+        println!("ABILITIES_EXACT: {}", ab.join(" "));
+        let it: Vec<&str> = totals.items_present.iter().map(|s| s.as_str()).collect();
+        println!("ITEMS_EXACT: {}", it.join(" "));
     }
 
     // Gate decision: any divergence is a hard failure. Unsupported units are ALSO a failure by
@@ -207,5 +220,28 @@ fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {
     println!("{label}:");
     for (k, n) in v.iter().take(15) {
         println!("    {n:>5}  {k}");
+    }
+}
+
+/// Walk a PS serialized battle state collecting pokemon ability/item ids. Presence in a
+/// fully-matched trace means these ids participated in exactly-verified games.
+fn collect_ability_items(v: &serde_json::Value, totals: &mut Totals) {
+    let Some(sides) = v.get("sides").and_then(|s| s.as_array()) else { return };
+    for side in sides {
+        let Some(mons) = side.get("pokemon").and_then(|p| p.as_array()) else { continue };
+        for mon in mons {
+            for key in ["ability", "baseAbility"] {
+                if let Some(a) = mon.get(key).and_then(|x| x.as_str()) {
+                    if !a.is_empty() {
+                        totals.abilities_present.insert(a.to_string());
+                    }
+                }
+            }
+            if let Some(i) = mon.get("item").and_then(|x| x.as_str()) {
+                if !i.is_empty() {
+                    totals.items_present.insert(i.to_string());
+                }
+            }
+        }
     }
 }
