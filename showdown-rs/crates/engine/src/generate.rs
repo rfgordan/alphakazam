@@ -50,8 +50,21 @@ fn ability_immune(move_type: Type, ability: crate::ids::Ability) -> bool {
         (Type::Water, WaterAbsorb | DrySkin | StormDrain) => true,
         (Type::Electric, VoltAbsorb | LightningRod | MotorDrive) => true,
         (Type::Grass, SapSipper) => true,
+        // Well-Baked Body: Fire immunity (+2 Def applied on the absorb branch).
+        (Type::Fire, WellBakedBody) => true,
         _ => false,
     }
+}
+
+/// Damaging moves with the `wind` flag (Wind Rider / Wind Power triggers). Non-damaging wind
+/// moves (Whirlwind, Tailwind, Sandstorm) route through the status path and are not covered.
+fn is_wind_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "aeroblast" | "aircutter" | "bleakwindstorm" | "blizzard" | "fairywind" | "gust"
+            | "heatwave" | "hurricane" | "icywind" | "petalblizzard" | "sandsearstorm"
+            | "springtidestorm" | "twister" | "wildboltstorm"
+    )
 }
 
 /// Multiplier for a stat stage (-6..=6), the standard gen formula.
@@ -107,6 +120,10 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
     }
     if p.ability == QuickFeet && p.status != Status::None {
         spe *= 1.5;
+    }
+    // Surge Surfer: ×2 Speed in Electric Terrain (PS onModifySpe chainModify(2)).
+    if p.ability == SurgeSurfer && state.terrain == crate::ids::Terrain::Electric {
+        spe *= 2.0;
     }
     // Slow Start halves Speed for the first five active turns after each switch-in.
     if p.ability == SlowStart && s.active_turns <= 5 {
@@ -1576,6 +1593,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             md.base_power = crate::damage::modify(md.base_power as i64, 4915, 4096) as u16;
         }
     }
+    // Liquid Voice: sound moves become Water-type (PS onModifyType, no power change).
+    if attacker.ability == crate::ids::Ability::LiquidVoice && md.flag_sound {
+        md.typ = Type::Water;
+    }
     let foe = side.other();
 
     let mut b = b;
@@ -1913,15 +1934,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         defender.ability
     };
+    // Wind Rider: immunity to damaging wind moves (+1 Atk applied on the absorb branch).
+    let wind_immune = def_ab == crate::ids::Ability::WindRider && is_wind_move(md.id);
     let flag_immune = (md.flag_sound && def_ab == crate::ids::Ability::Soundproof)
-        || (md.flag_bullet && def_ab == crate::ids::Ability::Bulletproof);
-    let scrappy = b.state.side(side).active().ability == crate::ids::Ability::Scrappy;
+        || (md.flag_bullet && def_ab == crate::ids::Ability::Bulletproof)
+        || wind_immune;
+    let scrappy = matches!(b.state.side(side).active().ability, crate::ids::Ability::Scrappy | crate::ids::Ability::MindsEye);
     let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
     let connects = crate::damage::type_multiplier(md.typ, def_types_eff) != 0.0
         && !ability_immune(md.typ, def_ab)
         && !flag_immune;
     if !connects {
-        out.push(scaled(&b, hit_prob));
+        let mut ib = scaled(&b, hit_prob);
+        // Absorbing abilities that boost the holder on the negated hit: Well-Baked Body (+2 Def
+        // vs Fire), Wind Rider (+1 Atk vs a wind move). Only when this ability caused the block.
+        if def_ab == crate::ids::Ability::WellBakedBody && md.typ == Type::Fire {
+            raise_boost(&mut ib, foe, BoostIndex::Defense, 2);
+        }
+        if wind_immune {
+            raise_boost(&mut ib, foe, BoostIndex::Attack, 1);
+        }
+        out.push(ib);
         // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
         // confusion) — route through the rampage/recoil tail rather than returning bare.
         let out = apply_rampage_state(out, side, move_id);
@@ -2244,6 +2277,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
                 atk_stat = crate::damage::modify(atk_stat, 3, 2)
             }
             // Type-boosting abilities (applied to the offensive stat like the others above).
+            // Stakeout: ×2 offensive stat vs a target that switched in this turn (activeTurns==0).
+            // PS onModifyAtk / onModifySpA chainModify(2).
+            Ab::Stakeout if b.state.side(foe).active_turns == 0 => atk_stat = crate::damage::modify(atk_stat, 2, 1),
             Ab::WaterBubble if md.typ == Type::Water => atk_stat = crate::damage::modify(atk_stat, 2, 1),
             Ab::Transistor if md.typ == Type::Electric => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
             Ab::DragonsMaw if md.typ == Type::Dragon => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -2320,7 +2356,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if matches!(def_ab, Ab::Multiscale | Ab::ShadowShield) && defender.hp == defender.max_hp {
         fmod = chain_final(fmod, 2048);
     }
-    let scrappy = attacker.ability == Ab::Scrappy;
+    let scrappy = matches!(attacker.ability, Ab::Scrappy | Ab::MindsEye);
     let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
     let type_mult = crate::damage::type_multiplier(md.typ, def_types_eff);
     if matches!(def_ab, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
@@ -2454,7 +2490,21 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             | (Item::SilkScarf, Type::Normal)
             | (Item::FairyFeather, Type::Fairy)
     );
-    if type_item_boost {
+    // (The 17 Arceus plates' ×1.2 for any holder + Judgment typing landed on main — tranche
+    // c3c, plate_type() — and is deliberately not duplicated here; the merge takes main's.)
+    // Species-locked orbs/crystals: ×1.2 to two specific types, only for the signature species
+    // (PS keys on baseSpecies.num; forme ids share the species prefix). Dialga=Steel/Dragon,
+    // Palkia=Water/Dragon, Giratina=Ghost/Dragon.
+    let orb_boost = match attacker.item {
+        Item::AdamantOrb | Item::AdamantCrystal =>
+            attacker.species.to_id().starts_with("dialga") && matches!(md.typ, Type::Steel | Type::Dragon),
+        Item::LustrousOrb | Item::LustrousGlobe =>
+            attacker.species.to_id().starts_with("palkia") && matches!(md.typ, Type::Water | Type::Dragon),
+        Item::GriseousOrb | Item::GriseousCore =>
+            attacker.species.to_id().starts_with("giratina") && matches!(md.typ, Type::Ghost | Type::Dragon),
+        _ => false,
+    };
+    if type_item_boost || orb_boost {
         base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
     }
 
@@ -3450,6 +3500,12 @@ const BOOST_ORDER: [BoostIndex; BoostIndex::COUNT] = [
 
 /// Whether `status` can be inflicted on `p` right now (status-free + type + Purifying Salt).
 fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
+    status_applies_src(p, status, false)
+}
+
+/// Corrosion-aware variant: `source_corrosion` = the attacker has Corrosion, which lets its
+/// move-inflicted poison/toxic bypass the target's Poison/Steel type immunity (PS setStatus).
+fn status_applies_src(p: &crate::state::Pokemon, status: Status, source_corrosion: bool) -> bool {
     if p.status != Status::None || !p.is_alive() {
         return false;
     }
@@ -3462,7 +3518,7 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
         Status::Burn => !p.types.contains(&Type::Fire) && !matches!(p.ability, Ab::WaterVeil | Ab::WaterBubble | Ab::ThermalExchange),
         Status::Paralysis => !p.types.contains(&Type::Electric) && p.ability != Ab::Limber,
         Status::Poison | Status::Toxic => {
-            !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel))
+            (source_corrosion || !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel)))
                 && p.ability != Ab::Immunity
         }
         // Insomnia / Vital Spirit / Sweet Veil grant immunity to sleep.
@@ -3475,6 +3531,12 @@ fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
 /// Field-level status blocks: Electric Terrain blocks sleep and Misty Terrain blocks all
 /// status for grounded targets. Checked alongside `status_applies` at application sites.
 fn status_blocked_by_field(state: &State, target: SideId, status: Status) -> bool {
+    // Leaf Guard: in (harsh) sun the holder cannot be given a major status at all.
+    if state.side(target).active().ability == crate::ids::Ability::LeafGuard
+        && matches!(effective_weather(state), Weather::Sun | Weather::HarshSun)
+    {
+        return true;
+    }
     if !is_grounded(state, target) {
         return false;
     }
@@ -3634,11 +3696,44 @@ fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
 /// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
 /// the ±6 clamp. Returns the effective change actually applied (0 if blocked/clamped out).
 fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+    use crate::ids::Ability as Ab;
     // Contrary inverts the change before anything else (so a "drop" becomes a raise and is no
     // longer blocked by Clear Body / counted as a drop by Defiant).
-    let delta = if b.state.side(target).active().ability == crate::ids::Ability::Contrary { -delta } else { delta };
-    if delta < 0 && b.state.side(target).active().ability == crate::ids::Ability::ClearBody {
-        return 0;
+    let delta = if b.state.side(target).active().ability == Ab::Contrary { -delta } else { delta };
+    // Every apply_boost_clamped call is an OPPONENT-inflicted change on `target` (self-drops go
+    // through apply_self_boost), so the "source && target === source" self-skip in PS's onTryBoost
+    // handlers never fires here. Protective abilities block foe-inflicted stat *drops*.
+    if delta < 0 {
+        let tgt = b.state.side(target).active();
+        let ab = tgt.ability;
+        // Clear Body / Full Metal Body / White Smoke block every stat drop; Flower Veil does so
+        // for a Grass-type holder; Big Pecks only Defense; Keen Eye / Mind's Eye only Accuracy.
+        let block_all = matches!(ab, Ab::ClearBody | Ab::FullMetalBody | Ab::WhiteSmoke)
+            || (ab == Ab::FlowerVeil && tgt.types.contains(&Type::Grass));
+        let block_stat = (ab == Ab::BigPecks && stat == BoostIndex::Defense)
+            || (matches!(ab, Ab::KeenEye | Ab::MindsEye) && stat == BoostIndex::Accuracy);
+        if block_all || block_stat {
+            return 0;
+        }
+        // Mirror Armor reflects a foe-inflicted drop back onto the source instead of the holder.
+        if ab == Ab::MirrorArmor {
+            let source = target.other();
+            if b.state.side(target).boost(stat) > -6 && b.state.side(source).active().is_alive() {
+                // The bounced drop respects the source's own Contrary; no re-bounce (PS guards
+                // with effect.name === 'Mirror Armor').
+                let sab = b.state.side(source).active().ability;
+                let sdelta = if sab == Ab::Contrary { -delta } else { delta };
+                let scur = b.state.side(source).boost(stat);
+                let seff = (scur + sdelta).clamp(-6, 6) - scur;
+                if seff != 0 {
+                    push(b, Instruction::Boost { side: source, stat, amount: seff });
+                    if seff < 0 {
+                        react_to_stat_drop(b, source);
+                    }
+                }
+            }
+            return 0;
+        }
     }
     let cur = b.state.side(target).boost(stat);
     let eff = (cur + delta).clamp(-6, 6) - cur;
@@ -3820,7 +3915,8 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     let mut applied_status_now = false;
     if target_eligible
         && md.secondary_status != Status::None
-        && status_applies(proc.state.side(foe).active(), md.secondary_status)
+        && status_applies_src(proc.state.side(foe).active(), md.secondary_status,
+            proc.state.side(side).active().ability == crate::ids::Ability::Corrosion)
         && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
         && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
     {
@@ -4389,7 +4485,8 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     let mut applied_sleep = false;
     if md.status != Status::None
         && !foe_immune
-        && status_applies(hit.state.side(foe).active(), md.status)
+        && status_applies_src(hit.state.side(foe).active(), md.status,
+            hit.state.side(side).active().ability == crate::ids::Ability::Corrosion)
         && !status_blocked_by_field(&hit.state, foe, md.status)
         && !(md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe))
     {
