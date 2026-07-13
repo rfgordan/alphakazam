@@ -91,6 +91,9 @@ pub struct Pokemon {
     /// Cud Chew (Tauros-Paldea): turns until the eaten berry's effect is re-applied. PS stores
     /// `abilityState.counter` (2 on eat, ticked each end-of-turn); 0 = no pending re-eat.
     pub cudchew_turns: u8,
+    /// Gender (0 = genderless, 1 = M, 2 = F). Static — no instruction changes it; drives
+    /// Attract / Cute Charm legality (opposite genders only).
+    pub gender: u8,
     pub base_species: Species,
     pub base_stats: [i16; StatIndex::COUNT],
     pub base_moves: [MoveSlot; 4],
@@ -137,6 +140,7 @@ impl Pokemon {
         slept_by_foe: false,
         last_berry: Item::None,
         cudchew_turns: 0,
+        gender: 0,
         base_species: Species::None,
         base_stats: [0; StatIndex::COUNT],
         base_moves: [MoveSlot::EMPTY; 4],

@@ -56,6 +56,25 @@ fn ability_immune(move_type: Type, ability: crate::ids::Ability) -> bool {
     }
 }
 
+/// Whether `item` can be removed from a mon of `species` by Knock Off / Magician /
+/// Pickpocket (PS `onTakeItem` returning false). Species-locked items can never be taken
+/// from their signature holder: Rusted Sword/Shield (Zacian/Zamazenta), the Ogerpon masks,
+/// and the Origin orbs/crystals (Dialga/Palkia/Giratina). Arceus plates are locked only to
+/// Arceus, which is outside the randbats pool.
+fn item_removable(species: crate::ids::Species, item: Item) -> bool {
+    let sid = species.to_id();
+    !match item {
+        Item::RustedSword => sid.starts_with("zacian"),
+        Item::RustedShield => sid.starts_with("zamazenta"),
+        Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask => sid.starts_with("ogerpon"),
+        Item::AdamantCrystal | Item::AdamantOrb => sid.starts_with("dialga"),
+        Item::LustrousGlobe | Item::LustrousOrb => sid.starts_with("palkia"),
+        Item::GriseousCore | Item::GriseousOrb => sid.starts_with("giratina"),
+        Item::None => true, // "removable" is meaningless without an item
+        _ => false,
+    }
+}
+
 /// Damaging moves with the `wind` flag (Wind Rider / Wind Power triggers). Non-damaging wind
 /// moves (Whirlwind, Tailwind, Sandstorm) route through the status path and are not covered.
 fn is_wind_move(id: crate::ids::MoveId) -> bool {
@@ -448,7 +467,7 @@ pub fn generate_move_action(
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
         return vec![StateInstructions { percentage: 100.0, instructions: Vec::new() }];
     }
-    execute_move(start, Action { side, move_idx, pivot, foe_pending_move })
+    execute_move(start, Action { side, move_idx, pivot, foe_pending_move, custap: false })
         .into_iter()
         .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
         .collect()
@@ -481,6 +500,30 @@ fn apply_tera(b: &mut Branch, side: SideId) {
 pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Option<u8>; 2], tera: [bool; 2]) -> Vec<StateInstructions> {
     let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
     let mut branches = vec![start];
+
+    // 0) Custap Berry fires at QUEUE time (PS onFractionalPriority runs when the turn's
+    // actions are resolved, before anything executes): a holder at ≤1/4 HP (≤1/2 with
+    // Gluttony) whose chosen move has effective priority ≤ 0 eats the berry immediately and
+    // gains +0.1 priority for this turn's ordering (the `custap` flag on its Action).
+    let mut custap = [false; 2];
+    for (i, (side, choice)) in [(SideId::One, s1), (SideId::Two, s2)].into_iter().enumerate() {
+        let MoveChoice::Move(idx) = choice else { continue };
+        let p = state.side(side).active();
+        let pinch = p.hp * 4 <= p.max_hp
+            || (p.ability == crate::ids::Ability::Gluttony && p.hp * 2 <= p.max_hp);
+        if p.item == Item::CustapBerry
+            && p.is_alive()
+            && pinch
+            && effective_priority(state, side, idx) <= 0
+        {
+            custap[i] = true;
+            for b in &mut branches {
+                let slot = b.state.side(side).active_index;
+                push(b, Instruction::ChangeItem { side, slot, previous: Item::CustapBerry, new: Item::None });
+                on_berry_eaten_id(b, side, Item::CustapBerry);
+            }
+        }
+    }
 
     // 1) Switches resolve before moves, in speed order when both sides switch (the slower
     //    side's switch-in ability resolves last and e.g. its weather wins).
@@ -528,10 +571,10 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
     }
 
     // 2) Moves, ordered by priority then effective speed (speed ties branch 50/50).
-    let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0]), (SideId::Two, s2, pivot[1])]
+    let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0], custap[0]), (SideId::Two, s2, pivot[1], custap[1])]
         .into_iter()
-        .filter_map(|(side, c, pv)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None }),
+        .filter_map(|(side, c, pv, cu)| match c {
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, custap: cu }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -615,6 +658,12 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
             let slot = previous;
             push(b, Instruction::ChangeAbility { side, slot, previous: p.ability, new: p.base_ability });
         }
+    }
+    // Attract ends when its source leaves the field (PS condition onUpdate: source not
+    // active). In singles the source of the OPPONENT's infatuation is necessarily this
+    // outgoing active, so the foe's Attract volatile is cleared here.
+    if b.state.side(side.other()).volatiles.contains(VolatileStatus::Attract) {
+        push(b, Instruction::RemoveVolatile { side: side.other(), volatile: VolatileStatus::Attract });
     }
     // A transformed mon reverts to its own identity as it leaves the field.
     revert_transform(b, side);
@@ -1064,6 +1113,9 @@ struct Action {
     /// moved, switched, or there is no second move). Lets Sucker Punch / Thunderclap know
     /// whether the target is about to attack.
     foe_pending_move: Option<crate::ids::MoveId>,
+    /// Custap Berry fired at queue time (+0.1 fractional priority for this action). The
+    /// berry was already consumed at turn start, so the flag must ride on the action.
+    custap: bool,
 }
 
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action]) -> Vec<Branch> {
@@ -1080,7 +1132,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action]) -> Vec<Branch> {
         1 => execute_move(b, actions[0]),
         _ => {
             let (a, b_act) = (actions[0], actions[1]);
-            let order = move_order(&b.state, a.side, a.move_idx, b_act.side, b_act.move_idx);
+            let order = move_order(&b.state, &a, &b_act);
             match order {
                 Order::First(first) => {
                     let (f, s) = if first == a.side { (a, b_act) } else { (b_act, a) };
@@ -1182,11 +1234,31 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     pri
 }
 
-fn move_order(state: &State, sa: SideId, ma: u8, sb: SideId, mb: u8) -> Order {
-    let pa = effective_priority(state, sa, ma);
-    let pb = effective_priority(state, sb, mb);
+fn move_order(state: &State, a: &Action, b: &Action) -> Order {
+    let (sa, sb) = (a.side, b.side);
+    let pa = effective_priority(state, sa, a.move_idx);
+    let pb = effective_priority(state, sb, b.move_idx);
     if pa != pb {
         return Order::First(if pa > pb { sa } else { sb });
+    }
+    // Fractional priority inside an equal bracket: Custap Berry +0.1 (already consumed at
+    // queue time — the flag rides on the Action) and Mycelium Might −0.1 on status moves.
+    let frac = |act: &Action| -> i8 {
+        let mut f = 0i8;
+        if act.custap {
+            f += 1;
+        }
+        let p = state.side(act.side).active();
+        if p.ability == crate::ids::Ability::MyceliumMight
+            && move_data(p.moves[act.move_idx as usize].id).category == MoveCategory::Status
+        {
+            f -= 1;
+        }
+        f
+    };
+    let (fa, fb) = (frac(a), frac(b));
+    if fa != fb {
+        return Order::First(if fa > fb { sa } else { sb });
     }
     let va = effective_speed(state, sa);
     let vb = effective_speed(state, sb);
@@ -1322,6 +1394,12 @@ fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         out.extend(confusion_self_hit(scaled(&b, act * 0.33), side));
         act *= 0.67;
     }
+    // Attract: 50% chance to be immobilized by love (PS attract condition onBeforeMove,
+    // priority 2 — between confusion (3) and paralysis (1)).
+    if b.state.side(side).volatiles.contains(VolatileStatus::Attract) {
+        out.push(scaled(&b, act * 0.5)); // immobilized: no move
+        act *= 0.5;
+    }
     if status == Status::Paralysis {
         out.push(scaled(&b, act * 0.25)); // fully paralyzed: no move
         act *= 0.75;
@@ -1378,6 +1456,40 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
     // the USER; everything else on the foe.
     let foe = if md.target == crate::data::MoveTarget::User { side } else { side.other() };
     if !b.state.side(foe).active().is_alive() || b.state.side(foe).volatiles.contains(v) {
+        return vec![b];
+    }
+    let mold_breaker = matches!(
+        b.state.side(side).active().ability,
+        crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+    );
+    // Aroma Veil (breakable): blocks attract / disable / encore / heal block / taunt /
+    // torment inflicted on the holder('s side) by a move.
+    if foe != side
+        && !mold_breaker
+        && b.state.side(foe).active().ability == crate::ids::Ability::AromaVeil
+        && matches!(
+            v,
+            VolatileStatus::Attract | VolatileStatus::Disable | VolatileStatus::Encore
+                | VolatileStatus::HealBlock | VolatileStatus::Taunt | VolatileStatus::Torment
+        )
+    {
+        return vec![b];
+    }
+    // Attract: only lands between opposite genders; Oblivious (breakable) is immune to
+    // both Attract and Taunt (PS oblivious onTryAddVolatile).
+    if v == VolatileStatus::Attract {
+        let a = b.state.side(side).active();
+        let t = b.state.side(foe).active();
+        let genders_ok = (a.gender == 1 && t.gender == 2) || (a.gender == 2 && t.gender == 1);
+        if !genders_ok || (!mold_breaker && t.ability == crate::ids::Ability::Oblivious) {
+            return vec![b];
+        }
+    }
+    if v == VolatileStatus::Taunt
+        && foe != side
+        && !mold_breaker
+        && b.state.side(foe).active().ability == crate::ids::Ability::Oblivious
+    {
         return vec![b];
     }
     match v {
@@ -1597,6 +1709,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if attacker.ability == crate::ids::Ability::LiquidVoice && md.flag_sound {
         md.typ = Type::Water;
     }
+    // Analytic: ×1.3 base power when no other active will still move this turn (PS
+    // onBasePower chainModify([5325, 4096]); queue.willMove is falsy for a foe that already
+    // moved, chose a switch, or is fainted — exactly foe_pending_move == None here).
+    // NOTE: dynamic-BP moves (weight/HP-scaled) recompute base power inside compute_damage
+    // and drop this multiply; no in-format Analytic holder carries one.
+    if attacker.ability == crate::ids::Ability::Analytic
+        && foe_pending_move.is_none()
+        && md.category != MoveCategory::Status
+        && md.base_power > 0
+    {
+        md.base_power = crate::damage::modify(md.base_power as i64, 5325, 4096) as u16;
+    }
     let foe = side.other();
 
     let mut b = b;
@@ -1714,8 +1838,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
     let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
     if status == Status::Sleep {
-        if counter > 1 {
-            push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - 1 });
+        // Early Bird burns sleep turns twice as fast (PS slp onBeforeMove: an extra time--).
+        let tick = if b.state.side(side).active().ability == crate::ids::Ability::EarlyBird { 2 } else { 1 };
+        if counter > tick {
+            push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - tick });
             return vec![b];
         }
         push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
@@ -1881,6 +2007,31 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && b.state.side(foe).active().is_alive()
     {
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+    }
+
+    // Queenly Majesty (breakable): the foe's increased-priority moves fail against the
+    // holder's side (PS onFoeTryMove, move.priority > 0.1 — the EFFECTIVE priority, so
+    // Prankster / Gale Wings / Grassy Glide boosts count; foeSide-targeting moves exempt).
+    {
+        let holder = b.state.side(foe).active();
+        if holder.is_alive() && holder.ability == crate::ids::Ability::QueenlyMajesty {
+            let atk = b.state.side(side).active();
+            let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
+            let mut pri = md.priority;
+            if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
+                pri += 1;
+            }
+            if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
+                pri += 1;
+            }
+            if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
+                pri += 1;
+            }
+            let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
+            if pri > 0 && !mb && !side_targeting {
+                return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+            }
+        }
     }
 
     // Air Balloon: the holder is untargetable by Ground moves until the balloon pops.
@@ -2406,8 +2557,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         fmod = chain_final(fmod, 5324);
     }
 
-    // Knock Off: ×1.5 base power when the target is holding a (removable) item.
-    let mut base_power = if md.id.to_id() == "knockoff" && defender.item != Item::None {
+    // Knock Off: ×1.5 base power when the target is holding a REMOVABLE item — no boost when
+    // the item is species-locked (Rusted Sword/Shield, Ogerpon masks, Origin orbs) or the
+    // holder has Sticky Hold (PS's basePowerCallback runs the TakeItem event first).
+    let mut base_power = if md.id.to_id() == "knockoff"
+        && defender.item != Item::None
+        && item_removable(defender.species, defender.item)
+        && def_ab != Ab::StickyHold // breakable → def_ab is already Mold-Breaker-suppressed
+    {
         crate::damage::modify(md.base_power as i64, 3, 2) as u16
     } else {
         md.base_power
@@ -2999,6 +3156,51 @@ fn apply_post_damage(
                         raise_boost(b, foe, BoostIndex::SpecialAttack, 1);
                     }
                 }
+                Ab::AngerShell => {
+                    // Same half-HP crossing as Berserk: +1 Atk/SpA/Spe, -1 Def/SpD (PS
+                    // onAfterMoveSecondary with the checkedAngerShell threshold test).
+                    let hp = f.hp as i32;
+                    let pre = hp + total_dealt;
+                    if pre * 2 > f.max_hp as i32 && hp * 2 <= f.max_hp as i32 {
+                        raise_boost(b, foe, BoostIndex::Attack, 1);
+                        raise_boost(b, foe, BoostIndex::SpecialAttack, 1);
+                        raise_boost(b, foe, BoostIndex::Speed, 1);
+                        // Self-inflicted drops: no Clear-Body-family blocking, no Mirror
+                        // Armor bounce, no Defiant — just the ±6 clamp.
+                        for stat in [BoostIndex::Defense, BoostIndex::SpecialDefense] {
+                            let cur = b.state.side(foe).boost(stat);
+                            let eff = (cur - 1).clamp(-6, 6) - cur;
+                            if eff != 0 {
+                                push(b, Instruction::Boost { side: foe, stat, amount: eff });
+                            }
+                        }
+                        apply_white_herb(b, foe);
+                    }
+                }
+                Ab::SeedSower => {
+                    // Being hit by a damaging move plants Grassy Terrain (PS onDamagingHit
+                    // this.field.setTerrain — fails silently if already Grassy).
+                    if b.state.terrain != crate::ids::Terrain::Grassy {
+                        let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
+                        push(b, Instruction::ChangeTerrain {
+                            previous: b.state.terrain,
+                            previous_turns: b.state.terrain_turns,
+                            new: crate::ids::Terrain::Grassy,
+                            new_turns: turns,
+                        });
+                    }
+                }
+                Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
+                    // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
+                    // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
+                    // Defiant/Competitive apply on the attacker's side).
+                    if b.state.side(side).active().is_alive() {
+                        if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
+                            react_to_stat_drop(b, side);
+                            apply_white_herb(b, side);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3011,10 +3213,16 @@ fn apply_post_damage(
         }
     }
 
-    // Knock Off removes the target's held item (so it no longer triggers Leftovers heals etc.).
+    // Knock Off removes the target's held item (so it no longer triggers Leftovers heals
+    // etc.) — unless the item is species-locked to the holder (PS onTakeItem false) or the
+    // holder has Sticky Hold (suppressed by Mold Breaker, but def_ability reflects that).
     if md.id.to_id() == "knockoff" && !hit_sub {
         let f = b.state.side(foe).active();
-        if f.is_alive() && f.item != Item::None {
+        if f.is_alive()
+            && f.item != Item::None
+            && item_removable(f.species, f.item)
+            && def_ability != Ab::StickyHold
+        {
             let (prev, fslot) = (f.item, b.state.side(foe).active_index);
             push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
             on_item_lost(b, foe);
@@ -3023,13 +3231,74 @@ fn apply_post_damage(
         }
     }
 
+    // Magician: after landing a damaging move, an itemless attacker steals the target's item
+    // (PS onAfterMoveSecondarySelf; excluded for pivot moves — source.switchFlag — and Fling).
+    if any_damage
+        && !hit_sub
+        && b.state.side(side).active().ability == Ab::Magician
+        && b.state.side(side).active().is_alive()
+        && b.state.side(side).active().item == Item::None
+        && !md.self_switch
+        && md.category != MoveCategory::Status
+    {
+        let f = b.state.side(foe).active();
+        if f.item != Item::None && item_removable(f.species, f.item) && def_ability != Ab::StickyHold {
+            let stolen = f.item;
+            let fslot = b.state.side(foe).active_index;
+            let aslot = b.state.side(side).active_index;
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: stolen, new: Item::None });
+            on_item_lost(b, foe);
+            push(b, Instruction::ChangeItem { side, slot: aslot, previous: Item::None, new: stolen });
+            // Gaining an item ends an active Unburden speed boost.
+            if b.state.side(side).volatiles.contains(VolatileStatus::Unburden) {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Unburden });
+            }
+            reveal(b, foe, 0, crate::state::Reveal::ITEM);
+        }
+    }
+
+    // Pickpocket: when hit by a contact move, an itemless holder steals the attacker's item
+    // (PS onAfterMoveSecondary; not on pivot moves — source.switchFlag).
+    if any_damage
+        && !hit_sub
+        && md.flag_contact
+        && !md.self_switch
+        && def_ability == Ab::Pickpocket
+        && b.state.side(foe).active().is_alive()
+        && b.state.side(foe).active().item == Item::None
+    {
+        let a = b.state.side(side).active();
+        if a.item != Item::None
+            && item_removable(a.species, a.item)
+            && a.ability != Ab::StickyHold
+        {
+            let stolen = a.item;
+            let aslot = b.state.side(side).active_index;
+            let fslot = b.state.side(foe).active_index;
+            push(b, Instruction::ChangeItem { side, slot: aslot, previous: stolen, new: Item::None });
+            on_item_lost(b, side);
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: Item::None, new: stolen });
+            if b.state.side(foe).volatiles.contains(VolatileStatus::Unburden) {
+                push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Unburden });
+            }
+            reveal(b, side, 0, crate::state::Reveal::ITEM);
+        }
+    }
+
     // A transformed mon that fainted this hit (the target, or the attacker via a contact
     // punisher / recoil) reverts to its own identity — PS runs clearVolatile on faint.
+    // A faint also releases the OPPONENT's infatuation (Attract's source is gone).
     if !b.state.side(foe).active().is_alive() {
         revert_transform(b, foe);
+        if b.state.side(side).volatiles.contains(VolatileStatus::Attract) {
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Attract });
+        }
     }
     if !b.state.side(side).active().is_alive() {
         revert_transform(b, side);
+        if b.state.side(foe).volatiles.contains(VolatileStatus::Attract) {
+            push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Attract });
+        }
     }
 }
 
@@ -3500,30 +3769,34 @@ const BOOST_ORDER: [BoostIndex; BoostIndex::COUNT] = [
 
 /// Whether `status` can be inflicted on `p` right now (status-free + type + Purifying Salt).
 fn status_applies(p: &crate::state::Pokemon, status: Status) -> bool {
-    status_applies_src(p, status, false)
+    status_applies_src(p, status, false, false)
 }
 
-/// Corrosion-aware variant: `source_corrosion` = the attacker has Corrosion, which lets its
+/// Source-aware variant: `source_corrosion` = the attacker has Corrosion, which lets its
 /// move-inflicted poison/toxic bypass the target's Poison/Steel type immunity (PS setStatus).
-fn status_applies_src(p: &crate::state::Pokemon, status: Status, source_corrosion: bool) -> bool {
+/// `breaker` = the attacker's move ignores breakable abilities (Mold Breaker family, or a
+/// Mycelium Might status move), piercing the ability-based immunities but not type ones
+/// (nor Comatose, which is `cantsuppress`).
+fn status_applies_src(p: &crate::state::Pokemon, status: Status, source_corrosion: bool, breaker: bool) -> bool {
     if p.status != Status::None || !p.is_alive() {
         return false;
     }
     use crate::ids::Ability as Ab;
-    // Blanket status immunities.
-    if matches!(p.ability, Ab::PurifyingSalt | Ab::Comatose) {
+    // Blanket status immunities (Purifying Salt is breakable; Comatose is not).
+    if p.ability == Ab::Comatose || (!breaker && p.ability == Ab::PurifyingSalt) {
         return false;
     }
+    let ab = if breaker { Ab::None } else { p.ability };
     match status {
-        Status::Burn => !p.types.contains(&Type::Fire) && !matches!(p.ability, Ab::WaterVeil | Ab::WaterBubble | Ab::ThermalExchange),
-        Status::Paralysis => !p.types.contains(&Type::Electric) && p.ability != Ab::Limber,
+        Status::Burn => !p.types.contains(&Type::Fire) && !matches!(ab, Ab::WaterVeil | Ab::WaterBubble | Ab::ThermalExchange),
+        Status::Paralysis => !p.types.contains(&Type::Electric) && ab != Ab::Limber,
         Status::Poison | Status::Toxic => {
             (source_corrosion || !(p.types.contains(&Type::Poison) || p.types.contains(&Type::Steel)))
-                && p.ability != Ab::Immunity
+                && ab != Ab::Immunity
         }
         // Insomnia / Vital Spirit / Sweet Veil grant immunity to sleep.
-        Status::Sleep => !matches!(p.ability, Ab::Insomnia | Ab::VitalSpirit | Ab::SweetVeil),
-        Status::Freeze => !p.types.contains(&Type::Ice) && p.ability != Ab::MagmaArmor,
+        Status::Sleep => !matches!(ab, Ab::Insomnia | Ab::VitalSpirit | Ab::SweetVeil),
+        Status::Freeze => !p.types.contains(&Type::Ice) && ab != Ab::MagmaArmor,
         _ => true,
     }
 }
@@ -3683,6 +3956,16 @@ fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
         if prev != berry {
             push(b, Instruction::SetLastBerry { side, slot, previous: prev, new: berry });
         }
+        // Cud Chew stores the eaten berry with a 2-residual countdown (PS onEatItem sets
+        // counter = 2; the same-turn residual ticks it to 1, so the re-eat lands at the END
+        // OF THE NEXT TURN — identical net timing to PS's queue-empty `counter--` special
+        // case for during-residual eats, since our residual tick runs after the eat sites).
+        if b.state.side(side).active().ability == crate::ids::Ability::CudChew {
+            let cc = b.state.side(side).active().cudchew_turns;
+            if cc != 2 {
+                push(b, Instruction::SetCudChew { side, slot, previous: cc, new: 2 });
+            }
+        }
     }
     on_item_lost(b, side);
     let p = b.state.side(side).active();
@@ -3783,6 +4066,56 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
     let foe = side.other();
     let atk_ab = b.state.side(side).active().ability;
     let def_ab = b.state.side(foe).active().ability;
+    // Effect Spore (defender): a contact hit rolls one d100 — <11 sleep, <21 paralysis,
+    // <30 poison, else nothing (PS onDamagingHit). The whole roll is skipped for powder-
+    // immune attackers (Grass types, Overcoat, Safety Goggles).
+    if def_ab == Ab::EffectSpore && md.flag_contact {
+        let a = b.state.side(side).active();
+        let powder_immune = a.types.contains(&Type::Grass)
+            || a.ability == Ab::Overcoat
+            || a.item == Item::SafetyGoggles;
+        if !a.is_alive() || powder_immune {
+            return vec![b];
+        }
+        let mut out = Vec::new();
+        let mut noproc_p = 0.70f32;
+        for (p, status) in [(0.11, Status::Sleep), (0.10, Status::Paralysis), (0.09, Status::Poison)] {
+            let applies = status_applies(b.state.side(side).active(), status)
+                && !status_blocked_by_field(&b.state, side, status)
+                && !(status == Status::Sleep && sleep_clause_blocks(&b.state, side));
+            if !applies {
+                noproc_p += p; // the roll lands there but the status fails: no state change
+                continue;
+            }
+            let mut proc = scaled(&b, p);
+            let slot = proc.state.side(side).active_index;
+            push(&mut proc, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
+            if status == Status::Sleep {
+                mark_slept_by_foe(&mut proc, side);
+                out.extend(branch_sleep_counter(proc, side));
+            } else {
+                out.push(proc);
+            }
+        }
+        out.push(scaled(&b, noproc_p));
+        return out;
+    }
+    // Cute Charm (defender): 30% chance a contact hit infatuates the attacker — only for
+    // opposite genders; Oblivious and Aroma Veil on the attacker block the volatile.
+    if def_ab == Ab::CuteCharm && md.flag_contact {
+        let a = b.state.side(side).active();
+        let d = b.state.side(foe).active();
+        let genders_ok = (a.gender == 1 && d.gender == 2) || (a.gender == 2 && d.gender == 1);
+        let blocked = matches!(atk_ab, Ab::Oblivious | Ab::AromaVeil)
+            || b.state.side(side).volatiles.contains(VolatileStatus::Attract);
+        if a.is_alive() && genders_ok && !blocked {
+            let mut proc = scaled(&b, 0.30);
+            let noproc = scaled(&b, 0.70);
+            push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Attract });
+            return vec![proc, noproc];
+        }
+        return vec![b];
+    }
     // Toxic Chain (attacker) badly-poisons the target on any damaging hit (30%, not contact-
     // gated). Otherwise a contact hit can trigger the defender's status ability or the
     // attacker's Poison Touch.
@@ -3916,7 +4249,9 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if target_eligible
         && md.secondary_status != Status::None
         && status_applies_src(proc.state.side(foe).active(), md.secondary_status,
-            proc.state.side(side).active().ability == crate::ids::Ability::Corrosion)
+            proc.state.side(side).active().ability == crate::ids::Ability::Corrosion,
+            matches!(proc.state.side(side).active().ability,
+                crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze))
         && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
         && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
     {
@@ -3958,10 +4293,21 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     use crate::instruction::ActiveCounter;
     if target_eligible {
       if let Some(v) = md.secondary_volatile {
+        // Aroma Veil also blocks these when they arrive as a damaging move's secondary
+        // (Psychic Noise's heal block); breakable, so Mold Breaker attackers pierce it.
+        let aroma_veil_blocks = matches!(
+            v,
+            VolatileStatus::Attract | VolatileStatus::Disable | VolatileStatus::Encore
+                | VolatileStatus::HealBlock | VolatileStatus::Taunt | VolatileStatus::Torment
+        ) && b.state.side(foe).active().ability == crate::ids::Ability::AromaVeil
+            && !matches!(
+                b.state.side(side).active().ability,
+                crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+            );
         procs = procs
             .into_iter()
             .flat_map(|mut x| {
-                if x.state.side(foe).active().is_alive() && !x.state.side(foe).volatiles.contains(v) {
+                if !aroma_veil_blocks && x.state.side(foe).active().is_alive() && !x.state.side(foe).volatiles.contains(v) {
                     push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: v });
                     if v == VolatileStatus::Confusion {
                         return branch_confusion_counter(x, foe);
@@ -4453,7 +4799,16 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     // White Herb restores the user's own drops (Shell Smash's −Def/−SpD).
     apply_white_herb(&mut hit, side);
     // Good as Gold blocks status moves that target the holder (boosts/status against it).
-    let foe_immune = hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold;
+    // It is a `breakable` ability: the Mold Breaker family pierces it, and Mycelium Might
+    // makes the user's status moves ignore the target's ability entirely (PS onModifyMove
+    // move.ignoreAbility for status moves).
+    let status_breaker = matches!(
+        hit.state.side(side).active().ability,
+        crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt
+            | crate::ids::Ability::Turboblaze | crate::ids::Ability::MyceliumMight
+    );
+    let foe_immune =
+        hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold && !status_breaker;
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
     if hit.state.side(foe).active().is_alive() && !foe_immune {
         let mut lowered = false;
@@ -4486,7 +4841,8 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
     if md.status != Status::None
         && !foe_immune
         && status_applies_src(hit.state.side(foe).active(), md.status,
-            hit.state.side(side).active().ability == crate::ids::Ability::Corrosion)
+            hit.state.side(side).active().ability == crate::ids::Ability::Corrosion,
+            status_breaker)
         && !status_blocked_by_field(&hit.state, foe, md.status)
         && !(md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe))
     {
@@ -4941,6 +5297,23 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
             };
             if orb_status != Status::None && status_applies(p, orb_status) {
                 push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
+            }
+        }
+
+        // Bad Dreams (Darkrai): each sleeping foe loses 1/8 max HP (PS onResidual 28.2).
+        // Comatose counts as asleep; Magic Guard on the sleeper prevents the damage.
+        if ability == Ab::BadDreams && b.state.side(side).active().is_alive() {
+            let foe = side.other();
+            let f = b.state.side(foe).active();
+            if f.is_alive()
+                && (f.status == Status::Sleep || f.ability == Ab::Comatose)
+                && f.ability != Ab::MagicGuard
+            {
+                let fslot = b.state.side(foe).active_index;
+                let dmg = (f.max_hp / 8).max(1).min(f.hp);
+                push(b, Instruction::Damage { side: foe, slot: fslot, amount: dmg });
+                // The chip can put the sleeper into its own pinch-berry range.
+                apply_pinch_berry(b, foe);
             }
         }
 
