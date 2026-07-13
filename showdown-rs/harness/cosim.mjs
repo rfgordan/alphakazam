@@ -333,6 +333,53 @@ const TEAM_C3 = {
 		'Indeedee||leftovers|psychicsurge|expandingforce,hypervoice,calmmind,protect|Timid|,,,252,4,252|||||,,,,,Psychic',
 		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,irondefense|Impish|248,,168,,92,|||||,,,,,Flying',
 	]],
+	// Legends + formes: As One Calyrexes (Unnerve + Chilling/Grim Neigh KO boosts), Judgment
+	// off a Splash Plate (Multitype Arceus-Water) + Will-O-Wisp feeding Sparkling Aria's burn
+	// cure, Own Tempo Petal Dance (rampage ends without confusion), Hustle Victory Dance,
+	// Mega Launcher Water Pulse, Unnerve Work Up, Light Ball Static Volt Tackle, Drought
+	// Precipice Blades, Fusion Bolt (its Flare counterpart lives in c3b2).
+	c3c1: [[
+		'Calyrex-Ice||leftovers|asoneglastrier|glaciallance,highhorsepower,agility,leechseed|Adamant|252,252,,,4,|||||,,,,,Ice',
+		'Meganium||leftovers|overgrow|petalblizzard,earthquake,synthesis,leechseed|Careful|252,,4,,252,|||||,,,,,Grass',
+		'Lilligant||leftovers|owntempo|petaldance,quiverdance,sleeppowder,synthesis|Timid|,,,252,4,252|||||,,,,,Grass',
+		'Clawitzer||leftovers|megalauncher|waterpulse,darkpulse,aurasphere,uturn|Modest|252,,,252,4,|||||,,,,,Water',
+		'Pyroar||leftovers|unnerve|workup,flamethrower,hypervoice,willowisp|Timid|,,,252,4,252|||||,,,,,Fire',
+		'Pikachu||lightball|static|volttackle,fakeout,quickattack,irontail|Jolly|,252,,,4,252|||||,,,,,Electric',
+	], [
+		'Calyrex-Shadow||leftovers|asonespectrier|astralbarrage,pollenpuff,nastyplot,substitute|Timid|,,,252,4,252|||||,,,,,Ghost',
+		'Lilligant-Hisui||leftovers|hustle|victorydance,closecombat,trailblaze,sleeppowder|Jolly|,252,,,4,252|||||,,,,,Fighting',
+		'Arceus-Water||splashplate|multitype|judgment,shadowclaw,recover,willowisp|Bold|248,,252,,8,|||||,,,,,Water',
+		'Primarina||leftovers|torrent|sparklingaria,moonblast,psychic,flipturn|Modest|248,,,252,8,|||||,,,,,Water',
+		'Groudon||leftovers|drought|precipiceblades,stoneedge,swordsdance,roost|Adamant|252,252,,,4,|||||,,,,,Ground',
+		'Kyurem-Black||leftovers|teravolt|fusionbolt,iciclespear,dragondance,substitute|Adamant|,252,,,4,252|||||,,,,,Electric',
+	]],
+	// Remaining specials: Trace Mystical Fire, Night Shade, Pounce, Strong Jaw Psychic Fangs
+	// (screens to shatter across), Secret Sword vs physical Defense, Seed Bomb, Strange Steam,
+	// Tachyon Cutter twin hits, Take Heart, Scrappy Triple Arrows (dual secondary).
+	c3c2: [[
+		'Gardevoir||leftovers|trace|mysticalfire,moonblast,psyshock,calmmind|Timid|,,,252,4,252|||||,,,,,Fairy',
+		'Deoxys-Defense||leftovers|pressure|nightshade,recover,spikes,knockoff|Bold|252,,252,4,,|||||,,,,,Psychic',
+		'Kricketune||leftovers|swarm|pounce,knockoff,stickyweb,suckerpunch|Adamant|252,252,,,4,|||||,,,,,Bug',
+		'Bruxish||leftovers|strongjaw|psychicfangs,crunch,liquidation,swordsdance|Jolly|,252,,,4,252|||||,,,,,Psychic',
+		'Keldeo-Resolute||leftovers|justified|secretsword,surf,vacuumwave,calmmind|Timid|,,,252,4,252|||||,,,,,Water',
+		'Cacturne||leftovers|waterabsorb|seedbomb,suckerpunch,drainpunch,spikes|Adamant|252,252,,,4,|||||,,,,,Grass',
+	], [
+		'Weezing-Galar||leftovers|levitate|strangesteam,sludgebomb,willowisp,painsplit|Bold|252,,252,,4,|||||,,,,,Fairy',
+		'Iron Crown||boosterenergy|quarkdrive|tachyoncutter,focusblast,voltswitch,calmmind|Timid|,,,252,4,252|||||,,,,,Steel',
+		'Phione||leftovers|hydration|takeheart,scald,grassknot,rest|Bold|252,,252,,4,|||||,,,,,Water',
+		'Decidueye-Hisui||heavydutyboots|scrappy|triplearrows,leafblade,shadowsneak,roost|Adamant|252,252,,,4,|||||,,,,,Grass',
+		'Grimmsnarl||lightclay|prankster|reflect,lightscreen,spiritbreak,thunderwave|Careful|248,,8,,252,|||||,,,,,Steel',
+		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,uturn|Impish|248,,168,,92,|||||,,,,,Flying',
+	]],
+	// Mop-up 2v2: Light Ball Volt Tackle (recoil + 10% par) and Mega Launcher Water Pulse
+	// (20% confusion) as leads — both drowned on the bench in the full c3c games.
+	c3c3: [[
+		'Pikachu||lightball|static|volttackle,fakeout,quickattack,irontail|Jolly|,252,,,4,252|||||,,,,,Electric',
+		'Clawitzer||leftovers|megalauncher|waterpulse,darkpulse,aurasphere,icebeam|Modest|252,,,252,4,|||||,,,,,Water',
+	], [
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,protect|Calm|252,,252,,4,|||||,,,,,Normal',
+		'Corviknight||leftovers|pressure|bravebird,roost,bodypress,irondefense|Impish|248,,168,,92,|||||,,,,,Flying',
+	]],
 };
 
 // Ability coverage (`d*.json.gz`, `--teamset flashfire`): a Flash Fire carrier (Heatran) faces

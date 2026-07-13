@@ -351,7 +351,9 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                         if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
                             push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
                         }
-                        if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
+                        if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion)
+                            && b.state.side(side).active().ability != crate::ids::Ability::OwnTempo
+                        {
                             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
                             consume_lum_if_statused(&mut b, side);
                             if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
@@ -1910,6 +1912,10 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
             }
         }
         VolatileStatus::Confusion => {
+            // Own Tempo is confusion-immune (PS `onTryAddVolatile`): the move just fails.
+            if b.state.side(foe).active().ability == crate::ids::Ability::OwnTempo {
+                return vec![b];
+            }
             push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
             return branch_confusion_counter(b, foe);
         }
@@ -2098,6 +2104,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         } else if sp != crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None) {
             // PS `onTry` fails the move outright for non-Morpeko users.
             return vec![b];
+        }
+    }
+    // Judgment: takes the type of the user's held Plate (PS `onModifyType` via
+    // `item.onPlate`; randbats Arceus formes always hold their matching Plate).
+    if md.id.to_id() == "judgment" {
+        if let Some(t) = plate_type(attacker.item) {
+            md.typ = t;
         }
     }
     // Tera Blast: when the user is Terastallized it becomes the tera type and uses whichever
@@ -2563,6 +2576,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
     }
 
+    // Brick Break / Psychic Fangs / Raging Bull shatter the target's screens BEFORE the
+    // accuracy roll (PS `onTryHit` precedes the accuracy step — the break sticks even on a
+    // miss), through a Substitute, but not when Protect already blocked the move above.
+    if matches!(md.id.to_id(), "brickbreak" | "psychicfangs" | "ragingbull") {
+        for sc in [SideConditionId::Reflect, SideConditionId::LightScreen, SideConditionId::AuroraVeil] {
+            let cur = match sc {
+                SideConditionId::Reflect => b.state.side(foe).side_conditions.reflect,
+                SideConditionId::LightScreen => b.state.side(foe).side_conditions.light_screen,
+                _ => b.state.side(foe).side_conditions.aurora_veil,
+            };
+            if cur != 0 {
+                push(&mut b, Instruction::SetSideCondition { side: foe, condition: sc, previous: cur, new: 0 });
+            }
+        }
+    }
+
     // Damaging move: branch on accuracy (hit/miss), then crit, then the 16 rolls.
     let mut out = Vec::new();
     // Branches where the move failed to connect. Kept apart from `out` so the rampage lock
@@ -2789,6 +2818,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_bug_bite(&mut hb, side, &md);
             apply_thaw_on_hit(&mut hb, foe, &md);
             apply_spirit_shackle(&mut hb, side, &md);
+            apply_sparkling_aria(&mut hb, side, &md);
         }
         // Stone Axe sets Stealth Rock on the target's side whether the hit landed on the mon
         // OR its Substitute (PS has both `onAfterHit` and `onAfterSubDamage`), as long as the
@@ -3267,8 +3297,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         _ => {}
     }
     // Type-boosting held items: ×1.2 base power for the matching move type (PS onBasePower
-    // chainModify([4915, 4096])).
-    let type_item_boost = matches!(
+    // chainModify([4915, 4096])). Plates boost their type too (all 17, for Arceus formes).
+    let type_item_boost = plate_type(attacker.item) == Some(md.typ) && plate_type(attacker.item).is_some()
+        || matches!(
         (attacker.item, md.typ),
         (Item::Charcoal, Type::Fire)
             | (Item::MysticWater, Type::Water)
@@ -3280,7 +3311,6 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             | (Item::SoftSand, Type::Ground)
             | (Item::SharpBeak, Type::Flying)
             | (Item::TwistedSpoon, Type::Psychic)
-            | (Item::MindPlate, Type::Psychic)
             | (Item::SilverPowder, Type::Bug)
             | (Item::HardStone, Type::Rock)
             | (Item::SpellTag, Type::Ghost)
@@ -3739,13 +3769,21 @@ fn apply_post_damage(
         }
     }
 
-    // Moxie: +1 Atk when the move knocks out the target.
+    // Moxie / Chilling Neigh (+ As One Glastrier): +1 Atk on a KO; Grim Neigh (+ As One
+    // Spectrier): +1 SpA on a KO.
     if any_damage
         && !b.state.side(foe).active().is_alive()
-        && b.state.side(side).active().ability == Ab::Moxie
         && b.state.side(side).active().is_alive()
     {
-        raise_boost(b, side, BoostIndex::Attack, 1);
+        match b.state.side(side).active().ability {
+            Ab::Moxie | Ab::ChillingNeigh | Ab::AsOneGlastrier => {
+                raise_boost(b, side, BoostIndex::Attack, 1);
+            }
+            Ab::GrimNeigh | Ab::AsOneSpectrier => {
+                raise_boost(b, side, BoostIndex::SpecialAttack, 1);
+            }
+            _ => {}
+        }
     }
 
     // Beast Boost: a KO raises the attacker's highest stat by 1.
@@ -4043,6 +4081,53 @@ fn apply_thaw_on_hit(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
     if d.is_alive() && d.status == Status::Freeze && thaws {
         let slot = b.state.side(foe).active_index;
         push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Freeze, new: Status::None });
+    }
+}
+
+/// The 17 Arceus Plates: the boosted/granted type (PS `item.onPlate`).
+fn plate_type(item: Item) -> Option<Type> {
+    Some(match item {
+        Item::DracoPlate => Type::Dragon,
+        Item::DreadPlate => Type::Dark,
+        Item::EarthPlate => Type::Ground,
+        Item::FistPlate => Type::Fighting,
+        Item::FlamePlate => Type::Fire,
+        Item::IciclePlate => Type::Ice,
+        Item::InsectPlate => Type::Bug,
+        Item::IronPlate => Type::Steel,
+        Item::MeadowPlate => Type::Grass,
+        Item::MindPlate => Type::Psychic,
+        Item::PixiePlate => Type::Fairy,
+        Item::SkyPlate => Type::Flying,
+        Item::SplashPlate => Type::Water,
+        Item::SpookyPlate => Type::Ghost,
+        Item::StonePlate => Type::Rock,
+        Item::ToxicPlate => Type::Poison,
+        Item::ZapPlate => Type::Electric,
+        _ => return None,
+    })
+}
+
+/// Sparkling Aria cures the (single) target's burn after the hit: its 100% secondary plants
+/// a marker volatile whose removal in `onAfterMove` triggers the cure — so in singles the
+/// cure is blocked by Shield Dust / Covert Cloak (the secondary never lands) and removed by
+/// Sheer Force. The caller gates on !hit_sub (sound moves bypass subs anyway).
+fn apply_sparkling_aria(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if md.id.to_id() != "sparklingaria" {
+        return;
+    }
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return;
+    }
+    let foe = side.other();
+    let d = b.state.side(foe).active();
+    if d.is_alive()
+        && d.status == Status::Burn
+        && d.ability != crate::ids::Ability::ShieldDust
+        && d.item != Item::CovertCloak
+    {
+        let slot = b.state.side(foe).active_index;
+        push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Burn, new: Status::None });
     }
 }
 
@@ -4680,7 +4765,10 @@ fn status_blocked_by_field(state: &State, target: SideId, status: Status) -> boo
 /// Lum Berry: cures any status the instant it lands, consuming the berry (a real state
 /// change — the old model pretended the status never stuck, leaving the berry in hand).
 fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
-    if b.state.side(side.other()).active().ability == crate::ids::Ability::Unnerve && b.state.side(side.other()).active().is_alive() {
+    if matches!(
+        b.state.side(side.other()).active().ability,
+        crate::ids::Ability::Unnerve | crate::ids::Ability::AsOneGlastrier | crate::ids::Ability::AsOneSpectrier
+    ) && b.state.side(side.other()).active().is_alive() {
         return;
     }
     // Lum also cures confusion (it triggers on any status condition incl. volatile confusion).
@@ -4747,7 +4835,10 @@ fn on_item_lost(b: &mut Branch, side: SideId) {
 /// Sitrus Berry: when damage leaves the holder at 1/2 max HP or less, it eats the berry
 /// and heals 1/4 max HP.
 fn maybe_eat_sitrus(b: &mut Branch, side: SideId) {
-    if b.state.side(side.other()).active().ability == crate::ids::Ability::Unnerve && b.state.side(side.other()).active().is_alive() {
+    if matches!(
+        b.state.side(side.other()).active().ability,
+        crate::ids::Ability::Unnerve | crate::ids::Ability::AsOneGlastrier | crate::ids::Ability::AsOneSpectrier
+    ) && b.state.side(side.other()).active().is_alive() {
         return;
     }
     let p = b.state.side(side).active();
@@ -5126,6 +5217,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
             .flat_map(|mut x| {
                 if x.state.side(foe).active().is_alive()
                     && !x.state.side(foe).volatiles.contains(VolatileStatus::Confusion)
+                    && x.state.side(foe).active().ability != crate::ids::Ability::OwnTempo
                 {
                     push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Confusion });
                     return branch_confusion_counter(x, foe);
@@ -5141,7 +5233,10 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         procs = procs
             .into_iter()
             .flat_map(|mut x| {
-                if x.state.side(foe).active().is_alive() && !x.state.side(foe).volatiles.contains(v) {
+                if x.state.side(foe).active().is_alive() && !x.state.side(foe).volatiles.contains(v)
+                    && !(v == VolatileStatus::Confusion
+                        && x.state.side(foe).active().ability == crate::ids::Ability::OwnTempo)
+                {
                     push(&mut x, Instruction::ApplyVolatile { side: foe, volatile: v });
                     if v == VolatileStatus::Confusion {
                         return branch_confusion_counter(x, foe);
@@ -6318,25 +6413,48 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::Heal { side, slot, amount: heal });
         }
 
-        // Leech Seed has residual order 8 in PS, before burn/poison (order 9).  This matters
-        // when the seeded mon is also in range to faint from status: the drain and heal happen
-        // first, then status damage KOs it.
-        let p = b.state.side(side).active();
-        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
-            let drain = (maxhp / 8).max(1).min(p.hp);
-            push(b, Instruction::Damage { side, slot, amount: drain });
-            let other = side.other();
-            let (f_alive, f_room, fslot) = {
-                let f = b.state.side(other).active();
-                (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
-            };
-            if f_alive && !heal_blocked(b, other) {
-                let heal = drain.min(f_room);
-                if heal > 0 {
-                    push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
-                }
+    }
+    // Leech Seed (PS residual order 8): runs for BOTH actives before any status chip (order
+    // 9) — PS's residual queue is globally ordered, so the drain's heal must see the healer
+    // at its pre-burn HP (cosim caught the per-side interleaving healing a burn chip away).
+    // PS also skips the residual entirely — drain AND heal — when the seeding slot's
+    // occupant has fainted and not yet been replaced (`getAtSlot(sourceSlot)` -> fainted).
+    for side in [SideId::One, SideId::Two] {
+        let (alive, hp, maxhp, magic_guard) = {
+            let p = b.state.side(side).active();
+            (p.is_alive(), p.hp, p.max_hp, p.ability == crate::ids::Ability::MagicGuard)
+        };
+        if !alive || magic_guard || !b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
+            continue;
+        }
+        let other = side.other();
+        if !b.state.side(other).active().is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let drain = (maxhp / 8).max(1).min(hp);
+        push(b, Instruction::Damage { side, slot, amount: drain });
+        let (f_room, fslot) = {
+            let f = b.state.side(other).active();
+            (f.max_hp - f.hp, b.state.side(other).active_index)
+        };
+        if !heal_blocked(b, other) {
+            let heal = drain.min(f_room);
+            if heal > 0 {
+                push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
             }
         }
+    }
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let maxhp = p.max_hp;
+        use crate::ids::Ability as Ab;
+        let ability = p.ability;
+        let magic_guard = ability == Ab::MagicGuard;
 
         // Status residual. Poison Heal *heals* 1/8 instead of taking poison/toxic damage;
         // Magic Guard cancels the damage entirely.
