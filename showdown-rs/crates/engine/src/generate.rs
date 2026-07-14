@@ -1784,6 +1784,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if md.id.to_id() == "revelationdance" && attacker.types[0] != Type::None {
         md.typ = attacker.types[0];
     }
+    // Raging Bull's type follows the Paldean Tauros forme (PS onModifyType by species).
+    if md.id.to_id() == "ragingbull" {
+        let sid = attacker.species.to_id();
+        if sid == "taurospaldeacombat" {
+            md.typ = Type::Fighting;
+        } else if sid == "taurospaldeablaze" {
+            md.typ = Type::Fire;
+        } else if sid == "taurospaldeaaqua" {
+            md.typ = Type::Water;
+        }
+    }
     // Analytic: ×1.3 base power when no other active will still move this turn (PS
     // onBasePower chainModify([5325, 4096]); queue.willMove is falsy for a foe that already
     // moved, chose a switch, or is fainted — exactly foe_pending_move == None here).
@@ -3125,19 +3136,21 @@ fn apply_post_damage(
                 push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
             }
         }
-        // Contact punishers: Rocky Helmet (1/6) and Rough Skin / Iron Barbs (1/8).
+        // Contact punishers: Rough Skin / Iron Barbs (1/8, ability onDamagingHit) AND Rocky
+        // Helmet (1/6, item) — PS runs BOTH when the holder has ability + item (the c5
+        // directed traces caught the engine applying only one).
         if md.flag_contact && !hit_sub {
-            let frac = if def_item == Item::RockyHelmet {
-                Some(6)
-            } else if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
-                Some(8)
-            } else {
-                None
-            };
-            if let Some(d) = frac {
+            if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
                 let atk = b.state.side(side).active();
                 if atk.is_alive() {
-                    let dmg = (atk.max_hp / d).max(1).min(atk.hp);
+                    let dmg = (atk.max_hp / 8).max(1).min(atk.hp);
+                    push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+                }
+            }
+            if def_item == Item::RockyHelmet {
+                let atk = b.state.side(side).active();
+                if atk.is_alive() {
+                    let dmg = (atk.max_hp / 6).max(1).min(atk.hp);
                     push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
                 }
             }
@@ -3286,32 +3299,39 @@ fn apply_post_damage(
                         apply_white_herb(b, foe);
                     }
                 }
-                Ab::SeedSower => {
-                    // Being hit by a damaging move plants Grassy Terrain (PS onDamagingHit
-                    // this.field.setTerrain — fails silently if already Grassy).
-                    if b.state.terrain != crate::ids::Terrain::Grassy {
-                        let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
-                        push(b, Instruction::ChangeTerrain {
-                            previous: b.state.terrain,
-                            previous_turns: b.state.terrain_turns,
-                            new: crate::ids::Terrain::Grassy,
-                            new_turns: turns,
-                        });
-                    }
-                }
-                Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
-                    // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
-                    // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
-                    // Defiant/Competitive apply on the attacker's side).
-                    if b.state.side(side).active().is_alive() {
-                        if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
-                            react_to_stat_drop(b, side);
-                            apply_white_herb(b, side);
-                        }
-                    }
-                }
                 _ => {}
             }
+        }
+        // onDamagingHit reactions that fire even while the holder is FAINTING (PS runs the
+        // event before faint processing; the c5 directed traces caught the is_alive gate):
+        // Seed Sower's terrain is field-level, and Gooey/Tangling Hair boost the ATTACKER.
+        let f = b.state.side(foe).active();
+        match f.ability {
+            Ab::SeedSower => {
+                // Being hit by a damaging move plants Grassy Terrain (PS onDamagingHit
+                // this.field.setTerrain — fails silently if already Grassy).
+                if b.state.terrain != crate::ids::Terrain::Grassy {
+                    let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
+                    push(b, Instruction::ChangeTerrain {
+                        previous: b.state.terrain,
+                        previous_turns: b.state.terrain_turns,
+                        new: crate::ids::Terrain::Grassy,
+                        new_turns: turns,
+                    });
+                }
+            }
+            Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
+                // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
+                // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
+                // Defiant/Competitive apply on the attacker's side).
+                if b.state.side(side).active().is_alive() {
+                    if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
+                        react_to_stat_drop(b, side);
+                        apply_white_herb(b, side);
+                    }
+                }
+            }
+            _ => {}
         }
         // Soul-Heart: +1 SpA whenever a Pokémon faints from this hit.
         if !b.state.side(foe).active().is_alive()
@@ -5306,17 +5326,22 @@ fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
         // first, then status damage KOs it.
         let p = b.state.side(side).active();
         if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::LeechSeed) {
-            let drain = (maxhp / 8).max(1).min(p.hp);
-            push(b, Instruction::Damage { side, slot, amount: drain });
             let other = side.other();
             let (f_alive, f_room, fslot) = {
                 let f = b.state.side(other).active();
                 (f.is_alive(), f.max_hp - f.hp, b.state.side(other).active_index)
             };
-            if f_alive && !heal_blocked(b, other) {
-                let heal = drain.min(f_room);
-                if heal > 0 {
-                    push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
+            // PS: "Nothing to leech into" — when the seeder's slot occupant is fainted (a
+            // mid-turn faint whose replacement arrives only after the residual phase), the
+            // WHOLE residual is skipped: no drain either. (c5c directed trace.)
+            if f_alive {
+                let drain = (maxhp / 8).max(1).min(p.hp);
+                push(b, Instruction::Damage { side, slot, amount: drain });
+                if !heal_blocked(b, other) {
+                    let heal = drain.min(f_room);
+                    if heal > 0 {
+                        push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
+                    }
                 }
             }
         }
