@@ -389,6 +389,12 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     };
     // Cud Chew pending re-eat timer lives in abilityState.counter (absent = 0).
     let cudchew_turns = p["abilityState"].get("counter").and_then(Value::as_i64).unwrap_or(0).max(0) as u8;
+    // Gender (Attract / Cute Charm legality): serialized as "M" / "F" / "" (or "N").
+    let gender = match s(p, "gender") {
+        "M" => 1,
+        "F" => 2,
+        _ => 0,
+    };
     Ok(Pokemon {
         species,
         level,
@@ -398,6 +404,7 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         slept_by_foe,
         last_berry,
         cudchew_turns,
+        gender,
         base_species,
         base_stats,
         base_moves: if transformed { [MoveSlot::EMPTY; 4] } else { moves },

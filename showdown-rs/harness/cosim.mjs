@@ -405,6 +405,73 @@ const TEAM_DIRECTED = {
 	]],
 };
 
+// Directed c5 teamsets: the audited-abilities batch (proactive implementation of the
+// unimplemented-audit vocabulary). Genders are set explicitly so Attract / Cute Charm
+// legality is deterministic from the teamset.
+
+// c5a: Magic Bounce vs hazards + prankster status; Well-Baked Body, Mirror Armor,
+// Aroma Veil, Liquid Voice, Corrosion, Effect Spore, Analytic.
+const TEAM_C5A_1 = [
+	'Hatterene||leftovers|magicbounce|psychic,dazzlinggleam,calmmind,mysticalfire|Bold|252,,252,,4,|F||||,,,,,Water',
+	'Espeon||leftovers|magicbounce|psychic,shadowball,calmmind,dazzlinggleam|Timid|,,,252,4,252|M||||,,,,,Fairy',
+	'Dachsbun||leftovers|wellbakedbody|playrough,bodypress,crunch,roost|Impish|248,,252,,8,|M||||,,,,,Fire',
+	'Corviknight||leftovers|mirrorarmor|bravebird,bodypress,roost,uturn|Impish|248,,168,,92,|M||||,,,,,Flying',
+	'Alcremie||leftovers|aromaveil|dazzlinggleam,psychic,calmmind,recover|Bold|248,,252,,8,|F||||,,,,,Fairy',
+	'Primarina||leftovers|liquidvoice|hypervoice,moonblast,psychic,energyball|Modest|248,,,252,8,|F||||,,,,,Water',
+].join(']');
+const TEAM_C5A_2 = [
+	'Skarmory||rockyhelmet|sturdy|spikes,stealthrock,whirlwind,bodypress|Impish|252,,252,,4,|M||||,,,,,Water',
+	'Grimmsnarl||lightclay|prankster|thunderwave,taunt,spiritbreak,reflect|Careful|248,,8,,252,|M||||,,,,,Steel',
+	'Salazzle||leftovers|corrosion|toxic,flamethrower,sludgebomb,substitute|Timid|,,,252,4,252|F||||,,,,,Poison',
+	'Amoonguss||rockyhelmet|effectspore|spore,gigadrain,sludgebomb,synthesis|Calm|248,,80,,180,|M||||,,,,,Water',
+	'Magnezone||choicespecs|analytic|thunderbolt,flashcannon,voltswitch,bodypress|Modest|172,,,252,,84|||||,,,,,Electric',
+	'Ceruledge||leftovers|weakarmor|bitterblade,shadowsneak,swordsdance,shadowclaw|Adamant|248,252,,,8,|M||||,,,,,Fire',
+].join(']');
+
+// c5b: Bad Dreams + sleep economy; Early Bird, Pickpocket, Cud Chew, Anger Shell,
+// Queenly Majesty vs priority, Gooey, Cute Charm + Attract (opposite genders present).
+const TEAM_C5B_1 = [
+	'Darkrai||leftovers|baddreams|hypnosis,darkpulse,nastyplot,focusblast|Timid|,,,252,4,252|M||||,,,,,Dark',
+	'Houndoom||leftovers|earlybird|crunch,flamethrower,nastyplot,darkpulse|Timid|,,,252,4,252|M||||,,,,,Fire',
+	'Weavile|||pickpocket|knockoff,iceshard,iciclecrash,swordsdance|Jolly|,252,,,4,252|M||||,,,,,Ice',
+	'Tauros-Paldea-Combat||sitrusberry|cudchew|ragingbull,bodypress,closecombat,irondefense|Impish|248,,252,,8,|M||||,,,,,Fighting',
+	'Klawf||rockyhelmet|angershell|rockslide,xscissor,crunch,swordsdance|Adamant|248,252,,,8,|M||||,,,,,Rock',
+	'Tsareena||leftovers|queenlymajesty|powerwhip,uturn,knockoff,synthesis|Adamant|248,252,,,8,|F||||,,,,,Grass',
+].join(']');
+const TEAM_C5B_2 = [
+	'Amoonguss||rockyhelmet|effectspore|spore,gigadrain,sludgebomb,synthesis|Calm|248,,80,,180,|F||||,,,,,Water',
+	'Breloom||focussash|technician|machpunch,bulletseed,spore,swordsdance|Adamant|,252,,,4,252|M||||,,,,,Fighting',
+	'Dragonite||heavydutyboots|multiscale|extremespeed,earthquake,dragonclaw,roost|Adamant|,252,,,4,252|F||||,,,,,Flying',
+	'Goodra||leftovers|gooey|dragonpulse,flamethrower,thunderbolt,recover|Modest|248,,,252,8,|F||||,,,,,Dragon',
+	'Kingambit||leftovers|defiant|suckerpunch,kowtowcleave,ironhead,swordsdance|Adamant|232,252,,,,24|M||||,,,,,Dark',
+	'Wigglytuff||leftovers|cutecharm|bodyslam,attract,dazzlinggleam,protect|Bold|252,,252,,4,|F||||,,,,,Fairy',
+].join(']');
+
+// c5c: Dancer (Oricorio) vs dance users; Custap Berry, Mycelium Might (incl. vs Good as
+// Gold), Surge Surfer + Electric Surge, Magician (itemless), Seed Sower.
+const TEAM_C5C_1 = [
+	'Oricorio||leftovers|dancer|revelationdance,quiverdance,roost,hurricane|Timid|248,,,,8,252|F||||,,,,,Fire',
+	'Toedscruel||leftovers|myceliummight|spore,earthpower,leechseed,gigadrain|Calm|248,,,,252,8|M||||,,,,,Ground',
+	'Raichu-Alola||leftovers|surgesurfer|thunderbolt,psychic,surf,nastyplot|Timid|,,,252,4,252|M||||,,,,,Electric',
+	'Delphox|||magician|flamethrower,psychic,dazzlinggleam,calmmind|Timid|,,,252,4,252|F||||,,,,,Fire',
+	'Forretress||custapberry|sturdy|stealthrock,spikes,bodypress,voltswitch|Relaxed|252,,252,,4,|M||||,,,,,Steel',
+	'Arboliva||leftovers|seedsower|energyball,earthpower,dazzlinggleam,synthesis|Modest|248,,,252,8,|F||||,,,,,Grass',
+].join(']');
+const TEAM_C5C_2 = [
+	'Volcarona||leftovers|flamebody|fierydance,quiverdance,bugbuzz,roost|Timid|,,,252,4,252|M||||,,,,,Fire',
+	'Lilligant-Hisui||leftovers|hustle|victorydance,closecombat,leafblade,sleeppowder|Jolly|,252,,,4,252|F||||,,,,,Fighting',
+	'Pincurchin||leftovers|electricsurge|thunderbolt,surf,recover,toxicspikes|Bold|252,,252,,4,|M||||,,,,,Electric',
+	'Gholdengo||choicescarf|goodasgold|makeitrain,shadowball,thunderbolt,focusblast|Timid|,,,252,4,252|||||,,,,,Flying',
+	'Dragapult||heavydutyboots|clearbody|dragondarts,shadowball,uturn,dracometeor|Naive|,84,,172,,252|M||||,,,,,Dragon',
+	'Garchomp||rockyhelmet|roughskin|earthquake,dragonclaw,stealthrock,swordsdance|Jolly|,252,,,4,252|M||||,,,,,Steel',
+].join(']');
+
+const TEAM_C5 = {
+	c5a: [TEAM_C5A_1, TEAM_C5A_2],
+	c5b: [TEAM_C5B_1, TEAM_C5B_2],
+	c5c: [TEAM_C5C_1, TEAM_C5C_2],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -811,6 +878,8 @@ async function main() {
 			? TEAM_COVERAGE[TEAMSET].map(t => t.join(']'))
 			: TEAM_SM[TEAMSET]
 			? TEAM_SM[TEAMSET].map(t => t.join(']'))
+			: TEAM_C5[TEAMSET]
+			? TEAM_C5[TEAMSET].map(t => t.join(']'))
 			: TEAM_DIRECTED[TEAMSET]
 			? TEAM_DIRECTED[TEAMSET].map(t => t.join(']'))
 			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];

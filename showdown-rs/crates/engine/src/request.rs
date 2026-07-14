@@ -181,9 +181,10 @@ impl Flow {
         }
 
         // Decomposed path (a pivot move is in play), mirroring generate_instructions_ctx:
-        // switches -> tera -> ordered moves (pausing on PivotPending) -> EOT.
+        // custap -> switches -> tera -> ordered moves (pausing on PivotPending) -> EOT.
         let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new() };
         let mut exec = Exec::Sample(self.rng);
+        let custap = crate::generate::custap_stage(std::slice::from_mut(&mut b), &self.state, m1, m2);
 
         let mut switch_actions: Vec<(SideId, u8)> = Vec::new();
         if let MoveChoice::Switch(t) = m1 {
@@ -202,18 +203,20 @@ impl Flow {
             }
         }
 
-        let mk_action = |side: SideId, mc: MoveChoice, paused: bool| match mc {
+        let mk_action = |side: SideId, mc: MoveChoice, paused: bool, cu: bool| match mc {
             MoveChoice::Move(slot) => Some(Action {
                 side,
                 move_idx: slot,
                 pivot: if paused { Pivot::Pause } else { Pivot::Stay },
                 foe_pending_move: None,
                 shell_phys: None,
+                custap: cu,
+                external_move: None,
             }),
             MoveChoice::Switch(_) => None,
         };
-        let a1 = mk_action(SideId::One, m1, pause[0]);
-        let a2 = mk_action(SideId::Two, m2, pause[1]);
+        let a1 = mk_action(SideId::One, m1, pause[0], custap[0]);
+        let a2 = mk_action(SideId::Two, m2, pause[1], custap[1]);
         let switched = [matches!(m1, MoveChoice::Switch(_)), matches!(m2, MoveChoice::Switch(_))];
 
         match (a1, a2) {
@@ -226,7 +229,7 @@ impl Flow {
                 self.finish_turn(b, switched);
             }
             (Some(a), Some(bb)) => {
-                let (mut first, mut second) = match move_order(&b.state, a.side, a.move_idx, bb.side, bb.move_idx) {
+                let (mut first, mut second) = match move_order(&b.state, &a, &bb) {
                     Order::First(f) if f == a.side => (a, bb),
                     Order::First(_) => (bb, a),
                     Order::Tie => {
