@@ -1035,6 +1035,10 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     if ability == Imposter {
         apply_transform(b, side);
     }
+    // Wind Rider: +1 Atk on switch-in while the holder's own Tailwind is active (PS onStart).
+    if ability == WindRider && b.state.side(side).side_conditions.tailwind > 0 {
+        raise_boost(b, side, BoostIndex::Attack, 1);
+    }
     // Frisk reveals the opponent's held item on switch-in (information only).
     if ability == Frisk {
         let foe = side.other();
@@ -5123,6 +5127,14 @@ fn apply_own_side_condition(b: &mut Branch, side: SideId, sc: SideConditionId) {
         _ => 5,
     };
     push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: turns });
+    // Wind Rider: +1 Atk when Tailwind starts on the holder's side (PS onSideConditionStart;
+    // in singles the only mon on the side is the setter itself).
+    if sc == SideConditionId::Tailwind
+        && b.state.side(side).active().ability == crate::ids::Ability::WindRider
+        && b.state.side(side).active().is_alive()
+    {
+        raise_boost(b, side, BoostIndex::Attack, 1);
+    }
 }
 
 /// Self-set weather duration: 8 turns when the setter holds the matching rock, else 5.
