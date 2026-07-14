@@ -33,6 +33,7 @@ pub enum ActiveCounter {
     ThroatChop,
     HealBlock,
     ActiveTurns,
+    MagnetRise,
 }
 use crate::volatile::VolatileStatus;
 use crate::ids::Species;
@@ -158,6 +159,8 @@ pub enum Instruction {
     SetFutureSight { side: SideId, previous: (u8, u8), new: (u8, u8) },
     /// Special damage this side's active took from the foe this turn (Mirror Coat's 2× source).
     SetSpecialDamageTaken { side: SideId, previous: i16, new: i16 },
+    /// Physical damage this side's active took from the foe this turn (Focus Punch's fail gate).
+    SetPhysicalDamageTaken { side: SideId, previous: i16, new: i16 },
     /// Transform / Imposter: replace the active's battle identity with a copy of the foe's
     /// (or restore its own on switch-out). `previous_base_moves` keeps reversal byte-exact:
     /// entering a transform overwrites `base_moves` with the pre-transform slots.
@@ -342,6 +345,9 @@ impl State {
             SetSpecialDamageTaken { side, new, .. } => {
                 self.side_mut(side).special_damage_taken = new;
             }
+            SetPhysicalDamageTaken { side, new, .. } => {
+                self.side_mut(side).physical_damage_taken = new;
+            }
             SetAbilityUsed { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].ability_used = new;
             }
@@ -508,6 +514,9 @@ impl State {
             SetSpecialDamageTaken { side, previous, .. } => {
                 self.side_mut(side).special_damage_taken = previous;
             }
+            SetPhysicalDamageTaken { side, previous, .. } => {
+                self.side_mut(side).physical_damage_taken = previous;
+            }
             SetAbilityUsed { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].ability_used = previous;
             }
@@ -554,6 +563,7 @@ fn set_active_counter(state: &mut State, side: SideId, which: ActiveCounter, val
         ActiveCounter::ThroatChop => s.throat_chop_turns = value,
         ActiveCounter::HealBlock => s.heal_block_turns = value,
         ActiveCounter::ActiveTurns => s.active_turns = value,
+        ActiveCounter::MagnetRise => s.magnet_rise_turns = value,
     }
 }
 

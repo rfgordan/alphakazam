@@ -273,7 +273,26 @@ pub(crate) fn battle_over(state: &State) -> bool {
     })
 }
 
+/// True if `side` has at least one living Pokémon (active or benched). PS's `AfterFaint` event —
+/// which drives Moxie/Beast Boost/Neigh KO boosts — is skipped when the faint ends the battle
+/// (`checkWin` returns before `AfterFaint`), so those boosts only apply while the KO'd mon's side
+/// still has a Pokémon left.
+fn side_has_living_mon(state: &State, side: SideId) -> bool {
+    state.side(side).pokemon.iter().any(|p| p.species != crate::ids::Species::None && p.is_alive())
+}
+
 /// Is the active Pokémon grounded (subject to Spikes / Toxic Spikes / Sticky Web)?
+/// Moves with PS `ignoreAbility`: they suppress the TARGET's ability for the move's damage and
+/// immunity checks, exactly like a Mold Breaker user (Sunsteel Strike / Moongeist Beam / Photon
+/// Geyser and the Ultra Necrozma Z-moves).
+fn move_ignores_ability(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "sunsteelstrike" | "moongeistbeam" | "photongeyser"
+            | "searingsunrazesmash" | "menacingmoonrazemaelstrom"
+    )
+}
+
 /// The weather as mechanics see it: Air Lock / Cloud Nine on either active suppresses all
 /// weather effects (the weather itself keeps ticking).
 fn effective_weather(state: &State) -> Weather {
@@ -859,6 +878,12 @@ pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveC
                                     volatile: VolatileStatus::StatsRaisedThisTurn,
                                 });
                             }
+                            if nb.state.side(s).volatiles.contains(VolatileStatus::StatsLoweredThisTurn) {
+                                push(&mut nb, Instruction::RemoveVolatile {
+                                    side: s,
+                                    volatile: VolatileStatus::StatsLoweredThisTurn,
+                                });
+                            }
                         }
                         nb
                     })
@@ -891,6 +916,7 @@ pub fn switch_into(state: &mut State, side: SideId, target: u8) {
 fn clear_stats_raised_markers(state: &mut State) {
     for side in [SideId::One, SideId::Two] {
         state.side_mut(side).volatiles.remove(VolatileStatus::StatsRaisedThisTurn);
+        state.side_mut(side).volatiles.remove(VolatileStatus::StatsLoweredThisTurn);
     }
 }
 
@@ -1009,7 +1035,9 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     {
         let p = b.state.side(side).active();
         let palafin = crate::ids::Species::from_id("palafin");
-        if p.ability == crate::ids::Ability::ZeroToHero && Some(p.species) == palafin {
+        // PS's `onSwitchOut` forme change does NOT run for a fainted mon — a Palafin that faints
+        // stays in its base forme.
+        if !replacing_fainted && p.ability == crate::ids::Ability::ZeroToHero && Some(p.species) == palafin {
             if let Some(hero) = crate::ids::Species::from_id("palafinhero") {
                 let level = p.level;
                 let base = crate::data::base_stats(hero);
@@ -2382,6 +2410,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             md.typ = Type::Water;
         }
     }
+    // Weather Ball takes the type of the active weather (PS onModifyType); its base-power
+    // doubling under any weather is applied in compute_damage's base_power match.
+    if md.id.to_id() == "weatherball" {
+        md.typ = match effective_weather(&b.state) {
+            Weather::Sun | Weather::HarshSun => Type::Fire,
+            Weather::Rain | Weather::HeavyRain => Type::Water,
+            Weather::Sand => Type::Rock,
+            Weather::Snow => Type::Ice,
+            _ => Type::Normal,
+        };
+    }
     // Analytic: ×1.3 base power when no other active will still move this turn (PS
     // onBasePower chainModify([5325, 4096]); queue.willMove is falsy for a foe that already
     // moved, chose a switch, or is fainted — exactly foe_pending_move == None here).
@@ -2942,7 +2981,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let def_ab = if matches!(
         b.state.side(side).active().ability,
         crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
-    ) {
+    ) || move_ignores_ability(md.id) {
         crate::ids::Ability::None
     } else {
         defender.ability
@@ -3137,6 +3176,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if md.id.to_id() == "stoneaxe" && hb.state.side(side).active().is_alive() {
             apply_hazard(&mut hb, foe, SideConditionId::StealthRock);
         }
+        // Ceaseless Edge lays a layer of Spikes on the target's side on any hit (PS
+        // `onAfterHit`/`onAfterSubDamage`), as long as the user is still standing.
+        if md.id.to_id() == "ceaselessedge" && hb.state.side(side).active().is_alive() {
+            apply_hazard(&mut hb, foe, SideConditionId::Spikes);
+        }
         if md.id.to_id() == "glaiverush" && hb.state.side(side).active().is_alive()
             && !hb.state.side(side).volatiles.contains(VolatileStatus::GlaiveRush)
         {
@@ -3244,7 +3288,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let defender = b.state.side(foe).active();
     // Mold Breaker suppresses the defender's damage-affecting ability for this move; `def_ab`
     // is the defender's ability as the damage calc should see it (None when suppressed).
-    let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
+    let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze)
+        || move_ignores_ability(md.id);
     let def_ab = if mb { Ab::None } else { defender.ability };
 
     // Foul Play uses the defender's Attack stat and Attack boost (attacker's burn still
@@ -3371,7 +3416,9 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             Ab::Reckless if md.recoil.0 > 0 => atk_stat = crate::damage::modify(atk_stat, 4915, 4096),
             Ab::Defeatist if (attacker.hp as i32) * 2 <= attacker.max_hp as i32 => atk_stat = crate::damage::modify(atk_stat, 1, 2),
             Ab::ToughClaws if md.flag_contact => atk_stat = crate::damage::modify(atk_stat, 5325, 4096), // ×1.3
-            Ab::Sharpness if md.flag_slicing => atk_stat = crate::damage::modify(atk_stat, 3, 2),
+            // Sharpness is handled as a base-power modifier below (PS `onBasePower`), not here —
+            // its ×1.5 placement matters once a ×0.5 type multiplier is in play (cosim caught a
+            // Ceaseless Edge unit whose rounding only matched with the base-power floor).
             Ab::MegaLauncher if md.flag_pulse => atk_stat = crate::damage::modify(atk_stat, 3, 2),
             // Punk Rock is handled as a base-power modifier below (PS `onBasePower`), not here.
             Ab::Hustle if md.category == MoveCategory::Physical => atk_stat = crate::damage::modify(atk_stat, 3, 2),
@@ -3579,6 +3626,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         "venoshock" | "barbbarrage" if matches!(defender.status, Status::Poison | Status::Toxic) => base_power = base_power.saturating_mul(2),
         "brine" if defender.hp * 2 <= defender.max_hp => base_power = base_power.saturating_mul(2),
         "acrobatics" if attacker.item == Item::None => base_power = base_power.saturating_mul(2),
+        // Weather Ball doubles (50 -> 100) under any active weather (PS onModifyMove); its type
+        // was already resolved in execute_move.
+        "weatherball" if effective_weather(&b.state) != Weather::None => base_power = base_power.saturating_mul(2),
+        // Lash Out doubles if the user had a stat lowered this turn (PS onBasePower).
+        "lashout" if b.state.side(side).volatiles.contains(VolatileStatus::StatsLoweredThisTurn) =>
+            base_power = base_power.saturating_mul(2),
         // HP-proportional spread moves: BP = floor(150 · userHP / userMaxHP), min 1.
         "eruption" | "waterspout" | "dragonenergy" => {
             let hp = attacker.hp.max(0) as u32;
@@ -3689,6 +3742,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Strong Jaw is an onBasePower modifier in PS. Applying it to Attack changes rounding
     // support (caught by the exact Crunch kernel on Strong Jaw Bruxish).
     if attacker.ability == Ab::StrongJaw && md.flag_bite {
+        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
+    }
+    // Sharpness: ×1.5 base power for slicing moves (PS `onBasePower`). On base power, not the
+    // attack stat, so the floor lands where PS's does under a ×0.5 type matchup.
+    if attacker.ability == Ab::Sharpness && md.flag_slicing {
         base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
     }
     // Iron Fist: ×1.2 base power for punch moves (PS `onBasePower`). Moved off the attack
@@ -4120,6 +4178,7 @@ fn apply_post_damage(
     if any_damage
         && !b.state.side(foe).active().is_alive()
         && b.state.side(side).active().is_alive()
+        && side_has_living_mon(&b.state, foe)
     {
         match b.state.side(side).active().ability {
             Ab::Moxie | Ab::ChillingNeigh | Ab::AsOneGlastrier => {
@@ -4137,6 +4196,7 @@ fn apply_post_damage(
         && !b.state.side(foe).active().is_alive()
         && b.state.side(side).active().ability == Ab::BeastBoost
         && b.state.side(side).active().is_alive()
+        && side_has_living_mon(&b.state, foe)
     {
         let stat = match proto_stat(b.state.side(side).active()) {
             crate::ids::StatIndex::Attack => BoostIndex::Attack,
@@ -4222,6 +4282,15 @@ fn apply_post_damage(
         let new = total_dealt as i16;
         if prev != new {
             push(b, Instruction::SetSpecialDamageTaken { side: foe, previous: prev, new });
+        }
+    }
+    // Symmetric record for physical damage the target just took, so its own Focus Punch (which
+    // fails if hit by any damaging move this turn) can detect the hit. Sub hits don't count.
+    if any_damage && !hit_sub && md.category == MoveCategory::Physical {
+        let prev = b.state.side(foe).physical_damage_taken;
+        let new = total_dealt as i16;
+        if prev != new {
+            push(b, Instruction::SetPhysicalDamageTaken { side: foe, previous: prev, new });
         }
     }
 
@@ -5440,7 +5509,10 @@ fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: 
                 if seff != 0 {
                     push(b, Instruction::Boost { side: source, stat, amount: seff });
                     if seff < 0 {
+                        mark_stats_lowered(b, source);
                         react_to_stat_drop(b, source);
+                    } else {
+                        mark_stats_raised(b, source);
                     }
                 }
             }
@@ -5453,6 +5525,8 @@ fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: 
         push(b, Instruction::Boost { side: target, stat, amount: eff });
         if eff > 0 {
             mark_stats_raised(b, target);
+        } else {
+            mark_stats_lowered(b, target);
         }
     }
     eff
@@ -5468,6 +5542,15 @@ fn mark_stats_raised(b: &mut Branch, side: SideId) {
     }
 }
 
+/// PS sets `pokemon.statsLoweredThisTurn` whenever a boost event actually lowered a stat; it is
+/// reset for all actives at end of turn. Lash Out's ×2 is gated on it. Modeled as an active-only
+/// volatile, cleared on switch-out and at end of turn (mirrors `StatsRaisedThisTurn`).
+fn mark_stats_lowered(b: &mut Branch, side: SideId) {
+    if !b.state.side(side).volatiles.contains(VolatileStatus::StatsLoweredThisTurn) {
+        push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::StatsLoweredThisTurn });
+    }
+}
+
 /// Apply a *self*-boost (Swords Dance, Leaf Storm's −2 SpA, ...). Self-boosts ignore Clear
 /// Body but are inverted by Contrary. Returns nothing; clamps to ±6.
 fn apply_self_boost(b: &mut Branch, side: SideId, stat: BoostIndex, delta: i8) {
@@ -5478,6 +5561,8 @@ fn apply_self_boost(b: &mut Branch, side: SideId, stat: BoostIndex, delta: i8) {
         push(b, Instruction::Boost { side, stat, amount: eff });
         if eff > 0 {
             mark_stats_raised(b, side);
+        } else {
+            mark_stats_lowered(b, side);
         }
     }
 }
@@ -6884,6 +6969,10 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
         let prev = b.state.side(side).special_damage_taken;
         if prev != 0 {
             push(b, Instruction::SetSpecialDamageTaken { side, previous: prev, new: 0 });
+        }
+        let prevp = b.state.side(side).physical_damage_taken;
+        if prevp != 0 {
+            push(b, Instruction::SetPhysicalDamageTaken { side, previous: prevp, new: 0 });
         }
     }
     // Hunger Switch (Morpeko): the forme toggles every end of turn (PS `onResidual` order

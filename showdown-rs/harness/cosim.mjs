@@ -472,6 +472,52 @@ const TEAM_C5 = {
 	c5c: [TEAM_C5C_1, TEAM_C5C_2],
 };
 
+// Final strict-gap move tranche (`c6*.json.gz`, `--teamset c6a1`..): directed customgame games
+// whose movesets are dominated by the last never-exercised randbats-eligible moves. Same TEAM_C3
+// array-of-arrays shape; the uniform choice policy plus long games flush every target move.
+const TEAM_C6 = {
+	// c6a1 — plain/data-driven attacks + resolved dynamic-BP mechanics: Water Spout / Origin Pulse
+	// (Kyogre HP-scaled + spread), Weather Ball (Water ×2 under Kyogre/Pelipper rain), Psystrike
+	// (defense-override), Dragon Energy (Regidrago HP-scaled), Lumina Crash (−2 SpD), Ceaseless
+	// Edge (Spikes-on-hit), Low Kick (weight BP) + Ice Shard priority, Overheat (−2 SpA self),
+	// Spacial Rend (high crit), Lunge (−1 Atk), Muddy Water (−acc spread), Heat Wave + Lash Out
+	// (×2 after Espathra's Lumina Crash lowers Honchkrow's SpD the same turn).
+	c6a1: [[
+		'Kyogre||leftovers|drizzle|waterspout,originpulse,icebeam,calmmind|Modest|248,,,252,8,|||||,,,,,Water',
+		'Pelipper||damprock|drizzle|weatherball,hurricane,uturn,roost|Modest|248,,,252,8,|||||,,,,,Water',
+		'Mewtwo||leftovers|pressure|psystrike,aurasphere,calmmind,recover|Timid|,,,252,4,252|||||,,,,,Psychic',
+		'Regidrago||choicespecs|dragonsmaw|dragonenergy,dracometeor,thunderbolt,dragonpulse|Modest|,,,252,4,252|||||,,,,,Dragon',
+		'Espathra||leftovers|speedboost|luminacrash,storedpower,calmmind,roost|Timid|248,,,252,8,|||||,,,,,Psychic',
+		'Samurott-Hisui||heavydutyboots|sharpness|ceaselessedge,aquacutter,sacredsword,swordsdance|Adamant|,252,,,4,252|||||,,,,,Dark',
+	], [
+		'Weavile||heavydutyboots|pressure|lowkick,iceshard,knockoff,swordsdance|Jolly|,252,,,4,252|||||,,,,,Ice',
+		'Chi-Yu||heavydutyboots|beadsofruin|overheat,darkpulse,flamethrower,nastyplot|Timid|,,,252,4,252|||||,,,,,Fire',
+		'Palkia||lustrousorb|pressure|spacialrend,hydropump,thunderbolt,fireblast|Timid|,,,252,4,252|||||,,,,,Dragon',
+		'Leavanny||leftovers|swarm|lunge,leafblade,knockoff,swordsdance|Jolly|,252,,,4,252|||||,,,,,Bug',
+		'Bellibolt||leftovers|static|muddywater,voltswitch,slackoff,thunderbolt|Bold|248,,252,,8,|||||,,,,,Electric',
+		'Honchkrow||heavydutyboots|moxie|heatwave,lashout,bravebird,suckerpunch|Naive|,252,,4,,252|||||,,,,,Dark',
+	]],
+	// c6a2 — remaining plain attacks + weight/forme mechanics: Bite (flinch), Jet Punch (priority),
+	// Wild Charge (recoil), Freezing Glare (freeze), Moongeist Beam (ability-ignoring, incl. vs
+	// Garganacl's Purifying Salt), Heat Crash (weight-ratio BP), Raging Bull (Blaze forme = Fire
+	// + screen shatter), and Weather Ball again under Torkoal's sun (Fire ×2, via Victreebel).
+	c6a2: [[
+		'Maushold||widelens|friendguard|bite,populationbomb,encore,tidyup|Jolly|,252,,,4,252|||||,,,,,Normal',
+		'Palafin||choiceband|zerotohero|jetpunch,wavecrash,flipturn,closecombat|Jolly|,252,,,4,252|||||,,,,,Water',
+		'Luxray||leftovers|intimidate|wildcharge,crunch,icefang,swordsdance|Adamant|,252,,,4,252|||||,,,,,Electric',
+		'Articuno-Galar||heavydutyboots|competitive|freezingglare,hurricane,recover,calmmind|Timid|,,,252,4,252|||||,,,,,Psychic',
+		'Lunala||leftovers|shadowshield|moongeistbeam,moonblast,calmmind,roost|Timid|,,,252,4,252|||||,,,,,Ghost',
+		'Victreebel||lifeorb|chlorophyll|weatherball,leafstorm,sludgebomb,gigadrain|Modest|,,,252,4,252|||||,,,,,Grass',
+	], [
+		'Copperajah||leftovers|sheerforce|heatcrash,ironhead,playrough,stealthrock|Adamant|248,252,,,8,|||||,,,,,Steel',
+		'Tauros-Paldea-Blaze||leftovers|intimidate|ragingbull,closecombat,bodypress,earthquake|Jolly|,252,,,4,252|||||,,,,,Fire',
+		'Torkoal||heatrock|drought|lavaplume,bodypress,rapidspin,yawn|Bold|248,,252,,8,|||||,,,,,Fire',
+		'Snorlax||leftovers|thickfat|bodyslam,crunch,curse,protect|Careful|248,,8,,252,|||||,,,,,Normal',
+		'Garganacl||leftovers|purifyingsalt|saltcure,recover,bodypress,stealthrock|Careful|248,,8,,252,|||||,,,,,Water',
+		'Corviknight||leftovers|pressure|bravebird,bodypress,roost,uturn|Impish|248,,168,,92,|||||,,,,,Flying',
+	]],
+};
+
 // ---- deterministic choice RNG -------------------------------------------------
 
 function makeRng(seed) {
@@ -880,6 +926,8 @@ async function main() {
 			? TEAM_SM[TEAMSET].map(t => t.join(']'))
 			: TEAM_C5[TEAMSET]
 			? TEAM_C5[TEAMSET].map(t => t.join(']'))
+			: TEAM_C6[TEAMSET]
+			? TEAM_C6[TEAMSET].map(t => t.join(']'))
 			: TEAM_DIRECTED[TEAMSET]
 			? TEAM_DIRECTED[TEAMSET].map(t => t.join(']'))
 			: TEAMSET === 'diverse' ? [TEAM_DIVERSE_1, TEAM_DIVERSE_2] : [TEAM_OU_1, TEAM_OU_2];

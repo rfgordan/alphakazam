@@ -282,6 +282,13 @@ pub struct Side {
     /// this side's active, read by Mirror Coat (priority -5, so it moves after the hit), and
     /// cleared at end of turn. Not part of the diffed manifest (mirrors PS's duration-1 volatile).
     pub special_damage_taken: i16,
+    /// Damage the active took from the FOE's most recent Physical-category damaging hit THIS
+    /// turn. Same transient lifetime as `special_damage_taken`; read by Focus Punch (fails if the
+    /// user was hit by any damaging move this turn) and cleared at end of turn.
+    pub physical_damage_taken: i16,
+    /// Magnet Rise: turns remaining of Ground immunity / ungrounding (5 on use, ticks each end of
+    /// turn; 0 = inactive). The `MagnetRise` volatile marks presence.
+    pub magnet_rise_turns: u8,
 }
 
 impl Side {
@@ -322,6 +329,8 @@ impl Side {
         wish: (0, 0),
         future_sight: (0, 0),
         special_damage_taken: 0,
+        physical_damage_taken: 0,
+        magnet_rise_turns: 0,
     };
 
     #[inline]

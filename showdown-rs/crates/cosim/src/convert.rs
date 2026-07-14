@@ -219,6 +219,9 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
     if b(active_v, "statsRaisedThisTurn") {
         side.volatiles.insert(VolatileStatus::StatsRaisedThisTurn);
     }
+    if b(active_v, "statsLoweredThisTurn") {
+        side.volatiles.insert(VolatileStatus::StatsLoweredThisTurn);
+    }
     // Protean/Libero once-per-switch-in marker lives in abilityState, not volatiles.
     let ast = &active_v["abilityState"];
     if b(ast, "libero") || b(ast, "protean") {

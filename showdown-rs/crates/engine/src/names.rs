@@ -179,4 +179,6 @@ id_map!(VolatileStatus {
     FlashFire => "flashfire",
     Truant => "truant",
     StatsRaisedThisTurn => "statsraisedthisturn",
+    StatsLoweredThisTurn => "statsloweredthisturn",
+    MagnetRise => "magnetrise",
 });
