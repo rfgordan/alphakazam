@@ -5834,14 +5834,26 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
         return vec![b];
     }
+    let mut b = b;
     let foe = side.other();
     let d = b.state.side(foe).active();
-    if !d.is_alive()
-        || d.ability == crate::ids::Ability::InnerFocus
-        || d.ability == crate::ids::Ability::ShieldDust
-        || d.item == Item::CovertCloak
-        || b.state.side(foe).volatiles.contains(VolatileStatus::Flinch)
-    {
+    let alive = d.is_alive();
+    // Shield Dust / Covert Cloak strip the flinch secondary via PS `ModifySecondaries` BEFORE
+    // the roll — no draw. The shield is inert on a fainted mon.
+    let shielded = alive
+        && (d.ability == crate::ids::Ability::ShieldDust || d.item == Item::CovertCloak);
+    if shielded {
+        return vec![b];
+    }
+    // Inner Focus (`onTryAddVolatile`), an already-flinched target, and a fainted target all
+    // still let PS roll the flinch `random(100)` in `secondaries()` — the block/no-op happens
+    // later in the volatile-add path. Emit the draw-and-discard on a single branch (the effect
+    // cannot land, so there is no proc/no-proc split).
+    let can_flinch = alive
+        && d.ability != crate::ids::Ability::InnerFocus
+        && !b.state.side(foe).volatiles.contains(VolatileStatus::Flinch);
+    if !can_flinch {
+        draw(&mut b, "random", &[100], 0, "flinch");
         return vec![b];
     }
     let pct = if b.state.side(side).active().ability == crate::ids::Ability::SereneGrace {
@@ -5955,13 +5967,27 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         return vec![b];
     }
     let foe = side.other();
+    let mut b = b;
     let has_self = md.secondary_self_boosts.iter().any(|&x| x != 0);
-    let target_eligible = b.state.side(foe).active().is_alive()
-        && b.state.side(foe).active().ability != crate::ids::Ability::ShieldDust
-        && b.state.side(foe).active().item != Item::CovertCloak;
+    let alive = b.state.side(foe).active().is_alive();
+    // Shield Dust / Covert Cloak strip target-facing (non-`self`) secondaries via PS
+    // `ModifySecondaries` BEFORE the `random(100)` roll — so no draw at all. The shield is only
+    // active while the mon is on the field alive (a fainted mon's ability is inert).
+    let shielded = alive
+        && (b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+            || b.state.side(foe).active().item == Item::CovertCloak);
+    let target_eligible = alive && !shielded;
     // Shield Dust / Covert Cloak remove target-facing secondaries, but PS preserves a
     // secondary's `self` payload (Fiery Dance can still boost its user, including on a KO).
     if !target_eligible && !has_self {
+        // PS `secondaries()` still rolls one `random(100)` per secondary when the target has
+        // fainted from the hit — the target object is present (not `false`), so the roll fires
+        // and the effect merely no-ops. Emit the draw-and-discard on the single branch (both
+        // proc/no-proc outcomes are identical here, so no split — Enumerate/Sample unchanged).
+        // A Shield-Dust/Covert-Cloak strip, by contrast, removes the secondary before the roll.
+        if !shielded {
+            draw(&mut b, "random", &[100], 0, "secondary");
+        }
         return vec![b];
     }
     // Serene Grace doubles the secondary chance.
@@ -6150,7 +6176,13 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     // Force removes them (in exchange for the ×1.3 base power it already applied).
     let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce
         && md.secondary_self_boosts.iter().any(|&x| x != 0);
-    if !sheer_force && md.secondary_chance == 0 {
+    if !sheer_force && md.secondary_chance == 0 && md.secondary_self_boosts.iter().any(|&x| x != 0) {
+        // A 100%-chance self-only secondary (`secondary: {chance: 100, self: {boosts}}` —
+        // Rapid Spin +Spe, Trailblaze +Spe, Power-Up Punch +Atk, …) is still a SECONDARY: PS
+        // `secondaries()` rolls one `random(100)` for it (always < 100 → always applies) before
+        // `moveHit`. Emit the draw-and-discard, then apply the guaranteed self-boost. This is a
+        // secondary, so it rolls after any `move.self.boosts` self-drop above.
+        draw(b, "random", &[100], 0, "secondary");
         for (i, &delta) in md.secondary_self_boosts.iter().enumerate() {
             if delta != 0 {
                 apply_self_boost(b, side, BOOST_ORDER[i], delta);
