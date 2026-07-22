@@ -3055,10 +3055,43 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // PS `hitStepAccuracy`: a move with a numeric accuracy rolls `randomChance(accuracy, 100)`
     // once (before the hit loop); accuracy `true` (engine `md.accuracy == 0`) skips the roll.
+    // The roll runs only AFTER the earlier hit-steps pass: a move against a FAINTED foe (no
+    // valid target), a SEMI-INVULNERABLE dodger (`hitStepInvulnerabilityEvent`), or a
+    // TYPE/ABILITY/FLAG-immune target (`hitStepTypeImmunity`/`hitStepTryHitEvent` — Levitate,
+    // Water Absorb, Soundproof, a 0× type chart, …) fails earlier and never reaches
+    // `hitStepAccuracy`, so PS makes no accuracy draw. (Protect blocks earlier still — already
+    // returned above.) Gate the annotation on the move actually reaching the accuracy step.
     // Annotate on `b` so both the hit and miss branches inherit this draw. (Accuracy/evasion
     // stages and modifiers shift the recorded arg; unmodeled here — the differ flags them.)
     if annotating() && md.accuracy != 0 {
-        draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+        let reaches_accuracy = {
+            let foe_alive = b.state.side(foe).active().is_alive();
+            let semi_invuln = matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m));
+            let connects = {
+                let defender = b.state.side(foe).active();
+                let def_ab = if matches!(
+                    b.state.side(side).active().ability,
+                    crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+                ) || move_ignores_ability(md.id) {
+                    crate::ids::Ability::None
+                } else {
+                    defender.ability
+                };
+                let wind_immune = def_ab == crate::ids::Ability::WindRider && is_wind_move(md.id);
+                let flag_immune = (md.flag_sound && def_ab == crate::ids::Ability::Soundproof)
+                    || (md.flag_bullet && def_ab == crate::ids::Ability::Bulletproof)
+                    || wind_immune;
+                let scrappy = matches!(b.state.side(side).active().ability, crate::ids::Ability::Scrappy | crate::ids::Ability::MindsEye);
+                let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
+                crate::damage::type_multiplier(md.typ, def_types_eff) != 0.0
+                    && !ability_immune(md.typ, def_ab)
+                    && !flag_immune
+            };
+            foe_alive && !semi_invuln && connects
+        };
+        if reaches_accuracy {
+            draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+        }
     }
 
     if miss_prob > 0.0 {
