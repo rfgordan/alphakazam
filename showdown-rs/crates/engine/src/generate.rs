@@ -6315,10 +6315,19 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
             }
             return vec![fb];
         }
-        let success_p = 1.0 / 3f32.powi(n.min(6) as i32);
+        // PS `stall` volatile: the FIRST protect use has no `stall` volatile yet, so its
+        // `onStallMove` never runs — guaranteed success, no draw. Each subsequent consecutive use
+        // rolls `randomChance(1, counter)` with `counter = 3^n` (capped at 729 = 3^6). The engine's
+        // `stall_counter` is exactly that `n`, so `n == 0` makes no draw and `n >= 1` rolls
+        // `randomChance(1, 3^n)`.
+        let denom = 3i32.pow(n.min(6) as u32);
+        let success_p = 1.0 / denom as f32;
         let mut out = Vec::new();
         // Success branch.
         let mut sb = scaled(&b, success_p);
+        if n >= 1 {
+            draw(&mut sb, "randomChance", &[1, denom], 1, "stall");
+        }
         if !sb.state.side(side).volatiles.contains(VolatileStatus::Protect) {
             push(&mut sb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protect });
         }
@@ -6327,6 +6336,9 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         // Failure branch (the move fails, breaking the chain) — only when failure is possible.
         if success_p < 1.0 {
             let mut fb = scaled(&b, 1.0 - success_p);
+            if n >= 1 {
+                draw(&mut fb, "randomChance", &[1, denom], 0, "stall");
+            }
             if n != 0 {
                 push(&mut fb, Instruction::SetStallCounter { side, previous: n, new: 0 });
             }
