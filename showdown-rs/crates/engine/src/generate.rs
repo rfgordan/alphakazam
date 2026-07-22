@@ -6489,6 +6489,11 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
                 push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Curse });
             }
         } else {
+            // Non-Ghost Curse: PS `onTryHit` rewrites the move to `move.self = {boosts:
+            // {spe:-1, atk:1, def:1}}`, so `selfDrops` rolls one `random(100)` draw-and-discard
+            // (no `self.chance` → always applies) before the boosts land. Curse's accuracy is
+            // `true`, so this self-drop roll is the move's only draw.
+            draw(&mut b, "random", &[100], 0, "self-drop");
             for (stat, delta) in [(BoostIndex::Attack, 1), (BoostIndex::Defense, 1), (BoostIndex::Speed, -1)] {
                 let cur = b.state.side(side).boost(stat);
                 let eff = (cur + delta).clamp(-6, 6) - cur;
@@ -6771,6 +6776,10 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     if md.id.to_id() == "strengthsap" {
         let mut b = b;
         if b.state.side(foe).active().is_alive() {
+            // Strength Sap is a foe-targeting numeric-accuracy status move — PS `hitStepAccuracy`
+            // rolls `randomChance(100, 100)` before the drain/drop. (Special-cased above the
+            // general status accuracy branch, so emit it here.)
+            draw(&mut b, "randomChance", &[md.accuracy as i32, 100], 1, "accuracy");
             let atk_val = {
                 let t = b.state.side(foe).active();
                 let boost = b.state.side(foe).boost(BoostIndex::Attack);
