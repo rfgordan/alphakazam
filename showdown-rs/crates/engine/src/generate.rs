@@ -6247,7 +6247,7 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 
 /// Execute a status move from its data: self-heal, hazard, and/or target status, with an
 /// accuracy hit/miss branch when the move can miss.
-fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
+fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
     let foe = side.other();
 
     // Powder moves have no effect on Grass types, Overcoat, or Safety Goggles holders.
@@ -6766,6 +6766,19 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
 
     let hit_prob = accuracy_of(&b, side, md);
     let miss_prob = 1.0 - hit_prob;
+    // PS `hitStepAccuracy`: a foe-targeting status move with numeric accuracy rolls
+    // `randomChance(accuracy, 100)` once (before its effect resolves). The roll is bypassed —
+    // accuracy forced to `true` — for `accuracy: true` moves (md.accuracy == 0), self-targeting
+    // status moves (`target === 'self'`: Swords Dance, Calm Mind, Recover, weather, hazards…),
+    // and Toxic used by a Poison-type (gen >= 8). Emit on `b` so both the hit and miss branches
+    // inherit it. (Accuracy/evasion stages and accuracy-boosting abilities/items shift the
+    // recorded arg away from the raw accuracy; unmodeled here — the differ flags those.)
+    if md.accuracy != 0
+        && md.target != crate::data::MoveTarget::User
+        && !(md.id.to_id() == "toxic" && b.state.side(side).active().types.contains(&Type::Poison))
+    {
+        draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+    }
     let mut hit = scaled(&b, hit_prob);
 
     // Whether the heal user was at full HP *before* healing — a self-heal move (Roost/Recover)
