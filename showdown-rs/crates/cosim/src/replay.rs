@@ -534,7 +534,7 @@ fn compare_distribution(
 /// Did `side_key`'s active faint (making its pending switch request a faint replacement
 /// rather than a pivot)? Decided from the request JSON itself: PS marks the slot in
 /// `forceSwitch` and the side's active condition shows `fnt` for faints.
-fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &str) -> bool {
+pub(crate) fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &str) -> bool {
     // Prefer the request: side.pokemon[active].condition endswith " fnt".
     if let Some(req) = sw.requests.get(side_key) {
         if let Some(mons) = req["side"]["pokemon"].as_array() {
@@ -554,7 +554,7 @@ fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &st
         .unwrap_or(false)
 }
 
-fn resolve_choice(
+pub(crate) fn resolve_choice(
     state: &State,
     si: usize,
     choice: &crate::trace::ChoiceRec,

@@ -27,6 +27,63 @@ pub enum MoveChoice {
     Switch(u8), // party index 0..=5
 }
 
+/// A single PRNG draw the engine *would* make, in Pokémon Showdown's call form. Emitted at
+/// each stochastic site when draw annotation is enabled (Replicate/DRAW_DIFF). `kind`/`args`
+/// mirror PS's `random`/`randomChance`/`sample`/`shuffle`; `result` is the realized outcome
+/// under PS's interpretation (bool as 0/1, roll/sample index, etc.; shuffle result is -1 since
+/// PS logs shuffle order as null — the ordering is verified via the resulting state instead).
+///
+/// The draw stream carried by a branch is the ordered list of draws that produced *that*
+/// branch's outcome. The consumption differ picks the branch reproducing PS's recorded
+/// `stateAfter` and compares this stream against PS's recorded draw log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrawEvent {
+    /// "random" | "randomChance" | "sample" | "shuffle".
+    pub kind: &'static str,
+    /// PS call args: random(n)->[n]; random(m,n)->[m,n]; randomChance(a,d)->[a,d];
+    /// sample(len)->[len]; shuffle(len,start,end)->[len,start,end].
+    pub args: Vec<i32>,
+    /// Outcome under PS's interpretation. randomChance: 0/1. random(n)/random(m,n): the drawn
+    /// integer. sample: chosen index. shuffle: -1 (order not in PS's log).
+    pub result: i64,
+    /// Engine-side site tag, for triage when the recorded label is unavailable.
+    pub site: &'static str,
+}
+
+thread_local! {
+    /// When set, stochastic sites append their [`DrawEvent`] to each branch they produce. Off
+    /// by default so `Enumerate`/`Sample` and every existing caller keep identical behavior and
+    /// pay zero annotation cost. Set/cleared around annotated entry points only.
+    static ANNOTATE_DRAWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+pub(crate) fn annotating() -> bool {
+    ANNOTATE_DRAWS.with(|c| c.get())
+}
+
+/// Append a draw to a branch's stream (no-op unless annotation is enabled).
+#[inline]
+pub(crate) fn draw(b: &mut Branch, kind: &'static str, args: &[i32], result: i64, site: &'static str) {
+    if annotating() {
+        b.draws.push(DrawEvent { kind, args: args.to_vec(), result, site });
+    }
+}
+
+/// RAII guard: enable draw annotation for the current thread, restore prior state on drop.
+struct AnnotateGuard(bool);
+impl AnnotateGuard {
+    fn enable() -> Self {
+        let prev = ANNOTATE_DRAWS.with(|c| c.replace(true));
+        AnnotateGuard(prev)
+    }
+}
+impl Drop for AnnotateGuard {
+    fn drop(&mut self) {
+        ANNOTATE_DRAWS.with(|c| c.set(self.0));
+    }
+}
+
 /// One node of the outcome tree: a probability, the resulting state, and the
 /// instructions that produced it (relative to the input state).
 #[derive(Clone)]
@@ -34,6 +91,8 @@ pub(crate) struct Branch {
     pub(crate) prob: f32,
     pub(crate) state: State,
     pub(crate) ins: Vec<Instruction>,
+    /// Ordered PRNG draws that produced this branch (populated only under annotation).
+    pub(crate) draws: Vec<DrawEvent>,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -736,7 +795,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -786,7 +845,43 @@ pub fn generate_instructions_ex(state: &State, s1: MoveChoice, s2: MoveChoice, p
 }
 
 pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    generate_branches_ctx(state, s1, s2, pivot, tera, exec)
+        .into_iter()
+        .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
+        .collect()
+}
+
+/// One fully-resolved outcome with its probability, the instructions that produced it, and the
+/// ordered PRNG draw stream the engine would consume to realize it (PS call form). Returned by
+/// [`generate_instructions_annotated`] for the draw-consumption differ.
+pub struct AnnotatedOutcome {
+    pub percentage: f32,
+    pub instructions: Vec<Instruction>,
+    pub draws: Vec<DrawEvent>,
+}
+
+/// Like [`generate_instructions_ex`] but additionally returns, per outcome branch, the ordered
+/// PRNG draws (PS call form) that produce it. Runs the full enumeration with draw annotation
+/// enabled; the differ selects the branch reproducing PS's recorded `stateAfter` and compares
+/// its `draws` against PS's recorded draw log. Enumerate/Sample behavior is unchanged: the
+/// annotation guard is thread-local and scoped to this call only.
+pub fn generate_instructions_annotated(
+    state: &State,
+    s1: MoveChoice,
+    s2: MoveChoice,
+    pivot: [Option<u8>; 2],
+    tera: [bool; 2],
+) -> Vec<AnnotatedOutcome> {
+    let _guard = AnnotateGuard::enable();
+    let pv = [pivot[0].map_or(Pivot::Stay, Pivot::Target), pivot[1].map_or(Pivot::Stay, Pivot::Target)];
+    generate_branches_ctx(state, s1, s2, pv, tera, &mut Exec::Enumerate)
+        .into_iter()
+        .map(|b| AnnotatedOutcome { percentage: b.prob, instructions: b.ins, draws: b.draws })
+        .collect()
+}
+
+fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -894,16 +989,13 @@ pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveC
     branches = exec.prune(branches);
 
     branches
-        .into_iter()
-        .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
-        .collect()
 }
 
 /// Apply a (forced) switch-in directly to `state`: reset the outgoing active's boosts
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -1162,7 +1254,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
 /// actives, then switch-in abilities in speed order of the INCOMING actives.
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -1578,10 +1670,16 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
                         let (f, s) = if a_first { (a, b_act) } else { (b_act, a) };
                         sequence_two_moves(b, f, s, exec)
                     }
-                    // Enumerated: 50/50 over the two orderings.
+                    // Enumerated: 50/50 over the two orderings. PS resolves an equal-speed action
+                    // tie with `prng.shuffle` over the 2 queued actions -> shuffle(2, 0, 2). The
+                    // ordering is validated by the resulting state (PS logs shuffle order as null).
                     None => {
-                        let mut res = sequence_two_moves(scaled(&b, 0.5), a, b_act, exec);
-                        res.extend(sequence_two_moves(scaled(&b, 0.5), b_act, a, exec));
+                        let mut ba = scaled(&b, 0.5);
+                        draw(&mut ba, "shuffle", &[2, 0, 2], -1, "speed-tie");
+                        let mut bb = scaled(&b, 0.5);
+                        draw(&mut bb, "shuffle", &[2, 0, 2], -1, "speed-tie");
+                        let mut res = sequence_two_moves(ba, a, b_act, exec);
+                        res.extend(sequence_two_moves(bb, b_act, a, exec));
                         res
                     }
                 },
@@ -1591,7 +1689,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone() }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone() }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -1906,9 +2004,13 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         return dispatch_move_inner(b, action);
     }
     // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
+    // PS frz `onBeforeMove` (priority 10) rolls `randomChance(1, 5)` to thaw.
     if status == Status::Freeze {
-        let mut out = vec![scaled(&b, 0.80)];
+        let mut frozen = scaled(&b, 0.80);
+        draw(&mut frozen, "randomChance", &[1, 5], 0, "frz");
+        let mut out = vec![frozen];
         let mut thawed = scaled(&b, 0.20);
+        draw(&mut thawed, "randomChance", &[1, 5], 1, "frz");
         let slot = thawed.state.side(side).active_index;
         push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
         // frz (priority 10) ran; Truant (9) is next — a thawed loafer stays put this turn.
@@ -1948,21 +2050,31 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
             confused = false;
         }
     }
+    // PS runs the BeforeMove cancel handlers in descending priority, each rolling its own draw:
+    // confusion (priority 3) `randomChance(33, 100)`, attract (2) `randomChance(1, 2)`,
+    // paralysis (1) `randomChance(1, 4)`. A handler that fires cancels the move (its later
+    // handlers don't roll). Annotate the roll on the cancel branch AND on the pass-through `b`.
     let mut out = Vec::new();
     let mut act = 1.0f32;
     if confused {
-        // PS uses randomChance(33, 100), not an exact one-third check.
-        out.extend(confusion_self_hit(scaled(&b, act * 0.33), side));
+        let mut hit = scaled(&b, act * 0.33);
+        draw(&mut hit, "randomChance", &[33, 100], 1, "confusion");
+        out.extend(confusion_self_hit(hit, side));
+        draw(&mut b, "randomChance", &[33, 100], 0, "confusion");
         act *= 0.67;
     }
-    // Attract: 50% chance to be immobilized by love (PS attract condition onBeforeMove,
-    // priority 2 — between confusion (3) and paralysis (1)).
     if b.state.side(side).volatiles.contains(VolatileStatus::Attract) {
-        out.push(scaled(&b, act * 0.5)); // immobilized: no move
+        let mut imm = scaled(&b, act * 0.5); // immobilized: no move
+        draw(&mut imm, "randomChance", &[1, 2], 1, "attract");
+        out.push(imm);
+        draw(&mut b, "randomChance", &[1, 2], 0, "attract");
         act *= 0.5;
     }
     if status == Status::Paralysis {
-        out.push(scaled(&b, act * 0.25)); // fully paralyzed: no move
+        let mut fp = scaled(&b, act * 0.25); // fully paralyzed: no move
+        draw(&mut fp, "randomChance", &[1, 4], 1, "par");
+        out.push(fp);
+        draw(&mut b, "randomChance", &[1, 4], 0, "par");
         act *= 0.75;
     }
     if out.is_empty() {
@@ -2184,6 +2296,8 @@ fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
         }
         let dmg = (dmg.max(1) as i16).min(hp);
         let mut sb = scaled(&b, 1.0 / 16.0);
+        // PS's confusion self-hit rolls `random(16)` for its damage (no crit, typeless 40 BP).
+        draw(&mut sb, "random", &[16], i, "confusion-damage");
         if dmg > 0 {
             let slot = sb.state.side(side).active_index;
             push(&mut sb, Instruction::Damage { side, slot, amount: dmg });
@@ -2939,6 +3053,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let hit_prob = accuracy_of(&b, side, &md);
     let miss_prob = 1.0 - hit_prob;
 
+    // PS `hitStepAccuracy`: a move with a numeric accuracy rolls `randomChance(accuracy, 100)`
+    // once (before the hit loop); accuracy `true` (engine `md.accuracy == 0`) skips the roll.
+    // Annotate on `b` so both the hit and miss branches inherit this draw. (Accuracy/evasion
+    // stages and modifiers shift the recorded arg; unmodeled here — the differ flags them.)
+    if annotating() && md.accuracy != 0 {
+        draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+    }
+
     if miss_prob > 0.0 {
         let mut mb = scaled(&b, miss_prob);
         // High Jump Kick / Jump Kick / Supercell Slam: missing costs the user 1/2 of its
@@ -3112,6 +3234,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     continue;
                 }
                 let mut hb = scaled(&b, prob);
+                annotate_hits(&mut hb, &combo, crit_p);
                 let hit_sub = apply_damage_hit_indexed(&mut hb, side, &md, &calcs, &combo);
                 v.push((hb, hit_sub));
             }
@@ -3129,6 +3252,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 continue;
             }
             let mut hb = scaled(&b, prob);
+            annotate_hits(&mut hb, &combo, crit_p);
             let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
             v.push((hb, hit_sub));
         }
@@ -3246,6 +3370,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_dancer_copies(out, side, move_id)
     } else {
         out
+    }
+}
+
+/// Annotate the per-hit PRNG draws PS makes inside the hit loop, in order: for each hit, the
+/// crit roll `randomChance(1, critDen)` (only when the crit chance is a genuine coin — a
+/// guaranteed crit via `willCrit`/high-crit-stage and a crit-immune target both skip PS's
+/// roll) followed by the damage `random(16)`. The engine's roll index equals PS's `random(16)`
+/// value by construction (`damage_rolls[roll]` uses factor `(100-roll)/100`), and results are
+/// validated against `stateAfter`, so only kind/args/order/count are load-bearing.
+fn annotate_hits(hb: &mut Branch, combo: &[(u8, bool)], crit_p: f32) {
+    if !annotating() {
+        return;
+    }
+    let crit_den = if crit_p > 0.0 && crit_p < 1.0 { (1.0 / crit_p).round() as i32 } else { 0 };
+    for &(roll, crit) in combo {
+        if crit_den > 0 {
+            draw(hb, "randomChance", &[1, crit_den], crit as i64, "crit");
+        }
+        draw(hb, "random", &[16], roll as i64, "damage-roll");
     }
 }
 
@@ -5670,7 +5813,11 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
     }
     let chance = 0.30;
     let mut proc = scaled(&b, chance);
-    let noproc = scaled(&b, 1.0 - chance);
+    let mut noproc = scaled(&b, 1.0 - chance);
+    // PS contact-status abilities (Static/Flame Body/Poison Point) and Poison Touch/Toxic Chain
+    // roll `randomChance(3, 10)` in their onDamagingHit handler.
+    draw(&mut proc, "randomChance", &[3, 10], 1, "contact-status");
+    draw(&mut noproc, "randomChance", &[3, 10], 0, "contact-status");
     let slot = proc.state.side(target).active_index;
     push(&mut proc, Instruction::ChangeStatus { side: target, slot, previous: Status::None, new: status });
     vec![proc, noproc]
@@ -5704,7 +5851,10 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     };
     let chance = pct as f32 / 100.0;
     let mut proc = scaled(&b, chance);
-    let noproc = scaled(&b, 1.0 - chance);
+    let mut noproc = scaled(&b, 1.0 - chance);
+    // PS models flinch as a move secondary → one `random(100)`.
+    draw(&mut proc, "random", &[100], 0, "flinch");
+    draw(&mut noproc, "random", &[100], (pct as i64).max(1), "flinch");
     push(&mut proc, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Flinch });
     vec![proc, noproc]
 }
@@ -5822,7 +5972,10 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     };
     let chance = pct as f32 / 100.0;
     let mut proc = scaled(&b, chance);
-    let noproc = scaled(&b, 1.0 - chance);
+    let mut noproc = scaled(&b, 1.0 - chance);
+    // PS `secondaries()`: one `random(100)` per secondary (procs when roll < chance).
+    draw(&mut proc, "random", &[100], 0, "secondary");
+    draw(&mut noproc, "random", &[100], (pct as i64).max(1), "secondary");
     if has_self && proc.state.side(side).active().is_alive() {
         for (i, &delta) in md.secondary_self_boosts.iter().enumerate() {
             if delta != 0 {

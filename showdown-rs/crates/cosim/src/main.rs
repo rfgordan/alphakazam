@@ -10,6 +10,7 @@
 
 mod convert;
 mod diff;
+mod drawdiff;
 mod replay;
 mod trace;
 
@@ -43,6 +44,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let verbose = std::env::var("VERBOSE").is_ok();
+
+    // Draw-consumption differ mode: classify each unit DRAW-EXACT vs first-mismatch category,
+    // and print the burn-down scoreboard. Leaves the state-verification path untouched.
+    if std::env::var("DRAW_DIFF").is_ok() {
+        return run_draw_diff(&args);
+    }
 
     let mut totals = Totals::default();
     let mut ps_commit: Option<String> = None;
@@ -209,6 +216,48 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_draw_diff(args: &[String]) -> ExitCode {
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let mut board = drawdiff::DrawScoreboard::default();
+    let mut ps_commit: Option<String> = None;
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        match &ps_commit {
+            None => ps_commit = Some(t.ps_commit.clone()),
+            Some(c) if *c != t.ps_commit => {
+                eprintln!("{path}: PS commit differs — corpus is mixed; refusing");
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        match drawdiff::draw_diff_trace(&t) {
+            Ok(units) => {
+                let (mut ex, mut mm, mut un) = (0u32, 0u32, 0u32);
+                for u in &units {
+                    board.add(u);
+                    match &u.class {
+                        drawdiff::DrawClass::Exact => ex += 1,
+                        drawdiff::DrawClass::Unsupported(_) => un += 1,
+                        drawdiff::DrawClass::Mismatch { .. } => mm += 1,
+                    }
+                }
+                if verbose {
+                    println!("=== {path} === units: {} | draw-exact {ex} | mismatch {mm} | unsupported {un}", units.len());
+                }
+            }
+            Err(u) => eprintln!("{path}: {}", u.0),
+        }
+    }
+    if let Some(c) = ps_commit {
+        println!("(ps {c})");
+    }
+    board.report();
+    ExitCode::SUCCESS
 }
 
 fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {
