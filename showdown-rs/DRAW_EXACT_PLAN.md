@@ -109,7 +109,13 @@ roughly increasing difficulty:
 
 - [x] Branch cloned from main @ 433d299 (c6a landed; c6b/C7/seed-finalization paused with
       the main campaign — see memory/equivalence-campaign-state.md for their resume points).
-- [ ] Phase 0 (PRNG port + gate)
-- [ ] Phase 1 (Replicate mode + differ)
-- [ ] Phase 2 burn-down
+- [x] Phase 0 (PRNG port + gate) — Gen-5 LCG confirmed for battle seeds; `crates/engine/src/psprng.rs`
+      + `harness/psprng-gate.mjs`, 25.6M draws bit-identical.
+- [x] Phase 1 (Replicate annotation mode + differ) — draw-annotated enumeration
+      (`generate_instructions_annotated`) + `DRAW_DIFF=1` differ; first scoreboard **56.98%
+      draw-exact** (2183/3831). Ranked burn-down queue + hypotheses in `DRAW_EXACT_SCOREBOARD.md`.
+      All prior gates green (corpus 3831/3831 exact). Kill criteria not triggered.
+- [ ] Phase 2 burn-down — top item: PS `speedSort` handler-order shuffles (`shuffle@generic`);
+      then self-boost/secondary `random(100)` draw-and-discard, status-move accuracy, duration
+      rolls (`random(2,5)@slp`), variable multi-hit count (`sample@bulletseed`).
 - [ ] Phase 3 seed-exact certification
