@@ -66,6 +66,99 @@ PS-source basis. The fix-decay curve (% gained per class) is kill-criterion #2 e
 | 2026-07-23 | **duration draws** (`random[2,5]@slp`, `random[2,6]@confusion`, `random[2,4]@lockedmove`) | 78.57% | 80.19% | +1.62 (+62 u) | PS rolls a duration on the `onStart` of freshly-applied sleep (`random(2,5)`), confusion (`random(2,6)`), and a rampage lock (`lockedmove` `trueDuration = random(2,4)`). The engine already branched these counters — emit the draw in `branch_sleep_counter` / `branch_confusion_counter` / the rampage-start arm so the draw stream carries them. (residual `slp` at pos 4 = secondary-sleep ordering, left for a later pass) |
 | 2026-07-23 | **Protect stall counter** (`randomChance[1,3^n]@stall`) | 80.19% | 80.68% | +0.49 (+19 u) | PS `stall` volatile `onStallMove` rolls `randomChance(1, counter)` with `counter = 3^n` (capped 729) on each *consecutive* protect use; the first use has no `stall` volatile yet, so no roll. The engine's `stall_counter` is exactly `n` — emit `randomChance(1, 3^n)` on both the success and fail branches when `n >= 1`. |
 | 2026-07-23 | **special-cased status moves' missing draws** (`random[100]@curse`, `randomChance[100,100]@strengthsap`) | 80.68% | 81.44% | +0.76 (+29 u) | Curse and Strength Sap return early in `execute_status_move` before the general draw sites. Non-Ghost Curse's `onTryHit` rewrites the move to `move.self = {boosts}` → `selfDrops` rolls one `random(100)`. Strength Sap is a foe-targeting numeric-accuracy status move → `hitStepAccuracy` rolls `randomChance(100,100)`. Emit each in its special-case block. |
+| 2026-07-23 | **accuracy forced `true` skips the roll** (removes `accuracy` rust-extra vs No Guard / weather-perfect / Glaive Rush — the `crit-args` cluster: Hurricane, Poltergeist, Close Combat, Quick Attack, Beat Up) | 81.44% | 82.28% | +0.84 (+32 u) | PS overrides accuracy to `true` (no `randomChance` draw, but crit still rolls) via an event: No Guard (`onAnyAccuracy`), a Glaive Rush target (`onAccuracy`), and weather-perfect accuracy (Blizzard in snow; Thunder/Hurricane/Bleakwind/Wildbolt/Sandsear Storm in rain — `onModifyMove move.accuracy = true`). A plain 100-accuracy move still rolls `randomChance(100,100)`. New `accuracy_forced_true` predicate gates both the damaging and status accuracy draws. |
+
+## Burn-down summary
+56.98% → **82.28%** over 8 committed classes (+25.30 pts, +969 units). Fix-decay curve is
+healthy: each class landed a real, structured, decaying slice (207, 282, 132, 206, 62, 19,
+29, 32 units) with **no** new independent mismatch class revealed per fix beyond the known
+queue — kill-criterion #2 (non-decaying density) is **not** triggered. All 8 classes are
+draw-*accounting* fixes; none required unobservable state (kill-criterion #1 not triggered).
+
+## The keystone: `speedSort` handler-order shuffles (the remaining ~300 units)
+
+The dominant remaining class is PS's `battle.speedSort` shuffles (`shuffle[N, N-2, N]@generic`:
+counts 130 / 88 / 47 / 35 for the 2/4/3/5-length lists). This is charter Phase-2 item #3 and
+the single largest remaining block. Findings + the design to build (pin `b9dc987d`):
+
+**Where the draw comes from.** `speedSort(list, comparator)` (battle.ts:429) is a *selection
+sort*. At each output position `sorted` it gathers `nextIndexes` = every element tying the
+current best under the comparator; if that tie-group has length > 1 it calls
+`this.prng.shuffle(list, sorted, sorted + len)` — exactly one `shuffle[list.len, sorted,
+sorted+len]` draw (internal consumption already matches `psprng.shuffle`). So the recorded
+`shuffle[N, s, e]` says: a length-`N` handler list had a tie-group of `e-s` handlers starting
+at sorted-position `s`. The observed `[N, N-2, N]` shape = a 2-handler tie at the tail of the
+list.
+
+**The comparator (`comparePriority`, battle.ts:404)** orders by, in decreasing precedence:
+`order` (asc, default 2^32), `priority` (desc), `speed` (desc), `subOrder` (asc), `effectOrder`
+(asc). A *tie* (→ shuffle) needs ALL of these equal.
+  - `effectOrder` is set ONLY for `*SwitchIn` / `*RedirectTarget` callbacks (battle.ts:999);
+    for every OTHER event it is 0, so ties there collapse to (order, priority, speed, subOrder).
+  - `subOrder` (resolvePriority, battle.ts:950+): `{cb}SubOrder`, else by effectType —
+    Condition 2 (slot/side/field 3/4/5), Weather/Field 5, Poison Touch/Perish Body 6, Ability 7,
+    Item 8, Stall 9.
+  - `speed` = the holder's current Speed; on `*SwitchIn` a fractional `-indexOf(fieldPos)/…`
+    offset is subtracted so the two sides' switch-in handlers never tie on speed (position
+    breaks it), and hazards on one side tie fully and fall back to `effectOrder` = creation
+    order.
+
+**Which events shuffle.** `speedSort(handlers)` is called inside `runEvent`/`findEventHandlers`
+(battle.ts:507, 794) for essentially every event that collects ≥1 handler; `eachEvent`
+(battle.ts:468) speed-sorts the actives. A shuffle fires only when ≥2 collected handlers tie.
+In singles the common tie is **two handlers on the same Pokémon sharing a subOrder** (e.g. two
+Conditions/volatiles, both subOrder 2, same speed) or **two same-speed actives' handlers at an
+equal subOrder** — hence the tail-2 tie-groups. The `[12,10,12]` at turn 1 is a large
+switch-in/`onUpdate` handler list whose last two entries tie.
+
+**The design to build (minimal faithful, data-driven from the pin).**
+  1. A per-turn event *schedule*: the ordered list of `runEvent`/`eachEvent`/`singleEvent`
+     calls PS makes across a turn (before-move cancel events, damage-calc Modify* events,
+     on-hit `DamagingHit`/`AfterMoveSecondary`, switch-in `onStart`/`onSwitchIn`/`onUpdate`,
+     end-of-turn `onResidual`). Only events that can collect ≥2 tying handlers matter.
+  2. A handler *table*: for each (ability, item, volatile/condition, side/field condition,
+     weather) present on the field, which of those events it has a callback for, plus the
+     callback's `Order`/`Priority`/`SubOrder`. Extract data-driven from data/*.ts at the pin.
+  3. At each scheduled event, build the handler list from the current board, run the selection
+     sort, and for every tie-group of length > 1 emit `shuffle[len, start, start+len]`. Feed the
+     realized shuffle order back only insofar as it affects later state (the differ verifies via
+     `stateAfter`, so order need only be *consumed* correctly, not reproduced in the log).
+
+**Highest-leverage next step (do FIRST):** extend the cosim recorder to log, per `shuffle`
+draw, the `eventid` and the tying handlers' effect ids + sort keys (PS has all of this in
+`speedSort`/`resolvePriority`). That converts the 300-unit `@generic` blob into an exact,
+per-event work list and removes the guesswork of inferring events from shuffle sizes. It is a
+recorder-only change (no engine risk) and gates the whole keystone.
+
+**Kill-criterion assessment for the keystone.** Not triggered. For non-switch-in events the tie
+key is (order, priority, speed, subOrder) — all reconstructable from board state. The only
+insertion-order dependence is `effectOrder` on `*SwitchIn`/hazard handlers, which is *creation
+order* — reconstructable from the battle's hazard-application / entry history (state the engine
+already has or can track), not hidden JS object identity. So the keystone is effort-bound, not
+structurally blocked.
+
+## Other remaining classes (post-keystone, ranked)
+- `sample[20]@bulletseed` (19): variable multi-hit COUNT `sample([2,2,…,5])` = `random(20)`,
+  then per-hit crit/damage. The engine folds count into the sumset DP — needs the DP path to
+  emit the count sample (charter Phase-2 #2); structurally the largest non-shuffle item.
+- `randomChance[1,24]@bodypress` (14) + crit-immune targets: PS rolls the crit `randomChance(1,
+  critMult)` whenever `critRatio ≥ 1` and `willCrit` is undefined — even against a Battle
+  Armor / Shell Armor / Lucky Chant target (the `CriticalHit` event only downgrades the
+  *result*). The engine skips the crit draw when `crit_p == 0`; it should still roll and force
+  the result to no-crit.
+- `random[100]@saltcure` (14): a `secondary:{chance:100, volatileStatus}` (Salt Cure) rolls
+  `random(100)`; the engine applies the volatile deterministically as a `target_volatile`.
+  Same family as the Rapid Spin 100%-self-secondary — needs the codegen to distinguish a
+  100%-secondary volatile from a primary `onHit` volatile.
+- `randomChance[3,10]@cursedbody` (14, pos>0): Cursed Body's 30% disable roll on a hit that
+  KO'd / on a branch the engine short-circuits — same "roll fires even when the effect can't
+  land" family as the secondary fix, applied to the contact-ability path.
+- `randomChance[1,2]@harvest` (11): Harvest's end-of-turn 50% berry-restore `randomChance(1,2)`
+  (skipped in sun) — an end-of-turn ability duration/proc draw.
+- `sample[1]@trace` (11): Trace copying an ability picks among eligible targets via `sample`
+  (length 1 in singles) — a switch-in ability draw.
+- residual `random[2,5]@slp` (21, pos 4): secondary-applied sleep ordering (a sleep secondary
+  that lands after other draws) — a placement refinement of the duration class.
 
 ## Assessment
 The mismatch classes are **structured and finite** — handler-order `speedSort` shuffles,

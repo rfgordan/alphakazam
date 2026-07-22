@@ -700,6 +700,37 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
     (acc / 100.0).min(1.0)
 }
 
+/// Whether PS overrides a move's accuracy to `true` (bypassing the `hitStepAccuracy` roll
+/// entirely) via an `Accuracy`/`ModifyMove` event, as opposed to a numeric accuracy that merely
+/// evaluates to 100. A `true` override means PS makes NO accuracy draw — but a later crit /
+/// damage roll still happens, so the engine must not emit an accuracy draw here. Cases:
+///   * No Guard on either side (`onAnyAccuracy` returns true),
+///   * a Glaive Rush target (its volatile's `onAccuracy` returns true),
+///   * weather-perfect accuracy: Blizzard in snow, and Thunder/Hurricane/Bleakwind Storm/
+///     Wildbolt Storm/Sandsear Storm in rain (`onModifyMove` sets `move.accuracy = true`).
+/// The sun case for Thunder/Hurricane sets a NUMERIC 50 (still rolls) and is deliberately absent.
+/// A plain 100-accuracy move (Close Combat, Poltergeist) is NOT forced true — it rolls
+/// `randomChance(100, 100)`.
+fn accuracy_forced_true(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    let atk = b.state.side(side).active();
+    let def = b.state.side(side.other()).active();
+    if atk.ability == Ab::NoGuard || def.ability == Ab::NoGuard {
+        return true;
+    }
+    if b.state.side(side.other()).volatiles.contains(VolatileStatus::GlaiveRush) {
+        return true;
+    }
+    matches!(
+        (md.id.to_id(), effective_weather(&b.state)),
+        ("blizzard", Weather::Snow)
+            | (
+                "thunder" | "hurricane" | "bleakwindstorm" | "wildboltstorm" | "sandsearstorm",
+                Weather::Rain | Weather::HeavyRain
+            )
+    )
+}
+
 /// Public entry point. `s1`/`s2` are side one's and side two's chosen actions.
 pub fn generate_instructions(state: &State, s1: MoveChoice, s2: MoveChoice) -> Vec<StateInstructions> {
     generate_instructions_ex(state, s1, s2, [None, None], [false, false])
@@ -3070,7 +3101,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // returned above.) Gate the annotation on the move actually reaching the accuracy step.
     // Annotate on `b` so both the hit and miss branches inherit this draw. (Accuracy/evasion
     // stages and modifiers shift the recorded arg; unmodeled here — the differ flags them.)
-    if annotating() && md.accuracy != 0 {
+    if annotating() && md.accuracy != 0 && !accuracy_forced_true(&b, side, &md) {
         let reaches_accuracy = {
             let foe_alive = b.state.side(foe).active().is_alive();
             let semi_invuln = matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m));
@@ -6837,6 +6868,7 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     if md.accuracy != 0
         && md.target != crate::data::MoveTarget::User
         && !(md.id.to_id() == "toxic" && b.state.side(side).active().types.contains(&Type::Poison))
+        && !accuracy_forced_true(&b, side, md)
     {
         draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
     }
