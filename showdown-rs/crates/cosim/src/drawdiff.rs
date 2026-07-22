@@ -239,7 +239,20 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
         }
         if diff_states(&cand, &state_target).is_empty() {
             // Realized branch found: this is the honest comparison.
-            return match compare_draws(&o.draws, &rec) {
+            let res = compare_draws(&o.draws, &rec);
+            if std::env::var("DRAW_DBG").is_ok() {
+                if let Some((cat, label, detail)) = &res {
+                    if label.contains("accuracy") && cat.contains("not-next") {
+                        let p1 = state_before.sides[0].active();
+                        let p2 = state_before.sides[1].active();
+                        eprintln!("DBG turn {turn} mc={:?} p1alive={} p2alive={} | {detail}\n   rust={:?}\n   ps  ={:?}",
+                            mc, p1.is_alive(), p2.is_alive(),
+                            o.draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect::<Vec<_>>(),
+                            rec.iter().map(|r| r.label.clone()).collect::<Vec<_>>());
+                    }
+                }
+            }
+            return match res {
                 None => DrawUnit { turn, class: DrawClass::Exact },
                 Some((category, label, detail)) => DrawUnit { turn, class: DrawClass::Mismatch { category, label, detail } },
             };
