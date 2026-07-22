@@ -579,6 +579,8 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                         .into_iter()
                         .map(|rem| {
                             let mut nb = scaled(&b, 0.5);
+                            // PS `lockedmove` `onStart`: `trueDuration = this.random(2, 4)` (2/3).
+                            draw(&mut nb, "random", &[2, 4], rem as i64, "lockedmove");
                             push(&mut nb, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Rampaging(move_id, rem) });
                             if !nb.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
                                 push(&mut nb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::LockedMove });
@@ -2134,6 +2136,9 @@ fn branch_sleep_counter(b: Branch, side: SideId) -> Vec<Branch> {
         .into_iter()
         .map(|t| {
             let mut nb = scaled(&b, 1.0 / 3.0);
+            // PS `slp` condition `onStart`: `statusState.time = this.random(2, 5)` (2/3/4). The
+            // duration draw is consumed the moment sleep is applied.
+            draw(&mut nb, "random", &[2, 5], t as i64, "slp");
             push(&mut nb, Instruction::ChangeStatusCounter { side, slot, previous: prev, new: t });
             nb
         })
@@ -2148,6 +2153,8 @@ fn branch_confusion_counter(b: Branch, side: SideId) -> Vec<Branch> {
         .into_iter()
         .map(|t| {
             let mut nb = scaled(&b, 0.25);
+            // PS `confusion` `onStart`: `effectState.time = this.random(2, 6)` (2/3/4/5).
+            draw(&mut nb, "random", &[2, 6], t as i64, "confusion");
             push(&mut nb, Instruction::SetActiveCounter {
                 side,
                 which: crate::instruction::ActiveCounter::Confusion,
