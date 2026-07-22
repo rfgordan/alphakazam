@@ -52,6 +52,15 @@ state, so only draw shapes are compared.
 | 17 | `randomChance[100,100]@spore` | status-move accuracy. |
 | 15 | `randomChance[1,24]@bodypress` | args-mismatch: engine emits accuracy `[100,100]` where PS's next is the crit `[1,24]` — an alignment slip downstream of a missing leading handler shuffle (#2). |
 
+## Phase-2 burn-down log
+
+Each row: the class fixed, the differ % before/after (over 3831 supported units), and the
+PS-source basis. The fix-decay curve (% gained per class) is kill-criterion #2 evidence.
+
+| date | class fixed | before | after | Δ | basis |
+|------|-------------|--------|-------|---|-------|
+| 2026-07-22 | **self-boost draw-and-discard** (`random[100]@<move>`: Close Combat / Draco Meteor / Rapid Spin / Make It Rain / Headlong Rush / Superpower / Overheat / …) | 56.98% | 62.39% | +5.41 (+207 u) | PS `selfDrops` (battle-actions.ts:1338) rolls `random(100)` for `move.self.boosts` even at guaranteed 100% (no `self.chance`), consumed after the damage rolls and before target `secondaries`. |
+
 ## Assessment
 The mismatch classes are **structured and finite** — handler-order `speedSort` shuffles,
 self-boost/secondary `random(100)` draw-and-discard, status-move accuracy, duration rolls,

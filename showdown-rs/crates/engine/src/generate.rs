@@ -6131,6 +6131,15 @@ fn apply_triattack_secondary(b: Branch, side: SideId, md: &crate::data::MoveData
 /// A damaging move's deterministic on-hit effects: user self-boosts and any target
 /// volatile (Salt Cure, etc.).
 fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
+    // PS `selfDrops` (battle-actions.ts): a connecting move with `move.self.boosts` (Close
+    // Combat −Def/−SpD, Draco Meteor −SpA, Rapid Spin +Spe, Make It Rain −SpA, …) rolls a
+    // `random(100)` draw-and-discard even at a guaranteed 100% self-drop (these have no
+    // `self.chance`, so the boost always applies regardless of the roll). The roll is consumed
+    // after the damage rolls and *before* the target secondaries (`selfDrops` precedes
+    // `secondaries` in `spreadMoveHit`). Self-boosts apply even through a Substitute.
+    if md.self_boosts.iter().any(|&x| x != 0) {
+        draw(b, "random", &[100], 0, "self-drop");
+    }
     // Self-boosts apply even through a Substitute (they affect the attacker).
     for (i, &delta) in md.self_boosts.iter().enumerate() {
         if delta != 0 {
