@@ -5982,16 +5982,31 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
 /// Cursed Body (defender): 30% chance to Disable the move that just hit it.
 fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let foe = side.other();
-    if b.state.side(foe).active().ability != crate::ids::Ability::CursedBody
-        || !b.state.side(side).active().is_alive()
-        || b.state.side(side).volatiles.contains(VolatileStatus::Disable)
-        || md.id == crate::ids::MoveId::None
-        || !b.state.side(side).active().moves.iter().any(|m| m.id == md.id)
-    {
+    // PS Cursed Body `onDamagingHit` rolls `randomChance(3, 10)` whenever the holder (foe) is hit
+    // by a non-Struggle damaging move and the SOURCE isn't already Disabled. The roll fires even
+    // when the source can't actually be disabled — a source that fainted from the hit (its
+    // `.fainted` flag isn't set until after the hit resolves, so it's still present at the
+    // DamagingHit event). The engine had skipped the draw entirely in those cases.
+    let roll_fires = b.state.side(foe).active().ability == crate::ids::Ability::CursedBody
+        && md.id != crate::ids::MoveId::None
+        && md.id.to_id() != "struggle"
+        && !b.state.side(side).volatiles.contains(VolatileStatus::Disable);
+    if !roll_fires {
+        return vec![b];
+    }
+    // The disable only actually lands on a still-living attacker that knows the move.
+    let can_land = b.state.side(side).active().is_alive()
+        && b.state.side(side).active().moves.iter().any(|m| m.id == md.id);
+    if !can_land {
+        // Draw-and-discard: PS rolls, the disable no-ops. State validates, so no split.
+        let mut b = b;
+        draw(&mut b, "randomChance", &[3, 10], 3, "cursedbody");
         return vec![b];
     }
     let mut proc = scaled(&b, 0.30);
-    let noproc = scaled(&b, 0.70);
+    draw(&mut proc, "randomChance", &[3, 10], 0, "cursedbody");
+    let mut noproc = scaled(&b, 0.70);
+    draw(&mut noproc, "randomChance", &[3, 10], 3, "cursedbody");
     push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Disable });
     let prev = proc.state.side(side).disable;
     // The attacker has already moved this turn -> full 4-turn disable (PS duration 5 - 1
@@ -6027,6 +6042,12 @@ fn apply_partial_trap(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
         .map(|(turns, p)| {
             let mut nb = scaled(&b, p);
             push(&mut nb, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::PartiallyTrapped });
+            // PS `partiallytrapped` onStart rolls `this.random(5, 7)` for the duration — unless
+            // Grip Claw fixes it at 8 (no draw). Binding Band changes only the chip divisor, not
+            // the duration, so it still rolls. Draw-and-discard (state carries the realized turns).
+            if item != Item::GripClaw {
+                draw(&mut nb, "random", &[5, 7], turns as i64, "partialtrap");
+            }
             let prev = (nb.state.side(foe).partial_trap_turns, nb.state.side(foe).partial_trap_div);
             push(&mut nb, Instruction::SetPartialTrap { side: foe, previous: prev, new: (turns, div) });
             nb
@@ -6066,7 +6087,35 @@ fn apply_burning_jealousy(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
     consume_lum_if_statused(b, foe);
 }
 
+/// Moves PS models as a 100%-chance target-facing `secondary` (so `secondaries()` rolls one
+/// `random(100)` before applying it), but which the engine realizes through a non-secondary field
+/// (`target_volatile`, or a dedicated on-hit handler) with `secondary_chance == 0`. PS still
+/// consumes the roll (draw-and-discard — the effect always lands); emit it at the secondary site.
+/// Because the payload is target-facing, Shield Dust / Covert Cloak strip it before the roll and
+/// Sheer Force removes it outright (no draw) — same as any other secondary.
+fn extra_secondary_roll_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "saltcure" | "psychicnoise" | "throatchop" | "sparklingaria" | "syrupbomb" | "spiritshackle"
+    )
+}
+
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    let mut b = b;
+    // 100%-secondary moves the engine applies through `target_volatile`/a dedicated handler
+    // (secondary_chance == 0) still cost PS one `random(100)` at the secondaries site.
+    if extra_secondary_roll_move(md.id)
+        && b.state.side(side).active().ability != crate::ids::Ability::SheerForce
+    {
+        let foe = side.other();
+        let alive = b.state.side(foe).active().is_alive();
+        let shielded = alive
+            && (b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+                || b.state.side(foe).active().item == Item::CovertCloak);
+        if !shielded {
+            draw(&mut b, "random", &[100], 0, "secondary");
+        }
+    }
     if md.secondary_chance == 0 {
         return vec![b];
     }
@@ -6075,7 +6124,6 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         return vec![b];
     }
     let foe = side.other();
-    let mut b = b;
     let has_self = md.secondary_self_boosts.iter().any(|&x| x != 0);
     let alive = b.state.side(foe).active().is_alive();
     // Shield Dust / Covert Cloak strip target-facing (non-`self`) secondaries via PS
@@ -6466,9 +6514,19 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     // Ghost-types; fails if the target already has it.
     if md.id.to_id() == "octolock" {
         let mut b = b;
-        let t = b.state.side(foe).active();
-        if t.is_alive()
-            && !t.types.contains(&Type::Ghost)
+        let (alive, ghost) = {
+            let t = b.state.side(foe).active();
+            (t.is_alive(), t.types.contains(&Type::Ghost))
+        };
+        // Octolock is a foe-targeting numeric-accuracy (100) status move: PS `hitStepAccuracy`
+        // rolls `randomChance(100, 100)` — but only after `hitStepTryImmunity` passes, so a
+        // Ghost target (immune to `trapped`) fails first and never rolls. Special-cased above the
+        // general status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits).
+        if alive && !ghost {
+            draw(&mut b, "randomChance", &[100, 100], 1, "accuracy");
+        }
+        if alive
+            && !ghost
             && !b.state.side(foe).volatiles.contains(VolatileStatus::Octolock)
         {
             push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Octolock });
@@ -8001,29 +8059,47 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             .into_iter()
             .flat_map(|b| {
                 let p = b.state.side(side).active();
-                if p.ability == crate::ids::Ability::Harvest
-                    && p.item == Item::None
-                    && p.last_berry != Item::None
-                    && p.is_alive()
-                {
-                    let slot = b.state.side(side).active_index;
-                    let berry = p.last_berry;
-                    let sunny = matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun);
-                    let mut grow = scaled(&b, if sunny { 1.0 } else { 0.5 });
+                // PS Harvest `onResidual` (order 28) runs for EVERY living Harvest holder each
+                // end of turn: `if (sun || randomChance(1,2)) { if (!item && lastItem is berry)
+                // restore }`. So the `randomChance(1,2)` is rolled whenever it's not sunny —
+                // independent of whether a berry can actually be restored (the restore short-
+                // circuits inside). Only the state change is conditional on a consumed berry.
+                if p.ability != crate::ids::Ability::Harvest || !p.is_alive() {
+                    return vec![b];
+                }
+                let slot = b.state.side(side).active_index;
+                let berry = p.last_berry;
+                let can_restore = p.item == Item::None && berry != Item::None;
+                let sunny = matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun);
+                if sunny {
+                    // Sun short-circuits the roll (no draw); restore is guaranteed if possible.
+                    if !can_restore {
+                        return vec![b];
+                    }
+                    let mut grow = b;
                     push(&mut grow, Instruction::ChangeItem { side, slot, previous: Item::None, new: berry });
                     push(&mut grow, Instruction::SetLastBerry { side, slot, previous: berry, new: Item::None });
-                    // Restoring a berry runs PS's item Update event immediately.  A Harvested
-                    // Sitrus is therefore eaten in the same residual event when HP is already
-                    // at or below half (it does not wait for the next damage/end-turn check).
                     maybe_eat_sitrus(&mut grow, side);
-                    if sunny {
-                        vec![grow]
-                    } else {
-                        vec![grow, scaled(&b, 0.5)]
-                    }
-                } else {
-                    vec![b]
+                    return vec![grow];
                 }
+                // Not sunny: the roll always fires. When no berry can be restored both outcomes
+                // are identical, so emit a single draw-and-discard branch; otherwise split 50/50.
+                if !can_restore {
+                    let mut nb = b;
+                    draw(&mut nb, "randomChance", &[1, 2], 0, "harvest");
+                    return vec![nb];
+                }
+                let mut grow = scaled(&b, 0.5);
+                draw(&mut grow, "randomChance", &[1, 2], 1, "harvest");
+                push(&mut grow, Instruction::ChangeItem { side, slot, previous: Item::None, new: berry });
+                push(&mut grow, Instruction::SetLastBerry { side, slot, previous: berry, new: Item::None });
+                // Restoring a berry runs PS's item Update event immediately.  A Harvested
+                // Sitrus is therefore eaten in the same residual event when HP is already
+                // at or below half (it does not wait for the next damage/end-turn check).
+                maybe_eat_sitrus(&mut grow, side);
+                let mut nogrow = scaled(&b, 0.5);
+                draw(&mut nogrow, "randomChance", &[1, 2], 0, "harvest");
+                vec![grow, nogrow]
             })
             .collect();
     }

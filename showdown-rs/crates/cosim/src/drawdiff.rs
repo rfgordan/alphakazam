@@ -240,9 +240,10 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
         if diff_states(&cand, &state_target).is_empty() {
             // Realized branch found: this is the honest comparison.
             let res = compare_draws(&o.draws, &rec);
-            if std::env::var("DRAW_DBG").is_ok() {
+            if let Ok(filter) = std::env::var("DRAW_DBG") {
                 if let Some((cat, label, detail)) = &res {
-                    if label.contains("accuracy") && cat.contains("not-next") {
+                    if (filter.is_empty() && label.contains("accuracy") && cat.contains("not-next"))
+                        || (!filter.is_empty() && label.contains(&filter)) {
                         let p1 = state_before.sides[0].active();
                         let p2 = state_before.sides[1].active();
                         eprintln!("DBG turn {turn} mc={:?} p1alive={} p2alive={} | {detail}\n   rust={:?}\n   ps  ={:?}",
