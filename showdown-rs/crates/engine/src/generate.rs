@@ -380,6 +380,18 @@ fn emit_update(b: &mut Branch) {
     }
 }
 
+/// A turn-action `switch` runs its own `runAction` → post-action `eachEvent('Update')`
+/// (battle.ts:2881) on the PRE-swap board — the outgoing mon is still on the field when this
+/// Update speed-sorts, so the tie is evaluated BEFORE the incoming mon changes the Speed. Emit
+/// this shuffle (state-neutral) immediately before applying the switch, so a tied board contributes
+/// its extra `shuffle[2,0,2]` exactly where PS makes it (a Move+Switch turn: BeforeTurn + Update +
+/// this = 3 draws, vs the engine's turn-start bracket alone = 2). Annotation-only.
+fn emit_switch_pre_update(b: &mut Branch) {
+    if annotating() && actives_update_tie(&b.state, false) {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update");
+    }
+}
+
 /// Emit the per-hit `eachEvent('Update')` shuffle (battle-actions.ts:970) — fires once per
 /// connecting hit, on the PRE-faint-message board (a target at 0 HP still counts as on-field).
 fn emit_update_hit(b: &mut Branch) {
@@ -1114,12 +1126,14 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 order.swap(0, 1);
             }
             for &(side, target) in &order {
+                emit_switch_pre_update(b);
                 apply_switch(b, side, target);
             }
         }
     } else {
         for (side, target) in switch_actions {
             for b in &mut branches {
+                emit_switch_pre_update(b);
                 apply_switch(b, side, target);
             }
         }

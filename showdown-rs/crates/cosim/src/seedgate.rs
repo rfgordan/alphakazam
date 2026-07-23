@@ -167,6 +167,12 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> (usize,
     (choice, ambiguous)
 }
 
+thread_local! {
+    /// Debug: when set, `step_unit` dumps every generated outcome's draw stream. Enabled per
+    /// (game, decision-index) via `DBG_GAME`/`DBG_I` env vars, set in `run_game`.
+    static DBG_UNIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct GameResult {
     name: String,
     exact: bool,
@@ -225,6 +231,10 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
             j += 1;
         }
         total += 1;
+        let dbg_on = std::env::var("DBG_GAME").ok().is_some_and(|g| name.starts_with(&g))
+            && std::env::var("DBG_I").ok().and_then(|v| v.parse::<usize>().ok()).is_none_or(|di| di == i);
+        DBG_UNIT.with(|c| c.set(dbg_on));
+        if dbg_on { eprintln!("=== {name} d{i} t{} ===", dp.turn); }
         let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, sleep_clause, &mut prng) {
             Ok(x) => x,
             Err(label) => {
@@ -324,6 +334,12 @@ fn step_unit(
         return Err("no-branches".into());
     }
     let (choice, ambiguous) = replicate_select(&outcomes, prng);
+    if DBG_UNIT.with(|c| c.get()) {
+        eprintln!("--- unit: {} outcomes, chosen={} ambiguous={} ---", outcomes.len(), choice, ambiguous);
+        let c = &outcomes[choice];
+        let cs: Vec<String> = c.draws.iter().map(|d| format!("{}{:?}={}@{}", d.kind, d.args, d.result, d.site)).collect();
+        eprintln!("  CHOSEN [{choice}] draws=[{}]", cs.join(" "));
+    }
     let chosen_draws = outcomes[choice].draws.clone();
     state.apply_instructions(&outcomes[choice].instructions);
 
