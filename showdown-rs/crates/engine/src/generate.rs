@@ -134,6 +134,16 @@ fn item_removable(species: crate::ids::Species, item: Item) -> bool {
     }
 }
 
+/// Moves with the `defrost` flag at the pin: their frozen user thaws with no `randomChance` roll.
+fn is_defrost_move(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "burnup" | "flamewheel" | "flareblitz" | "fusionflare" | "hydrosteam" | "matchagotcha"
+            | "pyroball" | "sacredfire" | "scald" | "scorchingsands" | "sizzlyslide"
+            | "steameruption" | "polarflare"
+    )
+}
+
 /// Moves with the `dance` flag at the pin (Dancer copies them).
 fn is_dance_move(id: crate::ids::MoveId) -> bool {
     matches!(
@@ -2100,6 +2110,19 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
     // PS frz `onBeforeMove` (priority 10) rolls `randomChance(1, 5)` to thaw.
     if status == Status::Freeze {
+        // A `defrost`-flagged move (Flame Wheel, Scald, Sacred Fire, …) thaws the user
+        // deterministically with NO `randomChance` roll (PS frz `onBeforeMove` returns early on
+        // `move.flags['defrost']`). The engine had rolled 80/20 for every frozen mover — the
+        // no-thaw branch and its draw were both spurious for these moves.
+        let move_id = b.state.side(side).active().moves[action.move_idx as usize].id;
+        if is_defrost_move(move_id) {
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
+            if truant_gate(&mut b, side) {
+                return vec![b];
+            }
+            return dispatch_move_inner(b, action);
+        }
         let mut frozen = scaled(&b, 0.80);
         draw(&mut frozen, "randomChance", &[1, 5], 0, "frz");
         let mut out = vec![frozen];
@@ -5885,12 +5908,16 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
         let powder_immune = a.types.contains(&Type::Grass)
             || a.ability == Ab::Overcoat
             || a.item == Item::SafetyGoggles;
+        // PS `runStatusImmunity('powder')` gates the roll: a powder-immune attacker (Grass /
+        // Overcoat / Safety Goggles), or an absent source, means NO `random(100)` at all.
         if !a.is_alive() || powder_immune {
             return vec![b];
         }
         let mut out = Vec::new();
         let mut noproc_p = 0.70f32;
-        for (p, status) in [(0.11, Status::Sleep), (0.10, Status::Paralysis), (0.09, Status::Poison)] {
+        // PS rolls ONE `this.random(100)`: <11 slp, <21 par, <30 psn, else nothing — emitted on
+        // every branch out of this ability (draw-and-discard; result isn't compared, state is).
+        for (p, status, res) in [(0.11, Status::Sleep, 0i64), (0.10, Status::Paralysis, 11), (0.09, Status::Poison, 21)] {
             let applies = status_applies(b.state.side(side).active(), status)
                 && !status_blocked_by_field(&b.state, side, status)
                 && !(status == Status::Sleep && sleep_clause_blocks(&b.state, side));
@@ -5899,6 +5926,7 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
                 continue;
             }
             let mut proc = scaled(&b, p);
+            draw(&mut proc, "random", &[100], res, "effectspore");
             let slot = proc.state.side(side).active_index;
             push(&mut proc, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
             if status == Status::Sleep {
@@ -5908,7 +5936,9 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
                 out.push(proc);
             }
         }
-        out.push(scaled(&b, noproc_p));
+        let mut np = scaled(&b, noproc_p);
+        draw(&mut np, "random", &[100], 30, "effectspore");
+        out.push(np);
         return out;
     }
     // Cute Charm (defender): 30% chance a contact hit infatuates the attacker — only for

@@ -75,17 +75,21 @@ PS-source basis. The fix-decay curve (% gained per class) is kill-criterion #2 e
 | 2026-07-23 | **Cursed Body disable roll** (`randomChance[3,10]@cursedbody` — class 14→0) | — | — | (in +45 batch) | PS Cursed Body `onDamagingHit` rolls `randomChance(3, 10)` whenever the holder is hit by a non-Struggle damaging move and the SOURCE isn't already Disabled — the roll fires even when the source can't be disabled (it fainted from the hit; the `.fainted` flag isn't set until after the hit resolves, so the source is still present at the DamagingHit event). The engine skipped the draw whenever it couldn't apply the disable. New structure: `roll_fires` (foe CursedBody, non-Struggle, source not Disabled) gates the draw; when it can't land (source fainted / lacks the move) emit one draw-and-discard branch, else split proc/no-proc with the draw on each. |
 | 2026-07-23 | **Octolock status accuracy** (`randomChance[100,100]@octolock` — class 7→0) | — | — | (in +45 batch) | Octolock is a foe-targeting numeric-accuracy (100) status move, but it is special-cased above the general status-accuracy branch in `execute_status_move` and returned early with no accuracy roll. PS `hitStepAccuracy` rolls `randomChance(100,100)` — after `hitStepTryImmunity`, so a Ghost target (immune to `trapped`) fails first and never rolls. Emit the draw in the Octolock block gated on `alive && !ghost`. |
 | 2026-07-23 | **Partial-trap duration** (`random[5,7]@infestation` / Fire Spin / Bind / … — class 7→0) | — | **88.54%** | +1.17 (+45 u batch) | PS `partiallytrapped` onStart rolls `this.random(5, 7)` for the 5–6-turn duration — unless Grip Claw fixes it at 8 (no roll); Binding Band changes only the chip divisor and still rolls. The engine branched the duration (5,0.5)/(6,0.5) but emitted no draw. Emit `random(5,7)` on the non-Grip-Claw branches in `apply_partial_trap` (draw-and-discard; state carries the realized turns). |
+| 2026-07-23 | **Accuracy draw arg = modified accuracy** (`randomChance[80,100]@closecombat`/`@quickattack` — Hustle; `randomChance[50,100]@hurricane` — sun; classes 11+9+8→0) | 88.54% | 89.32% | +0.78 (+30 u) | PS `hitStepAccuracy` rolls `randomChance(accuracy, 100)` with accuracy AFTER `onModifyMove`/`ModifyAccuracy`; the engine emitted raw `md.accuracy`. New `accuracy_arg()` models the two integer-exact modifiers in the corpus: Hustle (physical ×0.8) and sun-halved Thunder/Hurricane (=50). Compound Eyes / Wide Lens and accuracy/evasion STAGE modifiers stay raw (need the foe evasion boost + 4096 chain rounding). Annotation-only (called only under `annotating()`; accuracy_of / hit-miss split untouched). |
+| 2026-07-23 | **Effect Spore contact roll** (`random[100]@effectspore` — class 6→0) | 89.32% | 89.42% | +0.10 (+incl. downstream) | PS Effect Spore `onDamagingHit` rolls one `this.random(100)` on any contact hit — `<11` slp, `<21` par, `<30` psn, else nothing — gated only on `checkMoveMakesContact && source.runStatusImmunity('powder')` (a Grass / Overcoat / Safety Goggles attacker never rolls). The engine branched the outcomes but emitted no draw. Emit one `random(100)` on every branch out of the ability (draw-and-discard). |
+| 2026-07-23 | **Defrost-move self-thaw** (`randomChance[1,5]@frz` rust-extra, defrost half) | 89.42% | **89.53%** | +0.11 (+8 u) | A `defrost`-flagged move (Flame Wheel, Scald, Sacred Fire, Pyro Ball, Hydro Steam, …) thaws its frozen user with NO `randomChance(1,5)` roll (PS frz `onBeforeMove` returns early on `move.flags['defrost']`). The engine modelled no defrost flag, rolling 80/20 for every frozen mover — the no-thaw branch and its draw were both spurious. `is_defrost_move()` + a deterministic-thaw path in the freeze branch of `execute_move`. STATE change (removes the spurious branch); corpus state-sweep 100% + smoke 18/18 re-verified. The 7 remaining `frz` rust-extra are a same-turn ice-secondary-freeze decision-boundary artifact (a mon frozen by the opponent's move this turn, then attempting to act), NOT defrost — left documented. |
 
 ## Burn-down summary
-56.98% → **88.54%** over 16 committed classes (+31.56 pts, +1209 units). Fix-decay curve is
+56.98% → **89.53%** over 20 committed classes (+32.55 pts, +1247 units). Fix-decay curve is
 healthy: each class landed a real, structured, decaying slice (207, 282, 132, 206, 62, 19,
-29, 32, 150, 9, 8, 28, and a 45-unit batch of harvest/cursed-body/octolock/partial-trap) with
+29, 32, 150, 9, 8, 28, 45-unit harvest/cursed-body/octolock/partial-trap batch, 30, 8, 8) with
 **no** new independent mismatch class revealed per fix beyond the known queue — kill-criterion #2
-(non-decaying density) is **not** triggered. All 16 classes are draw-*accounting* fixes; none
-required unobservable state (kill-criterion #1 not triggered). The dominant remaining class is
-still the `eachEvent('Update')` actives Speed-tie bracket (136 units), whose complete PS schedule
-is now fully reverse-engineered (see below) but requires move-kernel-interleaved emission — the
-deferred large tranche.
+(non-decaying density) is **not** triggered. All 20 classes are draw-*accounting* fixes; the only
+ones that touched state (Cursed Body's Struggle exclusion, Defrost self-thaw) are strict PS
+correctness improvements re-verified by the state-sweep + smoke. None required unobservable state
+(kill-criterion #1 not triggered). The dominant remaining class is still the `eachEvent('Update')`
+actives Speed-tie bracket (136 units), whose complete PS schedule is now fully reverse-engineered
+(see below) but requires move-kernel-interleaved emission — the deferred large tranche.
 
 ## The keystone: `speedSort` handler-order shuffles — label audit + what landed
 
@@ -134,6 +138,55 @@ Residual, Update). Faithful modeling therefore requires mirroring PS's per-turn 
 schedule inside `execute_move`/faint handling, not a single end-of-turn injection — a larger,
 move-kernel-interleaved change than the discrete Residual phase. Deferred as the next tranche;
 the predicate and call-site map above are the complete spec.
+
+#### COMPLETE per-turn schedule (fully reverse-engineered 2026-07-23 from the label audit)
+Let `T` = emit `shuffle[2,0,2]` iff both actives alive AND `effective_speed` equal, evaluated on
+**current** state at that moment (speeds change mid-turn: switches, stat drops from the moves
+themselves). PS walks the sorted action queue `[beforeTurn(4), switch(103), tera(106), move(200),
+residual(300)]` (battle.ts:2971 turnLoop); after EACH action `runAction` fires `eachEvent('Update')`
+(battle.ts:2882, gen≥5, choice≠'start'). The exact draw sequence for a fully-tied turn, verified
+against the audit (c1 d46/d47, d20/d45/d51, t1):
+
+1. **commitChoices initial `queue.sort()`** (battle.ts:3039 → `speedSort(list)`, eventid=`null`):
+   the two committed actions. Two moves (both order 200) tie → `shuffle[2,0,2]`; two switches (order
+   103, keyed on the OUTGOING mon's speed) tie → `shuffle[2,0,2]`; a move+switch never ties (orders
+   differ). *(The engine already emits this as `shuffle[2,0,2]@speed-tie` at the resolve_moves
+   Enumerate tie — line ~1715 — which is why move/move pos-0 already matches.)*
+2. **beforeTurn action**: `eachEvent('BeforeTurn')` (battle.ts:2830) → `T`; then runAction Update
+   (2882) → `T`; then, only if the NEXT action is a move (peek=='move'), gen8 dynamic-speed re-sort
+   (battle.ts:2940-2946 `queue.sort()`, eventid=`null`) over the remaining queue → for two tied
+   moves emits `shuffle[len,0,2]` where `len` = remaining-queue length = **3** for move/move (the
+   two moves + residual) → this is the `shuffle[3,0,2]` action-queue off-by-one (task item #2).
+3. **each switch action** (`runSwitch`, battle-actions.ts): switch-out `eachEvent('Update')`
+   (battle-actions.ts:83) → `T` (evaluated on the OLD actives, only if the outgoing mon is unfainted);
+   then the mon swaps in + switch-in ability fires (may change speed/faint); runAction Update (2882)
+   → `T`; then a `runSwitch` action's `getAllActive()` `speedSort` (battle-actions.ts:182, eventid=
+   `null`) → `T`; then runAction Update after runSwitch → `T`. Observed triple for one switch with
+   old-actives-not-tied: `[Update, null, Update]` (c1 d20). runSwitch batches consecutive switch-ins
+   (double switch → one shared runSwitch speedSort, c1 d45).
+4. **each move action** (execute_move): the move's own draws (acc/crit/damage/secondary/contact),
+   then per-hit `eachEvent('Update')` (battle-actions.ts:970, **once per connecting hit**, fires even
+   on a KO because the target's `.fainted` flag isn't set until faintMessages at :979 — so its tie is
+   the PRE-faint-message liveness) → `T`; then post-hit-loop `eachEvent('Update')` (battle-actions.ts:
+   1024, once, only if the move dealt damage — target now fainted, so a KO gives NO shuffle here) →
+   `T`; then runAction Update (2882) → `T`. A status move that connects fires only the per-hit (970)
+   + runAction (2882) Updates (no 1024). A miss / immunity / no-target move fires only runAction (2882).
+5. **residual action**: `fieldEvent('Residual')` shuffles (already LANDED via emit_residual_shuffles),
+   then runAction Update (2882) → `T`. This is the trailing `[…, Residual, Update]`.
+
+**Why this needs in-kernel emission (not an external post-hoc injection):** the 970/1024 Updates fall
+between the move's damage/secondary/contact draws and any afterMoveSecondary contact procs, and their
+tie predicate depends on connect/damage/hit-count/faint state known only inside `execute_move`. An
+external "emit N trailing Updates after execute_move" approximation cannot know whether a move
+connected, how many hits, or whether it KO'd (which flips the 1024/2882 shuffles off but leaves 970
+on). So the faithful build emits at the actual sites: (a) turn-start brackets in `generate_branches_ctx`
+before/around the switch+move resolution [items 1–3], (b) the per-hit 970 Update at the engine's
+per-hit completion point and the 1024 Update at the move's post-damage point inside the move kernel
+[item 4], (c) the runAction 2882 Update after each execute_move and after end-of-turn [items 2–5].
+Safety rail (as with Residual): only ever emit a `T` shuffle where PS definitely emits one — the
+differ's "no rust-side shuffle mismatch anywhere" invariant means over-emission would immediately
+show as a new mismatch, so build incrementally per turn-shape (move/move first — the common case —
+then switch-involved, then multi-hit) checking the differ after each.
 
 ### Excluded brackets (documented, cannot/should-not model here)
 - **`TrapPokemon` multi-trap stack** (`shuffle[3,0,3]`, trapF only): fires when one mon is trapped
@@ -246,11 +299,14 @@ and the queue is a clean ranked work list. The single highest-leverage item is m
 `speedSort` handler-order shuffles, which underlies both the direct `shuffle@generic` misses
 and many downstream alignment slips. Direction is viable; proceed to the Phase-2 burn-down.
 
-## Gates (all green, 2026-07-23 after Residual model)
-- `cargo test --release -p engine`: all suites pass (12/12 main + psprng raw gate + 29-fixture etc.).
-- `sampled_distribution`: Sample ≡ Enumerate (residual shuffles are annotation-guarded — Sample
-  unmoved).
-- Full corpus state-verify: **3831/3831 matched, 100% exact, 0 unsupported** (shuffles are
-  state-neutral; the residual model cannot move state).
-- Draw-consumption differ: **3302/3831 = 86.19% draw-exact**, no rust-side shuffle mismatch
-  anywhere in the corpus (zero false-positive residual emissions).
+## Gates (all green, 2026-07-23 after the +9-class draw-accounting batch → 89.53%)
+- `cargo test --release -p engine`: all suites pass (79 tests: 12 main + psprng raw gate +
+  29-fixture + trapping/generate/etc.).
+- Distribution smoke (`run-distribution-smoke.sh`, run sequentially — one node at a time):
+  **18/18** (17 diverse seeds + request-boundary randbattle seed 90). Covers the two state-
+  touching fixes (Cursed Body Struggle exclusion, Defrost self-thaw).
+- Full corpus state-verify: **3831/3831 matched, 100% exact, 0 unsupported**. Re-verified after
+  the Defrost self-thaw state change (PS always thaws on a defrost move → the engine's realized
+  branch still matches; the removed no-thaw branch was never PS's realized outcome).
+- Draw-consumption differ: **3430/3831 = 89.53% draw-exact** (from 86.64% at the start of this
+  session), no rust-side shuffle mismatch anywhere in the corpus.
