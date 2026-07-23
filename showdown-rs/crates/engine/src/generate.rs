@@ -700,6 +700,32 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
     (acc / 100.0).min(1.0)
 }
 
+/// The integer numerator PS passes to `randomChance(accuracy, 100)` at `hitStepAccuracy` —
+/// i.e. the move's accuracy AFTER `onModifyMove`/`ModifyAccuracy` shift it. The engine emitted
+/// the raw `md.accuracy`; PS records the modified value. Modelled: Hustle (physical ×0.8, an
+/// `onModifyMove`) and sun-halved Thunder/Hurricane (=50). Compound Eyes / Wide Lens and
+/// accuracy/evasion STAGE modifiers are NOT modelled (they need the foe's evasion boost and the
+/// 4096 chain rounding) — those args stay raw and the differ still flags them. Only ever called
+/// when a numeric-accuracy draw is actually emitted (`md.accuracy != 0`, not forced-true).
+fn accuracy_arg(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
+    use crate::ids::Ability as Ab;
+    // Sun fixes Thunder/Hurricane accuracy to 50 (`onModifyMove`), the only non-forced-true
+    // weather accuracy (rain forces `true`, handled by `accuracy_forced_true`).
+    if matches!(
+        (md.id.to_id(), effective_weather(&b.state)),
+        ("thunder" | "hurricane", Weather::Sun | Weather::HarshSun)
+    ) {
+        return 50;
+    }
+    let atk = b.state.side(side).active();
+    // Hustle lowers physical-move accuracy to 0.8× (`onModifyMove move.accuracy *= 0.8`). Move
+    // accuracies are multiples of 5, so ×4/5 is exact and integer.
+    if atk.ability == Ab::Hustle && md.category == MoveCategory::Physical {
+        return md.accuracy as i32 * 4 / 5;
+    }
+    md.accuracy as i32
+}
+
 /// Whether PS overrides a move's accuracy to `true` (bypassing the `hitStepAccuracy` roll
 /// entirely) via an `Accuracy`/`ModifyMove` event, as opposed to a numeric accuracy that merely
 /// evaluates to 100. A `true` override means PS makes NO accuracy draw — but a later crit /
@@ -3163,7 +3189,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             foe_alive && !semi_invuln && connects
         };
         if reaches_accuracy {
-            draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+            let acc = accuracy_arg(&b, side, &md);
+            draw(&mut b, "randomChance", &[acc, 100], (hit_prob > 0.0) as i64, "accuracy");
         }
     }
 
