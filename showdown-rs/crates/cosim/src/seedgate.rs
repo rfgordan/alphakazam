@@ -352,7 +352,13 @@ fn step_unit(
         let b3 = peek.random_range(0, 2); // gen8 dynamic re-sort
         engine::generate::set_forced_tie_order(Some(b0 == b3));
     }
+    // Install the realized multi-hit source: `*prng` is the PRNG state at this decision's start
+    // (replicate_select consumes it only after generation). A variable multi-hit move realizes its
+    // single branch by positioning a clone of this state past the branch's draws-so-far, then
+    // drawing count + per-hit rolls — the DP path emits no per-hit stream and would desync.
+    engine::generate::set_realized_source(Some(engine::generate::RealizedSource::Prng(*prng)));
     let outcomes = generate_instructions_annotated(state, mc[0], mc[1], pivots, tera);
+    engine::generate::set_realized_source(None);
     engine::generate::set_forced_tie_order(None);
     if outcomes.is_empty() {
         return Err("no-branches".into());

@@ -49,6 +49,27 @@ struct RecDraw {
     label: String,
 }
 
+/// The unit's recorded draw RESULTS in order, as the realized multi-hit executor reads them
+/// (sample → chosen index; randomChance → 0/1; random → value; shuffle/other → placeholder). Indexed
+/// by the engine branch's draws-so-far length, which equals the PS draw position when aligned.
+fn rec_results_of(unit: &[&Decision]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for d in unit {
+        for v in &d.draws {
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+            let r = v.get("result");
+            let val = match kind {
+                "sample" => r.and_then(|x| x.get("index")).and_then(Value::as_i64).unwrap_or(0),
+                "randomChance" => r.and_then(Value::as_bool).map(|b| b as i64).unwrap_or(0),
+                "random" => r.and_then(Value::as_i64).unwrap_or(0),
+                _ => -1, // shuffle / unknown — position placeholder, never read by the executor
+            };
+            out.push(val);
+        }
+    }
+    out
+}
+
 fn rec_draws_of(unit: &[&Decision]) -> Vec<RecDraw> {
     let mut out = Vec::new();
     for d in unit {
@@ -202,7 +223,15 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
         }
     }
 
+    // Install the realized multi-hit source (recorded results) so a variable multi-hit move
+    // realizes the single branch PS's stream dictates instead of the state-only DP fold (which
+    // emits no per-hit draws). Indexed by draws-so-far; the executor only reads it at the count +
+    // per-hit positions, which align with PS's recorded stream on units exact up to that point.
+    engine::generate::set_realized_source(Some(engine::generate::RealizedSource::Recorded(
+        std::rc::Rc::new(rec_results_of(unit)),
+    )));
     let outcomes = generate_instructions_annotated(&state_before, mc[0], mc[1], pivots, tera);
+    engine::generate::set_realized_source(None);
     if outcomes.is_empty() {
         return mk_unsupported("engine:no-branches".into());
     }

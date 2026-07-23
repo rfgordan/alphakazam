@@ -27,6 +27,36 @@ zero prior-exact game regressed):
 | P3.18 | 52/111 | 95.28% | **accuracy ModifyAccuracy 4096 chain + accuracy/evasion stages** — unified `accuracy_numerator`: onModifyMove (Hustle x0.8, sun Thunder/Hurricane=50) → ModifyAccuracy chain (Compound Eyes 5325/4096, Wide Lens 4505/4096) → stage boosts (trunc(acc*(3+b)/3) etc., ignoreEvasion moves excluded). `accuracy_of`+`accuracy_arg` now agree; previously accuracy_of ignored stages (no miss branch vs an evading target). | 4e7d4aa |
 | P3.19 | 52/111 | 96.50% | **differ tie-order branch selection (MEASUREMENT-ONLY, no engine change)** — `diff_unit` reports Exact iff ANY state-matching branch reproduces PS's exact draw sequence, not whichever tie-order enumerated first; removes the move-order-tie false-positives. shuffle[2,0,2]@generic 23→18, args-mismatch 64→35. | 4f12f90 |
 
+### Phase-3 variable multi-hit realized-executor tranche (2026-07-23) — RESERVED Class 2
+The largest remaining differ block: variable multi-hit COUNT `sample` + per-hit crit/damage. The
+Enumerate/Sample verification path folds the hit count into a sumset-DP (`apply_multihit_dp`) that
+is exact for STATE but emits **no** per-hit draw stream (the full per-hit product is 32^hits — the
+reason the DP exists), so Replicate/differ under-consume the PRNG on these moves and desync.
+
+**Architecture (single-path realized executor — DP path untouched).** A thread-local
+`RealizedSource` (`generate.rs`), installed ONLY by the seed gate (`RealizedSource::Prng` — the
+decision-start PsPrng) and the differ (`RealizedSource::Recorded` — the unit's recorded draw
+results), routes a variable multi-hit move through `apply_multihit_realized`: it draws the count +
+each hit's crit/damage off the source in PS's exact order (`battle-actions.ts:864` loop) and
+produces the ONE branch PS realized, reusing `apply_damage_hit` for per-hit application + KO /
+Substitute-break termination + the per-hit crit/damage/ModifyDamage draw emission. The `Prng`
+cursor positions a clone by shape-consuming the branch's draws-so-far (draw COUNT, not values,
+fixes the position); the `Recorded` cursor indexes by draws-so-far length. Enumerate/Sample never
+install a source → DP path byte-identical (state-sweep **3831/3831**, smoke **18/18**, engine tests
+all green, no exact game regressed — same 52 exact set).
+
+| family | landed | differ |
+|--------|--------|--------|
+| **[2,5] standard + Loaded Dice + Scale Shot + Skill Link** | bulletseed / iciclespear / rockblast / tailslap / bonerush / pinmissile / scaleshot: count `sample([2×7,3×7,4×3,5×3])` = `sample(20)` → table; a Loaded Dice holder that samples 2/3 re-rolls `5 - random(2)`; **Skill Link** rewrites `[2,5]`→plain 5 in `onModifyMove` (no sample draw — was the iciclespear residual); Scale Shot's self-drop rides the existing `selfDrops` site. | 96.50% → **97.18%** (3697→3723) |
+
+`sample[20]@bulletseed`/`@iciclespear`/`@tailslap`/`@rockblast`/`@scaleshot` labels all cleared; the
+[2,5] first-divergences advanced downstream (d1 d9→d38 par, d4 d11→d18, d5 d17→d19, c3c1s72 d15→d25,
+d6→d28). One residual on d4 t18 is a **screen×multi-hit damage-rounding** state-diff (draws now match;
+PS 326 vs engine 327 — a `compute_damage` screen-halving rounding class the DP masked by reaching the
+correct total via a different roll combo, now unmasked; separate from draw streams). Remaining
+multi-hit differ labels for the next families: `randomChance[1,24]@beatup` (9), `@populationbomb` (3),
+`randomChance[90,100]@tripleaxel` (3).
+
 ### Coordinator directive (differ-zero) — mandated observed-diff fixes (2026-07-23)
 The completion bar is ZERO differ mismatches corpus-wide (every observed count/order/kind/ARGS/
 handler-list diff is a fix target regardless of game yield). Landed this session:

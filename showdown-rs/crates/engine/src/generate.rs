@@ -80,6 +80,116 @@ fn forced_tie_order() -> Option<bool> {
     FORCED_TIE_ORDER.with(|c| c.get())
 }
 
+// ── Realized single-path multi-hit executor ────────────────────────────────────────────────
+//
+// A variable multi-hit move ([2,5] bulletseed/iciclespear/…, Population Bomb's 10 hits, Beat Up's
+// per-member hits) draws a hit COUNT (`sample`/`random`) then rolls crit+damage PER hit — the full
+// per-hit product is 32^hits, which is why the Enumerate/Sample verification path folds the count
+// into a sumset-DP (`apply_multihit_dp`) that emits NO per-hit draw stream. That is exact for STATE
+// but under-consumes the PRNG, so the Replicate (seed gate) and differ paths desync from PS's stream
+// on these moves. When a realized source is installed (only by those two callers) the multi-hit
+// dispatch instead REALIZES a single branch: it consumes the count draw and each hit's crit+damage
+// from the source in PS's exact order (`battle-actions.ts:864` hit loop), producing the one branch
+// PS's stream dictates with its exact draw log. Enumerate/Sample never install a source → DP path.
+
+/// Where the realized multi-hit executor reads its outcomes.
+pub enum RealizedSource {
+    /// Seed gate: the `PsPrng` state at the START of the decision. The executor positions a clone
+    /// by replaying the branch's draws-so-far (shape-consumed — draw COUNT, not values, matters for
+    /// positioning), then peeks the count + per-hit rolls off the clone.
+    Prng(crate::psprng::PsPrng),
+    /// Differ: the unit's recorded draw RESULTS in order (sample → chosen index). The executor
+    /// indexes by the branch's draws-so-far length, which equals PS's draw position when aligned.
+    Recorded(std::rc::Rc<Vec<i64>>),
+}
+
+thread_local! {
+    static REALIZED_SOURCE: std::cell::RefCell<Option<RealizedSource>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the realized multi-hit source for the current thread. See [`RealizedSource`].
+pub fn set_realized_source(src: Option<RealizedSource>) {
+    REALIZED_SOURCE.with(|c| *c.borrow_mut() = src);
+}
+
+/// gen≥5 [2,5] hit-count table: `sample([2×7, 3×7, 4×3, 5×3])` (battle-actions.ts:864). Index → count.
+const MULTIHIT_COUNT_TABLE: [u8; 20] = [2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+
+/// Advance a `PsPrng` by one draw of the given PS call shape (used to position the peek clone from
+/// a branch's recorded draw stream — only the number of consumed sub-draws matters).
+fn consume_shape(p: &mut crate::psprng::PsPrng, kind: &str, args: &[i32]) {
+    match kind {
+        "randomChance" => { p.random_chance(args[0] as u32, args[1] as u32); }
+        "random" if args.len() == 2 => { p.random_range(args[0] as u32, args[1] as u32); }
+        "random" => { p.random_n(args[0] as u32); }
+        "sample" => { p.sample_index(args[0] as u32); }
+        "shuffle" => {
+            let (start, end) = (args[1] as usize, args[2] as usize);
+            let mut s = start;
+            while s < end.saturating_sub(1) { p.random_range(s as u32, end as u32); s += 1; }
+        }
+        _ => {}
+    }
+}
+
+/// A positioned reader over the realized source: peeks successive draws in PS call form and returns
+/// the realized result under PS's interpretation (randomChance → 0/1, random/sample → value/index).
+enum RealizedCursor {
+    Prng(crate::psprng::PsPrng),
+    Recorded { results: std::rc::Rc<Vec<i64>>, idx: usize },
+}
+
+impl RealizedCursor {
+    fn peek(&mut self, kind: &str, args: &[i32]) -> i64 {
+        match self {
+            RealizedCursor::Prng(p) => match kind {
+                "randomChance" => p.random_chance(args[0] as u32, args[1] as u32) as i64,
+                "random" if args.len() == 2 => p.random_range(args[0] as u32, args[1] as u32) as i64,
+                "random" => p.random_n(args[0] as u32) as i64,
+                "sample" => p.sample_index(args[0] as u32) as i64,
+                _ => 0,
+            },
+            RealizedCursor::Recorded { results, idx } => {
+                let r = results.get(*idx).copied().unwrap_or(0);
+                *idx += 1;
+                r
+            }
+        }
+    }
+}
+
+/// Build a [`RealizedCursor`] positioned at the branch's current draw point, or `None` when no
+/// realized source is installed (Enumerate/Sample — the DP path stays in effect).
+fn realized_cursor(b: &Branch) -> Option<RealizedCursor> {
+    REALIZED_SOURCE.with(|c| match &*c.borrow() {
+        None => None,
+        Some(RealizedSource::Prng(start)) => {
+            let mut clone = *start;
+            for d in &b.draws {
+                consume_shape(&mut clone, d.kind, &d.args);
+            }
+            Some(RealizedCursor::Prng(clone))
+        }
+        Some(RealizedSource::Recorded(results)) => {
+            Some(RealizedCursor::Recorded { results: std::rc::Rc::clone(results), idx: b.draws.len() })
+        }
+    })
+}
+
+/// True if `md` is a multi-hit move the realized executor handles (variable [2,5] or a fixed count
+/// above the exact-enumeration cap — Population Bomb's 10). Beat Up routes separately.
+fn realized_multihit_move(md: &crate::data::MoveData) -> bool {
+    let (lo, hi) = (md.hits as usize, md.hits_max as usize);
+    lo != hi || (lo == hi && lo > MAX_EXACT_HITS)
+}
+
+/// True for the per-hit-accuracy multi-hit moves (`multiaccuracy`): each hit past the first rolls
+/// its own accuracy `randomChance(acc,100)` and a miss ends the move.
+fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
+    matches!(md.id.to_id(), "populationbomb" | "tripleaxel" | "triplekick")
+}
+
 /// Would this pair of move choices resolve as an equal-priority/equal-speed order TIE (the case
 /// PS breaks with a `commitChoices` `shuffle[2,0,2]`)? Both sides must be attacking; custap
 /// fractional priority is accounted for exactly as the turn resolver does. Used by the seed gate
@@ -3672,7 +3782,19 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
     // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
     // take the sumset-DP path, which also folds in the distribution over the hit count.
-    let damaged: Vec<(Branch, bool)> = if md.id.to_id() == "beatup" {
+    //
+    // Realized single-path executor: when a realized source is installed (seed gate / differ) and
+    // this is a variable multi-hit move the DP can't stream (non-multiaccuracy [2,5], incl. Scale
+    // Shot; multiaccuracy Population Bomb / Triple Axel route separately), draw the count + per-hit
+    // rolls off the source and produce the one branch PS realized. Enumerate/Sample: no source → DP.
+    let realized = if realized_multihit_move(&md) && !is_multiaccuracy_move(&md) && md.id.to_id() != "beatup" {
+        realized_cursor(&b)
+    } else {
+        None
+    };
+    let damaged: Vec<(Branch, bool)> = if let Some(cur) = realized {
+        apply_multihit_realized(&b, side, &md, hit_prob, cur)
+    } else if md.id.to_id() == "beatup" {
         // Beat Up: one hit per eligible party member with per-member base power.
         apply_beatup(&b, side, &md, hit_prob)
     } else if let Some(fixed) = fixed_damage_amount(&md, &b.state, side) {
@@ -5810,6 +5932,55 @@ fn apply_multihit_dp_sub(
         out.push((hb, only_hit_substitute));
     }
     out
+}
+
+/// Realized single-path multi-hit executor for a non-multiaccuracy variable-count move (the [2,5]
+/// family: bulletseed / iciclespear / rockblast / tailslap / bonerush / pinmissile / scaleshot).
+/// Consumes PS's exact draw stream off `cur`: the count `sample([2..5])` (plus the Loaded Dice
+/// `random(2)` re-roll when the sample landed below 4), then each hit's crit `randomChance(1,den)`
+/// and damage `random(16)`. The per-hit application, KO / Substitute-break termination, and the
+/// per-hit crit/damage/ModifyDamage draw emission all reuse [`apply_damage_hit`], so a KO mid-move
+/// truncates the stream exactly where PS's `hitStepMoveHitLoop` breaks. Returns the ONE realized
+/// branch. Only ever reached with a realized source installed (seed gate / differ).
+fn apply_multihit_realized(
+    b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32, mut cur: RealizedCursor,
+) -> Vec<(Branch, bool)> {
+    let mut hb = scaled(b, hit_prob);
+    // Hit count. Variable [2,5]: `sample(20)` → count table; a Loaded Dice holder that sampled
+    // 2 or 3 re-rolls `5 - random(2)` (battle-actions.ts:867). Skill Link's `onModifyMove` rewrites
+    // `multihit` from the [2,5] ARRAY to the plain number 5 BEFORE the hit loop, so PS never reaches
+    // the `Array.isArray` sample — a fixed max count with NO draw. Fixed count (non-multiaccuracy)
+    // likewise draws nothing here.
+    let (lo, hi) = (md.hits as usize, md.hits_max as usize);
+    let skill_link = hb.state.side(side).active().ability == crate::ids::Ability::SkillLink;
+    let loaded = hb.state.side(side).active().item == Item::LoadedDice;
+    let count = if lo != hi && !skill_link {
+        let idx = cur.peek("sample", &[20]);
+        draw(&mut hb, "sample", &[20], idx, "multihit-count");
+        let mut c = MULTIHIT_COUNT_TABLE[(idx as usize).min(19)] as usize;
+        if c < 4 && loaded {
+            let r = cur.peek("random", &[2]);
+            draw(&mut hb, "random", &[2], r, "loadeddice");
+            c = 5 - r as usize;
+        }
+        c
+    } else if lo != hi {
+        hi // Skill Link: fixed at the max, no count draw
+    } else {
+        lo
+    };
+    // Peek each hit's crit + damage roll in PS order; `apply_damage_hit` emits them (and the
+    // per-hit ModifyDamage shuffle) and applies with KO/Substitute-break termination — a hit past
+    // a faint never executes, so its peeked (over-read) values are simply unused.
+    let crit_den = ps_crit_den(&hb, side, md);
+    let mut hits: Vec<(u8, bool)> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let crit = crit_den > 0 && cur.peek("randomChance", &[1, crit_den]) != 0;
+        let roll = cur.peek("random", &[16]) as u8;
+        hits.push((roll & 0x0F, crit));
+    }
+    let hit_sub = apply_damage_hit(&mut hb, side, md, &hits, crit_den);
+    vec![(hb, hit_sub)]
 }
 
 /// Beat Up: one hit per eligible party member (PS `onModifyMove` filter: the user always, plus
