@@ -12,8 +12,8 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 52 / 111 full games exact end-to-end (46.8%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 96.50% (3697/3831), zero shuffle over-emission.**
+**Result: 55 / 111 full games exact end-to-end (49.5%); init-aligned from seed 105/111.
+Draw-consumption differ 90.16% → 97.42% (3732/3831), zero shuffle over-emission.**
 
 ### Phase-3 open-item-burn tranche (2026-07-23, 49 → 52; differ 94.07% → 96.50%)
 Five classes landed this session (all rails green throughout: engine tests, corpus state-sweep
@@ -45,17 +45,31 @@ fixes the position); the `Recorded` cursor indexes by draws-so-far length. Enume
 install a source → DP path byte-identical (state-sweep **3831/3831**, smoke **18/18**, engine tests
 all green, no exact game regressed — same 52 exact set).
 
-| family | landed | differ |
-|--------|--------|--------|
-| **[2,5] standard + Loaded Dice + Scale Shot + Skill Link** | bulletseed / iciclespear / rockblast / tailslap / bonerush / pinmissile / scaleshot: count `sample([2×7,3×7,4×3,5×3])` = `sample(20)` → table; a Loaded Dice holder that samples 2/3 re-rolls `5 - random(2)`; **Skill Link** rewrites `[2,5]`→plain 5 in `onModifyMove` (no sample draw — was the iciclespear residual); Scale Shot's self-drop rides the existing `selfDrops` site. | 96.50% → **97.18%** (3697→3723) |
+| family | landed | games | differ |
+|--------|--------|-------|--------|
+| **[2,5] standard + Loaded Dice + Scale Shot + Skill Link** | bulletseed / iciclespear / rockblast / tailslap / bonerush / pinmissile / scaleshot: count `sample([2×7,3×7,4×3,5×3])` = `sample(20)` → table; a Loaded Dice holder that samples 2/3 re-rolls `5 - random(2)`; **Skill Link** rewrites `[2,5]`→plain 5 in `onModifyMove` (no sample draw — was the iciclespear residual); Scale Shot's self-drop rides the existing `selfDrops` site. | 52→52 | 96.50% → **97.18%** (3697→3723) |
+| **multiaccuracy (Triple Axel / Triple Kick + Population Bomb)** | `apply_multihit_realized_ma`: each hit past the first rolls its OWN accuracy `randomChance(acc,100)` (battle-actions.ts:907) and a miss ends the move — UNLESS the holder has **Loaded Dice**, whose `onModifyMove` *deletes* `multiaccuracy` (so every hit lands, no per-hit roll; Population Bomb's count becomes `10 - random(7)`). Ascending-power indexed calcs for Triple Axel; KO/Substitute-break truncation. The enumerated Triple Axel path (32³, Enumerate/Sample only) is unchanged; Population Bomb's Enumerate stays on the DP. | 52→**55** | 97.18% → **97.42%** (3723→3732) |
 
-`sample[20]@bulletseed`/`@iciclespear`/`@tailslap`/`@rockblast`/`@scaleshot` labels all cleared; the
-[2,5] first-divergences advanced downstream (d1 d9→d38 par, d4 d11→d18, d5 d17→d19, c3c1s72 d15→d25,
-d6→d28). One residual on d4 t18 is a **screen×multi-hit damage-rounding** state-diff (draws now match;
+`sample[20]@bulletseed`/`@iciclespear`/`@tailslap`/`@rockblast`/`@scaleshot`, `@populationbomb`,
+`@tripleaxel` labels all cleared. **Games flipped exact: 52 → 55** — c6a2s113 (Population Bomb),
+r8 (Triple Axel), c3a2s22 (Skill Link iciclespear); zero prior-exact regressions (VERBOSE exact-set
+diff vs a clean baseline — the truncated 45-row non-exact list is NOT a reliable regression signal,
+so the exact-set diff is the gate). The [2,5]/Triple-Axel first-divergences advanced downstream
+(d1 d9→d38, d4 d11→d18, r2 d3→d7).
+
+**Why the realized path was needed for the enumerated Triple Axel too (KO truncation).** The
+enumerated Triple Axel path emits its per-hit crit/damage draws for the WHOLE combo then applies with
+KO-break — so a k=3 branch whose target faints on hit 2 carries 3 draw-pairs but PS's stream has only
+2; `replicate_select`, at the position where the k=2 branch has ended, sees only the k=3 branch has a
+draw there and consumes it, over-reading the NEXT decision's draw (r8's pre-existing d23 divergence,
+present in the true baseline). Routing Triple Axel/Kick + Population Bomb through
+`apply_multihit_realized_ma` (a single KO-truncated branch, only under a realized source) fixes it;
+the enumerated fallback (draws never emitted under Enumerate) is retained byte-identical.
+
+One residual on d4 t18 is a **screen×multi-hit damage-rounding** state-diff (draws now match;
 PS 326 vs engine 327 — a `compute_damage` screen-halving rounding class the DP masked by reaching the
 correct total via a different roll combo, now unmasked; separate from draw streams). Remaining
-multi-hit differ labels for the next families: `randomChance[1,24]@beatup` (9), `@populationbomb` (3),
-`randomChance[90,100]@tripleaxel` (3).
+multi-hit differ label for the next family: `randomChance[1,24]@beatup` (9 — Beat Up per-member crit).
 
 ### Coordinator directive (differ-zero) — mandated observed-diff fixes (2026-07-23)
 The completion bar is ZERO differ mismatches corpus-wide (every observed count/order/kind/ARGS/

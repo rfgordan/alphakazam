@@ -3819,6 +3819,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability);
         vec![(hb, false)]
+    } else if matches!(md.id.to_id(), "populationbomb")
+        && realized_cursor(&b).is_some()
+    {
+        // Population Bomb (10 hits, multiaccuracy) can't enumerate its per-hit product — realize the
+        // single branch off the source (per-hit accuracy + crit + damage, Loaded Dice count).
+        let cur = realized_cursor(&b).unwrap();
+        let calcs = vec![compute_damage(&b, side, &md)];
+        apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
     } else if matches!(md.id.to_id(), "tripleaxel" | "triplekick") {
         // Ascending power (20/40/60 or 10/20/30) with a fresh 90% accuracy check per hit;
         // a miss ends the move. hit_prob here is the single-hit accuracy.
@@ -3827,30 +3835,36 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             .map(|i| { let mut m = md; m.base_power = step * i; m })
             .collect();
         let calcs: Vec<DamageCalc> = mds.iter().map(|m| compute_damage(&b, side, m)).collect();
-        let crit_p = crit_chance(&b, side, &md);
-        let acc = hit_prob;
-        // The k=0 (full miss) case is the standard miss branch pushed earlier.
-        let mut v = Vec::new();
-        for k in 1..=3usize {
-            let count_p = acc.powi(k as i32) * if k < 3 { 1.0 - acc } else { 1.0 };
-            if count_p <= 0.0 {
-                continue;
-            }
-            for combo in HitCombos::new(k) {
-                let mut prob = count_p;
-                for &(_, crit) in &combo {
-                    prob *= (1.0 / 16.0) * if crit { crit_p } else { 1.0 - crit_p };
-                }
-                if prob <= 0.0 {
+        if let Some(cur) = realized_cursor(&b) {
+            // Realized single path (seed gate / differ): per-hit accuracy + crit + damage off the
+            // source, KO-truncated. The enumerated branch below serves Enumerate/Sample (no draws).
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
+        } else {
+            let crit_p = crit_chance(&b, side, &md);
+            let acc = hit_prob;
+            // The k=0 (full miss) case is the standard miss branch pushed earlier.
+            let mut v = Vec::new();
+            for k in 1..=3usize {
+                let count_p = acc.powi(k as i32) * if k < 3 { 1.0 - acc } else { 1.0 };
+                if count_p <= 0.0 {
                     continue;
                 }
-                let mut hb = scaled(&b, prob);
-                annotate_hits(&mut hb, &combo, ps_crit_den(&b, side, &md));
-                let hit_sub = apply_damage_hit_indexed(&mut hb, side, &md, &calcs, &combo);
-                v.push((hb, hit_sub));
+                for combo in HitCombos::new(k) {
+                    let mut prob = count_p;
+                    for &(_, crit) in &combo {
+                        prob *= (1.0 / 16.0) * if crit { crit_p } else { 1.0 - crit_p };
+                    }
+                    if prob <= 0.0 {
+                        continue;
+                    }
+                    let mut hb = scaled(&b, prob);
+                    annotate_hits(&mut hb, &combo, ps_crit_den(&b, side, &md));
+                    let hit_sub = apply_damage_hit_indexed(&mut hb, side, &md, &calcs, &combo);
+                    v.push((hb, hit_sub));
+                }
             }
+            v
         }
-        v
     } else if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
         let crit_p = crit_chance(&b, side, &md);
@@ -5980,6 +5994,105 @@ fn apply_multihit_realized(
         hits.push((roll & 0x0F, crit));
     }
     let hit_sub = apply_damage_hit(&mut hb, side, md, &hits, crit_den);
+    vec![(hb, hit_sub)]
+}
+
+/// Realized single-path executor for a `multiaccuracy` multi-hit move (Population Bomb's 10 hits,
+/// Triple Axel / Triple Kick's 3 ascending-power hits). PS rolls each hit past the first its OWN
+/// accuracy `randomChance(acc,100)` (battle-actions.ts:907) and a miss ends the move — UNLESS the
+/// holder has Loaded Dice, whose `onModifyMove` deletes `multiaccuracy` (items.ts) so every hit
+/// lands with no per-hit roll (and Population Bomb's count becomes `10 - random(7)`). `calcs` is the
+/// per-hit `DamageCalc` (broadcast if length 1; ascending for Triple Axel). Emits count/accuracy/
+/// crit/damage in PS's exact order and applies with KO / Substitute-break termination — a hit past a
+/// faint never executes, so the draw stream truncates exactly where PS's `hitStepMoveHitLoop` breaks.
+fn apply_multihit_realized_ma(
+    b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32,
+    calcs: &[DamageCalc], mut cur: RealizedCursor,
+) -> Vec<(Branch, bool)> {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    let mut hb = scaled(b, hit_prob);
+    let loaded = hb.state.side(side).active().item == Item::LoadedDice;
+    let multiacc = !loaded; // Loaded Dice deletes multiaccuracy → no per-hit accuracy roll
+    // Hit count: fixed (Triple Axel/Kick 3, Population Bomb 10); Loaded Dice Population Bomb rolls
+    // `10 - random(7)` (battle-actions.ts:877).
+    let mut count = md.hits_max as usize;
+    if md.id.to_id() == "populationbomb" && loaded {
+        let r = cur.peek("random", &[7]);
+        draw(&mut hb, "random", &[7], r, "loadeddice");
+        count = count.saturating_sub(r as usize);
+    }
+    let crit_den = ps_crit_den(&hb, side, md);
+    let acc_arg = accuracy_arg(&hb, side, md);
+    let (def_ability, def_item, def_maxhp, life_orb) =
+        (calcs[0].def_ability, calcs[0].def_item, calcs[0].def_maxhp, calcs[0].life_orb);
+    let mut any_damage = false;
+    let mut hit_sub = false;
+    let mut total: i32 = 0;
+    let mut hits_landed: u8 = 0;
+    let mut hits_executed: u8 = 0;
+    for i in 0..count {
+        // PS breaks the loop at the TOP once the target has fainted (before any hit draw).
+        if hb.state.side(foe).active().hp <= 0 {
+            break;
+        }
+        // Per-hit accuracy (hit>1) unless Loaded Dice removed multiaccuracy; a miss ends the move.
+        if i >= 1 && multiacc {
+            let hit = cur.peek("randomChance", &[acc_arg, 100]) != 0;
+            draw(&mut hb, "randomChance", &[acc_arg, 100], hit as i64, "accuracy");
+            if !hit {
+                break;
+            }
+        }
+        let crit = crit_den > 0 && cur.peek("randomChance", &[1, crit_den]) != 0;
+        if crit_den > 0 {
+            draw(&mut hb, "randomChance", &[1, crit_den], crit as i64, "crit");
+        }
+        let roll = (cur.peek("random", &[16]) as usize) & 0x0F;
+        draw(&mut hb, "random", &[16], roll as i64, "damage-roll");
+        emit_modifydamage_shuffle(&mut hb);
+        let calc = &calcs[i.min(calcs.len() - 1)];
+        let raw = if crit { calc.rolls_crit[roll] } else { calc.rolls_nocrit[roll] };
+        let bypass_sub = md.flag_sound
+            || hb.state.side(side).active().ability == Ab::Infiltrator;
+        let sub_hp = hb.state.side(foe).substitute_hp;
+        if sub_hp > 0 && !bypass_sub && hb.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
+            let sub_dmg = raw.min(sub_hp);
+            push(&mut hb, Instruction::DamageSubstitute { side: foe, amount: sub_dmg });
+            if raw >= sub_hp {
+                push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
+            }
+            total += sub_dmg as i32;
+            any_damage = true;
+            hit_sub = true;
+            hits_executed += 1;
+            continue;
+        }
+        let target_hp = hb.state.side(foe).active().hp;
+        if target_hp <= 0 {
+            break;
+        }
+        let mut dmg = raw.min(target_hp);
+        if (def_ability == Ab::Sturdy || def_item == Item::FocusSash)
+            && target_hp == def_maxhp && dmg >= target_hp
+        {
+            dmg = target_hp - 1;
+            if def_item == Item::FocusSash {
+                let slot = hb.state.side(foe).active_index;
+                push(&mut hb, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+            }
+        }
+        if dmg > 0 {
+            let slot = hb.state.side(foe).active_index;
+            push(&mut hb, Instruction::Damage { side: foe, slot, amount: dmg });
+            any_damage = true;
+            total += dmg as i32;
+            hits_landed += 1;
+            hits_executed += 1;
+        }
+    }
+    let times_count = if hits_landed > 0 { hits_executed } else { 0 };
+    apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
     vec![(hb, hit_sub)]
 }
 
