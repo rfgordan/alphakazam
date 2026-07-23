@@ -7807,9 +7807,10 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         let mut b = b;
         if b.state.side(foe).active().is_alive() {
             // Strength Sap is a foe-targeting numeric-accuracy status move — PS `hitStepAccuracy`
-            // rolls `randomChance(100, 100)` before the drain/drop. (Special-cased above the
-            // general status accuracy branch, so emit it here.)
-            draw(&mut b, "randomChance", &[md.accuracy as i32, 100], 1, "accuracy");
+            // rolls `randomChance(accuracy, 100)` before the drain/drop (accuracy post-ModifyAccuracy
+            // / stages via `accuracy_arg`). (Special-cased above the general status accuracy branch.)
+            let acc = accuracy_arg(&b, side, md);
+            draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
             let atk_val = {
                 let t = b.state.side(foe).active();
                 let boost = b.state.side(foe).boost(BoostIndex::Attack);
@@ -7877,14 +7878,17 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     // accuracy forced to `true` — for `accuracy: true` moves (md.accuracy == 0), self-targeting
     // status moves (`target === 'self'`: Swords Dance, Calm Mind, Recover, weather, hazards…),
     // and Toxic used by a Poison-type (gen >= 8). Emit on `b` so both the hit and miss branches
-    // inherit it. (Accuracy/evasion stages and accuracy-boosting abilities/items shift the
-    // recorded arg away from the raw accuracy; unmodeled here — the differ flags those.)
+    // inherit it. The arg is the post-`ModifyAccuracy` numerator (`accuracy_arg`: Wide Lens /
+    // Compound Eyes ×4096 chain + accuracy/evasion stage boosts) — the same value `hit_prob`
+    // (`accuracy_of`) already derives, so arg and result stay consistent (e.g. Wide Lens Encore/
+    // Taunt roll `randomChance(110, 100)`).
     if md.accuracy != 0
         && md.target != crate::data::MoveTarget::User
         && !(md.id.to_id() == "toxic" && b.state.side(side).active().types.contains(&Type::Poison))
         && !accuracy_forced_true(&b, side, md)
     {
-        draw(&mut b, "randomChance", &[md.accuracy as i32, 100], (hit_prob > 0.0) as i64, "accuracy");
+        let acc = accuracy_arg(&b, side, md);
+        draw(&mut b, "randomChance", &[acc, 100], (hit_prob > 0.0) as i64, "accuracy");
     }
     let mut hit = scaled(&b, hit_prob);
 
