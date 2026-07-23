@@ -7261,8 +7261,155 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
 
 // --- end of turn -------------------------------------------------------------
 
+/// One PS end-of-turn Residual event-handler, reduced to the keys `comparePriority` ties on.
+/// PS collects a handler for every effect (status / volatile / ability / item / side-condition /
+/// weather / terrain / trick-room) that has an `onResidual`-family callback OR a live `duration`,
+/// then `speedSort`s them; a tie needs equal (order, priority, speed, subOrder, effectOrder). For
+/// the Residual event priority and effectOrder are 0 for all handlers, so a tie ⟺ equal
+/// (order, speed, subOrder). `order` "false" (no `onResidualOrder`) sorts last, as `i64::MAX`.
+#[derive(Clone, Copy)]
+struct ResHandler {
+    order: i64,
+    speed: i64,
+    sub_order: i64,
+}
+
+/// Build PS's Residual handler list from the current board (keys per `resolvePriority` /
+/// data at pin `b9dc987d`). Orders/subOrders are the resolved values recorded by the cosim
+/// label-audit (weather onFieldResidual 1/5; terrain field 27/7 + Grassy per-active 5/2;
+/// trick-room 27/1; screens 26/{reflect1,lightscreen2,tailwind5,auroraveil10}; leftovers &
+/// black sludge 5/4; toxic/flame orb & sticky barb 28/3; speedboost/baddreams/harvest/cudchew
+/// 28/2; hungerswitch 29/7; wish slot-condition 4/3; psn/tox 9/0, brn 10/0; and the ordered
+/// volatiles leechseed 8, nightmare 11, curse 12, saltcure/partialtrap 13, octolock 14, taunt 15,
+/// encore 16, disable 17, magnetrise 18, healblock 20, throatchop 22, yawn 23, perish 24,
+/// ingrain 7, roost 25 — all subOrder 2; and protect/stall subOrder 2 at order "false").
+fn residual_handlers(state: &State) -> Vec<ResHandler> {
+    use crate::ids::{Ability as Ab, Item as It, Status as St, Terrain, Weather};
+    const FALSE: i64 = i64::MAX;
+    let mut hs: Vec<ResHandler> = Vec::new();
+    let field = |order: i64, sub: i64| ResHandler { order, speed: 0, sub_order: sub };
+
+    // --- field-level handlers (holder = field/side, speed 0) ---
+    if state.weather != Weather::None {
+        hs.push(field(1, 5)); // weather onFieldResidual (all weathers)
+    }
+    if state.terrain != Terrain::None {
+        hs.push(field(27, 7)); // terrain field-level duration handler
+    }
+    if state.trick_room {
+        hs.push(field(27, 1));
+    }
+    for side in [SideId::One, SideId::Two] {
+        let sc = &state.side(side).side_conditions;
+        if sc.reflect > 0 { hs.push(field(26, 1)); }
+        if sc.light_screen > 0 { hs.push(field(26, 2)); }
+        if sc.tailwind > 0 { hs.push(field(26, 5)); }
+        if sc.aurora_veil > 0 { hs.push(field(26, 10)); }
+    }
+
+    // --- per-active handlers (holder = active, speed = its current Speed) ---
+    for side in [SideId::One, SideId::Two] {
+        let s = state.side(side);
+        let p = s.active();
+        if !p.is_alive() {
+            continue;
+        }
+        let speed = effective_speed(state, side) as i64;
+        let mut push = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
+
+        // Grassy Terrain heals each active (per-active handler), regardless of grounding
+        // (the grounding test is inside PS's callback, after collection).
+        if state.terrain == Terrain::Grassy {
+            push(5, 2);
+        }
+        // Status residuals.
+        match p.status {
+            St::Poison | St::Toxic => push(9, 0),
+            St::Burn => push(10, 0),
+            _ => {}
+        }
+        // Ordered volatile / counter conditions (all subOrder 2).
+        use crate::volatile::VolatileStatus as V;
+        let v = s.volatiles;
+        if v.contains(V::Ingrain) { push(7, 2); }
+        if v.contains(V::LeechSeed) { push(8, 2); }
+        if v.contains(V::Nightmare) { push(11, 2); }
+        if v.contains(V::Curse) { push(12, 2); }
+        if v.contains(V::SaltCure) { push(13, 2); }
+        if s.partial_trap_turns > 0 { push(13, 2); }
+        if v.contains(V::Octolock) { push(14, 2); }
+        if s.taunt_turns > 0 { push(15, 2); }
+        if s.encore.1 > 0 { push(16, 2); }
+        if s.disable.1 > 0 { push(17, 2); }
+        if s.magnet_rise_turns > 0 { push(18, 2); }
+        if s.heal_block_turns > 0 { push(20, 2); }
+        if s.throat_chop_turns > 0 { push(22, 2); }
+        if s.yawn_turns > 0 { push(23, 2); }
+        if s.perish_turns > 0 { push(24, 2); }
+        if v.contains(V::Roost) { push(25, 2); }
+        // Wish resolves as a slot condition on the occupant (order 4, subOrder 3).
+        if s.wish.0 > 0 { push(4, 3); }
+        // Items.
+        match p.item {
+            It::Leftovers | It::BlackSludge => push(5, 4),
+            It::ToxicOrb | It::FlameOrb | It::StickyBarb => push(28, 3),
+            _ => {}
+        }
+        // Abilities with an end-of-turn onResidual.
+        match p.ability {
+            Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => push(28, 2),
+            Ab::HungerSwitch => push(29, 7),
+            _ => {}
+        }
+        // Protect + Stall: a mon that successfully protected this turn carries both the `protect`
+        // (duration-1) and `stall` (duration-2) volatiles at Residual; both order "false", subOrder
+        // 2, same holder → a guaranteed same-Pokémon tie (the dominant tail-2 shuffle).
+        if v.contains(V::Protect) {
+            push(FALSE, 2); // protect
+            if s.stall_counter > 0 {
+                push(FALSE, 2); // stall
+            }
+        }
+    }
+    hs
+}
+
+/// Emit the `speedSort` shuffle draws PS makes over the Residual handler list. Selection-sort
+/// mirror of `comparePriority`: sort best-first (order asc, speed desc, subOrder asc), then for
+/// every maximal run of ≥2 mutually-tying handlers emit one `shuffle[len, start, start+run]`, in
+/// ascending start position — exactly the sequence `battle.speedSort` produces.
+fn emit_residual_shuffles(b: &mut Branch) {
+    let mut hs = residual_handlers(&b.state);
+    if hs.len() < 2 {
+        return;
+    }
+    let len = hs.len() as i32;
+    // Stable sort keeps handler build order within a tie group (irrelevant — the group is shuffled).
+    hs.sort_by(|a, c| a.order.cmp(&c.order).then(c.speed.cmp(&a.speed)).then(a.sub_order.cmp(&c.sub_order)));
+    let ties = |a: &ResHandler, c: &ResHandler| a.order == c.order && a.speed == c.speed && a.sub_order == c.sub_order;
+    let mut i = 0usize;
+    while i + 1 < hs.len() {
+        let mut j = i + 1;
+        while j < hs.len() && ties(&hs[i], &hs[j]) {
+            j += 1;
+        }
+        if j - i >= 2 {
+            draw(b, "shuffle", &[len, i as i32, j as i32], -1, "residual");
+        }
+        i = j;
+    }
+}
+
 pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     let b = &mut branch;
+    // PS `fieldEvent('Residual')` speed-sorts the collected residual handlers via `speedSort`
+    // (battle.ts:507); every tie-group of ≥2 handlers equal under `comparePriority` consumes one
+    // `prng.shuffle`. Emit those shuffles here, in handler order, before any residual state is
+    // applied (the shuffles are state-neutral — order is validated by `stateAfter`). No-op unless
+    // draw annotation is on, so `Enumerate`/`Sample` are byte-unchanged.
+    if annotating() {
+        emit_residual_shuffles(b);
+    }
     // Mirror Coat's per-turn special-damage record (PS's duration-1 `mirrorcoat` volatile) does
     // not survive to the next turn — clear it so it never leaks into a later Mirror Coat.
     for side in [SideId::One, SideId::Two] {

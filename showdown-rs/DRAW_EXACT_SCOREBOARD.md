@@ -67,19 +67,79 @@ PS-source basis. The fix-decay curve (% gained per class) is kill-criterion #2 e
 | 2026-07-23 | **Protect stall counter** (`randomChance[1,3^n]@stall`) | 80.19% | 80.68% | +0.49 (+19 u) | PS `stall` volatile `onStallMove` rolls `randomChance(1, counter)` with `counter = 3^n` (capped 729) on each *consecutive* protect use; the first use has no `stall` volatile yet, so no roll. The engine's `stall_counter` is exactly `n` — emit `randomChance(1, 3^n)` on both the success and fail branches when `n >= 1`. |
 | 2026-07-23 | **special-cased status moves' missing draws** (`random[100]@curse`, `randomChance[100,100]@strengthsap`) | 80.68% | 81.44% | +0.76 (+29 u) | Curse and Strength Sap return early in `execute_status_move` before the general draw sites. Non-Ghost Curse's `onTryHit` rewrites the move to `move.self = {boosts}` → `selfDrops` rolls one `random(100)`. Strength Sap is a foe-targeting numeric-accuracy status move → `hitStepAccuracy` rolls `randomChance(100,100)`. Emit each in its special-case block. |
 | 2026-07-23 | **accuracy forced `true` skips the roll** (removes `accuracy` rust-extra vs No Guard / weather-perfect / Glaive Rush — the `crit-args` cluster: Hurricane, Poltergeist, Close Combat, Quick Attack, Beat Up) | 81.44% | 82.28% | +0.84 (+32 u) | PS overrides accuracy to `true` (no `randomChance` draw, but crit still rolls) via an event: No Guard (`onAnyAccuracy`), a Glaive Rush target (`onAccuracy`), and weather-perfect accuracy (Blizzard in snow; Thunder/Hurricane/Bleakwind/Wildbolt/Sandsear Storm in rain — `onModifyMove move.accuracy = true`). A plain 100-accuracy move still rolls `randomChance(100,100)`. New `accuracy_forced_true` predicate gates both the damaging and status accuracy draws. |
+| 2026-07-23 | **Residual handler-order `speedSort` shuffles** (the `shuffle[N,N-2,N]@generic` end-of-turn tail-ties: `shuffle[4,2,4]`/`[3,1,3]`/`[5,3,5]` — 88+47+35 u — plus the Residual half of `shuffle[2,0,2]`) | 82.28% | **86.19%** | +3.91 (+150 u) | PS `fieldEvent('Residual')` (battle.ts:507) `speedSort`s the collected residual handlers; every tie-group of ≥2 handlers equal under `comparePriority` consumes one `prng.shuffle(list, sorted, sorted+len)`. For the Residual event priority & effectOrder are 0 for all handlers, so a tie ⟺ equal (order, speed, subOrder). New `residual_handlers()` rebuilds PS's list from board state with per-effect (order, subOrder) keys from data at the pin (label-audit-verified: weather 1/5, terrain-field 27/7 + Grassy-per-active 5/2, trick-room 27/1, screens 26/{reflect 1, lightscreen 2, tailwind 5, auroraveil 10}, leftovers/black-sludge 5/4, orbs/sticky-barb 28/3, speedboost/baddreams/harvest/cudchew 28/2, hungerswitch 29/7, wish 4/3, psn/tox 9/0, brn 10/0, ordered volatiles ingrain 7…roost 25 all subOrder 2, protect+stall at order `false`); `emit_residual_shuffles()` is a selection-sort mirror of `comparePriority` emitting one shuffle per tie-group, called (annotation-only) at the top of `apply_end_of_turn`. Verified zero false-positive emissions (no rust-side shuffle mismatch anywhere in the corpus). |
 
 ## Burn-down summary
-56.98% → **82.28%** over 8 committed classes (+25.30 pts, +969 units). Fix-decay curve is
+56.98% → **86.19%** over 9 committed classes (+29.21 pts, +1119 units). Fix-decay curve is
 healthy: each class landed a real, structured, decaying slice (207, 282, 132, 206, 62, 19,
-29, 32 units) with **no** new independent mismatch class revealed per fix beyond the known
-queue — kill-criterion #2 (non-decaying density) is **not** triggered. All 8 classes are
+29, 32, 150 units) with **no** new independent mismatch class revealed per fix beyond the known
+queue — kill-criterion #2 (non-decaying density) is **not** triggered. All 9 classes are
 draw-*accounting* fixes; none required unobservable state (kill-criterion #1 not triggered).
 
-## The keystone: `speedSort` handler-order shuffles (the remaining ~300 units)
+## The keystone: `speedSort` handler-order shuffles — label audit + what landed
 
-The dominant remaining class is PS's `battle.speedSort` shuffles (`shuffle[N, N-2, N]@generic`:
-counts 130 / 88 / 47 / 35 for the 2/4/3/5-length lists). This is charter Phase-2 item #3 and
-the single largest remaining block. Findings + the design to build (pin `b9dc987d`):
+### Label-audit methodology (recorder enhancement, landed)
+The recorder (`instrumentPrng` in `harness/cosim.mjs`) now tags every `shuffle` draw with the
+triggering `eventid` (via a runEvent/fieldEvent/eachEvent id-stack, since PS sets `battle.event`
+*after* the speedSort) and the full handler list with each element's resolved
+(effect id/type/name, holder, order, priority, speed, subOrder, effectOrder). A ~28-trace
+label-audit set (r*/d*/ou/directed/trap/coverage seeds, same games as the certification corpus)
+was regenerated to `/tmp/drawlabels/` — the committed corpus stays the certification set. This
+turned the `@generic` blob into an exact per-(event,tie-group) work list. **The audit
+decomposes the 438 shuffle draws by bracket:**
+
+| eventid | draws | tie-group composition | scope |
+|---|---|---|---|
+| `Update` (eachEvent) | 240 | the two actives at **equal Speed** (`shuffle[2,0,2]`) | per-move / per-faint / end-of-turn — see below |
+| `Residual` (fieldEvent) | 94 | end-of-turn handler list, tail/cross-side ties | **LANDED** |
+| `null` (action queue) | 53 | `move,move` actor tie (partly modeled); `team,team` teampreview | partly modeled |
+| `BeforeTurn` (eachEvent) | 36 | actives equal Speed | same family as Update |
+| `ModifyDamage` (runEvent) | 11 | both sides' screens (`onAnyModifyDamage`, subOrder 4) equal | small |
+| `Weather`/`TerrainChange` (eachEvent) | 3 | actives equal Speed | Update family |
+| `TrapPokemon` (runEvent) | (trapF only) | No Retreat + Octolock + partial-trap stack tie | excluded (see below) |
+| `DisableMove` | 1 | choicelock + healblock tie | excluded (negligible) |
+
+### Residual bracket — LANDED (82.28% → 86.19%)
+See the burn-down row above. `residual_handlers()` + `emit_residual_shuffles()` in `generate.rs`
+rebuild PS's `fieldEvent('Residual')` list and selection-sort it, emitting one shuffle per
+tie-group. Ties reduce to equal (order, speed, subOrder) because priority & effectOrder are 0 for
+every Residual handler. Zero false-positive emissions across the whole corpus (the differ shows
+no rust-side shuffle mismatch anywhere), so no exact→fail regression is possible — the model only
+ever emits a shuffle PS also emits.
+
+### Remaining bracket — `eachEvent` actives Speed-tie (`Update`/`BeforeTurn`/`Weather`, the residual `shuffle[2,0,2]@generic` = 129 units)
+`eachEvent(eventid)` (battle.ts:465) speed-sorts `getAllActive()` with `(a,b)=>b.speed-a.speed`;
+in singles the two actives tie **iff their current Speeds are exactly equal**, emitting
+`shuffle[2,0,2]`. This is the dominant remaining class and is **concentrated in equal-Speed
+matchups** (audit: t1 99 draws / 21 decisions, c1 49/9, r10 32/6, c5a1 30/6, c7 27/4; 22 of 27
+audit traces have **zero**). The tie predicate (both actives alive, `effective_speed` equal) is
+fully reconstructable from state — **kill-criterion #1 not triggered**. What makes it larger than
+Residual is *call-count*: PS fires `eachEvent('Update')` at **seven** sites across a turn
+(battle.ts:474 after every Weather event, 2866/2882 in the faint/endturn loop; battle-actions.ts:83
+on switch-in, 970/1024 in the move/afterMove path), so a single equal-Speed turn emits an Update
+shuffle at turn-start, after each move hit, after each faint, and at end-of-turn — interleaved
+with the move kernel's own draws (see c1 dec20: Update, queue-tie, Update, [move draws], Update×3,
+Residual, Update). Faithful modeling therefore requires mirroring PS's per-turn Update dispatch
+schedule inside `execute_move`/faint handling, not a single end-of-turn injection — a larger,
+move-kernel-interleaved change than the discrete Residual phase. Deferred as the next tranche;
+the predicate and call-site map above are the complete spec.
+
+### Excluded brackets (documented, cannot/should-not model here)
+- **`TrapPokemon` multi-trap stack** (`shuffle[3,0,3]`, trapF only): fires when one mon is trapped
+  by ≥2 sources simultaneously (No Retreat + Octolock + partial-trap) whose handlers all tie at
+  order `false`/subOrder 2/equal speed. This is a `runEvent('TrapPokemon')` at switch/request time,
+  outside end-of-turn; it appears only in the deliberately-pathological trapF game. Reconstructable
+  from state (the trap volatiles are all tracked) but out of the Residual scope — a small directed
+  item for a later pass, not a corpus-wide class.
+- **`null` action-queue length** (`shuffle[3,0,2]` where the engine emits `shuffle[2,0,2]@speed-tie`):
+  PS's turn queue also holds the pending `residual` (and sometimes `beforeTurn`) action, so an
+  actor Speed-tie shuffles a length-3 list (`shuffle[3,0,2]`), not length-2. The engine's
+  action-tie site emits `shuffle[2,0,2]`; the fix is to widen its `list.len` arg to the true queue
+  length. Small, state-reconstructable; folded into the action-queue item.
+
+### The mechanism (reference)
+The dominant remaining class was PS's `battle.speedSort` shuffles (`shuffle[N, N-2, N]@generic`).
+Findings + the design (pin `b9dc987d`):
 
 **Where the draw comes from.** `speedSort(list, comparator)` (battle.ts:429) is a *selection
 sort*. At each output position `sorted` it gathers `nextIndexes` = every element tying the
@@ -137,7 +197,14 @@ order* — reconstructable from the battle's hazard-application / entry history 
 already has or can track), not hidden JS object identity. So the keystone is effort-bound, not
 structurally blocked.
 
-## Other remaining classes (post-keystone, ranked)
+## Other remaining classes (post-Residual, ranked at 86.19%)
+Current differ top labels: `shuffle[2,0,2]@generic` (129 — the `eachEvent` Update Speed-tie
+bracket documented above), then:
+- `random[2,5]@slp` (21, pos 4): residual-applied sleep duration ordering.
+- `randomChance[1,2]@harvest` (19): Harvest's end-of-turn 50% berry-restore, a residual ability
+  draw at order 28 — interleaves with the residual shuffles (a harvest+protect mon has PS order
+  `[harvest randomChance, protect+stall shuffle]`; the shuffle model emits the shuffle but not the
+  harvest roll, so these units await the harvest class before going exact).
 - `sample[20]@bulletseed` (19): variable multi-hit COUNT `sample([2,2,…,5])` = `random(20)`,
   then per-hit crit/damage. The engine folds count into the sumset DP — needs the DP path to
   emit the count sample (charter Phase-2 #2); structurally the largest non-shuffle item.
@@ -168,7 +235,11 @@ and the queue is a clean ranked work list. The single highest-leverage item is m
 `speedSort` handler-order shuffles, which underlies both the direct `shuffle@generic` misses
 and many downstream alignment slips. Direction is viable; proceed to the Phase-2 burn-down.
 
-## Gates (all green)
-- `cargo test --release -p engine`: all suites pass (psprng raw gate incl.).
-- `sampled_distribution`: Sample ≡ Enumerate (annotation didn't move Sample).
-- Full corpus state-verify: **3831/3831 matched, 100% exact, 0 unsupported**.
+## Gates (all green, 2026-07-23 after Residual model)
+- `cargo test --release -p engine`: all suites pass (12/12 main + psprng raw gate + 29-fixture etc.).
+- `sampled_distribution`: Sample ≡ Enumerate (residual shuffles are annotation-guarded — Sample
+  unmoved).
+- Full corpus state-verify: **3831/3831 matched, 100% exact, 0 unsupported** (shuffles are
+  state-neutral; the residual model cannot move state).
+- Draw-consumption differ: **3302/3831 = 86.19% draw-exact**, no rust-side shuffle mismatch
+  anywhere in the corpus (zero false-positive residual emissions).
