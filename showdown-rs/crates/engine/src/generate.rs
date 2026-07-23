@@ -1993,6 +1993,37 @@ fn crit_chance(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
     }
 }
 
+/// The denominator PS passes to `randomChance(1, critMult[critRatio])` in the crit step
+/// (battle-actions.ts:1645), or 0 when PS makes no roll. PS rolls whenever `willCrit === undefined`
+/// and the crit stage ≥ 1 — INDEPENDENT of target crit-immunity: Battle Armor / Shell Armor /
+/// Lucky Chant hook `CriticalHit`, which only downgrades the *result* AFTER the roll, not
+/// `ModifyCritRatio`. Always-crit moves set `willCrit = true` and skip the roll. gen9 crit
+/// denominators by stage (critRatio-1): 0→24, 1→8, 2→2, 3+→1 (`critMult = [0,24,8,2,1]`).
+/// Mirrors `crit_chance`'s stage math but ignores the immunity short-circuit and returns the
+/// exact PS call denominator (so crit-immune and always-via-ratio hits still roll).
+fn ps_crit_den(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
+    use crate::ids::Ability as Ab;
+    if md.always_crit {
+        return 0; // willCrit === true → PS skips the roll
+    }
+    let mut stage = (md.crit_ratio.max(1) - 1) as u32;
+    if b.state.side(side).volatiles.contains(VolatileStatus::FocusEnergy) {
+        stage += 2;
+    }
+    if matches!(b.state.side(side).active().item, Item::ScopeLens | Item::RazorClaw) {
+        stage += 1;
+    }
+    if b.state.side(side).active().ability == Ab::SuperLuck {
+        stage += 1;
+    }
+    match stage {
+        0 => 24,
+        1 => 8,
+        2 => 2,
+        _ => 1,
+    }
+}
+
 /// Maximum hit count for which we enumerate the *full* per-hit (roll × crit) product.
 /// At 3 hits that's 32³ = 32,768 branches (~28 MB of states) — fine. Above this the
 /// product explodes (Population Bomb's 10 hits → 32¹⁰ ≈ 1.1e15 branches, ~1 EB, which
@@ -3305,7 +3336,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     continue;
                 }
                 let mut hb = scaled(&b, prob);
-                annotate_hits(&mut hb, &combo, crit_p);
+                annotate_hits(&mut hb, &combo, ps_crit_den(&b, side, &md));
                 let hit_sub = apply_damage_hit_indexed(&mut hb, side, &md, &calcs, &combo);
                 v.push((hb, hit_sub));
             }
@@ -3323,7 +3354,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 continue;
             }
             let mut hb = scaled(&b, prob);
-            annotate_hits(&mut hb, &combo, crit_p);
+            annotate_hits(&mut hb, &combo, ps_crit_den(&b, side, &md));
             let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
             v.push((hb, hit_sub));
         }
@@ -3450,13 +3481,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 /// roll) followed by the damage `random(16)`. The engine's roll index equals PS's `random(16)`
 /// value by construction (`damage_rolls[roll]` uses factor `(100-roll)/100`), and results are
 /// validated against `stateAfter`, so only kind/args/order/count are load-bearing.
-fn annotate_hits(hb: &mut Branch, combo: &[(u8, bool)], crit_p: f32) {
+fn annotate_hits(hb: &mut Branch, combo: &[(u8, bool)], crit_den: i32) {
     if !annotating() {
         return;
     }
-    let crit_den = if crit_p > 0.0 && crit_p < 1.0 { (1.0 / crit_p).round() as i32 } else { 0 };
     for &(roll, crit) in combo {
         if crit_den > 0 {
+            // PS rolls once per hit whenever `willCrit` is undefined (crit_den > 0), even against a
+            // crit-immune target (the realized `crit` is already false on that branch — the roll is
+            // draw-and-discard). `result` isn't compared by the differ; the state validates it.
             draw(hb, "randomChance", &[1, crit_den], crit as i64, "crit");
         }
         draw(hb, "random", &[16], roll as i64, "damage-roll");
