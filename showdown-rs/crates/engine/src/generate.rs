@@ -7988,6 +7988,13 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
         }
         // Abilities with an end-of-turn onResidual.
         match p.ability {
+            // Hydration (order 5, subOrder 3): its onResidual is collected for every living
+            // holder regardless of weather (the rain/status check is inside the callback), so
+            // it sits in the Residual handler list ahead of Leftovers (order 5, subOrder 4) and
+            // the order-`false` stall/protect tie. The engine previously omitted it, shortening
+            // the list by one and mis-sizing the tail shuffle (`[2,0,2]`/`[3,1,3]` where PS has
+            // `[3,1,3]`/`[4,2,4]`). Verified as the ONLY residual handler missing corpus-wide.
+            Ab::Hydration => push(5, 3),
             Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => push(28, 2),
             Ab::HungerSwitch => push(29, 7),
             _ => {}
