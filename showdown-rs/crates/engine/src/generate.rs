@@ -895,49 +895,80 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
         return 1.0;
     }
     let id = md.id.to_id();
+    // Weather-perfect (forced-`true`) accuracy — always hits. (Sun-halved Thunder/Hurricane is a
+    // NUMERIC 50 and flows through `accuracy_numerator` below.)
     match (id, effective_weather(&b.state)) {
         ("blizzard", Weather::Snow) => return 1.0,
         ("thunder" | "hurricane" | "bleakwindstorm" | "wildboltstorm" | "sandsearstorm", Weather::Rain | Weather::HeavyRain) => return 1.0,
-        ("thunder" | "hurricane", Weather::Sun | Weather::HarshSun) => return 0.5,
         _ => {}
     }
-    let mut acc = md.accuracy as f32;
-    if atk.ability == Ab::CompoundEyes {
-        acc *= 1.3;
-    }
-    if atk.ability == Ab::Hustle && md.category == MoveCategory::Physical {
-        acc *= 0.8;
-    }
-    if atk.item == Item::WideLens {
-        acc *= 1.1;
-    }
-    (acc / 100.0).min(1.0)
+    (accuracy_numerator(b, side, md) as f32 / 100.0).min(1.0)
 }
 
-/// The integer numerator PS passes to `randomChance(accuracy, 100)` at `hitStepAccuracy` —
-/// i.e. the move's accuracy AFTER `onModifyMove`/`ModifyAccuracy` shift it. The engine emitted
-/// the raw `md.accuracy`; PS records the modified value. Modelled: Hustle (physical ×0.8, an
-/// `onModifyMove`) and sun-halved Thunder/Hurricane (=50). Compound Eyes / Wide Lens and
-/// accuracy/evasion STAGE modifiers are NOT modelled (they need the foe's evasion boost and the
-/// 4096 chain rounding) — those args stay raw and the differ still flags them. Only ever called
-/// when a numeric-accuracy draw is actually emitted (`md.accuracy != 0`, not forced-true).
-fn accuracy_arg(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
+/// PS `chainModify` step: fold a `next`/4096 factor into a running `prev`/4096 modifier with
+/// PS's round-half-up (`(prev*next + 2048) >> 12`). Both args are 4096-fixed-point (4096 = ×1).
+fn chain_mod(prev: i64, next: i64) -> i64 {
+    (prev * next + 2048) >> 12
+}
+
+/// Whether a move ignores the target's evasion boost (`ignoreEvasion: true`, data/moves.ts) —
+/// its accuracy stage combines only the attacker's accuracy boost, not the target's evasion.
+fn move_ignores_evasion(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "chipaway" | "darkestlariat" | "nihillight" | "sacredsword")
+}
+
+/// The exact integer numerator PS passes to `randomChance(accuracy, 100)` at `hitStepAccuracy`:
+/// `move.accuracy` after `onModifyMove` (Hustle physical ×0.8, sun Thunder/Hurricane = 50), the
+/// `ModifyAccuracy` ×4096 chain (Compound Eyes 5325/4096, Wide Lens 4505/4096 — applied to the
+/// raw accuracy BEFORE the stage boosts), and the accuracy/evasion STAGE boosts
+/// (`trunc(acc*(3+b)/3)` up / `trunc(acc*3/(3-b))` down, with `b = clamp(acc_stage) then
+/// clamp(b - eva_stage)`). May exceed 100 (the caller caps the probability). Only meaningful for
+/// a numeric-accuracy move that isn't forced-`true`. PS ref: battle-actions.ts:685 hitStepAccuracy.
+fn accuracy_numerator(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
     use crate::ids::Ability as Ab;
-    // Sun fixes Thunder/Hurricane accuracy to 50 (`onModifyMove`), the only non-forced-true
-    // weather accuracy (rain forces `true`, handled by `accuracy_forced_true`).
-    if matches!(
+    let atk = b.state.side(side).active();
+    let foe = side.other();
+    // --- onModifyMove (runs before hitStepAccuracy) ---
+    let mut acc: i64 = if matches!(
         (md.id.to_id(), effective_weather(&b.state)),
         ("thunder" | "hurricane", Weather::Sun | Weather::HarshSun)
     ) {
-        return 50;
+        50
+    } else if atk.ability == Ab::Hustle && md.category == MoveCategory::Physical {
+        // Move accuracies are multiples of 5 → ×4/5 is exact and integer.
+        md.accuracy as i64 * 4 / 5
+    } else {
+        md.accuracy as i64
+    };
+    // --- runEvent('ModifyAccuracy'): attacker item/ability ×4096 chain ---
+    let mut modf: i64 = 4096; // running event.modifier (4096-fixed; 4096 = ×1)
+    if atk.ability == Ab::CompoundEyes {
+        modf = chain_mod(modf, 5325); // 5325/4096 ≈ ×1.3
     }
-    let atk = b.state.side(side).active();
-    // Hustle lowers physical-move accuracy to 0.8× (`onModifyMove move.accuracy *= 0.8`). Move
-    // accuracies are multiples of 5, so ×4/5 is exact and integer.
-    if atk.ability == Ab::Hustle && md.category == MoveCategory::Physical {
-        return md.accuracy as i32 * 4 / 5;
+    if atk.item == Item::WideLens {
+        modf = chain_mod(modf, 4505); // 4505/4096 ≈ ×1.1
     }
-    md.accuracy as i32
+    if modf != 4096 {
+        acc = crate::damage::modify(acc, modf, 4096);
+    }
+    // --- accuracy / evasion stage boosts (combined, clamped -6..6) ---
+    let mut boost: i64 = (b.state.side(side).boost(BoostIndex::Accuracy) as i64).clamp(-6, 6);
+    if !move_ignores_evasion(md.id) {
+        boost = (boost - b.state.side(foe).boost(BoostIndex::Evasion) as i64).clamp(-6, 6);
+    }
+    if boost > 0 {
+        acc = acc * (3 + boost) / 3; // trunc
+    } else if boost < 0 {
+        acc = acc * 3 / (3 - boost); // trunc
+    }
+    acc as i32
+}
+
+/// The integer numerator PS passes to `randomChance(accuracy, 100)` at `hitStepAccuracy`. Only
+/// ever called when a numeric-accuracy draw is actually emitted (`md.accuracy != 0`, not
+/// forced-true), so it delegates straight to the exact `accuracy_numerator`.
+fn accuracy_arg(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
+    accuracy_numerator(b, side, md)
 }
 
 /// Whether PS overrides a move's accuracy to `true` (bypassing the `hitStepAccuracy` roll
