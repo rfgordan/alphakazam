@@ -12,12 +12,35 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 43 / 111 full games exact end-to-end (38.7%); init-aligned from seed 105/111.**
+**Result: 49 / 111 full games exact end-to-end (44.1%); init-aligned from seed 105/111.
+Draw-consumption differ 90.16% → 93.19% (3570/3831), zero shuffle over-emission.**
 
-### Phase-3 deferral-burn-down tranche (2026-07-23, 42 → …) — working the merged dossier queue
+### Phase-3 deferral-burn-down tranche (2026-07-23, 42 → 49) — working the merged dossier queue
 | step | games | class landed | commit |
 |------|-------|--------------|--------|
-| P3.7 | 43/111 | **double-switch batched/interleaved runSwitch bracket** (both-sides-switch turns) | (this tranche) |
+| P3.7 | 43/111 | **double-switch batched/interleaved runSwitch bracket** (both-sides-switch turns) | double-switch |
+| P3.8 | 44/111 | **Tri Attack secondary draws** (`random[100]`+`sample[3]` status pick) | triattack |
+| P3.9 | 45/111 | **Dire Claw secondary** (`random[100]`+`sample[3]`, sleep-dur on slp) | direclaw |
+| P3.10 | 47/111 | **Substitute-blocked secondary rolls** (sub hit still rolls `random(100)`) | sub-secondary |
+| P3.11 | 48/111 | **Alluring Voice secondary roll** (100%-secondary emission) | alluringvoice |
+| P3.12 | 49/111 | **ModifyDamage screen-tie shuffle** (both/either side screened, `[K,0,K]`) | modifydamage |
+
+*P3.12 — ModifyDamage screen shuffle.* PS `getDamage` runs `runEvent('ModifyDamage')` after the
+damage roll (battle-actions.ts:1830). Reflect/Light Screen/Aurora Veil register `onAnyModifyDamage`
+handlers whose `effectHolder` is the SIDE (no `getStat`) → comparePriority `speed` 0, `subOrder` 4
+(side condition); every present screen ties on (order false, priority 0, speed 0, subOrder 4)
+regardless of active Speed. `speedSort` shuffles the tie-group once when ≥2 screens are on the field.
+Every other ModifyDamage handler (resist berries, Multiscale, Life Orb, …) has speed>0/subOrder 7-8
+and sorts BEFORE the speed-0 screens — corpus-wide EVERY mid-move ModifyDamage shuffle is `[K,0,K]`
+(scan: 69× `[2,0,2]` + 4× `[3,0,3]`, start always 0). Emitted per damaging hit after the damage
+roll in `apply_damage_hit`/`annotate_hits`. This is the mid-move `shuffle@<move>` the earlier analysis
+mislabeled a handler-order mystery. Flips d2, advances d4 (bulletseed/Class 2). Corrects the
+scoreboard's earlier "equal holder Speed" claim: side-condition handlers have speed 0, so screens
+tie unconditionally.
+
+**NOTE — the earlier "970-after-secondaries" model was incomplete:** the `shuffle@<move>` between the
+damage roll and the secondary is NOT the per-hit 970 Update (that fires after `spreadMoveHit`); it is
+this ModifyDamage screen tie inside `getDamage`.
 
 *P3.7 — double-switch bracket.* A turn-action `sw/sw` turn is NOT batched: PS's `switch` action
 (order 103) queues its `runSwitch` (order 101), which preempts the OTHER side's pending `switch`

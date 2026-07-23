@@ -400,6 +400,30 @@ fn emit_update_hit(b: &mut Branch) {
     }
 }
 
+/// Emit the `ModifyDamage` screen-tie shuffle PS makes inside `getDamage` (`runEvent('ModifyDamage')`,
+/// battle-actions.ts:1830), fired per damaging hit AFTER the damage roll and before the secondary.
+/// The Reflect / Light Screen / Aurora Veil side-conditions each register an `onAnyModifyDamage`
+/// handler whose `effectHolder` is the SIDE (Side has no `getStat`), so comparePriority sees `speed`
+/// 0 and `subOrder` 4 (side condition) — every present screen ties on (order false, priority 0,
+/// speed 0, subOrder 4), independent of any active's Speed. `speedSort` shuffles the tie-group once
+/// when ≥2 screens are on the field. Every OTHER ModifyDamage handler (resist berries, Multiscale,
+/// Life Orb, Expert Belt, …) has speed>0 / subOrder 7-8 and sorts strictly BEFORE the speed-0
+/// screens; corpus-wide EVERY mid-move ModifyDamage shuffle is `[K,0,K]` (no such handler precedes
+/// the screens on a tied hit), so the tie-group starts at 0. Annotation-only; state-neutral.
+fn emit_modifydamage_shuffle(b: &mut Branch) {
+    if !annotating() {
+        return;
+    }
+    let mut k = 0i32;
+    for side in [SideId::One, SideId::Two] {
+        let sc = &b.state.side(side).side_conditions;
+        k += (sc.reflect > 0) as i32 + (sc.light_screen > 0) as i32 + (sc.aurora_veil > 0) as i32;
+    }
+    if k >= 2 {
+        draw(b, "shuffle", &[k, 0, k], -1, "modifydamage");
+    }
+}
+
 /// Emit the turn-start Update bracket PS produces before any move executes, in queue order:
 ///   1. `commitChoices` `queue.sort()` (battle.ts:3039): the two committed actions tie →
 ///      `shuffle[2,0,2]`. Two moves tie iff a full `move_order` tie (equal order/priority/
@@ -3816,6 +3840,8 @@ fn annotate_hits(hb: &mut Branch, combo: &[(u8, bool)], crit_den: i32) {
             draw(hb, "randomChance", &[1, crit_den], crit as i64, "crit");
         }
         draw(hb, "random", &[16], roll as i64, "damage-roll");
+        // ModifyDamage screen-tie shuffle (per getDamage, after the damage roll).
+        emit_modifydamage_shuffle(hb);
     }
 }
 
@@ -4539,6 +4565,8 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             draw(b, "randomChance", &[1, crit_den], crit as i64, "crit");
         }
         draw(b, "random", &[16], roll as i64, "damage-roll");
+        // ModifyDamage screen-tie shuffle (per getDamage, after the damage roll).
+        emit_modifydamage_shuffle(b);
         let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
         let raw = rolls[roll as usize];
         // Route to the Substitute if the target has one up (it absorbs the whole hit).
