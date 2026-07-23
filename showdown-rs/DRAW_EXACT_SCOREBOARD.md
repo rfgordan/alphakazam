@@ -12,7 +12,28 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 21 / 111 full games exact end-to-end (18.9%); init-aligned from seed 105/111.**
+**Result: 36 / 111 full games exact end-to-end (32.4%); init-aligned from seed 105/111.**
+
+### Phase-3 burn-down progression (games exact end-to-end, from seed)
+| step | games | class(es) landed |
+|------|-------|------------------|
+| baseline (threshold-secondary + move-order forcing) | 21/111 | — |
+| P3.1 | 36/111 | **multi-hit KO early-termination** (`drawexact-p3: rust-extra crit — 21→…`) + **accuracy hit/miss site-typed selection** |
+
+P3.1 — two draw-order corrections, both realized-path (Replicate) only, Enumerate byte-identical:
+1. *Multi-hit KO early-termination.* The per-hit crit+damage draws are now emitted INSIDE the
+   exact-hit loop (`apply_damage_hit`), after the top-of-loop KO check, matching PS's
+   `hitStepMoveHitLoop` (the `targets.every(!hp)` break precedes the next hit's `getDamage`
+   crit/damage rolls). A multi-hit that faints the target on hit *k* stops the draw stream at
+   *k* pairs; combos that differ only in phantom post-KO rolls collapse to the same
+   (draws, instructions), so the Replicate filter never over-consumes the PRNG. Cleared the whole
+   `rust-extra randomChance[1,24]@crit` class (23 games' first-divergence).
+2. *Accuracy hit/miss selection.* The accuracy `randomChance(acc,100)` draw was annotated on the
+   shared pre-split branch with `result = (can-hit)`, so BOTH hit and miss branches carried `1`;
+   on a real miss the filter matched neither, fell through to the crit roll, and mis-selected a
+   HIT branch. Now the hit branches carry the hit value (1) and the miss branch overrides its copy
+   to 0 — site-typed, per-branch, no prefer-longer-branch heuristic. (These two interact: the
+   accuracy fix is what exposed/cleared the crit over-roll on the same games.)
 
 ### PsPrng from-seed validation (`RAW_DRAW_GATE=1`, `INIT_SCAN=1`)
 Every one of the 111 games' recorded **strong** draw streams (the ~3.9k non-shuffle draws with

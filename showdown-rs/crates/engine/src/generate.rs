@@ -3349,6 +3349,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // returned above.) Gate the annotation on the move actually reaching the accuracy step.
     // Annotate on `b` so both the hit and miss branches inherit this draw. (Accuracy/evasion
     // stages and modifiers shift the recorded arg; unmodeled here — the differ flags them.)
+    let mut acc_draw_pushed = false;
     if annotating() && md.accuracy != 0 && !accuracy_forced_true(&b, side, &md) {
         let reaches_accuracy = {
             let foe_alive = b.state.side(foe).active().is_alive();
@@ -3377,12 +3378,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         };
         if reaches_accuracy {
             let acc = accuracy_arg(&b, side, &md);
+            // Result is the HIT value (1): the accuracy `randomChance(acc,100)` is true iff the
+            // move connects, and every branch that survives this point is a hit branch. The MISS
+            // branch (built below) overrides its copy of this draw to 0 so the Replicate filter
+            // selects hit vs miss by the drawn value — not by a shared "can-hit" flag (which made
+            // both branches carry 1 and the filter fall through to the crit roll, mis-selecting a
+            // hit branch on a real miss).
             draw(&mut b, "randomChance", &[acc, 100], (hit_prob > 0.0) as i64, "accuracy");
+            acc_draw_pushed = true;
         }
     }
 
     if miss_prob > 0.0 {
         let mut mb = scaled(&b, miss_prob);
+        // The accuracy roll came up a miss on this branch: flip the inherited hit-result to 0.
+        if acc_draw_pushed {
+            if let Some(d) = mb.draws.last_mut() {
+                d.result = 0;
+            }
+        }
         // High Jump Kick / Jump Kick / Supercell Slam: missing costs the user 1/2 of its
         // max HP (crash; PS `onMoveFail` → `damage(source.baseMaxhp / 2)`).
         if matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
@@ -3563,6 +3577,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else if hits_min == hits_max && hits_min <= MAX_EXACT_HITS {
         let mut v = Vec::new();
         let crit_p = crit_chance(&b, side, &md);
+        let crit_den = ps_crit_den(&b, side, &md);
         for combo in HitCombos::new(hits_min) {
             let mut prob = hit_prob;
             for &(_, crit) in &combo {
@@ -3572,8 +3587,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 continue;
             }
             let mut hb = scaled(&b, prob);
-            annotate_hits(&mut hb, &combo, ps_crit_den(&b, side, &md));
-            let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo);
+            // Per-hit crit+damage draws are emitted INSIDE the hit loop (KO-terminating), so a
+            // multi-hit move that faints the target early stops rolling exactly where PS does
+            // (`hitStepMoveHitLoop`: the top-of-loop `targets.every(!hp)` break precedes the next
+            // hit's crit/damage rolls). See `apply_damage_hit`.
+            let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo, crit_den);
             v.push((hb, hit_sub));
         }
         v
@@ -4414,7 +4432,7 @@ fn break_ice_face(b: &mut Branch, foe: SideId) {
     });
 }
 
-fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)]) -> bool {
+fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)], crit_den: i32) -> bool {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let initial_calc = compute_damage(b, side, md);
@@ -4429,6 +4447,20 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let mut hits_landed: u8 = 0;
     let mut hits_executed: u8 = 0;
     for &(roll, crit) in hits {
+        // PS's `hitStepMoveHitLoop` checks `targets.every(!hp)` at the TOP of each iteration,
+        // BEFORE that hit's crit/damage rolls (which happen inside `spreadMoveHit` → `getDamage`).
+        // So once the target has fainted, no further crit/damage draws are rolled. Emit the
+        // per-hit draws here — after this KO check, before applying the hit — so a multi-hit move
+        // that KOs early stops the draw stream exactly where PS does (fixes phantom-hit over-roll).
+        // A user faint mid-loop (recoil/contact item) is folded into `apply_post_damage`, so it
+        // never truncates the loop here; the corpus has no such multi-hit matchup.
+        if b.state.side(foe).active().hp <= 0 {
+            break;
+        }
+        if crit_den > 0 {
+            draw(b, "randomChance", &[1, crit_den], crit as i64, "crit");
+        }
+        draw(b, "random", &[16], roll as i64, "damage-roll");
         let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
         let raw = rolls[roll as usize];
         // Route to the Substitute if the target has one up (it absorbs the whole hit).
