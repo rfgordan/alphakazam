@@ -7594,11 +7594,18 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
     if bench.is_empty() {
         return vec![b];
     }
+    // PS picks the drag target with `sample(possibleSwitches)` (battle.ts getRandomSwitchable):
+    // one `sample` draw over the bench in party order (`side.pokemon` from active.length, fainted
+    // skipped). Each branch carries the drawn index as its `sample` result so the Replicate filter
+    // selects the realized target. Annotation-only (state-neutral to Enumerate/Sample).
+    let n = bench.len() as i32;
     let p = 1.0 / bench.len() as f32;
     bench
         .into_iter()
-        .map(|t| {
+        .enumerate()
+        .map(|(idx, t)| {
             let mut nb = scaled(&b, p);
+            draw(&mut nb, "sample", &[n], idx as i64, "drag");
             apply_switch(&mut nb, dragged, t);
             nb
         })
