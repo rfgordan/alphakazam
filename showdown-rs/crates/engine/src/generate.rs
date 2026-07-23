@@ -7281,12 +7281,15 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     }
 
     // NOTE: a connecting status move runs `moveHit`, after which PS fires the per-hit
-    // `eachEvent('Update')` (battle-actions.ts:970). It is NOT emitted here: PS skips `moveHit`
-    // (and the 970) whenever the move *fails* — a foe-targeting move that is type/ability-immune,
-    // or a self move that no-ops (Recover at full HP, Substitute with one already up, a boost at
-    // the cap) — and the engine's post-effect "hit" branch does not distinguish "ran moveHit" from
-    // "produced no change", so any blanket emit over-fires (measured net-negative). Status-move
-    // 970 is a documented deferral pending an exact `moveHit`-ran predicate.
+    // `eachEvent('Update')` (battle-actions.ts:970). It is a documented DEFERRAL — no clean emit
+    // point exists under the current model. PS skips `moveHit`/970 when the move fails at `tryHit`
+    // (immune foe, Recover at full HP, boost at cap), which the post-effect "hit" branch can't
+    // distinguish from a real hit; and the 970 stream POSITION depends on the move sub-type — a
+    // phaze/drag (Roar/Whirlwind `sample`) fires AFTER 970 while onHit status/boost/volatile draws
+    // fire BEFORE it, so a single emit site mis-orders one class or the other. Both a blanket emit
+    // and an instruction-count-gated ("moveHit changed state") emit measured net-negative (the
+    // mis-ordered phaze/self-destruct cases outweigh the gains). Needs move-subtype-aware placement
+    // plus a moveHit-ran signal.
     if miss_prob > 0.0 {
         hits.push(scaled(&b, miss_prob));
         hits
