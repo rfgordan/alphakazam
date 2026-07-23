@@ -3481,12 +3481,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             return execute_status_move(b, foe, &md, false);
         }
         // A Substitute blocks foe-targeting status moves unless they bypass it (sound
-        // moves, Taunt, Encore, ...) or the user has Infiltrator.
+        // moves, Taunt, Encore, ...) or the user has Infiltrator. PS blocks the move at
+        // `Substitute.onTryPrimaryHit` (inside `spreadMoveHit`, AFTER `hitStepAccuracy`), so a
+        // numeric-accuracy status move still consumes `randomChance(accuracy,100)` here — unless it
+        // was already stopped by an earlier hit step (powder / Thunder-Wave type immunity). The
+        // outcome is state-neutral (the sub blocks the effect; a miss does nothing) → draw-only.
         if targets_foe
             && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute)
             && !md.flag_bypass_sub
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator
         {
+            if annotating()
+                && md.accuracy != 0
+                && !accuracy_forced_true(&b, side, &md)
+                && status_move_reaches_accuracy(&b, side, &md)
+            {
+                let acc = accuracy_arg(&b, side, &md);
+                let hp = accuracy_of(&b, side, &md);
+                draw(&mut b, "randomChance", &[acc, 100], (hp > 0.0) as i64, "accuracy");
+            }
             return vec![b];
         }
         let ins_before = b.ins.len();
@@ -7299,6 +7312,28 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 
 /// Execute a status move from its data: self-heal, hazard, and/or target status, with an
 /// accuracy hit/miss branch when the move can miss.
+/// Whether a foe-targeting status move reaches PS's `hitStepAccuracy` — i.e. it is not stopped by
+/// an earlier hit step. The two status-move immunities that skip accuracy (all other status moves
+/// `ignoreImmunity`): powder immunity (Grass / Overcoat / Safety Goggles for a `flag_powder` move)
+/// and type immunity for Thunder Wave (the lone `ignoreImmunity:false` status move). Used to gate
+/// the accuracy roll when the move is later blocked by a Substitute (PS rolls accuracy first).
+fn status_move_reaches_accuracy(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    let t = b.state.side(side.other()).active();
+    if !t.is_alive() {
+        return false;
+    }
+    if md.flag_powder
+        && (t.types.contains(&Type::Grass) || t.ability == Ab::Overcoat || t.item == Item::SafetyGoggles)
+    {
+        return false;
+    }
+    if md.id.to_id() == "thunderwave" && crate::damage::type_multiplier(md.typ, t.types) == 0.0 {
+        return false;
+    }
+    true
+}
+
 fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
     let foe = side.other();
 
