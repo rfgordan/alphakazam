@@ -7954,14 +7954,24 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             Ab::HungerSwitch => push(29, 7),
             _ => {}
         }
-        // Protect + Stall: a mon that successfully protected this turn carries both the `protect`
-        // (duration-1) and `stall` (duration-2) volatiles at Residual; both order "false", subOrder
-        // 2, same holder → a guaranteed same-Pokémon tie (the dominant tail-2 shuffle).
+        // Protect + Stall: PS registers a Residual handler (via `getKey:'duration'`,
+        // battle.ts:487) for EACH duration-carrying volatile, independent of any onResidual
+        // callback. The `protect` volatile has duration 1 (removed the turn it's used); the
+        // `stall` volatile has duration 2 (conditions.ts), so it survives ONE residual PAST the
+        // protect volatile — on the turn AFTER a Protect (protect gone, stall still counting down)
+        // PS still keeps the stall handler, giving a 1-longer list (`[5,2,4]` vs the engine's old
+        // `[4,2,4]`). So the two handlers are gated INDEPENDENTLY: `protect` iff the Protect
+        // volatile is present (its own turn), `stall` iff the stall volatile is present. In the
+        // per-decision differ `stall_counter` is set from PS's stall volatile in the snapshot
+        // (convert.rs:485), so `stall_counter > 0` ⟺ the stall volatile is present — the exact
+        // predicate; both order "false", subOrder 2. (Stream-neutral for the from-seed gate — both
+        // list lengths consume one `random` over the same tie-group — so this only sharpens the
+        // differ's strict args comparison; no game's draw count changes.)
         if v.contains(V::Protect) {
-            push(FALSE, 2); // protect
-            if s.stall_counter > 0 {
-                push(FALSE, 2); // stall
-            }
+            push(FALSE, 2); // protect (own-turn: duration-1 volatile)
+        }
+        if s.stall_counter > 0 {
+            push(FALSE, 2); // stall (duration-2 volatile; survives one turn past protect)
         }
     }
     hs
