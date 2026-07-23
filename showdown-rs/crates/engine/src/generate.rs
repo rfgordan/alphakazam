@@ -3729,6 +3729,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // A Substitute blocks the target's own secondaries (boosts/status) and contact
         // abilities; otherwise split on the move's secondary, then the contact-status ability.
         let branches = if hit_sub {
+            // PS `spreadMoveHit` sets `targets[i] = null` on a Substitute hit (battle-actions.ts:1085),
+            // and `secondaries()` skips only `target === false` (`null !== false`), so it STILL rolls
+            // `this.random(100)` per secondary — the effect merely no-ops (moveHit on a null target).
+            // `ModifySecondaries` runs on the (null) target, so Shield Dust / Covert Cloak do NOT
+            // strip it here; only Sheer Force (which removed the secondaries upfront) suppresses the
+            // roll. Emit those draw-and-discard rolls so the sub hit consumes the same stream PS does.
+            emit_sub_secondary_rolls(&mut hb, side, &md);
             vec![hb]
         } else {
             apply_burning_jealousy(&mut hb, side, &md);
@@ -6267,6 +6274,30 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
 /// Split a hit on the move's flinch chance (×2 under Serene Grace): the proc branch applies
 /// the Flinch volatile to the target, which `sequence_two_moves` uses to skip a target that
 /// hasn't moved yet. Inner Focus and an already-flinched target are immune.
+/// A hit absorbed by the target's Substitute still costs PS the per-secondary `random(100)`
+/// rolls (the effects no-op against the `null` target — see the call site in `execute_move`).
+/// The target is `null` in `secondaries()`, so target-based strips (Shield Dust / Covert Cloak)
+/// don't fire; only Sheer Force (which removes the move's secondaries at `onModifyMove`, before
+/// the move) suppresses them. Emits, in PS's per-secondary order, one `random(100)` for the
+/// move's target boost/status secondary (or a 100%-effect `extra_secondary_roll_move`) and one
+/// for its flinch secondary — draw-and-discard (annotation-only; no state change, no split).
+/// (Tri Attack / Dire Claw behind a Substitute — a `sample`-status secondary — are not modeled
+/// here; no such matchup exists in the corpus and a partial emit would risk a new offset.)
+fn emit_sub_secondary_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if !annotating() {
+        return;
+    }
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return;
+    }
+    if md.secondary_chance > 0 || extra_secondary_roll_move(md.id) {
+        draw(b, "random", &[100], 0, "secondary");
+    }
+    if md.flinch_chance > 0 {
+        draw(b, "random", &[100], 0, "flinch");
+    }
+}
+
 fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     if md.flinch_chance == 0 {
         return vec![b];
