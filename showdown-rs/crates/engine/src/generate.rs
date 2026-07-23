@@ -157,6 +157,34 @@ impl RealizedCursor {
             }
         }
     }
+    /// Consume the inter-hit `ModifyDamage` screen-tie `shuffle[k,0,k]` that `apply_damage_hit`
+    /// emits after each damaging hit's roll (`emit_modifydamage_shuffle`, fired when `k >= 2`
+    /// screens are on the field). The peek loop reads all hits' crit+damage up front, so it must
+    /// step the cursor past this shuffle between hits or every hit past the first desyncs (a
+    /// screened multi-hit move — e.g. Bullet Seed into Reflect+Light Screen). The `Prng` cursor
+    /// consumes the raw `random(0,k)` draws PS's `speedSort` makes; the `Recorded` cursor skips
+    /// the single logged shuffle entry.
+    fn consume_shuffle(&mut self, k: i32) {
+        if k < 2 {
+            return;
+        }
+        match self {
+            RealizedCursor::Prng(p) => consume_shape(p, "shuffle", &[k, 0, k]),
+            RealizedCursor::Recorded { idx, .. } => *idx += 1,
+        }
+    }
+}
+
+/// Number of screens (Reflect / Light Screen / Aurora Veil) present across BOTH sides — the
+/// tie-group length `k` of the `ModifyDamage` screen shuffle. `emit_modifydamage_shuffle` fires
+/// exactly when this is `>= 2`.
+fn modifydamage_screen_count(b: &Branch) -> i32 {
+    let mut k = 0i32;
+    for side in [SideId::One, SideId::Two] {
+        let sc = &b.state.side(side).side_conditions;
+        k += (sc.reflect > 0) as i32 + (sc.light_screen > 0) as i32 + (sc.aurora_veil > 0) as i32;
+    }
+    k
 }
 
 /// Build a [`RealizedCursor`] positioned at the branch's current draw point, or `None` when no
@@ -524,11 +552,7 @@ fn emit_modifydamage_shuffle(b: &mut Branch) {
     if !annotating() {
         return;
     }
-    let mut k = 0i32;
-    for side in [SideId::One, SideId::Two] {
-        let sc = &b.state.side(side).side_conditions;
-        k += (sc.reflect > 0) as i32 + (sc.light_screen > 0) as i32 + (sc.aurora_veil > 0) as i32;
-    }
+    let k = modifydamage_screen_count(b);
     if k >= 2 {
         draw(b, "shuffle", &[k, 0, k], -1, "modifydamage");
     }
@@ -5994,11 +6018,19 @@ fn apply_multihit_realized(
     // per-hit ModifyDamage shuffle) and applies with KO/Substitute-break termination — a hit past
     // a faint never executes, so its peeked (over-read) values are simply unused.
     let crit_den = ps_crit_den(&hb, side, md);
+    // The inter-hit `ModifyDamage` screen shuffle `apply_damage_hit` emits between hits (when
+    // ≥2 screens are on the field) sits between each hit's damage roll and the next hit's crit
+    // roll in PS's stream, so the peek cursor must step over it or every hit past the first
+    // reads the shuffle's slot as its crit/damage. (Non-screened moves: k<2 → no-op.)
+    let screen_k = modifydamage_screen_count(&hb);
     let mut hits: Vec<(u8, bool)> = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         let crit = crit_den > 0 && cur.peek("randomChance", &[1, crit_den]) != 0;
         let roll = cur.peek("random", &[16]) as u8;
         hits.push((roll & 0x0F, crit));
+        if i + 1 < count {
+            cur.consume_shuffle(screen_k);
+        }
     }
     let hit_sub = apply_damage_hit(&mut hb, side, md, &hits, crit_den);
     vec![(hb, hit_sub)]
@@ -6060,6 +6092,10 @@ fn apply_multihit_realized_ma(
         let roll = (cur.peek("random", &[16]) as usize) & 0x0F;
         draw(&mut hb, "random", &[16], roll as i64, "damage-roll");
         emit_modifydamage_shuffle(&mut hb);
+        // Step the peek cursor past the inter-hit ModifyDamage screen shuffle just emitted (the
+        // `draw` above advances the real prng / draw log but not this cursor clone), so the next
+        // hit's crit/accuracy/damage peek stays aligned on a screened target.
+        cur.consume_shuffle(modifydamage_screen_count(&hb));
         let calc = &calcs[i.min(calcs.len() - 1)];
         let raw = if crit { calc.rolls_crit[roll] } else { calc.rolls_nocrit[roll] };
         let bypass_sub = md.flag_sound

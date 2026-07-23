@@ -13,7 +13,30 @@ order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
 **Result: 56 / 111 full games exact end-to-end (50.5%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 97.55% (3737/3831), zero shuffle over-emission.**
+Draw-consumption differ 90.16% → 97.57% (3738/3831), zero shuffle over-emission.**
+
+### Phase-3 realized-cursor screen-shuffle desync (2026-07-23) — the misattributed "compute_damage rounding" class
+The `state-mismatch-despite-draw-match` residue flagged as a screen×multi-hit **damage-rounding**
+off-by-one (d4 t18, PS 326 vs engine 327) was NOT a `compute_damage` rounding bug — it was a
+**draw-accounting desync in the realized multi-hit peek cursor**. `apply_multihit_realized` peeks
+all hits' crit+damage up front from a positioned `RealizedCursor`, and `apply_multihit_realized_ma`
+peeks inline; both step the cursor only over the crit/damage draws, NOT over the inter-hit
+`ModifyDamage` screen-tie `shuffle[k,0,k]` that `apply_damage_hit`/the ma loop actually emit between
+hits (`emit_modifydamage_shuffle`, fired when ≥2 screens are on the field). So for a **screened**
+multi-hit move (d4 t18: Breloom Bullet Seed into an Amoonguss behind Reflect+Light Screen — k=2, one
+shuffle per hit) every hit past the first read the shuffle's PRNG slot as its own crit/damage:
+engine realized rolls `[1,12,3,4,4]` vs PS's recorded `[1,14,4,0,4]`, total 54 vs 55, leaving
+Amoonguss (post Giga-Drain heal) at 327 not 326. Non-screened multi-hits (k<2) were unaffected —
+which is why the DP-masked total only surfaced now and why the corpus's other multi-hit games stayed
+exact. **Fix:** new `RealizedCursor::consume_shuffle(k)` (Prng cursor consumes `random(0,k)` draws
+per PS `speedSort`; Recorded cursor skips the one logged shuffle entry) + `modifydamage_screen_count`
+helper; called between hits in `apply_multihit_realized` and after each hit's emit in
+`apply_multihit_realized_ma`. Enumerate/Sample DP path untouched (realized source not installed).
+**d4 advanced d18[t18] → d54[t48]** (16/17 → 46/47 decisions); differ 97.55% → 97.57% (state-mismatch
+5→4); state-sweep 3831/3831, engine tests all green, smoke 18/18, exact-set identical 56 (0
+regression). The Beat Up state-mismatch residue (2 `@beatup` units, c2a2/c2a5) is separate — those
+games are unscreened and diverge in SEED_GATE earlier (futuremove/accuracy); a genuine per-member
+damage-calc item, still open.
 
 ### Phase-3 open-item-burn tranche (2026-07-23, 49 → 52; differ 94.07% → 96.50%)
 Five classes landed this session (all rails green throughout: engine tests, corpus state-sweep
