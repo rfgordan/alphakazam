@@ -413,7 +413,7 @@ fn emit_update_hit(b: &mut Branch) {
 ///      queued action is a move (i.e. NEITHER side switches) and the two moves tie: the remaining
 ///      queue is `[move,move,residual]` (length 3) → `shuffle[3,0,2]`.
 /// All four are state-neutral annotation draws emitted on the pre-switch board.
-fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custap: [bool; 2]) {
+fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custap: [bool; 2], tera: [bool; 2]) {
     if !annotating() {
         return;
     }
@@ -439,15 +439,26 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
         _ => false,
     };
     let speed_tie = actives_speed_tied(st);
+    // A `terastallize` action (gen9, order 106) is queued for each side that teras AND moves. It
+    // precedes the two move actions (order 200) in the commit `queue.sort()`, so it lengthens the
+    // sorted list and shifts the move-tie group: for `k` tera actions the moves tie at [k, k+2) of
+    // a length-(k+2) list → `shuffle[k+2, k, k+2]`. Each tera action also runs its own `runAction`
+    // → an extra `eachEvent('Update')` shuffle (battle.ts:2882) on a Speed tie. (k=2 with two
+    // equal-Speed teras also ties the teras themselves at [0,2); left unmodeled — vanishingly rare.)
+    let k = (tera[0] && matches!(s1, MoveChoice::Move(_))) as i32
+        + (tera[1] && matches!(s2, MoveChoice::Move(_))) as i32;
     if commit_tie {
-        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 1. commitChoices sort
+        draw(b, "shuffle", &[2 + k, k, k + 2], -1, "update"); // 1. commitChoices sort (tera-shifted)
     }
     if speed_tie {
         draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 2. eachEvent('BeforeTurn')
-        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3. runAction Update
+        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3. runAction Update (after beforeTurn)
+        for _ in 0..k {
+            draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3b. runAction Update after each tera action
+        }
     }
     if both_move && commit_tie {
-        draw(b, "shuffle", &[3, 0, 2], -1, "update"); // 4. dynamic-speed re-sort (len-3 queue)
+        draw(b, "shuffle", &[3, 0, 2], -1, "update"); // 4. dynamic-speed re-sort (len-3 queue [move,move,residual])
     }
 }
 
@@ -1098,7 +1109,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     //    re-sort), emitted on the pre-switch board before any action runs — the leading
     //    `shuffle` draws of an equal-Speed turn. Annotation-only (no-op without draw annotation).
     for b in &mut branches {
-        emit_turn_start_bracket(b, s1, s2, custap);
+        emit_turn_start_bracket(b, s1, s2, custap, tera);
     }
 
     // 1) Switches resolve before moves, in speed order when both sides switch (the slower

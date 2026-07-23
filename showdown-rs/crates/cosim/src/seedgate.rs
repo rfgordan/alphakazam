@@ -337,10 +337,19 @@ fn step_unit(
         // moves (its [0,2) tie-group) iff b3==1. speedSort composes to: side One executes first iff
         // b0 == b3. (Peeking only b0 — the pre-dynamic-resort order — mis-selects whenever b0 != b3;
         // that was the residual both-move-tie divergence.)
+        // Each side that terastallizes queues a `terastallize` action (order 106) that runs before
+        // the moves, adding one extra runAction Update shuffle between the beforeTurn Update and the
+        // dynamic re-sort — so the dynamic bit sits `k` positions later (k = number of tera'ing
+        // sides). The commit shuffle (b0) shifts its RANGE with the queue length but still consumes
+        // exactly one `random` draw, so composing b0 vs the dynamic bit is unchanged.
+        let k = tera[0] as u32 + tera[1] as u32;
         let b0 = peek.random_range(0, 2);
-        let _b1 = peek.random_range(0, 2);
-        let _b2 = peek.random_range(0, 2);
-        let b3 = peek.random_range(0, 2);
+        let _b1 = peek.random_range(0, 2); // eachEvent('BeforeTurn')
+        let _b2 = peek.random_range(0, 2); // runAction Update after beforeTurn
+        for _ in 0..k {
+            let _ = peek.random_range(0, 2); // runAction Update after each tera action
+        }
+        let b3 = peek.random_range(0, 2); // gen8 dynamic re-sort
         engine::generate::set_forced_tie_order(Some(b0 == b3));
     }
     let outcomes = generate_instructions_annotated(state, mc[0], mc[1], pivots, tera);
