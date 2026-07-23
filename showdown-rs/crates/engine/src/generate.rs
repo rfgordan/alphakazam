@@ -7375,6 +7375,14 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
             || status_blocked_by_field(&b.state, side, Status::Sleep);
         if hp < maxhp && !blocked {
             let slot = b.state.side(side).active_index;
+            // PS Rest `onHit` calls `setStatus('slp')` FIRST — the `slp` condition's `onStart`
+            // rolls `this.random(2, 5)` (data/conditions.ts) — and only THEN overrides
+            // `statusState.time = 3`. So the duration draw is consumed and discarded on every
+            // successful Rest (including the Chesto-cured case, since Chesto's `onUpdate` cures
+            // the sleep AFTER it is set). Emit it as a draw-and-discard at the apply moment.
+            if annotating() {
+                draw(&mut b, "random", &[2, 5], 3, "slp");
+            }
             // Chesto Berry immediately cures the Rest sleep (and is eaten).
             if item == Item::ChestoBerry {
                 if status != Status::None {
