@@ -12,7 +12,22 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 42 / 111 full games exact end-to-end (37.8%); init-aligned from seed 105/111.**
+**Result: 43 / 111 full games exact end-to-end (38.7%); init-aligned from seed 105/111.**
+
+### Phase-3 deferral-burn-down tranche (2026-07-23, 42 → …) — working the merged dossier queue
+| step | games | class landed | commit |
+|------|-------|--------------|--------|
+| P3.7 | 43/111 | **double-switch batched/interleaved runSwitch bracket** (both-sides-switch turns) | (this tranche) |
+
+*P3.7 — double-switch bracket.* A turn-action `sw/sw` turn is NOT batched: PS's `switch` action
+(order 103) queues its `runSwitch` (order 101), which preempts the OTHER side's pending `switch`
+(103) — so PS runs `switch(A), runSwitch(A), switch(B), runSwitch(B)` interleaved, and each switch
+fires the SAME full 4-shuffle bracket as a single switch (switch-out :83, switch runAction 2882,
+runSwitch getAllActive speedSort :182, runSwitch runAction 2882). The engine's double-switch loop
+emitted only the switch-out :83 Update per switch; the three post-swap Updates per switch were
+missing. Each shuffle is gated on the CURRENT incrementally-swapped board's tie (switch(B)'s
+switch-out Update sees A already swapped in). Flips c1 (dossier Class 1a, predicted → EXACT); zero
+prior-exact regressions.
 
 ### Phase-3 keystone tranche (2026-07-23, 38 → 42) — speedSort brackets + Thunder Wave immunity
 Five draw-accounting/mechanics classes landed this session (3 commits), all rails green

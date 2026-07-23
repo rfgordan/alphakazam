@@ -1136,9 +1136,20 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
             if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
                 order.swap(0, 1);
             }
+            // A turn-action double switch is NOT batched: the `switch` action (order 103)
+            // queues its `runSwitch` (order 101), which preempts the other side's pending
+            // `switch` (103), so PS runs `switch(A), runSwitch(A), switch(B), runSwitch(B)`
+            // interleaved. Each switch therefore fires the SAME full bracket as a single
+            // switch (battle.ts:2881 switch-out :83, switch runAction 2882, runSwitch
+            // getAllActive speedSort battle-actions.ts:182, runSwitch runAction 2882), and
+            // each shuffle is gated on the CURRENT (incrementally-swapped) board's tie —
+            // switch(B)'s switch-out Update sees A already swapped in. (c1 d45.)
             for &(side, target) in &order {
-                emit_switch_pre_update(b);
+                emit_switch_pre_update(b); // switch-out :83 (pre-swap board)
                 apply_switch(b, side, target);
+                emit_update(b); // switch runAction Update (2882)
+                emit_update(b); // runSwitch getAllActive speedSort
+                emit_update(b); // runSwitch runAction Update (2882)
             }
         }
     } else {
