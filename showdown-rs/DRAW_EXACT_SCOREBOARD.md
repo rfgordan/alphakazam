@@ -12,13 +12,22 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 36 / 111 full games exact end-to-end (32.4%); init-aligned from seed 105/111.**
+**Result: 38 / 111 full games exact end-to-end (34.2%); init-aligned from seed 105/111.**
 
 ### Phase-3 burn-down progression (games exact end-to-end, from seed)
-| step | games | class(es) landed |
-|------|-------|------------------|
-| baseline (threshold-secondary + move-order forcing) | 21/111 | — |
-| P3.1 | 36/111 | **multi-hit KO early-termination** (`drawexact-p3: rust-extra crit — 21→…`) + **accuracy hit/miss site-typed selection** |
+| step | games | class(es) landed | commit |
+|------|-------|------------------|--------|
+| baseline (threshold-secondary + move-order forcing) | 21/111 | — | — |
+| P3.1 | 36/111 | **multi-hit KO early-termination** + **accuracy hit/miss site-typed selection** | b62bf51 |
+| P3.2 | 37/111 | **switch-action pre-swap `eachEvent('Update')` shuffle** | 46668f1 |
+| P3.3 | 38/111 | **drag-target `sample`** (Whirlwind/Roar/Dragon Tail) | 3a8ccc4 |
+
+All four classes are realized-path (Replicate/annotation) corrections; the Enumerate/Sample paths
+are byte-identical (every new draw site is gated on `annotating()`; the multi-hit KO break is
+redundant with the existing lower one). Rails green throughout: engine tests, corpus state-sweep
+**3831/3831** (0 diverged, 0 unsupported), distribution smoke 18/18, per-game SEED_GATE monotone
+non-decreasing with **zero** previously-exact game regressing at any step (verified by exact-list
+diff against the prior binary).
 
 P3.1 — two draw-order corrections, both realized-path (Replicate) only, Enumerate byte-identical:
 1. *Multi-hit KO early-termination.* The per-hit crit+damage draws are now emitted INSIDE the
@@ -84,17 +93,33 @@ ambiguous shuffle forks that are genuine move-order ties).
 | 3 | `PS-unconsumed sample@whirlwind` | **Drag-target `sample`** (Whirlwind / Roar / Dragon Tail random replacement) the engine picks deterministically without a draw. |
 | few | `PS random[2,5]@slp` / `sample@bulletseed` | Residual sleep-duration ordering placement; variable multi-hit COUNT `sample` (folded into the DP). |
 
-**Kill-criteria status: NOT triggered.** Every class above is a known, finite draw-order item
-from the deferred-class analyses — none needs unobservable state (crit#1), and the density decays
-per fix (move-order forcing + threshold secondary landed +13 games with no new independent class
-revealed, crit#2). The dominant remaining blockers (multi-hit KO termination, deferred Update
-sites) are the exact single-path signals the charter predicted the annotation approach folds away.
+### Post-P3.3 first-divergence spectrum (38 non-exact games, ranked by root cause)
+| games | class | root cause (analyzed) |
+|------|-------|------------------------|
+| 38 | `draws-match/state-diff` | Catch-all: draw SHAPES match PS but state diverges — an **upstream PRNG offset** from an unmodeled draw earlier in the game shifts the damage-roll index. Dominant source is unmodeled `eachEvent('Update')` / handler-order `speedSort` shuffles on **tied-Speed** boards (see below); a residual tail is per-move quirks (Diamond Storm rolls `random(100)` **twice** for its `self`+`secondary`; sleep-duration `random(2,5)` placement vs a same-turn drag `sample`). Each fix advances a game to its *next* divergence, so this bucket both drains and refills. |
+| ~11 | `PS shuffle@<ctx>` / `PS-unconsumed shuffle` | **The keystone — unmodeled speedSort shuffles.** Ground-truthed against the pinned PS `eachEvent` trace: on a tied-Speed board PS fires `shuffle[2,0,2]` at (a) each `eachEvent('Update')` during a **status move's** moveHit (Calm Mind mirror = 2 Updates: battle-actions.ts:970 per-hit + the runAction 2882 post-move), and (b) **handler-order** `speedSort` of equal-(order,priority,speed,subOrder) event-handler lists mid-move (`shuffle[4,0,2]`, `[4,2,4]`, … — e.g. both mons' Leftovers/ability handlers for one event). (b) needs PS's per-event handler enumeration + comparator keys — the charter's flagged "largest unknown". These desync the **commitChoices tie bit** the move-order forcing peeks, so they also masquerade as move-order mismatches in tied games (t2: shadowball-first vs PS calmmind-first). |
+| 4 | `rust-extra randomChance@accuracy` | Engine emits an accuracy roll where PS makes none: Mirror Coat/Counter **fail before the accuracy step** (no qualifying damage taken → `onTry` fails), and Thunder-Wave-family immunity/paralysis blocks evaluated against the wrong (pre-switch) target. Per-move `reaches_accuracy` refinement. |
+| ~9 (1 ea) | `args randomChance@<move>` | **Accuracy-arg 4096-modifier chain** not integer-exact: confusion self-hit `[33,100]`, Beat Up per-hit `[1,24]`, evasion/accuracy stages, Compound Eyes / Wide Lens. Engine emits raw accuracy; PS's is post-`ModifyAccuracy`. |
+| 4 | `PS-unconsumed sample@<move>` / `PS random@<move>` | Variable multi-hit COUNT `sample([2,2,…,5])` + per-hit crit/damage in the realized loop (Icicle Spear / Bullet Seed / Tail Slap — the DP path emits no per-hit stream); Tri Attack status `random(100)` split; Dire Claw / sludgewave secondary count. |
+| 1 | `move-order-tie` | Genuine unfilterable shuffle fork (both order-branches share an identical draw stream). |
+
+**Kill-criteria status: NOT triggered.** Density is still decaying — the four landed classes each
+*removed* a class (multi-hit `rust-extra crit`: 23→0; accuracy hit/miss folded into the filter;
+`sample@whirlwind`: 3→0; switch Update: the Move+Switch case). No fix revealed a NEW independent
+class, and no blocker needs unobservable state — the keystone (speedSort) is a KNOWN, finite,
+bug-for-bug-modelable draw-accounting item (PS is deterministic-by-seed; the recorder even labels
+every shuffle's dispatching event + tying-handler group). The remaining climb to ≥60 is gated on
+that speedSort modeling (status-move Updates are ground-truthed and mechanical; handler-order ties
+need PS's per-event handler lists) plus a decaying tail of per-move draw-count quirks.
 
 ### Regression rail (all green — Enumerate/Sample untouched)
 - `cargo test --release -p engine`: all suites pass (the `FORCED_TIE_ORDER` thread-local defaults
-  `None`, so Enumerate/Sample paths are byte-identical).
-- Corpus state-sweep: **3831/3831 matched, 0 diverged, 100.00%**.
-- Draw-consumption differ: **3454/3831 = 90.16%** (unchanged — annotation path untouched).
+  `None`, and every P3.1–P3.3 draw site is `annotating()`-gated, so Enumerate/Sample paths are
+  byte-identical).
+- Corpus state-sweep: **3831/3831 matched, 0 diverged, 0 unsupported, 100.00%**.
+- Distribution smoke: **18/18** (run sequentially — one node process at a time).
+- Per-game SEED_GATE monotone non-decreasing 21→36→37→38 with **zero** prior-exact game regressing
+  (exact-list diff vs the pre-change binary at every step).
 
 ---
 
