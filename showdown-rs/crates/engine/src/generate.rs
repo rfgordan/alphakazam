@@ -6615,20 +6615,32 @@ fn apply_triattack_secondary(b: Branch, side: SideId, md: &crate::data::MoveData
     if b.state.side(side).active().ability == Ab::SheerForce {
         return vec![b];
     }
-    let target_eligible = b.state.side(foe).active().is_alive()
-        && b.state.side(foe).active().ability != Ab::ShieldDust
-        && b.state.side(foe).active().item != Item::CovertCloak;
-    if !target_eligible {
+    // Shield Dust / Covert Cloak strip the secondary BEFORE the roll (no draw); a fainted-but-
+    // present target still rolls (the `trySetStatus` merely no-ops), so gate only on the shield.
+    let alive = b.state.side(foe).active().is_alive();
+    let shielded = alive
+        && (b.state.side(foe).active().ability == Ab::ShieldDust
+            || b.state.side(foe).active().item == Item::CovertCloak);
+    if shielded {
         return vec![b];
     }
     let pct: u16 = if b.state.side(side).active().ability == Ab::SereneGrace { 40 } else { 20 };
     let chance = pct as f32 / 100.0;
     let sun = effective_weather(&b.state) == Weather::Sun;
-    let mut out = vec![scaled(&b, 1.0 - chance)];
-    for status in [Status::Burn, Status::Paralysis, Status::Freeze] {
+    // PS `secondaries()` rolls `random(100)` for the 20% chance; on a proc the secondary's
+    // `onHit` runs `this.sample(['brn','par','frz'])` (one `sample[3]` draw) then `trySetStatus`.
+    // The sample fires on any proc — even against an already-statused / status-immune target (the
+    // set merely no-ops), so the draw is annotated regardless of `can_apply`.
+    let mut noproc = scaled(&b, 1.0 - chance);
+    draw(&mut noproc, "random", &[100], pct as i64, "secondary");
+    let mut out = vec![noproc];
+    for (idx, status) in [Status::Burn, Status::Paralysis, Status::Freeze].into_iter().enumerate() {
         let mut pb = scaled(&b, chance / 3.0);
+        draw(&mut pb, "random", &[100], 0, "secondary");
+        draw(&mut pb, "sample", &[3], idx as i64, "secondary");
         // Freeze additionally fails in harsh sunlight (PS `trySetStatus` weather guard).
-        let can_apply = status_applies(pb.state.side(foe).active(), status)
+        let can_apply = alive
+            && status_applies(pb.state.side(foe).active(), status)
             && !status_blocked_by_field(&pb.state, foe, status)
             && !(status == Status::Freeze && sun);
         if can_apply {
