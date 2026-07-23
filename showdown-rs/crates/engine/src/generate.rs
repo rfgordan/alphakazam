@@ -3735,6 +3735,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
+                .flat_map(|sb| apply_direclaw_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
@@ -6648,6 +6649,64 @@ fn apply_triattack_secondary(b: Branch, side: SideId, md: &crate::data::MoveData
             push(&mut pb, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: status });
             apply_synchronize(&mut pb, foe, status);
             consume_lum_if_statused(&mut pb, foe);
+        }
+        out.push(pb);
+    }
+    out
+}
+
+/// Dire Claw's secondary — PS `{chance:50, onHit: this.sample(['psn','par','slp'])}` (moves.ts).
+/// The engine carries `secondary_chance == 0` for it (the status isn't a fixed-status secondary),
+/// so `apply_target_secondary` never rolls; PS rolls one `random(100)` for the 50% and, on a proc,
+/// one `sample[3]` for the status, then `trySetStatus`. Structurally identical to Tri Attack but
+/// with a sleep member (index 2), which additionally rolls the `random(2,5)` duration on apply.
+/// Sleep respects Sleep Clause; Shield Dust / Covert Cloak / Sheer Force strip the roll entirely.
+fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    use crate::ids::Ability as Ab;
+    if md.id.to_id() != "direclaw" {
+        return vec![b];
+    }
+    let foe = side.other();
+    if b.state.side(side).active().ability == Ab::SheerForce {
+        return vec![b];
+    }
+    let alive = b.state.side(foe).active().is_alive();
+    let shielded = alive
+        && (b.state.side(foe).active().ability == Ab::ShieldDust
+            || b.state.side(foe).active().item == Item::CovertCloak);
+    if shielded {
+        return vec![b];
+    }
+    let pct: u16 = if b.state.side(side).active().ability == Ab::SereneGrace { 100 } else { 50 };
+    let chance = pct as f32 / 100.0;
+    let corrosion = b.state.side(side).active().ability == Ab::Corrosion;
+    let breaker = matches!(b.state.side(side).active().ability,
+        Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
+    let mut noproc = scaled(&b, 1.0 - chance);
+    draw(&mut noproc, "random", &[100], pct as i64, "secondary");
+    let mut out = vec![noproc];
+    for (idx, status) in [Status::Poison, Status::Paralysis, Status::Sleep].into_iter().enumerate() {
+        let mut pb = scaled(&b, chance / 3.0);
+        draw(&mut pb, "random", &[100], 0, "secondary");
+        draw(&mut pb, "sample", &[3], idx as i64, "secondary");
+        let can_apply = alive
+            && status_applies_src(pb.state.side(foe).active(), status, corrosion, breaker)
+            && !status_blocked_by_field(&pb.state, foe, status)
+            && !(status == Status::Sleep && sleep_clause_blocks(&pb.state, foe));
+        if can_apply {
+            let slot = pb.state.side(foe).active_index;
+            push(&mut pb, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: status });
+            let slept = status == Status::Sleep && pb.state.side(foe).active().status == Status::Sleep;
+            if slept {
+                mark_slept_by_foe(&mut pb, foe);
+            }
+            apply_synchronize(&mut pb, foe, status);
+            consume_lum_if_statused(&mut pb, foe);
+            if slept && pb.state.side(foe).active().status == Status::Sleep {
+                // Freshly-applied sleep rolls its `random(2,5)` duration at the slp `onStart`.
+                out.extend(branch_sleep_counter(pb, foe));
+                continue;
+            }
         }
         out.push(pb);
     }
