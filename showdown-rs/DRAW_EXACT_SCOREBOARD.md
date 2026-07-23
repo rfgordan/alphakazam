@@ -12,8 +12,20 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 49 / 111 full games exact end-to-end (44.1%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 94.07% (3604/3831), zero shuffle over-emission.**
+**Result: 52 / 111 full games exact end-to-end (46.8%); init-aligned from seed 105/111.
+Draw-consumption differ 90.16% → 96.50% (3697/3831), zero shuffle over-emission.**
+
+### Phase-3 open-item-burn tranche (2026-07-23, 49 → 52; differ 94.07% → 96.50%)
+Five classes landed this session (all rails green throughout: engine tests, corpus state-sweep
+**7662 matched / 0 diverged / 0 unsupported**, distribution smoke **18/18**, SEED_GATE monotone —
+zero prior-exact game regressed):
+| step | games | differ | class landed | commit |
+|------|-------|--------|--------------|--------|
+| P3.15 | **52/111** | 94.57% | **Rest sleep-duration draw-and-discard** — PS Rest onHit `setStatus('slp')` rolls `random(2,5)` in slp.onStart THEN overrides `time=3`; engine omitted it (incl. Chesto-cured). Advances 3 games (c3a2s22/s23, c3c2s83 family). | 906e360 |
+| P3.16 | 52/111 | 94.65% | **Hydration residual handler** — `residual_handlers()` omitted Hydration (Ability, order 5, subOrder 3), sorting ahead of Leftovers/stall/protect. `shuffle[3,1,3]@generic` 4→0; stream-neutral. | c742e69 |
+| P3.17 | 52/111 | 94.86% | **Cute Charm / Poison Touch contact procs** — both roll `randomChance(3,10)` on ANY contact hit regardless of whether the effect can land; engine emitted no draw (Cute Charm) / skipped when status couldn't apply (Poison Touch). Poison Touch keeps PS's Shield Dust/Covert Cloak pre-roll bail. | 8710021 |
+| P3.18 | 52/111 | 95.28% | **accuracy ModifyAccuracy 4096 chain + accuracy/evasion stages** — unified `accuracy_numerator`: onModifyMove (Hustle x0.8, sun Thunder/Hurricane=50) → ModifyAccuracy chain (Compound Eyes 5325/4096, Wide Lens 4505/4096) → stage boosts (trunc(acc*(3+b)/3) etc., ignoreEvasion moves excluded). `accuracy_of`+`accuracy_arg` now agree; previously accuracy_of ignored stages (no miss branch vs an evading target). | 4e7d4aa |
+| P3.19 | 52/111 | 96.50% | **differ tie-order branch selection (MEASUREMENT-ONLY, no engine change)** — `diff_unit` reports Exact iff ANY state-matching branch reproduces PS's exact draw sequence, not whichever tie-order enumerated first; removes the move-order-tie false-positives. shuffle[2,0,2]@generic 23→18, args-mismatch 64→35. | 4f12f90 |
 
 ### Coordinator directive (differ-zero) — mandated observed-diff fixes (2026-07-23)
 The completion bar is ZERO differ mismatches corpus-wide (every observed count/order/kind/ARGS/
@@ -23,22 +35,43 @@ handler-list diff is a fix target regardless of game yield). Landed this session
 | P3.13 | 93.27% | **stall residual handler (turn-after)** — `[5,2,4]` drained (stream-neutral, differ-only) | stall |
 | P3.14 | 94.07% | **TrapPokemon multi-trap shuffle** — `shuffle[3,0,3]` drained (13→0), `[2,0,2]` 41→23; advances t6 d4→d24 | trappokemon |
 
-**NAMED OPEN ITEMS (observed diffs still outstanding — PS evidence, for the next tranche):**
-- **`shuffle[2,0,2]@generic` (23)** — status-move/secondary-move per-hit `eachEvent('Update')` (970)
-  the engine still omits (deferred: needs the "did `moveHit` run" signal). PS battle-actions.ts:970.
-- **`shuffle[3,0,2]@generic` (5)** — turn-start action-queue length: on a both-move Speed tie PS's
-  dynamic re-sort shuffles a length-3 queue `[move,move,residual]`; some paths emit `[2,0,2]`.
-- **`shuffle[3,1,3]`/`[4,2,4]` (4+4)** — a residual handler the engine's `residual_handlers()` table
-  still misses (ps list 1 longer, tie-group shifted by 1 → the missing handler sorts BEFORE the
-  tail tie, i.e. it is NOT stall; a low-`order` residual handler to identify). Stream-neutral.
-- **`random[2,5]@slp` (21)** — sleep-duration placement (dossier Class 4): the duration draw fires
-  at the residual/apply moment, not where the engine emits it. `data/conditions.ts` slp.onStart.
-- **`sample[20]@bulletseed`/`@iciclespear` (19+5), `randomChance[1,24]@beatup` (9)** — variable
-  multi-hit COUNT `sample` + per-hit crit/damage (dossier Class 2, HIGH regression risk — DP path
-  shared with Enumerate/Sample; reserved for a dedicated tranche).
-- **`randomChance[100,100]@accuracy` (9), `[1,5]@frz` (7), `@seismictoss`/`@icebeam`/`@bodypress`
-  (args)** — pre-accuracy fail / frz-thaw decision boundary / `ModifyAccuracy` arg chain (dossier
-  Classes 9 & 5). **`randomChance[3,10]@poisontouch`/`@cutecharm` (4+3)** — ability residual proc.
+**NAMED OPEN ITEMS (observed diffs still outstanding at 96.50% — PS evidence, for the next tranche):**
+- **`sample[20]@bulletseed`/`@iciclespear`/`@tailslap` (19+5+…), `randomChance[1,24]@beatup` (9),
+  `@populationbomb`/`@tripleaxel`** — variable multi-hit COUNT `sample([2..5])` (battle-actions.ts:864)
+  + per-hit crit/damage; DP path shared with Enumerate/Sample (HIGH regression risk). **This is now
+  the single largest block and the highest game-yield (~7-10 games direct).** Reserved for a
+  dedicated tranche: land per sub-move-family, Replicate path only, full rails after each family.
+- **`shuffle[2,0,2]@generic` (18, down from 23)** — the residue is the FIRST-MOVER no-draw
+  status/failed move on a Speed tie: PS runs it first and fires its runAction `eachEvent('Update')`
+  (2882) BEFORE the second move's draws; the differ's tie-order fix cleared the shape-ambiguous
+  cases, but where the first mover produces NO draws the engine's enumeration can't shape-match
+  either order (one has a leading shuffle, one doesn't). Needs the move-order/annotation path to
+  interleave the first mover's 2882 Update ahead of the second move. **NOTE the SEED_GATE (Replicate)
+  path already handles these via forced_tie_order — this is a differ/annotation-ordering residue, not
+  a game blocker for the affected games (c5/c7 are exact through those turns).** PS battle.ts:2881.
+- **`randomChance[100,100]@accuracy` (9)** — dossier Class 9: engine rolls accuracy where PS fails
+  earlier at `onTry`. Gigaton Hammer / Blood Moon `cantusetwice` (disabled for SELECTION in PS, so
+  the failing mon's recorded choice is murky in the differ's mc-resolution), Counter/Mirror Coat
+  (accuracy:true, already no roll). Investigated: the mechanism is selection-time disable, not an
+  execution `onTry` — needs the differ mc-resolution to mirror PS's disabled-move handling.
+- **`randomChance[1,5]@frz` (7)** — same-turn ice-secondary-freeze decision boundary (a mon frozen by
+  the opponent THIS turn then acting rolls the thaw where PS doesn't). `data/conditions.ts` frz.
+- **`shuffle[3,0,2]@generic` (5), `[4,2,4]`/`[5,2,4]`/`[5,3,5]` (few)** — DOWNSTREAM/cosmetic. The
+  `[3,0,2]` are Residual-event shuffles that appear as cascade artifacts of an upstream desync (no
+  game first-diverges on them). The `[4,2,4]`↔`[5,2,4]` is the turn-after `stall` volatile length
+  (Gothitelle protected LAST turn keeps `stall` without `protect`, but convert.rs derives
+  `stall_counter` from the volatile counter via `log3` which rounds the turn-after counter to 0 →
+  the handler is dropped). Stream-neutral (both consume one shuffle over the tie-group). Needs a
+  "stall-volatile-present" flag in State/convert distinct from `stall_counter`.
+- **`randomChance[33,100]@shedskin` (3)** — end-of-turn Shed Skin cure roll (abilities.ts, onResidual
+  order 5 subOrder 3): `if hp && status && randomChance(33,100)` cure. State-affecting; same family as
+  the landed Harvest/Cursed Body residual procs, needs correct residual-order placement.
+- **`randomChance[90,100]@leechseed` (3)** — Leech Seed accuracy skip vs a specific target; and a tail
+  of args cascades (`@seismictoss`/`@icebeam`/`@bodypress` — downstream of the multi-hit desync).
+
+**LANDED this session (were open items): `random[2,5]@slp` (Rest, P3.15), `shuffle[3,1,3]`/[4,2,4]
+missing residual handler (Hydration, P3.16), `randomChance[3,10]@poisontouch`/`@cutecharm` (P3.17),
+`ModifyAccuracy` arg chain incl. Wide Lens/Compound Eyes/stages (P3.18).**
 
 ### Phase-3 deferral-burn-down tranche (2026-07-23, 42 → 49) — working the merged dossier queue
 | step | games | class landed | commit |
