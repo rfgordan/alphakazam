@@ -312,6 +312,98 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
     spe as i32
 }
 
+/// PS `eachEvent('Update')` / `runAction` post-action Update speed-sorts `getAllActive()` with
+/// `(a,b)=>b.speed-a.speed`; in singles the two actives tie — consuming one `prng.shuffle` —
+/// iff they are both on the field and share `effective_speed`. `prefaint`: at the per-hit
+/// `eachEvent('Update')` (battle-actions.ts:970) a just-KO'd target is STILL in `getAllActive`
+/// (its `.fainted` flag isn't set until `faintMessages` at :979), so liveness there is "the slot
+/// is occupied" (species present) rather than HP>0. Every other Update site (turn-start,
+/// post-hit-loop 1024, runAction 2882, post-residual) evaluates AFTER `faintMessages`, so a
+/// fainted mon is gone and the tie needs both actives alive.
+fn actives_update_tie(state: &State, prefaint: bool) -> bool {
+    let a = state.side(SideId::One).active();
+    let d = state.side(SideId::Two).active();
+    let live_ok = if prefaint {
+        a.species != crate::ids::Species::None && d.species != crate::ids::Species::None
+    } else {
+        a.is_alive() && d.is_alive()
+    };
+    live_ok && effective_speed(state, SideId::One) == effective_speed(state, SideId::Two)
+}
+
+/// Both actives alive and equal `effective_speed` (turn-order / commitChoices tie predicate).
+fn actives_speed_tied(state: &State) -> bool {
+    actives_update_tie(state, false)
+}
+
+/// Emit the post-action `eachEvent('Update')` shuffle (battle.ts:2882 runAction, post-residual,
+/// switch/tera brackets, and post-hit-loop 1024) — fires iff both actives are alive and tied.
+/// Annotation-only; state-neutral (PS logs the shuffle order as null, validated via `stateAfter`).
+fn emit_update(b: &mut Branch) {
+    if annotating() && actives_update_tie(&b.state, false) {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update");
+    }
+}
+
+/// Emit the per-hit `eachEvent('Update')` shuffle (battle-actions.ts:970) — fires once per
+/// connecting hit, on the PRE-faint-message board (a target at 0 HP still counts as on-field).
+fn emit_update_hit(b: &mut Branch) {
+    if annotating() && actives_update_tie(&b.state, true) {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update");
+    }
+}
+
+/// Emit the turn-start Update bracket PS produces before any move executes, in queue order:
+///   1. `commitChoices` `queue.sort()` (battle.ts:3039): the two committed actions tie →
+///      `shuffle[2,0,2]`. Two moves tie iff a full `move_order` tie (equal order/priority/
+///      fractional-priority/speed); two switches tie iff equal OUTGOING (current-active) speed;
+///      a move+switch never ties (orders 200 vs 103 differ).
+///   2. `beforeTurn` action → `eachEvent('BeforeTurn')` (battle.ts:2830): `shuffle[2,0,2]` on a
+///      speed tie (independent of priority/action kind).
+///   3. runAction Update after the beforeTurn action (battle.ts:2882): `shuffle[2,0,2]` on a
+///      speed tie.
+///   4. gen8 dynamic-speed re-sort before the first move (battle.ts:2938), only when the next
+///      queued action is a move (i.e. NEITHER side switches) and the two moves tie: the remaining
+///      queue is `[move,move,residual]` (length 3) → `shuffle[3,0,2]`.
+/// All four are state-neutral annotation draws emitted on the pre-switch board.
+fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custap: [bool; 2]) {
+    if !annotating() {
+        return;
+    }
+    let st = &b.state;
+    let mk = |side: SideId, idx: u8, cu: bool| Action {
+        side,
+        move_idx: idx,
+        pivot: Pivot::Stay,
+        shell_phys: None,
+        foe_pending_move: None,
+        custap: cu,
+        external_move: None,
+    };
+    let both_move = matches!(s1, MoveChoice::Move(_)) && matches!(s2, MoveChoice::Move(_));
+    let commit_tie = match (s1, s2) {
+        (MoveChoice::Move(i1), MoveChoice::Move(i2)) => {
+            let a = mk(SideId::One, i1, custap[0]);
+            let c = mk(SideId::Two, i2, custap[1]);
+            move_order(st, &a, &c) == Order::Tie
+        }
+        // Two switch actions sort on the outgoing (current) active's speed at order 103.
+        (MoveChoice::Switch(_), MoveChoice::Switch(_)) => actives_speed_tied(st),
+        _ => false,
+    };
+    let speed_tie = actives_speed_tied(st);
+    if commit_tie {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 1. commitChoices sort
+    }
+    if speed_tie {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 2. eachEvent('BeforeTurn')
+        draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3. runAction Update
+    }
+    if both_move && commit_tie {
+        draw(b, "shuffle", &[3, 0, 2], -1, "update"); // 4. dynamic-speed re-sort (len-3 queue)
+    }
+}
+
 /// Whether the active Pokémon has a Protosynthesis / Quark Drive boost active.
 fn has_proto(s: &crate::state::Side) -> bool {
     s.volatiles.contains(VolatileStatus::Protosynthesis) || s.volatiles.contains(VolatileStatus::QuarkDrive)
@@ -954,6 +1046,13 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
+
+    // 0) Turn-start Update bracket (PS `commitChoices` sort + `beforeTurn` action + gen8 dynamic
+    //    re-sort), emitted on the pre-switch board before any action runs — the leading
+    //    `shuffle` draws of an equal-Speed turn. Annotation-only (no-op without draw annotation).
+    for b in &mut branches {
+        emit_turn_start_bracket(b, s1, s2, custap);
+    }
 
     // 1) Switches resolve before moves, in speed order when both sides switch (the slower
     //    side's switch-in ability resolves last and e.g. its weather wins).
@@ -1713,6 +1812,20 @@ pub(crate) struct Action {
     pub(crate) external_move: Option<crate::ids::MoveId>,
 }
 
+/// Run one move action and append its trailing runAction Update (battle.ts:2882): after EVERY
+/// move action completes — hit, miss, immunity, or a fully-cancelled attempt — PS fires
+/// `eachEvent('Update')`, which shuffles on a surviving equal-Speed pair. The in-kernel per-hit
+/// (970) and post-hit-loop (1024) Updates are emitted inside `execute_move`; this adds the 2882.
+fn run_move_action(b: Branch, action: Action) -> Vec<Branch> {
+    let mut out = execute_move(b, action);
+    if annotating() {
+        for nb in &mut out {
+            emit_update(nb);
+        }
+    }
+    out
+}
+
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action], exec: &mut Exec) -> Vec<Branch> {
     let mut out = Vec::new();
     for b in branches {
@@ -1725,7 +1838,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
     match actions.len() {
         0 => vec![b],
         1 => {
-            let out = execute_move(b, actions[0]);
+            let out = run_move_action(b, actions[0]);
             exec.prune(out)
         }
         _ => {
@@ -1743,14 +1856,13 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
                         let (f, s) = if a_first { (a, b_act) } else { (b_act, a) };
                         sequence_two_moves(b, f, s, exec)
                     }
-                    // Enumerated: 50/50 over the two orderings. PS resolves an equal-speed action
-                    // tie with `prng.shuffle` over the 2 queued actions -> shuffle(2, 0, 2). The
-                    // ordering is validated by the resulting state (PS logs shuffle order as null).
+                    // Enumerated: 50/50 over the two orderings. PS resolves the equal-speed action
+                    // tie with `prng.shuffle` over the committed actions — already emitted as the
+                    // commitChoices `shuffle[2,0,2]` in `emit_turn_start_bracket` (item 1), which
+                    // both order-branches inherited here. The ordering is validated by `stateAfter`.
                     None => {
-                        let mut ba = scaled(&b, 0.5);
-                        draw(&mut ba, "shuffle", &[2, 0, 2], -1, "speed-tie");
-                        let mut bb = scaled(&b, 0.5);
-                        draw(&mut bb, "shuffle", &[2, 0, 2], -1, "speed-tie");
+                        let ba = scaled(&b, 0.5);
+                        let bb = scaled(&b, 0.5);
                         let mut res = sequence_two_moves(ba, a, b_act, exec);
                         res.extend(sequence_two_moves(bb, b_act, a, exec));
                         res
@@ -1840,7 +1952,8 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
     let mut out = Vec::new();
     // The prune between the movers is what kills the branch cross-product in Sample mode:
     // the second mover executes on one sampled first-move outcome instead of all of them.
-    for fb in exec.prune(execute_move(b, first)) {
+    // `run_move_action` appends the first mover's runAction Update (2882) to each outcome.
+    for fb in exec.prune(run_move_action(b, first)) {
         // The second mover acts only if its active is alive and wasn't flinched by the first.
         let flinched = fb.state.side(second.side).volatiles.contains(VolatileStatus::Flinch);
         // Once the first action ends the battle (for example Life Orb recoil KOs that side's
@@ -1851,12 +1964,21 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
         if fb.state.side(second.side).active().is_alive() && !battle_over(&fb.state) {
             if flinched {
                 // The move is cancelled, but the BeforeMove handlers above flinch's priority
-                // still run (sleep tick / thaw roll / Truant toggle / recharge consumption).
-                out.extend(flinch_cancel_chain(fb, second.side));
+                // still run (sleep tick / thaw roll / Truant toggle / recharge consumption). The
+                // flinched mon's move action still completes, so its runAction Update (2882) fires.
+                let mut fc = flinch_cancel_chain(fb, second.side);
+                if annotating() {
+                    for nb in &mut fc {
+                        emit_update(nb);
+                    }
+                }
+                out.extend(fc);
             } else {
-                out.extend(execute_move(fb, second));
+                // `run_move_action` appends the second mover's runAction Update (2882).
+                out.extend(run_move_action(fb, second));
             }
         } else {
+            // The second action never runs (its user fainted or the battle ended) — no 2882.
             out.push(fb);
         }
     }
@@ -3490,6 +3612,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
+            // In-kernel Update shuffles for this connecting hit, in PS order (after `spreadMoveHit`
+            // = self-drops + target secondaries + DamagingHit contact abilities have all rolled):
+            //   970  per-hit `eachEvent('Update')` — fires on the PRE-faint board (a target
+            //        reduced to 0 HP this hit is still in getAllActive), so a KO still shuffles.
+            //   1024 post-hit-loop `eachEvent('Update')` — fires once for the move but AFTER
+            //        faintMessages, so a KO'd (now-fainted) target breaks the tie and it doesn't.
+            // Both emitted before the pivot/drag switch changes the on-field mon (and its Speed).
+            emit_update_hit(&mut sb);
+            emit_update(&mut sb);
             // Pivot move (U-turn): switch the user out now that it connected.
             match pivot {
                 Pivot::Target(t) => {
@@ -7149,6 +7280,13 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         }
     }
 
+    // NOTE: a connecting status move runs `moveHit`, after which PS fires the per-hit
+    // `eachEvent('Update')` (battle-actions.ts:970). It is NOT emitted here: PS skips `moveHit`
+    // (and the 970) whenever the move *fails* — a foe-targeting move that is type/ability-immune,
+    // or a self move that no-ops (Recover at full HP, Substitute with one already up, a boost at
+    // the cap) — and the engine's post-effect "hit" branch does not distinguish "ran moveHit" from
+    // "produced no change", so any blanket emit over-fires (measured net-negative). Status-move
+    // 970 is a documented deferral pending an exact `moveHit`-ran predicate.
     if miss_prob > 0.0 {
         hits.push(scaled(&b, miss_prob));
         hits
@@ -8249,6 +8387,13 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                     .collect::<Vec<_>>()
             })
             .collect();
+    }
+    // runAction Update after the `residual` action completes (battle.ts:2882): one `shuffle[2,0,2]`
+    // on a surviving equal-Speed pair. Emitted last, after every residual draw (incl. Future Sight).
+    if annotating() {
+        for nb in &mut out {
+            emit_update(nb);
+        }
     }
     out
 }
