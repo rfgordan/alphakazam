@@ -542,12 +542,75 @@ function instrumentPrng(battle, draws) {
 		move: battle.activeMove?.id ?? null,
 		pokemon: battle.activePokemon?.fullname ?? null,
 	});
+	// Event-id stack for speedSort/shuffle attribution. PS sets `battle.event` only AFTER the
+	// speedSort inside `runEvent` (battle.ts:794 sorts, 807 assigns), so at shuffle time
+	// `battle.event.id` is the PARENT event, not the one dispatching the shuffled handlers.
+	// Wrap the three speedSort call sites (runEvent / fieldEvent / eachEvent) to push the true
+	// dispatching eventid so `shuffleContext()` can read it. (singleEvent has no handler list and
+	// never speed-sorts; queue sorts go through `eachEvent`/action-tie shuffle, tagged below.)
+	const eventStack = [];
+	const wrapEvent = (name, eventIdOf) => {
+		const orig = battle[name].bind(battle);
+		battle[name] = (...args) => {
+			eventStack.push(eventIdOf(args));
+			try { return orig(...args); }
+			finally { eventStack.pop(); }
+		};
+	};
+	wrapEvent('runEvent', (a) => a[0]);       // runEvent(eventid, ...)
+	wrapEvent('fieldEvent', (a) => a[0]);     // fieldEvent(eventid, ...) — Residual / SwitchIn
+	wrapEvent('eachEvent', (a) => a[0]);      // eachEvent(eventid, ...)
+	const curEvent = () => (eventStack.length ? eventStack[eventStack.length - 1] : null);
+
+	// Compact descriptor of one speedSort element: a runEvent/fieldEvent handler
+	// ({effect, effectHolder, order, priority, speed, subOrder, effectOrder}), an `eachEvent`
+	// active Pokemon ({speed, fullname}), or an action-queue entry ({choice, pokemon, ...}).
+	const descElem = (x) => {
+		if (x == null || typeof x !== 'object') return { raw: stringify(x) };
+		const d = {};
+		if (x.effect) {                       // event handler
+			d.effect = x.effect.id ?? null;
+			d.effectType = x.effect.effectType ?? null;
+			d.name = x.effect.name ?? null;
+			d.holder = x.effectHolder?.fullname ?? x.effectHolder?.id ?? null;
+			d.order = x.order ?? null;
+			d.priority = x.priority ?? null;
+			d.speed = x.speed ?? null;
+			d.subOrder = x.subOrder ?? null;
+			d.effectOrder = x.effectOrder ?? null;
+			if (x.callback && x.callback.name) d.cb = x.callback.name;
+		} else if (x.choice !== undefined) {  // action-queue entry
+			d.choice = x.choice;
+			d.pokemon = x.pokemon?.fullname ?? null;
+			d.order = x.order ?? null;
+			d.priority = x.priority ?? null;
+			d.subOrder = x.subOrder ?? null;
+			d.fractionalPriority = x.fractionalPriority ?? null;
+			d.speed = x.speed ?? null;
+		} else {                               // active Pokemon (eachEvent speed comparator)
+			d.pokemon = x.fullname ?? x.id ?? null;
+			d.speed = x.speed ?? null;
+		}
+		return d;
+	};
+	// For a shuffle(list, start, end) call: attribute the dispatching event and enumerate the
+	// full handler list (indices [start,end) are the tying group PS shuffles).
+	const shuffleContext = (args) => {
+		const [list, start, end] = args;
+		let full = null;
+		try { full = Array.isArray(list) ? list.map(descElem) : null; } catch { full = null; }
+		return { eventid: curEvent(), start, end, group: full ? full.slice(start, end) : null, full };
+	};
+
 	// randomChance/sample call this.random internally; record only the outermost call so each
 	// semantic draw appears exactly once.
 	let depth = 0;
-	const wrap = (name, fmtArgs) => {
+	const wrap = (name, fmtArgs, extra) => {
 		const orig = prng[name].bind(prng);
 		prng[name] = (...args) => {
+			// Capture pre-call context for shuffle: PS mutates `list` in place, and the selection
+			// sort has already positioned the tying group at [start,end) before calling shuffle.
+			const ctx = extra ? extra(args) : null;
 			depth++;
 			let result;
 			try {
@@ -556,7 +619,7 @@ function instrumentPrng(battle, draws) {
 				depth--;
 			}
 			if (depth === 0) {
-				draws.push({ kind: name, args: fmtArgs(args), result: serializeResult(name, result, args), ...label() });
+				draws.push({ kind: name, args: fmtArgs(args), result: serializeResult(name, result, args), ...label(), ...(ctx || {}) });
 			}
 			return result;
 		};
@@ -564,7 +627,7 @@ function instrumentPrng(battle, draws) {
 	wrap('random', (a) => a.filter(x => x !== undefined));
 	wrap('randomChance', (a) => a);
 	wrap('sample', (a) => [a[0]?.length]);          // record domain size, result index below
-	wrap('shuffle', (a) => [a[0]?.length, a[1], a[2]]);
+	wrap('shuffle', (a) => [a[0]?.length, a[1], a[2]], shuffleContext);
 }
 
 function serializeResult(kind, result, args) {
@@ -925,7 +988,7 @@ async function main() {
 			: TEAM_SM[TEAMSET]
 			? TEAM_SM[TEAMSET].map(t => t.join(']'))
 			: TEAM_C5[TEAMSET]
-			? TEAM_C5[TEAMSET].map(t => t.join(']'))
+			? TEAM_C5[TEAMSET]
 			: TEAM_C6[TEAMSET]
 			? TEAM_C6[TEAMSET].map(t => t.join(']'))
 			: TEAM_DIRECTED[TEAMSET]
