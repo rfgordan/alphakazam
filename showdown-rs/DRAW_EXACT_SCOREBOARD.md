@@ -12,7 +12,101 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 38 / 111 full games exact end-to-end (34.2%); init-aligned from seed 105/111.**
+**Result: 42 / 111 full games exact end-to-end (37.8%); init-aligned from seed 105/111.**
+
+### Phase-3 keystone tranche (2026-07-23, 38 → 42) — speedSort brackets + Thunder Wave immunity
+Five draw-accounting/mechanics classes landed this session (3 commits), all rails green
+throughout (engine tests, corpus state-sweep **3831/3831**, distribution smoke **18/18**),
+SEED_GATE monotone with **zero** prior-exact game regressing at any step:
+
+| step | games | class(es) landed | commit |
+|------|-------|------------------|--------|
+| P3.4 | 39/111 | **move-order tie composition** (b0==b3) + **status-move 970/1024 Update** + **Thunder Wave type immunity** | fb2e4cd |
+| P3.5 | 42/111 | **switch / runSwitch post-swap Update bracket** (flips c2, c6, rd287) | bb5e6c4 |
+| P3.6 | 42/111 | **terastallize turn-start bracket** (extra tera runAction Update; advances t2 d3→d9) | 08f4c0c |
+
+Net flips vs the 38 baseline: **c2, c6, d7, rd287** (0 regressions). The two Update-bracket
+classes plus the tie composition also advanced most tied-Speed games to a later (downstream)
+divergence.
+
+**Class details.**
+1. *Move-order tie composition.* A both-move Speed tie's turn-start bracket is FOUR shuffles
+   — commit `queue.sort()` (b0), `eachEvent('BeforeTurn')`, runAction Update, and the gen8
+   dynamic re-sort of `[move,move,residual]` (b3, battle.ts:2946). `speedSort` composes the two
+   queue sorts: side One executes first iff **b0 == b3**. The prior peek read only b0 (the
+   pre-dynamic-resort order) and mis-selected whenever b0 != b3 — the residual both-move-tie
+   divergence (c7 d29: surf-first, not the engine's saltcure-first).
+2. *Status-move 970/1024 Update.* PS runs a status move through `hitStepMoveHitLoop` exactly
+   like a damaging move: a `moveHit` that applies its effect fires the per-hit (battle-actions.ts:970)
+   and post-hit-loop (:1024) Updates; a fully-failed move fires neither. Emitted at the
+   execute_status_move call site gated on "the branch added ≥1 effect instruction" (protect-fail
+   bookkeeping excluded). Both are actives-Speed-tie shuffles → no-op off a tie. RE-LANDS the
+   reverted status-move Update; the scoreboard's earlier "calmmind = 970+2882" model was wrong —
+   it's **970+1024+2882** (a self-boost leaves damage[i]=0, so line 1022 does not early-return).
+3. *Thunder Wave type immunity.* Status moves default `ignoreImmunity = true` (battle-actions.ts:497);
+   **Thunder Wave is the ONE status move with `ignoreImmunity: false`**, so a Ground target (0× to
+   Electric) fails it outright — no accuracy roll, no paralysis. Every other status move ignores
+   type-chart immunity (Toxic vs Steel still rolls then fails at setStatus; Roar/Growl affect
+   Ghost; hazards target a side). Real mechanics gate; flips d7.
+4. *Switch / runSwitch post-swap Update bracket.* PS runs a `switch` as two queue actions
+   (`switch`, `runSwitch`), each ending in a runAction `eachEvent('Update')` (battle.ts:2881), plus
+   the `runSwitch` `getAllActive()` speedSort (battle-actions.ts:182). The engine emitted only the
+   PRE-swap switch-out Update (battle-actions.ts:83); the three POST-swap shuffles were missing.
+   Ground truth (c2 d16): p2 switches a QuarkDrive-speed-boosted Iron Valiant (untied pre-swap)
+   into Toxapex (tied post-swap), so the shuffles are all POST-swap — the observed `[Update, null,
+   Update]`. The mirror `[BeforeTurn, Update, Update]` is a pre-tied/post-untied switch. Both
+   empirical switch schedules now reconstruct from the pre/post-swap effective_speed predicate.
+5. *Terastallize turn-start bracket.* A gen9 `terastallize` action (order 106) runs before the
+   moves, so a Speed-tied both-move tera turn gains one shuffle: the tera action's runAction Update
+   (battle.ts:2882). The commit sort also lengthens to `[tera,move,move]` (`shuffle[k+2,k,k+2]`) —
+   stream-/state-neutral — but the missing tera Update was the real desync. Advances t2 (d3→d9).
+
+### Label-audit methodology (this session)
+The recorder (`instrumentPrng` in cosim.mjs) already tags every `shuffle` with its dispatching
+`eventid` (via a runEvent/fieldEvent/eachEvent id-stack) and the full handler/active list with
+each element's (effect id/type, holder, order, priority, speed, subOrder, effectOrder). All 111
+traces were regenerated to `/tmp/drawlabels2/` (deterministic per seed+teamset+format), giving a
+complete `shuffle` inventory bucketed by eventid: **Update 625, Residual 275, null 162, BeforeTurn
+90, TrapPokemon 35, ModifyDamage 34, Weather/WeatherChange/TerrainChange 5, DisableMove 1.** A
+one-off per-action tracker (wrapping runAction/switchIn/runSwitch) attributed each switch-turn
+shuffle to its exact PS call site (line 83 vs 182 vs 2881), decoding the switch bracket. This audit
+plus the seedgate DRAW_DIFF differ (victim-vs-source: the continuous-PRNG SEED_GATE label is the
+*victim* decision; the re-synced annotation differ points at the *source* shuffle) drove the fixes.
+
+### Handler-order handler-table — the (b) keystone class, characterized, DEFERRED
+The task's "(b) mid-move handler-order speedSort over equal handler lists" reduces, in this corpus,
+to almost entirely **`ModifyDamage` screen ties** (34 draws): a damaging move's `runEvent('ModifyDamage')`
+collects each side's `onAnyModifyDamage` screen handler (Reflect/Light Screen/Aurora Veil, **subOrder
+4**), and when both sides are screened with equal holder Speed the two handlers tie → `shuffle[2,0,2]`,
+fired between the damage roll and the secondary (verified d4 t12: two `lightscreen` handlers). The
+data-driven design mirrors `residual_handlers`/`emit_residual_shuffles`: a per-(damaging-hit) handler
+table of the present screens keyed on (order,priority,holder-speed,subOrder=4), selection-sorted,
+one shuffle per tie-group ≥2. Left DEFERRED (not implemented) this session — it blocks no game's
+FIRST divergence (all ModifyDamage ties are downstream of a switch/Update source), and the
+over-emission risk needs a per-hit incremental gate. Spec is complete; it is the clean next tranche.
+
+### DEFERRED / documented follow-ups (with precise specs)
+- **Switch bracket — double-switch (sw/sw)**: only the single-switch (move+switch) path landed;
+  PS batches consecutive `runSwitch` into ONE shared speedSort. Both-side-switch turns still need
+  the batched-runSwitch schedule. Small, state-reconstructable.
+- **`TrapPokemon` runEvent shuffles (35 draws, trap games t1/t6/…)**: fire at switch/request time
+  when a mon is trapped by ≥2 tying sources (No Retreat + Octolock + partial-trap, order `false`
+  subOrder 2). The EXCLUDED directed class from the prior scoreboard — these desync the trap games'
+  streams (t6 d4: an unmodeled `shuffle[2,0,2]@TrapPokemon` shifts the crit roll). Reconstructable
+  from the trap volatiles; a directed item, not corpus-wide.
+- **First-mover runAction Update on a no-draw first move (c5/c7 t61/t28)**: a both-move tie where
+  the FIRST mover is a status/failed move (e.g. Recover at full HP) emits its runAction Update
+  (2882) BEFORE the second move's draws — an extra leading `shuffle[2,0,2]` (5-shuffle bracket
+  `[commit,BeforeTurn,Update,dynamic,Update]` vs the usual 4). The engine sequences both moves but
+  the first mover's 2882 lands after its (empty) draw list; needs the move-order path to interleave
+  it ahead of the second move on a tie. Blocks c5, c7 (else predicted exact).
+- **Residual handler-length cosmetic (`[4,2,4]` vs `[5,2,4]`)**: PS's `stall` volatile has
+  `duration: 2` (conditions.ts:439), so it survives one turn past the `protect` volatile — a mon
+  can carry `stall` (an extra residual handler) without `protect`. The engine gates the `stall`
+  residual handler on the Protect volatile, dropping it that turn. **Stream- and state-neutral**
+  (both list lengths consume one `random(2,4)` over the same tie-group), so it is a label artifact,
+  NOT a divergence source — no game hinges on it.
+
 
 ### Phase-3 burn-down progression (games exact end-to-end, from seed)
 | step | games | class(es) landed | commit |
