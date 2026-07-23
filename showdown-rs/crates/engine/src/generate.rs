@@ -6282,8 +6282,11 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
         out.push(np);
         return out;
     }
-    // Cute Charm (defender): 30% chance a contact hit infatuates the attacker — only for
-    // opposite genders; Oblivious and Aroma Veil on the attacker block the volatile.
+    // Cute Charm (defender): PS `onDamagingHit` rolls `randomChance(3, 10)` on EVERY contact hit
+    // against the holder — the gender / Oblivious / Aroma Veil / already-attracted checks live
+    // inside `addVolatile('attract')`, so the roll fires regardless of whether the attacker can
+    // actually be infatuated (a 30% draw-and-discard when it can't land). The holder being at
+    // 0 HP (pre-faint) doesn't stop the roll. The engine previously emitted NO draw at all.
     if def_ab == Ab::CuteCharm && md.flag_contact {
         let a = b.state.side(side).active();
         let d = b.state.side(foe).active();
@@ -6292,29 +6295,51 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
             || b.state.side(side).volatiles.contains(VolatileStatus::Attract);
         if a.is_alive() && genders_ok && !blocked {
             let mut proc = scaled(&b, 0.30);
-            let noproc = scaled(&b, 0.70);
+            let mut noproc = scaled(&b, 0.70);
+            draw(&mut proc, "randomChance", &[3, 10], 1, "cutecharm");
+            draw(&mut noproc, "randomChance", &[3, 10], 0, "cutecharm");
             push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Attract });
             return vec![proc, noproc];
         }
+        // Roll fires but the effect can't land → single draw-and-discard branch.
+        let mut b = b;
+        draw(&mut b, "randomChance", &[3, 10], 0, "cutecharm");
         return vec![b];
     }
     // Toxic Chain (attacker) badly-poisons the target on any damaging hit (30%, not contact-
     // gated). Otherwise a contact hit can trigger the defender's status ability or the
     // attacker's Poison Touch.
-    let (target, status) = if atk_ab == Ab::ToxicChain {
-        (foe, Status::Toxic)
+    let (target, status, poison_touch) = if atk_ab == Ab::ToxicChain {
+        (foe, Status::Toxic, false)
     } else if !md.flag_contact {
         return vec![b];
     } else {
         match def_ab {
-            Ab::FlameBody => (side, Status::Burn),
-            Ab::Static => (side, Status::Paralysis),
-            Ab::PoisonPoint => (side, Status::Poison),
-            _ if atk_ab == Ab::PoisonTouch => (foe, Status::Poison),
+            Ab::FlameBody => (side, Status::Burn, false),
+            Ab::Static => (side, Status::Paralysis, false),
+            Ab::PoisonPoint => (side, Status::Poison, false),
+            _ if atk_ab == Ab::PoisonTouch => (foe, Status::Poison, true),
             _ => return vec![b],
         }
     };
-    if !status_applies(b.state.side(target).active(), status) {
+    // Poison Touch is the ONE contact ability that PS gates on the target's Shield Dust /
+    // Covert Cloak: it returns BEFORE the roll, so no `randomChance` at all (the other contact
+    // abilities status the attacker and ignore its Shield Dust). PS ref: abilities.ts poisontouch.
+    if poison_touch {
+        let t = b.state.side(target).active();
+        if t.ability == Ab::ShieldDust || t.item == Item::CovertCloak {
+            return vec![b];
+        }
+    }
+    // PS `onDamagingHit` / `onSourceDamagingHit` rolls `randomChance(3, 10)` on every qualifying
+    // hit, INDEPENDENT of whether the status can be applied (`trySetStatus` runs inside the proc
+    // branch). When it can't land — target already statused / type-immune / fainted this hit —
+    // the roll is a single draw-and-discard. The engine previously skipped the draw entirely.
+    let can_land = b.state.side(target).active().is_alive()
+        && status_applies(b.state.side(target).active(), status);
+    if !can_land {
+        let mut b = b;
+        draw(&mut b, "randomChance", &[3, 10], 0, "contact-status");
         return vec![b];
     }
     let chance = 0.30;
