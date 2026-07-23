@@ -6461,6 +6461,10 @@ fn extra_secondary_roll_move(id: crate::ids::MoveId) -> bool {
     matches!(
         id.to_id(),
         "saltcure" | "psychicnoise" | "throatchop" | "sparklingaria" | "syrupbomb" | "spiritshackle"
+        // Alluring Voice: `secondary:{chance:100, onHit: confuse iff the target raised a stat this
+        // turn}` — PS `secondaries()` always rolls one `random(100)`; the confusion is conditional
+        // (and, when it lands, rolls its own 2-6 duration — unmodeled, absent from the corpus).
+        | "alluringvoice"
     )
 }
 
