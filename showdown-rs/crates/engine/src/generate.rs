@@ -1133,8 +1133,21 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     } else {
         for (side, target) in switch_actions {
             for b in &mut branches {
+                // Switch-out `eachEvent('Update')` (battle-actions.ts:83) — PRE-swap board.
                 emit_switch_pre_update(b);
                 apply_switch(b, side, target);
+                // POST-swap switch bracket (each a `shuffle[2,0,2]` iff both actives alive and
+                // equal effective_speed on the POST-swap board): the `switch` action's runAction
+                // Update (battle.ts:2881), the `runSwitch` `getAllActive()` speedSort
+                // (battle-actions.ts:182), and the `runSwitch` runAction Update (2881). PS runs
+                // `switch` and `runSwitch` as two queue actions, each ending in a runAction Update.
+                // (c2 d16: p2 switches Iron Valiant→Toxapex; pre-swap Garganacl vs QuarkDrive-boosted
+                // Iron Valiant is untied so switch-out is skipped, post-swap Garganacl==Toxapex==106
+                // ties → [Update, null, Update]. A pre-tied/post-untied switch gives the mirror
+                // [BeforeTurn, Update, Update] from the turn-start bracket + switch-out Update.)
+                emit_update(b); // switch action runAction Update
+                emit_update(b); // runSwitch getAllActive speedSort
+                emit_update(b); // runSwitch runAction Update
             }
         }
     }
