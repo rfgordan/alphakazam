@@ -9059,12 +9059,18 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 if p.ability == crate::ids::Ability::ShedSkin && p.status != Status::None && p.is_alive() {
                     let slot = b.state.side(side).active_index;
                     let (prev, prev_ctr) = (p.status, p.status_counter);
+                    // PS Shed Skin (abilities.ts, onResidual order 5 subOrder 3) rolls
+                    // `randomChance(33, 100)` for every living, statused holder each end of turn;
+                    // on success it cures. Emit the draw on both branches (proc=cure, noproc=keep)
+                    // so the residual draw stream carries it (was `ps unconsumed @shedskin`).
                     let mut cure = scaled(&b, 33.0 / 100.0);
+                    draw(&mut cure, "randomChance", &[33, 100], 1, "shedskin");
                     push(&mut cure, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
                     if prev_ctr != 0 {
                         push(&mut cure, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
                     }
-                    let keep = scaled(&b, 67.0 / 100.0);
+                    let mut keep = scaled(&b, 67.0 / 100.0);
+                    draw(&mut keep, "randomChance", &[33, 100], 0, "shedskin");
                     vec![cure, keep]
                 } else {
                     vec![b]
