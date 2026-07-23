@@ -1498,6 +1498,10 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
                 | TeraShell | TeraShift | TeraformZero
         );
         if b.state.side(foe).active().is_alive() && !untraceable {
+            // PS Trace `onUpdate` picks its target via `this.sample(possibleTargets)` — the
+            // traceable adjacent foes (battle abilities.ts). In singles that list is length 1, so
+            // one `sample[1]` draw fires before the copy (draw-and-discard; state validates).
+            draw(b, "sample", &[1], 0, "trace");
             let slot = b.state.side(side).active_index;
             push(b, Instruction::ChangeAbility { side, slot, previous: Trace, new: fa });
             // The copied ability activates as if the holder just switched in.
