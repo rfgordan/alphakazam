@@ -3795,8 +3795,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let damaged: Vec<(Branch, bool)> = if let Some(cur) = realized {
         apply_multihit_realized(&b, side, &md, hit_prob, cur)
     } else if md.id.to_id() == "beatup" {
-        // Beat Up: one hit per eligible party member with per-member base power.
-        apply_beatup(&b, side, &md, hit_prob)
+        // Beat Up: one hit per eligible party member with per-member base power. Realized single
+        // path (seed gate / differ) draws each member's crit + damage off the source; Enumerate/
+        // Sample stay on the sumset-DP convolution (no per-hit stream needed).
+        if let Some(cur) = realized_cursor(&b) {
+            let calcs = beatup_calcs(&b, side, &md);
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
+        } else {
+            apply_beatup(&b, side, &md, hit_prob)
+        }
     } else if let Some(fixed) = fixed_damage_amount(&md, &b.state, side) {
         // Fixed-damage moves (Night Shade / Seismic Toss = level, Dragon Rage = 40, ...) skip
         // the damage formula entirely: one deterministic outcome, no rolls or crit.
@@ -6013,10 +6020,12 @@ fn apply_multihit_realized_ma(
     let foe = side.other();
     let mut hb = scaled(b, hit_prob);
     let loaded = hb.state.side(side).active().item == Item::LoadedDice;
-    let multiacc = !loaded; // Loaded Dice deletes multiaccuracy → no per-hit accuracy roll
-    // Hit count: fixed (Triple Axel/Kick 3, Population Bomb 10); Loaded Dice Population Bomb rolls
-    // `10 - random(7)` (battle-actions.ts:877).
-    let mut count = md.hits_max as usize;
+    // Per-hit accuracy only for the actual multiaccuracy moves, and only when Loaded Dice hasn't
+    // deleted `multiaccuracy` (Beat Up is not multiaccuracy → no per-hit accuracy roll).
+    let multiacc = is_multiaccuracy_move(md) && !loaded;
+    // Hit count: Beat Up = one per participating member (calcs); Triple Axel/Kick 3; Population Bomb
+    // 10, and a Loaded Dice holder rolls `10 - random(7)` (battle-actions.ts:877).
+    let mut count = if md.id.to_id() == "beatup" { calcs.len() } else { md.hits_max as usize };
     if md.id.to_id() == "populationbomb" && loaded {
         let r = cur.peek("random", &[7]);
         draw(&mut hb, "random", &[7], r, "loadeddice");
@@ -6102,29 +6111,35 @@ fn apply_multihit_realized_ma(
 /// Attack vs the target's Defense (Dark, physical, no contact). We convolve the per-hit damage
 /// distributions (each 16 rolls × crit) in order, tracking `(sub_remaining, mon_damage, landed
 /// hits, sash_used)` so Substitute break, early faint, and Sturdy/Focus Sash stay exact.
+/// Beat Up's per-hit `DamageCalc` list: one entry per participating party member (party order — the
+/// user always, plus each ally that is alive and status-free), each with base power
+/// `5 + floor(species base Atk / 10)` but the USER's Attack vs the target's Defense.
+fn beatup_calcs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<DamageCalc> {
+    let mut calcs: Vec<DamageCalc> = Vec::new();
+    let s = b.state.side(side);
+    for i in 0..6usize {
+        let p = &s.pokemon[i];
+        if p.species == crate::ids::Species::None {
+            continue;
+        }
+        let included = i as u8 == s.active_index || (p.is_alive() && p.status == Status::None);
+        if !included {
+            continue;
+        }
+        let base_atk = crate::data::base_stats(p.species)[1];
+        let bp = (5 + (base_atk / 10)).max(1) as u16;
+        let mut m = *md;
+        m.base_power = bp;
+        calcs.push(compute_damage(b, side, &m));
+    }
+    calcs
+}
+
 fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32) -> Vec<(Branch, bool)> {
     use std::collections::HashMap;
     let foe = side.other();
     // Participating party members (party order): the user always, plus alive, status-free allies.
-    let mut calcs: Vec<DamageCalc> = Vec::new();
-    {
-        let s = b.state.side(side);
-        for i in 0..6usize {
-            let p = &s.pokemon[i];
-            if p.species == crate::ids::Species::None {
-                continue;
-            }
-            let included = i as u8 == s.active_index || (p.is_alive() && p.status == Status::None);
-            if !included {
-                continue;
-            }
-            let base_atk = crate::data::base_stats(p.species)[1];
-            let bp = (5 + (base_atk / 10)).max(1) as u16;
-            let mut m = *md;
-            m.base_power = bp;
-            calcs.push(compute_damage(b, side, &m));
-        }
-    }
+    let calcs: Vec<DamageCalc> = beatup_calcs(b, side, md);
     if calcs.is_empty() {
         // No participants is impossible (the user is always eligible), but stay total.
         return vec![(scaled(b, hit_prob), false)];

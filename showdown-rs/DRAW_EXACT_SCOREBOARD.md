@@ -12,8 +12,8 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 55 / 111 full games exact end-to-end (49.5%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 97.42% (3732/3831), zero shuffle over-emission.**
+**Result: 56 / 111 full games exact end-to-end (50.5%); init-aligned from seed 105/111.
+Draw-consumption differ 90.16% → 97.55% (3737/3831), zero shuffle over-emission.**
 
 ### Phase-3 open-item-burn tranche (2026-07-23, 49 → 52; differ 94.07% → 96.50%)
 Five classes landed this session (all rails green throughout: engine tests, corpus state-sweep
@@ -49,6 +49,15 @@ all green, no exact game regressed — same 52 exact set).
 |--------|--------|-------|--------|
 | **[2,5] standard + Loaded Dice + Scale Shot + Skill Link** | bulletseed / iciclespear / rockblast / tailslap / bonerush / pinmissile / scaleshot: count `sample([2×7,3×7,4×3,5×3])` = `sample(20)` → table; a Loaded Dice holder that samples 2/3 re-rolls `5 - random(2)`; **Skill Link** rewrites `[2,5]`→plain 5 in `onModifyMove` (no sample draw — was the iciclespear residual); Scale Shot's self-drop rides the existing `selfDrops` site. | 52→52 | 96.50% → **97.18%** (3697→3723) |
 | **multiaccuracy (Triple Axel / Triple Kick + Population Bomb)** | `apply_multihit_realized_ma`: each hit past the first rolls its OWN accuracy `randomChance(acc,100)` (battle-actions.ts:907) and a miss ends the move — UNLESS the holder has **Loaded Dice**, whose `onModifyMove` *deletes* `multiaccuracy` (so every hit lands, no per-hit roll; Population Bomb's count becomes `10 - random(7)`). Ascending-power indexed calcs for Triple Axel; KO/Substitute-break truncation. The enumerated Triple Axel path (32³, Enumerate/Sample only) is unchanged; Population Bomb's Enumerate stays on the DP. | 52→**55** | 97.18% → **97.42%** (3723→3732) |
+| **Beat Up** | one hit per participating party member (party order: the user + each alive, status-free ally), per-member base power `5 + floor(baseAtk/10)` but the USER's Atk; each member rolls crit `randomChance(1,24)` + damage `random(16)` (no count draw, not multiaccuracy). Routed through `apply_multihit_realized_ma` with the member `DamageCalc` list (`beatup_calcs`); Enumerate/Sample keep the sumset-DP `apply_beatup`. | 55→**56** | 97.42% → **97.55%** (3732→3737) |
+
+**Beat Up residue (damage-calc, NOT draw).** Beat Up's DRAW stream is now exact — the per-member
+crit/damage draws match PS (c2a4 is fully exact end-to-end). But pinning PS's exact rolls unmasks a
+per-member `compute_damage` discrepancy in the OTHER Beat Up games (c2a1/c2a2/c2a3/c2a5): the
+`randomChance[1,24]@beatup` DRAW mismatches (9) cleared, and a handful became
+`state-mismatch-despite-draw-match` (draws align, HP off by a small amount) — the SAME masked
+damage-rounding class as d4 t18, not a draw-stream defect. Those games diverge earlier in SEED_GATE
+anyway, so no game regressed.
 
 `sample[20]@bulletseed`/`@iciclespear`/`@tailslap`/`@rockblast`/`@scaleshot`, `@populationbomb`,
 `@tripleaxel` labels all cleared. **Games flipped exact: 52 → 55** — c6a2s113 (Population Bomb),
