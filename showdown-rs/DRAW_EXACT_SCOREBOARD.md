@@ -12,8 +12,8 @@ goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, 
 order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
-**Result: 56 / 111 full games exact end-to-end (50.5%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 97.65% (3741/3831), zero shuffle over-emission.**
+**Result: 58 / 111 full games exact end-to-end (52.3%); init-aligned from seed 105/111.
+Draw-consumption differ 90.16% → 97.83% (3748/3831), zero shuffle over-emission.**
 
 ### Phase-3 realized-cursor screen-shuffle desync (2026-07-23) — the misattributed "compute_damage rounding" class
 The `state-mismatch-despite-draw-match` residue flagged as a screen×multi-hit **damage-rounding**

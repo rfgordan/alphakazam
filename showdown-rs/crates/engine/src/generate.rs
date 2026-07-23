@@ -6914,6 +6914,15 @@ fn extra_secondary_roll_move(id: crate::ids::MoveId) -> bool {
         // turn}` — PS `secondaries()` always rolls one `random(100)`; the confusion is conditional
         // (and, when it lands, rolls its own 2-6 duration — unmodeled, absent from the corpus).
         | "alluringvoice"
+        // Burning Jealousy: `secondary:{chance:100, onHit: burn iff statsRaisedThisTurn}` — the roll
+        // always fires; the burn (applied in `apply_burning_jealousy`) is conditional.
+        | "burningjealousy"
+        // Ceaseless Edge / Stone Axe carry an EMPTY `secondary: {}` (present only so Sheer Force can
+        // boost them); PS `secondaries()` still rolls one `random(100)` per empty secondary (chance
+        // undefined ⇒ always "hits", does nothing). The Spikes / Stealth Rock are laid separately via
+        // `onAfterHit`. Shield Dust / Covert Cloak filter the empty secondary out (no `.self`/
+        // `.dustproof`) ⇒ no roll — the shared `shielded` guard already handles that.
+        | "ceaselessedge" | "stoneaxe"
     )
 }
 
