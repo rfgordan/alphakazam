@@ -213,7 +213,15 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
     // Materialize each outcome's final state exactly as replay does; find one matching `target`.
     // Draw *shapes* are invariant across the roll values that lead to a given state, so the
     // first state-matching outcome's draw log is representative.
+    //
+    // On a Speed tie both move orderings enumerate to the SAME `stateAfter` but with DIFFERENT
+    // (interleaved) draw streams; PS realized exactly one order (its commitChoices shuffle bit).
+    // The engine's enumeration produces both, so the honest question is whether ANY state-matching
+    // branch reproduces PS's recorded draw sequence — not whichever ordering happens to enumerate
+    // first. So collect every state-matching outcome: report Exact if one reproduces the draws,
+    // else report the first such outcome's mismatch as the representative (the DBG dump too).
     let mut draw_matched_but_state_off = false;
+    let mut first_state_match: Option<&engine::generate::AnnotatedOutcome> = None;
     for o in &outcomes {
         let mut cand = state_before;
         cand.apply_instructions(&o.instructions);
@@ -238,29 +246,39 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
             }
         }
         if diff_states(&cand, &state_target).is_empty() {
-            // Realized branch found: this is the honest comparison.
-            let res = compare_draws(&o.draws, &rec);
-            if let Ok(filter) = std::env::var("DRAW_DBG") {
-                if let Some((cat, label, detail)) = &res {
-                    if (filter.is_empty() && label.contains("accuracy") && cat.contains("not-next"))
-                        || (!filter.is_empty() && label.contains(&filter)) {
-                        let p1 = state_before.sides[0].active();
-                        let p2 = state_before.sides[1].active();
-                        eprintln!("DBG turn {turn} mc={:?} p1alive={} p2alive={} | {detail}\n   rust={:?}\n   ps  ={:?}",
-                            mc, p1.is_alive(), p2.is_alive(),
-                            o.draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect::<Vec<_>>(),
-                            rec.iter().map(|r| r.label.clone()).collect::<Vec<_>>());
-                    }
-                }
+            // A branch reproducing BOTH stateAfter AND the exact recorded draw sequence means the
+            // engine reproduced PS — return Exact regardless of which ordering enumerated first.
+            if compare_draws(&o.draws, &rec).is_none() {
+                return DrawUnit { turn, class: DrawClass::Exact };
             }
-            return match res {
-                None => DrawUnit { turn, class: DrawClass::Exact },
-                Some((category, label, detail)) => DrawUnit { turn, class: DrawClass::Mismatch { category, label, detail } },
-            };
-        }
-        if compare_draws(&o.draws, &rec).is_none() {
+            if first_state_match.is_none() {
+                first_state_match = Some(o);
+            }
+        } else if compare_draws(&o.draws, &rec).is_none() {
             draw_matched_but_state_off = true;
         }
+    }
+    // No state-matching branch reproduced the draws: report the first state-matching outcome's
+    // mismatch as the representative (with the DBG dump, as before).
+    if let Some(o) = first_state_match {
+        let res = compare_draws(&o.draws, &rec);
+        if let Ok(filter) = std::env::var("DRAW_DBG") {
+            if let Some((cat, label, detail)) = &res {
+                if (filter.is_empty() && label.contains("accuracy") && cat.contains("not-next"))
+                    || (!filter.is_empty() && label.contains(&filter)) {
+                    let p1 = state_before.sides[0].active();
+                    let p2 = state_before.sides[1].active();
+                    eprintln!("DBG turn {turn} mc={:?} p1alive={} p2alive={} | {detail}\n   rust={:?}\n   ps  ={:?}",
+                        mc, p1.is_alive(), p2.is_alive(),
+                        o.draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect::<Vec<_>>(),
+                        rec.iter().map(|r| r.label.clone()).collect::<Vec<_>>());
+                }
+            }
+        }
+        return match res {
+            None => DrawUnit { turn, class: DrawClass::Exact },
+            Some((category, label, detail)) => DrawUnit { turn, class: DrawClass::Mismatch { category, label, detail } },
+        };
     }
 
     // No branch reproduced PS's state (should be rare: the corpus is 100% state-matched by the
