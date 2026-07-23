@@ -3,6 +3,80 @@
 Reproduce: `cargo build --release -p cosim && DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz`
 PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
+---
+
+## Phase 3 — seed-driven full-battle Replicate gate (`crates/cosim/src/seedgate.rs`)
+
+The strategic pivot: annotation-mode scoreboarding (90.16% per-decision draw-exact) is done; the
+goal bar is a **single-path executor** — same seed ⇒ same sampled outcomes, same draw count and
+order — measured end-to-end per FULL GAME. Reproduce:
+`SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
+
+**Result: 21 / 111 full games exact end-to-end (18.9%); init-aligned from seed 105/111.**
+
+### PsPrng from-seed validation (`RAW_DRAW_GATE=1`, `INIT_SCAN=1`)
+Every one of the 111 games' recorded **strong** draw streams (the ~3.9k non-shuffle draws with
+checkable results) reproduces bit-exactly from the recorded battle seed `[n,n+7,n+13,n+29]` once
+the per-game init offset is applied (`no-fit = 0` over init 0..64). This certifies `PsPrng`
+(`from_limbs` + the LCG) at the *call* level across whole games, not just the 25.6M raw gate.
+
+### The pre-turn-1 offset — SOLVED (unlogged battle-construction draws)
+The recorder's instance-wrap attaches AFTER `new Battle(...)`, so construction draws were
+unlogged. Deep instrumentation (`Gen5RNG.prototype.next`, `/tmp/initprobe3.mjs`) identified them:
+**per-mon gender rolls**. PS `new Pokemon` (pokemon.js:116) does
+`this.gender = genders[set.gender] || species.gender || this.battle.sample(["M","F"])` — one
+`sample` draw per mon whose species is **dual-gender** (no fixed `gender` field in the dex) AND
+whose set leaves gender empty, in side-then-roster order (`Side.addPokemon`). For c1 that is
+exactly 7 (4 + 3 dual-gender mons; the paradox/genderless leads don't roll) — matching the
+observed offset (the 8th `next()` from the seed IS the teampreview shuffle value). Replicated in
+Rust: `init_gender_rolls()` burns one draw per dual-gender mon (species table
+`crates/cosim/src/fixed_gender.txt`, extracted from the pinned dex — 405 fixed-gender ids);
+random-battle formats pre-generate teams with explicit set genders → 0 construction rolls. This
+aligns 105/111 from seed. The residual 6 are custom directed teams whose SETS specify a gender
+for a dual-gender mon (Breloom `|M|`, the loyal-three, …): the set is not in the trace, so a
+set-gender is indistinguishable from a rolled gender in the snapshot — a documented gap needing
+either the set data or a recorder field. The teampreview action's own shuffle (0 or 1 draw,
+speed-tie dependent) is consumed from the recorded draw *shapes* (order-neutral).
+
+### Replicate executor — the draw-stream filter
+Reuses the `Enumerate` annotation: `generate_instructions_annotated` emits, per outcome branch,
+the ordered PS-form draws. `replicate_select` walks the draw positions, consumes the real
+`PsPrng` with each branch's `(kind,args)`, and keeps the branches whose realized value selects
+them — narrowing to the single realized outcome (exactly the branch PS's stream dictates).
+Handled draw types: `randomChance` (0/1), `random(16)` damage roll (index-exact, `HitCombos`
+enumerates all 16), duration `random(m,n)`, `sample` (index), and binary `random(100)`
+secondary/flinch/self-drop (the engine annotates proc=0 / noproc=chance — the filter is made
+threshold-aware: proc iff `drawn < chance`). Move-order **Speed ties** are resolved by peeking
+PS's `commitChoices` `shuffle[2,0,2]` bit (`random(0,2)`) and forcing that order via a new
+`Exec`-adjacent thread-local (`set_forced_tie_order` / `move_order_tie` in `generate.rs`); the
+generation still emits+consumes the shuffle draw, so the stream stays aligned. This took the gate
+8 → 21 games (the threshold-secondary fix alone was 8 → 21; move-order forcing collapses the
+ambiguous shuffle forks that are genuine move-order ties).
+
+### First-divergence burn-down queue (the new work list, ranked by games blocked)
+| games | class | analysis |
+|------|-------|----------|
+| 23 | `rust-extra randomChance[1,24]@crit` | **Multi-hit KO early-termination**: PS stops a multi-hit move when the target faints (or a Substitute breaks); the engine's folded hit path rolls crit+damage for all N hits (`times_hit engine=2 ps=1`). The engine over-draws → desync. Needs the hit loop to terminate on KO in the realized (Replicate) path. (Deferred-class "multi-hit multiplicity".) |
+| 23 | `draws-match/state-diff` | Filter value mis-selection: the draw SHAPE matches PS but the selected branch's state is off (small HP), i.e. a `random(100)`-family site whose proc/noproc encoding isn't the `{0,chance}` convention the threshold rule assumes (effect-spore d100, multi-way splits), or a residual-ordering placement. Per-site audit of the annotation `result` encoding. |
+| 4 | `PS shuffle[2,0,2]@generic` | **Deferred `eachEvent('Update')` Speed-tie sites** the annotation still omits (status-move 970 on a realized moveHit, switch/tera runSwitch brackets). PS shuffles where the engine's next draw is accuracy → the engine reads the shuffle's `random(0,2)` as its accuracy roll → shifted stream. |
+| ~10 (1 ea) | `args randomChance@<move>` | **Accuracy-arg modifiers** not yet integer-exact: Compound Eyes / Wide Lens / evasion-stage (needs the 4096 chain), confusion self-hit `[33,100]`, Beat Up per-hit `[1,24]` alignment. The engine emits raw accuracy; PS's is post-`ModifyAccuracy`. |
+| 3 | `PS-unconsumed sample@whirlwind` | **Drag-target `sample`** (Whirlwind / Roar / Dragon Tail random replacement) the engine picks deterministically without a draw. |
+| few | `PS random[2,5]@slp` / `sample@bulletseed` | Residual sleep-duration ordering placement; variable multi-hit COUNT `sample` (folded into the DP). |
+
+**Kill-criteria status: NOT triggered.** Every class above is a known, finite draw-order item
+from the deferred-class analyses — none needs unobservable state (crit#1), and the density decays
+per fix (move-order forcing + threshold secondary landed +13 games with no new independent class
+revealed, crit#2). The dominant remaining blockers (multi-hit KO termination, deferred Update
+sites) are the exact single-path signals the charter predicted the annotation approach folds away.
+
+### Regression rail (all green — Enumerate/Sample untouched)
+- `cargo test --release -p engine`: all suites pass (the `FORCED_TIE_ORDER` thread-local defaults
+  `None`, so Enumerate/Sample paths are byte-identical).
+- Corpus state-sweep: **3831/3831 matched, 0 diverged, 100.00%**.
+- Draw-consumption differ: **3454/3831 = 90.16%** (unchanged — annotation path untouched).
+
+---
+
 ## PRNG algorithm (Phase 0)
 Battle seeds use the **Gen-5 64-bit LCG** over a `[4×u16]` state, NOT the sodium/ChaCha path.
 `PRNG.setSeed` dispatches on the seed string; the recorder builds every battle with a 4-number

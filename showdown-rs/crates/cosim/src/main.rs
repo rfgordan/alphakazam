@@ -12,6 +12,7 @@ mod convert;
 mod diff;
 mod drawdiff;
 mod replay;
+mod seedgate;
 mod trace;
 
 use std::collections::BTreeMap;
@@ -49,6 +50,19 @@ fn main() -> ExitCode {
     // and print the burn-down scoreboard. Leaves the state-verification path untouched.
     if std::env::var("DRAW_DIFF").is_ok() {
         return run_draw_diff(&args);
+    }
+
+    // Raw seed→draw-stream gate: seed a PsPrng from the recorded battle seed and replay the
+    // recorded draw log in order, checking every non-shuffle draw's result reproduces. Validates
+    // the seed alignment (incl. the pre-turn-1 offset) and the PsPrng port at the call level,
+    // independent of the engine. RAW_DRAW_GATE=1 cosim <traces...>.
+    if std::env::var("RAW_DRAW_GATE").is_ok() {
+        return run_raw_draw_gate(&args);
+    }
+
+    // Seed-driven full-battle Replicate gate (Phase 3 deliverable #2).
+    if std::env::var("SEED_GATE").is_ok() {
+        return crate::seedgate::run_seed_gate(&args);
     }
 
     let mut totals = Totals::default();
@@ -258,6 +272,128 @@ fn run_draw_diff(args: &[String]) -> ExitCode {
     }
     board.report();
     ExitCode::SUCCESS
+}
+
+/// Consume one recorded draw from `prng` and return whether its result reproduces (shuffles are
+/// consumed but never checked — PS logs their order as null). `None` for an unknown kind.
+fn replay_recorded_draw(prng: &mut engine::psprng::PsPrng, dr: &serde_json::Value) -> Option<bool> {
+    use serde_json::Value;
+    let kind = dr.get("kind").and_then(Value::as_str)?;
+    let args: Vec<i64> = dr.get("args").and_then(Value::as_array)?
+        .iter().filter_map(Value::as_i64).collect();
+    let result = dr.get("result");
+    match kind {
+        "randomChance" => {
+            let got = prng.random_chance(args[0] as u32, args[1] as u32);
+            Some(result.and_then(Value::as_bool).map_or(true, |r| r == got))
+        }
+        "random" => {
+            let got = if args.len() == 2 {
+                prng.random_range(args[0] as u32, args[1] as u32)
+            } else {
+                prng.random_n(args[0] as u32)
+            };
+            Some(result.and_then(Value::as_i64).map_or(true, |r| r as u32 == got))
+        }
+        "sample" => {
+            let got = prng.sample_index(args[0] as u32);
+            Some(result.and_then(Value::as_i64).map_or(true, |r| r as u32 == got))
+        }
+        "shuffle" => {
+            // args [len,start,end]: Fisher-Yates over [start,end) consumes end-1-start draws.
+            let (start, end) = (args[1] as usize, args[2] as usize);
+            let mut s = start;
+            while s < end.saturating_sub(1) {
+                let _ = prng.random_range(s as u32, end as u32);
+                s += 1;
+            }
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Replay a game's full recorded draw stream through `prng` after burning `init` leading draws.
+/// Returns (all_strong_draws_ok, strong_draws_checked). Strong = non-shuffle (result checkable).
+fn replay_stream_with_init(t: &trace::Trace, limbs: [u16; 4], init: u32) -> (bool, u64) {
+    let mut prng = engine::psprng::PsPrng::from_limbs(limbs);
+    for _ in 0..init { let _ = prng.next(); }
+    let mut strong = 0u64;
+    for d in &t.decisions {
+        for dr in &d.draws {
+            match replay_recorded_draw(&mut prng, dr) {
+                Some(true) => { if dr.get("kind").and_then(|v| v.as_str()) != Some("shuffle") { strong += 1; } }
+                _ => return (false, strong),
+            }
+        }
+    }
+    (true, strong)
+}
+
+fn run_raw_draw_gate(args: &[String]) -> ExitCode {
+    // INIT_SCAN=1: report the per-game unlogged init-draw offset (find minimal `init` in 0..64
+    // reproducing the whole strong stream) to characterize the pre-turn-1 alignment convention.
+    if std::env::var("INIT_SCAN").is_ok() {
+        let mut hist: BTreeMap<i64, u32> = BTreeMap::new();
+        let mut none = 0u32;
+        for path in args {
+            let t = match trace::load_trace(path) { Ok(t) => t, Err(_) => continue };
+            let Some(limbs) = t.seed else { continue };
+            let mut found = None;
+            for init in 0..64u32 {
+                let (ok, n) = replay_stream_with_init(&t, limbs, init);
+                if ok && n >= 1 { found = Some(init); break; }
+            }
+            match found {
+                Some(init) => { *hist.entry(init as i64).or_default() += 1; }
+                None => { none += 1; println!("  NO-INIT-FITS: {path}"); }
+            }
+        }
+        println!("INIT-OFFSET histogram (init draws -> #games):");
+        for (init, c) in &hist { println!("  init={init:3}  {c} games"); }
+        println!("  no-fit: {none}");
+        return ExitCode::SUCCESS;
+    }
+    let mut games_ok = 0u32;
+    let mut games = 0u32;
+    let mut total_draws = 0u64;
+    let mut fails: Vec<String> = Vec::new();
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        let Some(limbs) = t.seed else {
+            fails.push(format!("{path}: no seed in trace"));
+            continue;
+        };
+        games += 1;
+        let mut prng = engine::psprng::PsPrng::from_limbs(limbs);
+        let mut ok = true;
+        let mut n = 0u64;
+        'outer: for d in &t.decisions {
+            for dr in &d.draws {
+                match replay_recorded_draw(&mut prng, dr) {
+                    Some(true) => { n += 1; }
+                    Some(false) => {
+                        ok = false;
+                        fails.push(format!("{path}: draw #{n} mismatch: {}", serde_json::to_string(dr).unwrap_or_default()));
+                        break 'outer;
+                    }
+                    None => {
+                        ok = false;
+                        fails.push(format!("{path}: draw #{n} unknown kind: {}", serde_json::to_string(dr).unwrap_or_default()));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        total_draws += n;
+        if ok { games_ok += 1; }
+    }
+    println!("RAW DRAW-STREAM GATE: {games_ok}/{games} games reproduce the full recorded draw stream ({total_draws} draws checked)");
+    for f in fails.iter().take(30) { println!("  {f}"); }
+    if games_ok == games { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {

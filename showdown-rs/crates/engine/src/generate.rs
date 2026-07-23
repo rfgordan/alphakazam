@@ -62,6 +62,41 @@ pub(crate) fn annotating() -> bool {
     ANNOTATE_DRAWS.with(|c| c.get())
 }
 
+thread_local! {
+    /// Replicate mode: when set, an equal-priority/equal-speed move-order tie resolves to a
+    /// SINGLE ordering (`Some(true)` = side One moves first) instead of the 50/50 enumerate fork.
+    /// The seed-driven gate reads PS's `commitChoices` shuffle bit and forces the realized order
+    /// so single-path replay is unambiguous. Default `None` — Enumerate/Sample are untouched.
+    static FORCED_TIE_ORDER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force (or clear) the move-order tie resolution for the current thread. See [`FORCED_TIE_ORDER`].
+pub fn set_forced_tie_order(order: Option<bool>) {
+    FORCED_TIE_ORDER.with(|c| c.set(order));
+}
+
+#[inline]
+fn forced_tie_order() -> Option<bool> {
+    FORCED_TIE_ORDER.with(|c| c.get())
+}
+
+/// Would this pair of move choices resolve as an equal-priority/equal-speed order TIE (the case
+/// PS breaks with a `commitChoices` `shuffle[2,0,2]`)? Both sides must be attacking; custap
+/// fractional priority is accounted for exactly as the turn resolver does. Used by the seed gate
+/// to know when to consume PS's order-deciding shuffle bit.
+pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
+    let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() }];
+    let custap = custap_stage(&mut branches, state, s1, s2);
+    let mk = |side: SideId, idx: u8, cu: bool| Action {
+        side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
+        foe_pending_move: None, custap: cu, external_move: None,
+    };
+    let a = mk(SideId::One, i1, custap[0]);
+    let c = mk(SideId::Two, i2, custap[1]);
+    move_order(state, &a, &c) == Order::Tie
+}
+
 /// Append a draw to a branch's stream (no-op unless annotation is enabled).
 #[inline]
 pub(crate) fn draw(b: &mut Branch, kind: &'static str, args: &[i32], result: i64, site: &'static str) {
@@ -1847,6 +1882,13 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
             match order {
                 Order::First(first) => {
                     let (f, s) = if first == a.side { (a, b_act) } else { (b_act, a) };
+                    sequence_two_moves(b, f, s, exec)
+                }
+                // Replicate: a forced order (from PS's commitChoices shuffle bit) collapses the
+                // tie to a single realized path — no 50/50 fork, no ambiguity for the differ.
+                Order::Tie if forced_tie_order().is_some() => {
+                    let a_first = forced_tie_order().unwrap();
+                    let (f, s) = if a_first { (a, b_act) } else { (b_act, a) };
                     sequence_two_moves(b, f, s, exec)
                 }
                 Order::Tie => match exec.coin() {

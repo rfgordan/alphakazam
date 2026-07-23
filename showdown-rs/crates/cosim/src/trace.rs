@@ -16,6 +16,10 @@ pub struct Trace {
     #[serde(rename = "psCommit")]
     pub ps_commit: String,
     pub format: String,
+    /// The battle seed the recorder built the game with (`[hi,..,lo]` u16 limbs). Present in v2
+    /// traces; drives the seed-replay gate (seed a `PsPrng`, drive Replicate, byte-compare).
+    #[serde(default)]
+    pub seed: Option<[u16; 4]>,
     pub teamset: Option<String>,
     pub decisions: Vec<Decision>,
     pub result: TraceResult,
