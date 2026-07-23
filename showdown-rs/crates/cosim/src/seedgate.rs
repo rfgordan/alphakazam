@@ -248,6 +248,11 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
         };
         let diffs = diff_states(&state, &state_target);
         if !diffs.is_empty() {
+            if std::env::var("DBG_DIFF").is_ok() && dbg_on {
+                for dd in &diffs {
+                    eprintln!("  DIFF {}: {}", dd.category, dd.detail);
+                }
+            }
             // Attribute the divergence to its draw-class: the first point where the engine's
             // chosen-outcome draw stream diverges from PS's recorded draws for this unit (the
             // input matched by construction — every prior decision was state-exact).
@@ -323,10 +328,20 @@ fn step_unit(
     let tie = engine::generate::move_order_tie(state, mc[0], mc[1]);
     if tie {
         let mut peek = *prng;
-        let bit = peek.random_range(0, 2);
-        // shuffle(list,0,2): swap iff random(0,2)==1. Committed order is [side One, side Two], so
-        // no-swap (bit==0) => side One moves first.
-        engine::generate::set_forced_tie_order(Some(bit == 0));
+        // A both-move Speed tie's turn-start bracket is FOUR shuffles (all consuming one
+        // `random(0,2)` each): [commit `queue.sort()` (b0), eachEvent('BeforeTurn') (b1),
+        // runAction Update (b2), gen8 dynamic re-sort of the [move,move,residual] queue (b3)].
+        // PS's executed order is set by composing the two queue sorts (b1/b2 are eachEvent actives
+        // shuffles that don't touch the move queue): commitChoices `shuffle[2,0,2]` swaps the
+        // committed [One,Two] pair iff b0==1, then the dynamic `shuffle[3,0,2]` re-shuffles the two
+        // moves (its [0,2) tie-group) iff b3==1. speedSort composes to: side One executes first iff
+        // b0 == b3. (Peeking only b0 — the pre-dynamic-resort order — mis-selects whenever b0 != b3;
+        // that was the residual both-move-tie divergence.)
+        let b0 = peek.random_range(0, 2);
+        let _b1 = peek.random_range(0, 2);
+        let _b2 = peek.random_range(0, 2);
+        let b3 = peek.random_range(0, 2);
+        engine::generate::set_forced_tie_order(Some(b0 == b3));
     }
     let outcomes = generate_instructions_annotated(state, mc[0], mc[1], pivots, tera);
     engine::generate::set_forced_tie_order(None);

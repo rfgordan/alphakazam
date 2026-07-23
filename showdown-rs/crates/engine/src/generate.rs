@@ -3235,7 +3235,28 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         {
             return vec![b];
         }
+        let ins_before = b.ins.len();
         let mut branches = execute_status_move(b, side, &md, foe_pending_move.is_some());
+        // PS runs a status move through `hitStepMoveHitLoop` exactly like a damaging move: a
+        // `moveHit` that applies its effect fires the per-hit `eachEvent('Update')`
+        // (battle-actions.ts:970) and the post-hit-loop `eachEvent('Update')` (:1024). A move that
+        // fails at `tryHit` / `spreadMoveHit` (immune / already-statused / missed / redundant boost)
+        // breaks BEFORE 970 and fires neither. Both are actives-Speed-tie shuffles (no-op off a
+        // tie), so this only affects tied boards. Detect a successful moveHit per-branch as "the
+        // status resolution added ≥1 effect instruction" — a failed move applies none. Pure
+        // protect-fail bookkeeping (only a `SetStallCounter` reset) is NOT a moveHit success.
+        if annotating() {
+            for sb in &mut branches {
+                let did_something = sb.ins.len() > ins_before
+                    && sb.ins[ins_before..]
+                        .iter()
+                        .any(|i| !matches!(i, Instruction::SetStallCounter { .. }));
+                if did_something {
+                    emit_update_hit(sb); // 970 (per-hit, pre-faint board)
+                    emit_update(sb); // 1024 (post-hit-loop, alive-gated)
+                }
+            }
+        }
         // Self-switch status moves (Teleport, Chilly Reception, Parting Shot) pivot out.
         match pivot {
             Pivot::Target(t) => {
@@ -7225,6 +7246,21 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
             push(&mut b, Instruction::Heal { side, slot, amount });
         }
         return vec![b];
+    }
+
+    // PS `hitStepTypeImmunity` runs BEFORE `hitStepAccuracy`, but for STATUS moves it is bypassed
+    // (`move.ignoreImmunity` defaults to `category === 'Status'`) — EXCEPT the lone status move that
+    // explicitly sets `ignoreImmunity: false`: **Thunder Wave**. So a Ground-type target (0× to
+    // Electric) fails Thunder Wave outright — no accuracy roll, no paralysis — while every other
+    // status move ignores type-chart immunity (Toxic vs Steel still rolls then fails at setStatus;
+    // Roar/Growl affect Ghost; hazards target a side). Electric-type targets take 0.5× (not 0), so
+    // Thunder Wave still rolls accuracy against them and the paralysis fails later at setStatus.
+    // This is a real (non-annotation) mechanics gate: PS makes no draw and applies nothing.
+    if md.id.to_id() == "thunderwave" {
+        let foe_p = b.state.side(foe).active();
+        if foe_p.is_alive() && crate::damage::type_multiplier(md.typ, foe_p.types) == 0.0 {
+            return vec![b];
+        }
     }
 
     let hit_prob = accuracy_of(&b, side, md);
