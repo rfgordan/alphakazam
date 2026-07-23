@@ -424,6 +424,36 @@ fn emit_modifydamage_shuffle(b: &mut Branch) {
     }
 }
 
+/// Emit the `TrapPokemon` shuffles PS makes while building the next move request. In `getRequests`
+/// PS runs `runEvent('TrapPokemon', pokemon)` for each active in `getAllActive()` order (p1 then
+/// p2, battle.ts:1640/1724). The trapping volatiles — `trapped` (Mean Look / Block / Spider Web /
+/// Jaw Lock), `partiallytrapped` (Bind / Fire Spin / …), `noretreat`, `octolock` — each register an
+/// `onTrapPokemon` handler at DEFAULT priority (no `onTrapPokemonPriority`), so their comparePriority
+/// keys are identical: order false, priority 0, subOrder 2 (Condition), holder = the same mon (same
+/// speed). A mon trapped by ≥2 of them therefore has all handlers tie → one `shuffle[N,0,N]`.
+/// (Commander's `commanded`/`commanding` use `onTrapPokemonPriority:-11`, a different priority — they
+/// never tie with these and don't occur in the corpus.) Fired at the end of the turn, after the
+/// post-residual Update, since `getRequests` runs after the turn completes. Annotation-only.
+fn emit_trap_pokemon_shuffles(b: &mut Branch) {
+    if !annotating() {
+        return;
+    }
+    for side in [SideId::One, SideId::Two] {
+        let s = b.state.side(side);
+        if !s.active().is_alive() {
+            continue;
+        }
+        let v = s.volatiles;
+        let n = (s.partial_trap_turns > 0) as i32
+            + v.contains(VolatileStatus::Trapped) as i32
+            + v.contains(VolatileStatus::NoRetreat) as i32
+            + v.contains(VolatileStatus::Octolock) as i32;
+        if n >= 2 {
+            draw(b, "shuffle", &[n, 0, n], -1, "trappokemon");
+        }
+    }
+}
+
 /// Emit the turn-start Update bracket PS produces before any move executes, in queue order:
 ///   1. `commitChoices` `queue.sort()` (battle.ts:3039): the two committed actions tie →
 ///      `shuffle[2,0,2]`. Two moves tie iff a full `move_order` tie (equal order/priority/
@@ -8706,6 +8736,9 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     if annotating() {
         for nb in &mut out {
             emit_update(nb);
+            // Then PS builds the next move request (`getRequests` → per-active TrapPokemon), whose
+            // multi-trap tie shuffle is the turn's trailing draw.
+            emit_trap_pokemon_shuffles(nb);
         }
     }
     out

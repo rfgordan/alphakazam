@@ -13,7 +13,32 @@ order — measured end-to-end per FULL GAME. Reproduce:
 `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz`.
 
 **Result: 49 / 111 full games exact end-to-end (44.1%); init-aligned from seed 105/111.
-Draw-consumption differ 90.16% → 93.19% (3570/3831), zero shuffle over-emission.**
+Draw-consumption differ 90.16% → 94.07% (3604/3831), zero shuffle over-emission.**
+
+### Coordinator directive (differ-zero) — mandated observed-diff fixes (2026-07-23)
+The completion bar is ZERO differ mismatches corpus-wide (every observed count/order/kind/ARGS/
+handler-list diff is a fix target regardless of game yield). Landed this session:
+| step | differ | class landed | commit |
+|------|--------|--------------|--------|
+| P3.13 | 93.27% | **stall residual handler (turn-after)** — `[5,2,4]` drained (stream-neutral, differ-only) | stall |
+| P3.14 | 94.07% | **TrapPokemon multi-trap shuffle** — `shuffle[3,0,3]` drained (13→0), `[2,0,2]` 41→23; advances t6 d4→d24 | trappokemon |
+
+**NAMED OPEN ITEMS (observed diffs still outstanding — PS evidence, for the next tranche):**
+- **`shuffle[2,0,2]@generic` (23)** — status-move/secondary-move per-hit `eachEvent('Update')` (970)
+  the engine still omits (deferred: needs the "did `moveHit` run" signal). PS battle-actions.ts:970.
+- **`shuffle[3,0,2]@generic` (5)** — turn-start action-queue length: on a both-move Speed tie PS's
+  dynamic re-sort shuffles a length-3 queue `[move,move,residual]`; some paths emit `[2,0,2]`.
+- **`shuffle[3,1,3]`/`[4,2,4]` (4+4)** — a residual handler the engine's `residual_handlers()` table
+  still misses (ps list 1 longer, tie-group shifted by 1 → the missing handler sorts BEFORE the
+  tail tie, i.e. it is NOT stall; a low-`order` residual handler to identify). Stream-neutral.
+- **`random[2,5]@slp` (21)** — sleep-duration placement (dossier Class 4): the duration draw fires
+  at the residual/apply moment, not where the engine emits it. `data/conditions.ts` slp.onStart.
+- **`sample[20]@bulletseed`/`@iciclespear` (19+5), `randomChance[1,24]@beatup` (9)** — variable
+  multi-hit COUNT `sample` + per-hit crit/damage (dossier Class 2, HIGH regression risk — DP path
+  shared with Enumerate/Sample; reserved for a dedicated tranche).
+- **`randomChance[100,100]@accuracy` (9), `[1,5]@frz` (7), `@seismictoss`/`@icebeam`/`@bodypress`
+  (args)** — pre-accuracy fail / frz-thaw decision boundary / `ModifyAccuracy` arg chain (dossier
+  Classes 9 & 5). **`randomChance[3,10]@poisontouch`/`@cutecharm` (4+3)** — ability residual proc.
 
 ### Phase-3 deferral-burn-down tranche (2026-07-23, 42 → 49) — working the merged dossier queue
 | step | games | class landed | commit |
@@ -24,6 +49,8 @@ Draw-consumption differ 90.16% → 93.19% (3570/3831), zero shuffle over-emissio
 | P3.10 | 47/111 | **Substitute-blocked secondary rolls** (sub hit still rolls `random(100)`) | sub-secondary |
 | P3.11 | 48/111 | **Alluring Voice secondary roll** (100%-secondary emission) | alluringvoice |
 | P3.12 | 49/111 | **ModifyDamage screen-tie shuffle** (both/either side screened, `[K,0,K]`) | modifydamage |
+| P3.13 | 49/111 | **stall residual handler (turn-after)** — differ-only, stream-neutral | stall |
+| P3.14 | 49/111 | **TrapPokemon multi-trap shuffle** (`[N,0,N]`, N≥2 trap sources) — advances t6 | trappokemon |
 
 *P3.12 — ModifyDamage screen shuffle.* PS `getDamage` runs `runEvent('ModifyDamage')` after the
 damage roll (battle-actions.ts:1830). Reflect/Light Screen/Aurora Veil register `onAnyModifyDamage`
