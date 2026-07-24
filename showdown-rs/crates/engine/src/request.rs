@@ -69,6 +69,13 @@ pub struct Flow {
     pub state: State,
     pub rng: u64,
     pending: Pending,
+    /// Optional PS-protocol capture (off = `None` = zero cost on the hot path). When enabled,
+    /// each resolved turn appends its `|turn|…|upkeep` protocol block via `engine::protocol`.
+    protocol_log: Option<Vec<String>>,
+    /// Pre-turn state + move choices stashed for the decomposed (pivot) path, whose full
+    /// instruction list is only complete at `finish_turn`.
+    turn_pre: State,
+    turn_m: [MoveChoice; 2],
 }
 
 fn winner_of(state: &State) -> i64 {
@@ -93,7 +100,35 @@ fn alive_bench(state: &State, side: SideId) -> Option<u8> {
 
 impl Flow {
     pub fn new(state: State, seed: u64) -> Flow {
-        Flow { state, rng: seed.wrapping_add(1), pending: Pending::Turn }
+        Flow {
+            state,
+            rng: seed.wrapping_add(1),
+            pending: Pending::Turn,
+            protocol_log: None,
+            turn_pre: state,
+            turn_m: [MoveChoice::Move(0); 2],
+        }
+    }
+
+    /// Turn PS-protocol capture on/off. When turning on, starts a fresh empty log. Off frees it
+    /// (zero cost afterward). Fetch accumulated lines with [`Flow::take_protocol_log`].
+    pub fn set_protocol_capture(&mut self, on: bool) {
+        self.protocol_log = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// Drain the accumulated protocol lines (leaving capture enabled with an empty buffer).
+    pub fn take_protocol_log(&mut self) -> Vec<String> {
+        match &mut self.protocol_log {
+            Some(v) => std::mem::take(v),
+            None => Vec::new(),
+        }
+    }
+
+    /// Emit one resolved turn's protocol block (no-op when capture is off).
+    fn emit_protocol(&mut self, pre: &State, m1: MoveChoice, m2: MoveChoice, ins: &[Instruction]) {
+        if let Some(log) = &mut self.protocol_log {
+            crate::protocol::protocol_turn(pre, m1, m2, ins, crate::protocol::HpStyle::Percent, log);
+        }
     }
 
     pub fn request(&self) -> Request {
@@ -153,6 +188,9 @@ impl Flow {
         ];
         let m1 = as_move_choice(c1, SideId::One, &self.state);
         let m2 = as_move_choice(c2, SideId::Two, &self.state);
+        // Pre-turn snapshot for protocol capture (both the fast path and the decomposed path,
+        // whose full instruction list only completes at `finish_turn`).
+        let pre = self.state;
 
         // A chosen move pauses for a landing/revive choice. A normal self-switch move (U-turn,
         // Teleport, Shed Tail, …) pauses only when the side has somewhere to go (PS: U-turn with
@@ -174,11 +212,17 @@ impl Flow {
         if !pause[0] && !pause[1] {
             // Fast path: whole-turn sampled resolution (identical to the certified resolver).
             let si = generate_instructions_sampled(&self.state, m1, m2, [Pivot::Stay; 2], tera, &mut self.rng);
+            self.emit_protocol(&pre, m1, m2, &si.instructions);
             self.state.apply_instructions(&si.instructions);
             self.state.turn += 1;
             self.after_turn();
             return;
         }
+
+        // Decomposed (pivot) path: the full instruction list is assembled across pause boundaries
+        // and only complete at `finish_turn`, which emits the protocol from `turn_pre`/`turn_m`.
+        self.turn_pre = pre;
+        self.turn_m = [m1, m2];
 
         // Decomposed path (a pivot move is in play), mirroring generate_instructions_ctx:
         // custap -> switches -> tera -> ordered moves (pausing on PivotPending) -> EOT.
@@ -354,6 +398,12 @@ impl Flow {
             self.rng = exec_state(&exec);
             b = out.into_iter().next().expect("EOT produced no branches");
         }
+        // Decomposed-turn protocol: the pivot path's full instruction list (moves across the pause
+        // boundary + landing switches + EOT) is complete here.
+        if self.protocol_log.is_some() {
+            let (pre, m1, m2) = (self.turn_pre, self.turn_m[0], self.turn_m[1]);
+            self.emit_protocol(&pre, m1, m2, &b.ins);
+        }
         self.state = b.state;
         self.state.turn += 1;
         self.after_turn();
@@ -397,6 +447,19 @@ impl Flow {
                 crate::generate::switch_into(&mut self.state, SideId::Two, t);
             }
             [false, false] => unreachable!("Replace with no sides"),
+        }
+        // Protocol: the incoming mon(s). (Entry-hazard `-damage` is applied inside `switch_into`
+        // and not surfaced as an instruction — the documented replace-switch hazard gap.)
+        if self.protocol_log.is_some() {
+            let style = crate::protocol::HpStyle::Percent;
+            if sides[0] {
+                let l = crate::protocol::switch_line(&self.state, SideId::One, style);
+                self.protocol_log.as_mut().unwrap().push(l);
+            }
+            if sides[1] {
+                let l = crate::protocol::switch_line(&self.state, SideId::Two, style);
+                self.protocol_log.as_mut().unwrap().push(l);
+            }
         }
         self.after_turn();
     }
@@ -468,5 +531,28 @@ fn exec_state(exec: &Exec) -> u64 {
     match exec {
         Exec::Sample(s) => *s,
         Exec::Enumerate => unreachable!("flow always samples"),
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn flow_captures_protocol_when_enabled() {
+        // Off by default = zero cost, empty log.
+        let mut f = Flow::new(crate::team::default_matchup(), 7);
+        assert!(f.take_protocol_log().is_empty());
+
+        // On: a resolved Turn appends a |turn|…|upkeep block.
+        f.set_protocol_capture(true);
+        let mv = |slot| Some(PlayerChoice::Move { slot, tera: false });
+        let _ = f.submit([mv(0), mv(0)]);
+        let log = f.take_protocol_log();
+        assert!(log.iter().any(|l| l.starts_with("|turn|")), "expected a |turn| line: {log:?}");
+        assert!(log.iter().any(|l| l == "|upkeep"), "expected |upkeep|: {log:?}");
+        assert!(log.iter().any(|l| l.starts_with("|move|")), "expected a |move| line: {log:?}");
+        // Draining leaves capture enabled with a fresh buffer.
+        assert!(f.take_protocol_log().is_empty());
     }
 }

@@ -949,6 +949,8 @@ pub struct FlowVec {
     /// Per-env team-draw RNG (separate stream from Flow's internal outcome sampling).
     draw_rngs: Vec<Rng>,
     pool: Option<Arc<Vec<PoolTeam>>>,
+    /// When set, each Flow accumulates PS protocol lines (fetched per-env via `protocol_log`).
+    capture_protocol: bool,
 }
 
 /// The reproducible outcome-sampling seed for env `i` (matches the pre-pool behaviour).
@@ -958,8 +960,10 @@ fn flow_seed(seed: u64, i: usize) -> u64 {
 
 /// A fresh `Flow`: pool teams drawn with `draw_rng` (or the fixed matchup when there is no pool),
 /// seeded for outcome sampling by `outcome_seed`.
-fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64) -> Flow {
-    Flow::new(draw_state(pool, draw_rng), outcome_seed)
+fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64, capture: bool) -> Flow {
+    let mut f = Flow::new(draw_state(pool, draw_rng), outcome_seed);
+    f.set_protocol_capture(capture);
+    f
 }
 
 #[pymethods]
@@ -967,19 +971,20 @@ impl FlowVec {
     /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
     /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None))]
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false))]
     fn new(
         num_envs: usize,
         seed: u64,
         max_requests_per_episode: u32,
         team_pool: Option<String>,
+        capture_protocol: bool,
     ) -> PyResult<Self> {
         let pool = load_pool_opt(team_pool)?;
         let mut draw_rngs: Vec<Rng> = (0..num_envs)
             .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
             .collect();
         let flows = (0..num_envs)
-            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i)))
+            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i), capture_protocol))
             .collect();
         Ok(FlowVec {
             flows,
@@ -988,7 +993,20 @@ impl FlowVec {
             seed,
             draw_rngs,
             pool,
+            capture_protocol,
         })
+    }
+
+    /// Drain env `i`'s accumulated PS protocol lines (empty unless constructed with
+    /// `capture_protocol=True`). Call after `step_all` to log/replay the turns just resolved;
+    /// pair with `harness/make-replay.mjs` for a replay HTML.
+    fn protocol_log(&mut self, env: usize) -> PyResult<Vec<String>> {
+        let n = self.flows.len();
+        let f = self
+            .flows
+            .get_mut(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={n})")))?;
+        Ok(f.take_protocol_log())
     }
 
     /// Number of teams in the loaded pool (0 when running the fixed default matchup).
@@ -1146,6 +1164,7 @@ impl FlowVec {
         let max_requests = self.max_requests;
         let seed = self.seed;
         let pool = &self.pool;
+        let capture = self.capture_protocol;
         let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
             self.flows
                 .par_iter_mut()
@@ -1172,7 +1191,7 @@ impl FlowVec {
                         _ => (false, -1),
                     };
                     if done && auto_reset {
-                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i));
+                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i), capture);
                         *reqs = 0;
                     }
                     (done, winner)

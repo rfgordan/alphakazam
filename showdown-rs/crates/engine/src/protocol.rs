@@ -80,6 +80,16 @@ pub fn protocol_turn(
     out.push("|upkeep".to_string());
 }
 
+/// A `|switch|pNa: Name|Details|HP` line for the mon at `side`'s active slot — used by the
+/// request-flow driver for faint-replacement / landing switch-ins (which apply through
+/// `switch_into` and so are not in the instruction stream). Hazard `-damage` after the switch is
+/// the documented gap (it lives in `switch_into`).
+pub fn switch_line(state: &State, side: SideId, hp_style: HpStyle) -> String {
+    let slot = state.side(side).active_index;
+    let p = &state.sides[side.index()].pokemon[slot as usize];
+    format!("|switch|{}|{}|{}", ident(state, side, slot), details(p), hp_frac(p.hp, p.max_hp, hp_style))
+}
+
 /// Emit a `|move|USER|Move|TARGET`. Self-targeting moves (Roost, Swords Dance, …) target the user;
 /// everything else targets the foe's active (singles).
 fn emit_move(out: &mut Vec<String>, s: &State, side: SideId, move_id: crate::ids::MoveId) {
