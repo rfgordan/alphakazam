@@ -80,6 +80,20 @@ fn forced_tie_order() -> Option<bool> {
     FORCED_TIE_ORDER.with(|c| c.get())
 }
 
+thread_local! {
+    /// Cached both-side effective Speeds frozen at the start of the CURRENT move action, mirroring
+    /// PS's `pokemon.speed` — a stat refreshed by `updateSpeed()` only at turn start and once before
+    /// each move action (battle.ts:2942), NOT continuously. So a Speed change APPLIED DURING a move
+    /// (paralysis from Thunder Wave, a Speed-dropping secondary, a self-boost) does NOT affect that
+    /// same move's internal `eachEvent('Update')` speed-sorts (970/1024/2882) — they still sort on
+    /// the pre-move cached Speed. `run_move_action` sets this to `Some([spe1, spe2])` while a move
+    /// resolves; `actives_update_tie` uses it for the Speed comparison (liveness stays live). `None`
+    /// everywhere else (turn-start bracket, switch brackets, residual, replacement bracket) → the
+    /// live `effective_speed` is used, which is correct there (those are between-action Updates that
+    /// PS evaluates after an `updateSpeed`).
+    static MOVE_TIE_SPEEDS: std::cell::Cell<Option<[i32; 2]>> = const { std::cell::Cell::new(None) };
+}
+
 // ── Realized single-path multi-hit executor ────────────────────────────────────────────────
 //
 // A variable multi-hit move ([2,5] bulletseed/iciclespear/…, Population Bomb's 10 hits, Beat Up's
@@ -530,7 +544,14 @@ fn actives_update_tie(state: &State, prefaint: bool) -> bool {
     } else {
         a.is_alive() && d.is_alive()
     };
-    live_ok && effective_speed(state, SideId::One) == effective_speed(state, SideId::Two)
+    // Mid-move Updates sort on the Speed cached at this move's start (PS's `pokemon.speed`), so a
+    // Speed change the move itself just applied (e.g. Thunder Wave's paralysis on a Speed-tied foe)
+    // does not break the tie for the SAME move's 970/1024/2882. Outside a move (`None`) → live Speed.
+    let (s1, s2) = match MOVE_TIE_SPEEDS.with(|c| c.get()) {
+        Some([a, b]) => (a, b),
+        None => (effective_speed(state, SideId::One), effective_speed(state, SideId::Two)),
+    };
+    live_ok && s1 == s2
 }
 
 /// Both actives alive and equal `effective_speed` (turn-order / commitChoices tie predicate).
@@ -2209,6 +2230,14 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     // by an earlier action this turn (sequence_two_moves reuses the branch for the second mover).
     b.move_failed = false;
     b.pivot_update_done = false;
+    // Freeze both actives' Speed at this move's start (PS's `updateSpeed()` before the move action)
+    // so the move's own internal Updates sort on the pre-move Speed — a paralysis/secondary Speed
+    // change the move applies does not retroactively break its own tie. Save/restore for called-move
+    // reentrancy (Dancer / Magic Bounce / Instruct re-execute a move within this one).
+    let prev_tie_speeds = MOVE_TIE_SPEEDS.with(|c| c.replace(Some([
+        effective_speed(&b.state, SideId::One),
+        effective_speed(&b.state, SideId::Two),
+    ])));
     let mut out = execute_move(b, action);
     if annotating() {
         for nb in &mut out {
@@ -2224,10 +2253,14 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
             // A pivot move already emitted its trailing 2882 on the PRE-switch board at the pivot
             // site (PS fires it before processing `switchFlag`); don't re-emit on the post-switch board.
             if !nb.pivot_update_done {
-                emit_update(nb);
+                emit_update(nb); // move action's trailing 2882 (uses the frozen pre-move Speed)
             }
         }
     }
+    // Restore AFTER the trailing 2882 emit: PS's `updateSpeed` runs at the END of runAction
+    // (battle.ts:2942), so this move's 2882 still sorts on the pre-move Speed; the NEXT action
+    // snapshots afresh.
+    MOVE_TIE_SPEEDS.with(|c| c.set(prev_tie_speeds));
     out
 }
 
