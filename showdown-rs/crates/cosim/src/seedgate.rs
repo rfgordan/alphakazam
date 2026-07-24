@@ -50,8 +50,13 @@ fn fixed_gender_set() -> std::collections::HashSet<&'static str> {
 /// explicit gender, so those mons don't roll — 0 construction draws. Custom-game corpora use
 /// fixed sets with (mostly) empty gender, so dual-gender species roll.
 ///
-/// The set-specified-gender case on directed custom teams is a documented residual (the set is
-/// not in the trace, so it cannot be distinguished from a rolled gender in the snapshot).
+/// A set that specifies its own gender (the recorded `setGender` roster field is non-empty)
+/// suppresses the construction roll: PS's `new Pokemon` uses `set.gender || species.gender ||
+/// sample(['M','F'])`, so an explicit set gender short-circuits before the sample. Directed
+/// custom teams (the c5 batch) fix genders in the packed set for deterministic Attract/Cute
+/// Charm legality, so those mons roll NOTHING at construction. Traces recorded before the
+/// recorder captured `setGender` lack the field entirely; those are treated as empty, preserving
+/// the original (empty-set-gender ⇒ roll for every dual-gender species) accounting.
 fn init_gender_rolls(t: &Trace) -> u32 {
     if t.format.contains("random") {
         return 0;
@@ -66,7 +71,10 @@ fn init_gender_rolls(t: &Trace) -> u32 {
                 .or_else(|| mon.get("species").and_then(Value::as_str))
                 .unwrap_or("");
             let sid = species_id_of_details(det);
-            if !fixed.contains(sid.as_str()) {
+            // Explicit set gender ⇒ no construction roll (PS short-circuits the sample).
+            let set_gender_explicit = mon.get("setGender").and_then(Value::as_str)
+                .map(|g| !g.is_empty()).unwrap_or(false);
+            if !fixed.contains(sid.as_str()) && !set_gender_explicit {
                 n += 1;
             }
         }
@@ -266,6 +274,17 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
                 return mk_fail(Some(format!("d{i}[t{}]:{label}", dp.turn)), decisions_ok, total, aligned);
             }
         };
+        if std::env::var("DRAWCMP").is_ok() {
+            let rec = rec_draw_labels(&unit);
+            if let Some(m) = first_draw_mismatch(&chosen_draws, &rec) {
+                let mid = unit.iter().any(|d| d.mid_turn);
+                let rs: Vec<String> = chosen_draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect();
+                let ps: Vec<String> = rec.iter().map(|r| r.label.clone()).collect();
+                eprintln!("[DRAWCMP] {name} d{i} t{} mid={mid}: {m}", dp.turn);
+                eprintln!("    rust[{}]: {}", rs.len(), rs.join(" "));
+                eprintln!("    ps  [{}]: {}", ps.len(), ps.join(" "));
+            }
+        }
         let target = &unit.last().unwrap().state_after;
         let state_target = match convert_state(target, &canon) {
             Ok(mut s) => { s.sleep_clause = sleep_clause; s }
@@ -417,6 +436,30 @@ fn step_unit(
             state.sides[side].active_turns = state.sides[side].active_turns.saturating_add(1);
         } else if !*was_replaced && pre_end_turn && state.sides[side].active().is_alive() {
             state.sides[side].active_turns = state.sides[side].active_turns.saturating_sub(1);
+        }
+    }
+    // Post-turn (not same-turn) forced-replacement switches: `switch_into`/`switch_into_pair` apply
+    // state only, but PS resolves each replacement as a `switch` action whose runAction fires a
+    // 3-shuffle bracket — switch-action runAction Update (battle.ts:2882), `runSwitch` getAllActive
+    // speedSort (battle-actions.ts:182), runSwitch runAction Update (2882) — each a `getAllActive()`
+    // speed-tie shuffle on the POST-swap board. A bracket fires (3 draws) at the transition to a
+    // both-actives-alive-and-Speed-tied board: for a single replacement, or for the SECOND of a
+    // simultaneous both-sides replacement (the first runs while the other slot is still fainted, so
+    // getAllActive has one active → no shuffle). Ground-truthed on c5a1 t11 (Primarina replaces a
+    // fainted Alcremie vs a Speed-tied Grimmsnarl → exactly 3 shuffles; PS seed 46844→21739). The
+    // engine's annotated switch bracket (generate.rs) covers only VOLUNTARY move+switch pivots; this
+    // consumes the forced-replacement bracket the gate would otherwise skip (a state-neutral drift
+    // that only surfaces at the next Speed-sensitive roll). Off a tie: 0 draws → no effect.
+    if !pre_end_turn && !replacements.is_empty() && engine::generate::replacement_bracket_tied(state) {
+        let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
+            1 // simultaneous both-sides double faint: only the second switch sees both actives alive
+        } else {
+            replacements.len()
+        };
+        for _ in 0..brackets {
+            for _ in 0..3 {
+                let _ = consume(prng, "shuffle", &[2, 0, 2]);
+            }
         }
     }
     Ok((chosen_draws, ambiguous))

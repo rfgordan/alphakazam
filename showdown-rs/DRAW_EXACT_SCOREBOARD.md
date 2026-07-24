@@ -5,6 +5,197 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Mid-turn-faint Update schedule — GROUND-TRUTHED TABLE (2026-07-24, tranche start at 93/111)
+
+Probed each mid-turn re-request unit in the 6 games with `harness/cosim_probe.mjs` (patched cosim
+recorder: wraps `prng.shuffle`, logs the dispatching `eachEvent`, the JS call-site frame, the live
+`getAllActive()` board, and the shuffle's handler `group`). **The engine already emits the correct
+LEADING brackets and the move's 970/1024 — the ONLY gap is exactly ONE trailing `shuffle[2,0,2]` per
+unit, from TWO distinct roots:**
+
+| game | unit | move | target | missing trailing shuffle — PS call site (probe) |
+|------|------|------|--------|--------------------------------------------------|
+| d6   | i25 t24 | p2 uturn (pivot, user survives) | p1 replacement survives | **uturn runAction Update (battle.js:2376=2882)** on the PRE-pivot board `[Garchomp\|Pelipper]` tied — the engine applies uturn's pivot switch INSIDE execute_move before `run_move_action`'s `emit_update`, so the 2882 sees the post-switch board (untied) and is dropped |
+| c3   | i45 t35 | p1 earthquake (KO) | p2 Toxapex faints | **Residual fieldEvent speedSort (battle.js:2344→333)** over `[leftovers/p1(o5,so4,spe106), leftovers/p2(o5,so4,spe106)]` — PS `fieldEvent('Residual')` iterates `side.active` (which still holds the just-fainted Toxapex, item retained, `clearVolatile` on faint wiped only volatiles) → 2 tied Leftovers → `shuffle[2,0,2]`. The engine's `residual_handlers` skips a fainted active → 1 Leftovers → no shuffle |
+| c4   | i30 t24 | earthquake (KO) | Toxapex faints | same Residual 2×Leftovers tie |
+| c5   | i70 t62 | saltcure (KO) | Toxapex faints | same Residual 2×Leftovers tie |
+| r6   | i20 t19 | p2 liquidation (KO) | p1 Tauros-Blaze faints | same Residual 2×Leftovers tie |
+
+PS `fieldEvent('Residual')` (battle.ts:487): the handler is collected for the fainted holder but the
+while-loop `if (handler.effectHolder.fainted) continue` SKIPS its execution — so the fainted mon's
+Leftovers contributes to the speed-SORT (the shuffle) but not to the heal. `getAllActive()` (excludes
+fainted) shows `[surviving-mon only]` at the shuffle, confirming the tie is over the residual HANDLER
+list (2 items), not the actives. c5a1's mid-turn i12 is a DIFFERENT class (`shuffle@generic` after a
+double-move, 3 unconsumed) and its later d18 is the thunderwave move-order class — left for the singles.
+
+## RESULT — mid-turn-faint tranche (2026-07-24): 93/111 -> 98/111, differ 99.09% -> 99.27%, 3 commits
+
+Three ground-truthed, zero-regression mechanics landed (rails green each commit: engine tests 12
+suites, state-sweep **7662/0/0**, distribution smoke **18/18**, seed-gate non-exact set a strict
+subset every step). The "dominant remaining class" hypothesized above (turn-start-vs-switch-in
+bracket) was REFINED by call-site probing: the engine's leading brackets and move 970/1024 were
+ALREADY correct — the actual gap was one trailing shuffle per unit, from three distinct roots:
+
+1. **mid-turn-faint Residual handler tie** (e06d2bb; flips c3, c4, c5, r6, **t1**). A mon that
+   faints mid-turn stays in PS's `side.active`, so `fieldEvent('Residual')` speed-sorts its
+   faint-surviving residual handler (Leftovers / Cud Chew ability) — one extra `shuffle[2,0,2]` when
+   it ties the surviving foe's. `residual_handlers` now collects a fainted active's item/status/
+   ability residuals.
+2. **pivot move trailing 2882 on pre-switch board** (71de8a4; advances d6 d28->d66). PS fires a
+   self-switch move's runAction Update before processing `switchFlag`, so it sorts with the pivot
+   user still on-field; the engine applied the switch first and dropped it. New per-branch
+   `pivot_update_done` + `emit_pivot_trailing_update` at each pivot apply site.
+3. **mid-move Update ties use the frozen pre-move Speed** (360ea83; advances c5a1 d18->d31; differ
+   +7 units). PS's `getAllActive` speedSort reads the cached `pokemon.speed` (refreshed only at
+   turn start / before each move by `updateSpeed`), so a paralysis/secondary Speed change a move
+   applies does not break the SAME move's 970/1024/2882 tie. `run_move_action` snapshots both
+   Speeds into `MOVE_TIE_SPEEDS`; `actives_update_tie` uses them (liveness stays live).
+
+### Remaining 13 non-exact (all init-aligned) — characterized open items, each 1-game/state-risky
+- **d6** d66: weather-SETTING mid-turn switch-in Update schedule — a voluntary mid-turn switch that
+  triggers Drizzle fires `eachEvent('WeatherChange')` + `eachEvent('Weather')` speed-sorts the engine
+  doesn't model, plus a `FieldResidual` weather-handler tie (probed: 3 missing shuffles). Distinct
+  intricate class, 1 game.
+- **c5a1** d31 / **c2a1** d9 / **c1c**/**c3c2s82**/**c3c2s83**/**r10**/**r11**/**t2**/**rd318** —
+  per-move STATE-computation divergences (draws match; active_index / hp / types / confusion_turns /
+  status differ). Not draw work — each a bespoke `compute_damage`/switch-state/status item.
+- **c6a2s114** d36: `PS-unconsumed random[100]@curse` in a mid-turn Palafin re-fire — an extra
+  secondary the engine's mid-turn recompute drops (pivot midTurn Palafin-Hero recompute).
+- **r2** d7: `shuffle[5,3,5]` vs `[4,2,4]` — a stall-volatile-present residual-handler LIST-LENGTH
+  arg (draw-count-neutral); real fix needs a State stall-volatile flag distinct from `stall_counter`.
+- **r3** d23: per-hit Cursed Body (`randomChance[3,10]` after EACH multi-hit hit) — deferred (Scale
+  Shot family regression risk to 55 exact games).
+
+**Kill criteria: NOT triggered.** Three real structured shared-path roots landed (density still
+decaying). Remaining climb is per-move state-computation + the weather-switch-in schedule (intricate,
+state-risky, ~1 game each).
+
+## Terminal state after the two Update-schedule tranches (93/111 = 83.8%)
+
+18 games remain non-exact. First-divergence classes (live seed gate):
+- **mid-turn re-request / faint Update schedule (c3, c4, c5, r6, d6; + c5a1's later thunderwave
+  divergence)** — THE dominant remaining class. A `midTurn:true` unit (a mon faints mid-turn, its
+  side switches in a replacement, the other side's move then resolves) whose Update shuffle schedule
+  the gate mis-counts: `step_unit` resolves the mid-turn switch as a pivot and emits a fresh
+  turn-start bracket instead of PS's mid-turn switch-in bracket (d6 idx25 ground-truthed: switch
+  runAction Update + runSwitch getAllActive speedSort battle-actions:178 + runSwitch runAction Update,
+  then the other side's move 970/1024). SHARED turn-resolution/faint path — HIGH regression risk;
+  reserved for a dedicated careful tranche (see HANDOFF diagnostic method: prng.getSeed vs
+  prng.limbs() drift-localization + call-site probe).
+- **c5a1 thunderwave move-order** (d18[t16]: PS `shuffle[2,0,2]@thunderwave` vs rust
+  `randomChance[1,4]@par`) — a status-move Update / move-order interleaving.
+- **c2a1** move-order-tie genuine fork; **c3c2s82/s83** Trace onUpdate re-fire; **c6a2s114** mid-turn
+  Palafin re-fire + curse; **d6** rust-extra crit (mid-turn); **r10** confusion; **r11** Poltergeist
+  accuracy skip; **r2** stall-volatile cosmetic; **r3** per-hit Cursed Body; **rd318** Fickle Beam;
+  **t1** frz thaw boundary; **t2** / **c1c** state-diff. (Per the ledger below.)
+
+**Kill criteria: NOT triggered.** Both landed classes were real structured shared-path roots
+(density still decaying); the remaining climb is gated on the mid-turn-faint schedule (intricate,
+state-risky) + per-move state-path items.
+
+---
+
+## Replacement-switch bracket tranche 2026-07-24 (90/111 -> 93/111; forced-switch draw gap)
+
+Root found by comparing PS's per-turn PRNG seed (probe `battle.prng.getSeed()`) against the gate's
+`prng.limbs()` at each decision start on c5a1: the gate's state at "t12-start" equalled PS's
+**t11-start** — the gate had under-consumed t11's forced-replacement switch draws, a state-neutral
+drift that only surfaced 2 turns later (t13 damage roll read the wrong PRNG slot: engine 11 vs PS 8).
+
+**The gap:** `seedgate.rs::step_unit` applies post-KO forced-replacement switches via
+`switch_into` / `switch_into_pair` (STATE only) and consumed ZERO PRNG draws for them. But PS
+resolves each replacement as a `switch` action whose runAction fires a **3-shuffle bracket** — probed
+on c5a1 t11 (Primarina replaces a fainted Alcremie vs Speed-tied Grimmsnarl, seed 46844→21739):
+
+| PS shuffle | call site | tie board |
+|-----------|-----------|-----------|
+| switch-action runAction Update | battle.js:2376 (=battle.ts:2882) | post-swap |
+| runSwitch getAllActive speedSort | battle-actions.js:178 (=:182) | post-swap |
+| runSwitch runAction Update | battle.js:2376 | post-swap |
+
+All three are `getAllActive()` speed-tie shuffles → 3 draws when both actives are alive & Speed-tied,
+0 otherwise. A bracket fires at the transition to a both-alive-tied board: once for a single
+replacement, and once for the SECOND of a simultaneous both-sides double faint (the first switch runs
+while the other slot is still fainted → getAllActive has one active → no shuffle). The engine's
+annotated switch bracket covers only VOLUNTARY move+switch pivots; forced replacements bypass it.
+
+**Fix** (seed-gate only; generate.rs adds only a `pub fn replacement_bracket_tied` wrapper over the
+existing `actives_update_tie(state,false)` predicate): after applying replacements in `step_unit`,
+consume 3 `shuffle[2,0,2]` draws per firing bracket, gated on `!pre_end_turn` (same-turn mid-move
+replacements have different timing, left untouched) and the post-swap tie. **Flips c3b2s52, c3b2s53,
+c6a2s112 exact; advances c5a1 d15[t13]->d18[t16]** (its new divergence is a `shuffle@thunderwave` vs
+`randomChance@par` move-order class, distinct). Safe by construction: a tied forced-replacement was
+ALWAYS broken before (the drift guaranteed a later desync), so no previously-exact game had one —
+consuming the tie-gated bracket only fixes (tied) or is neutral (off-tie: 0 draws). Rails: engine
+tests 12 suites, state-sweep 7662/0/0, smoke 18/18, differ 99.09% (unchanged — differ path untouched),
+seed gate 90->93 zero prior-exact regression (exact-set diff). Commit: (this tranche).
+
+---
+
+## Update-schedule tranche 2026-07-24 (89/111 -> 90/111; inter-move Update-count schedule)
+
+The dedicated careful tranche for the shared turn-resolution `eachEvent('Update')` schedule.
+Ground-truthed PS's EXACT per-turn Update-call table with a standalone PS probe (scratchpad
+`probe.mjs`: wraps `battle.prng.shuffle` + `eachEvent`/`runEvent`, replays a trace's recorded
+choices, logs every shuffle's dispatching event + call-site stack frame). All rails green: engine
+tests 12 suites, state-sweep **7662/0/0**, distribution smoke **18/18**, differ **99.03% -> 99.09%**
+(3794->3796, no over-emission increase), seed gate monotone by exact-set diff (zero prior-exact
+regression; remaining non-exact is a strict subset of the prior 22 minus c7).
+
+### THE GROUND-TRUTHED per-turn Update `shuffle[2,0,2]` schedule (probe-verified, c5a1 t12)
+For a turn on a Speed-tied board (both actives on-field, equal `effective_speed` — every Update
+speed-sorts `getAllActive()` so it shuffles iff the pair is tied), each **runAction** fires ONE
+trailing `eachEvent('Update')` (battle.js:2376 = battle.ts:2882), and each move ADDITIONALLY fires
+the moveHit-loop Updates ONLY if it enters the per-POKEMON loop. Mapping the c5a1 t12 stream
+(p1 Primarina psychic vs **p2 Grimmsnarl Prankster Reflect** — Reflect gets +1 priority so it runs
+FIRST despite the Speed tie; both actives Speed-tied so every Update shuffles):
+
+| PS pos | call site | what |
+|--------|-----------|------|
+| 0 | battle.js:2337 `eachEvent("BeforeTurn")` | beforeTurn action |
+| 1 | battle.js:2376 runAction Update | beforeTurn action's trailing 2882 |
+| 2 | battle.js:2376 runAction Update | **Reflect** action's trailing 2882 (NO move-internal Update) |
+| 3-6 | psychic accuracy/crit/damage/secondary | the damaging move's rolls |
+| 7 | battle-actions.js:843 per-hit `eachEvent("Update")` | psychic's moveHit-loop 970 |
+| 8 | battle-actions.js:888 post-hit-loop `eachEvent("Update")` | psychic's 1024 |
+| 9 | battle.js:2376 runAction Update | psychic action's trailing 2882 |
+| 10 | battle.js:2376 runAction Update | residual action's trailing 2882 |
+
+**Key fact: Reflect (target `allySide`) fired ZERO move-internal (843/888) Updates** — a
+side/field-targeting move resolves via the side/field `onHit` path and never enters
+`hitStepMoveHitLoop`. Self-targeting POKEMON moves (Calm Mind = `self`) DO enter the loop and fire
+970+1024 (confirmed by the existing calmmind schedule).
+
+### Fix landed
+The engine's status-move 970/1024 emission (`generate.rs` ~3624) gated on "the branch added ≥1
+effect instruction" — which is TRUE for side-condition moves (they push a SideCondition
+instruction) — so on a Speed-tied board it over-emitted 970+1024 for Reflect/screens/hazards/
+weather. Added a `hits_pokemon` gate excluding `MoveTarget::{AllySide, FoeSide, All, AllyTeam}`.
+These emits are `actives_update_tie`-gated (no-op off a Speed tie), so the change touches ONLY
+tied boards — minimal regression surface. **Flips c7 exact; advances c5a1 d14[t12]->d15[t13]**
+(c5a1's residual is now a `draws-match/state-diff` on `s1.boost.spa` — the same masked class as
+c3/c4/c5/r6, NOT the Update schedule). Commit: (this tranche).
+
+---
+
+## Endgame-queue session 2026-07-24 (83/111 -> 89/111; +6 games, 2 fix commits)
+
+Worked the endgame queue. All rails held every commit: engine tests 12 suites, state-sweep
+**7662/0/0**, distribution smoke **18/18**, seed gate monotone by exact-set diff (zero
+prior-exact regression — d7 explicitly verified after the -notarget scope fix).
+
+| step | games | root cause + PS ref | commit |
+|------|-------|---------------------|--------|
+| 1 | **88** | **Set-gender init-offset gap (the 6 align=false c5 games)** — the directed-c5 teamsets fix each mon's gender in the packed set (deterministic Attract/Cute Charm legality). PS's `new Pokemon` uses `set.gender \|\| species.gender \|\| sample(['M','F'])`, so an explicit set gender SHORT-CIRCUITS the construction-time gender sample. `init_gender_rolls` counted one sample per dual-gender species regardless -> over-emitted the unlogged construction draws -> desynced the PRNG at turn 1 (all 6 align=false). Recorder (`harness/cosim.mjs`): capture the raw per-mon `setGender` ('' \| M/F/N) in the roster snapshot — the resolved `gender` can't distinguish set-vs-rolled. Seed gate: a non-empty `setGender` suppresses the roll; pre-field traces lack it -> treated empty -> original accounting preserved (zero change to any non-c5 game). Re-recorded ONLY the 6 c5 traces at their original seeds/teamsets; verified each reproduces byte-identical choices/core-draws/states (sole delta: the setGender field). **All 111 games now init-aligned (0 align=false).** c5a2/c5b1/c5b2/c5c1/c5c2 fully exact; c5a1 aligns but reveals a downstream Update-count divergence (d14, PS randomChance[100,100]@psychic vs rust shuffle@update). | 2c43854 |
+| 2 | **89** | **`-notarget` draw suppression: foe status move into a fainted foe** — c2a3 d13's HP-off-by-1 (Double Shock 226 vs 227) was **NOT** compute_damage rounding (scoreboard's "STAB rounding" was WRONG). PS's recorded damage roll is 11 (dmg 109); Replicate selected roll 9 (dmg 110) because the PRNG stream was OFFSET BY ONE upstream. Differ pinned it at t7: Regieleki (faster) Explosion self-KOs + damages Tinkaton; Tinkaton's Encore then has no target -> PS's `getMoveTargets` returns empty -> `useMoveInner` bails BEFORE `hitStepAccuracy` (`-notarget`, battle-actions.ts) -> no accuracy draw. The engine executed Encore and emitted its always-true `randomChance[100,100]@accuracy`; state stayed exact (fainted foe = no effect) but the +1 draw shifted every later roll, masked six turns by robust randomChance until the sensitive random[16] at d13 exposed it. Fix: in the status branch of `execute_move_inner`, a move targeting a single foe pokemon (MoveTarget Normal/AdjacentFoe/Any/RandomNormal/Scripted — NOT User/FoeSide/All/AllySide) against a fainted foe returns no draws. **Annotation-gated** — the DP path emits no draws and is already state-neutral, so the sweep stays byte-identical. (First attempt used `targets_foe_status`, which also matches Substitute's self-volatile -> regressed d7; narrowed to an explicit foe-pokemon MoveTarget check.) | fc85004 |
+
+### Corrected diagnoses discovered this session (the one-line scoreboard roots were stale/wrong)
+- **c3b2s52 is the move-order-TIE COMPOSITION class, not "Aeroblast accuracy 90 vs 95".** Lugia and Latios are both Speed 350 (genuine tie); the engine's `forced_tie_order = (b0 == b3)` peek picks Latios-first, PS picks Lugia-first. Measured b0=1,b3=0 with a residual in the length-3 dynamic queue (`shuffle[3,0,2]`) -> the b0==b3 rule is wrong when the residual is present. This is the ONLY game whose first divergence is the tie composition (c3b2s53/c2a1/c6a2s112 are different classes: first-mover-Update / ambiguous-fork / Wave-Crash-faint). 1 game, high regression risk to the ~many exact tie games — deferred.
+- **t1 is a freeze-secondary alignment, not a simple thaw roll.** Both order Ice Beam (Blissey, side Two) first correctly; the divergence is that PS's Ice Beam freezes Golurk (roll <10) then rolls the [1,5] thaw for the blocked Earthquake, while the engine's realized random[100] reads 10 (no freeze) — an upstream PRNG offset masked exactly like c2a3.
+- **Many "draws-match/state-diff" games are UPSTREAM draw-count offsets, not compute bugs.** The differ compares kinds/args, not `random` result VALUES, so a same-shape offset (an over/under-emitted shuffle or accuracy) reads "draws-match" yet the realized rolls differ. The remaining cluster c3/c4/c7 all show `rust randomChance[100,100]@accuracy vs ps shuffle[2,0,2]@generic` — the engine UNDER-emits an inter-move eachEvent('Update') shuffle (the first-mover-no-draw Update / Task-3 Update-count class). c3c2s82/s83 = `ps unconsumed sample[1]@trace` (Trace onUpdate re-trace timing). c5/r6 = `ps unconsumed shuffle@generic`. c6a2s114 = `ps unconsumed random[100]@curse` + the mid-turn Palafin re-fire (its DP sweep is fragile — the -notarget guard had to be annotation-gated to keep it byte-identical). All intricate/state-risky, 0-to-few games each, deferred to avoid destabilizing the shared turn-resolution/multi-hit paths for the 89 exact games.
+
+---
+
 ## Seed-gate tail session 2026-07-24 (69/111 -> 83/111; +14 games, 5 commits)
 
 Worked the LEADS queue game-by-game. All rails held every commit: engine tests 12 suites,

@@ -1,5 +1,37 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**CURRENT STATE (2026-07-24): 93/111 full games byte-exact from seed (83.8%); ALL 111
+init-aligned; draw-consumption differ 99.09% (3796/3831).** Kill criteria NEVER triggered.
+DRAW_EXACT_SCOREBOARD.md is the source of truth (this file's older sections below are historical).
+
+## THE dominant remaining class — mid-turn re-request / faint Update schedule (NEXT SESSION)
+Six of the 18 remaining non-exact games (c3, c4, c5, r6, d6, + c5a1's later divergence) share ONE
+root: a **mid-turn re-request unit** (`midTurn:true` decision, e.g. d6 idx25 t24 "p1 switch 5 /
+p2 move 4" — a mon fainted mid-turn, its side switches in a replacement, then the other side's move
+resolves) whose `eachEvent('Update')` shuffle schedule the seed gate mis-counts. Diagnostic method
+(proven this session): compare PS's per-turn `battle.prng.getSeed()` (scratchpad `seedcmp.mjs`,
+teamset-parameterized) against the gate's `prng.limbs()` (temporarily print in `seedgate.rs`
+step-loop) — the drift localizes to the exact mid-turn unit, then probe the shuffle call-sites
+(`probe_d6.mjs` wraps `prng.shuffle`+`eachEvent`) to ground-truth the schedule. d6 idx25 PS schedule
+(6 shuffles): [switch runAction Update, runSwitch getAllActive speedSort (battle-actions:178),
+runSwitch runAction Update, {p2 move: acc/crit/dmg}, move 970 Update, move 1024 Update, ... ]. The
+gate's `step_unit` resolves p1's mid-turn "switch" as a pivot (mc) and emits a fresh turn-start
+bracket — mismatching PS's mid-turn switch-in bracket. This is the shared turn-resolution/faint path;
+HIGH regression risk to the 93 exact games — needs its own careful tranche with full call-site
+ground-truthing of the mid-turn re-request schedule (do NOT bolt it on).
+
+## Landed this session (2026-07-24, 89 -> 93, 2 commits, all rails green, zero regression)
+1. **Side/field-targeting status moves fire no moveHit Update** (89->90; flips c7). A status move
+   targeting a SIDE/FIELD (Reflect/screens/hazards/weather) never enters PS's per-pokemon
+   hitStepMoveHitLoop, so it fires no 970/1024 Update — the engine over-emitted them on tied boards.
+   Ground-truthed on c5a1 t12 (Prankster Reflect). generate.rs `hits_pokemon` gate.
+2. **Forced-replacement switch bracket** (90->93; flips c3b2s52, c3b2s53, c6a2s112). The gate applied
+   post-KO replacements (`switch_into`) to state but consumed ZERO PRNG draws; PS fires a 3-shuffle
+   bracket (switch runAction Update + runSwitch speedSort + runSwitch runAction Update), tie-gated.
+   seedgate.rs `step_unit` now consumes it via `replacement_bracket_tied`.
+
+--- historical (pre-89) below ---
+
 Paused 2026-07-24 at session limits, mid-finishing-tranche. **State: 63/111 full games
 byte-exact from seed (56.8%); draw-consumption differ 98.93% (3790/3831 units; 41 mismatched
 units remain).** Twelve tranches complete; kill criteria NEVER triggered.

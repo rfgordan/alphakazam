@@ -687,6 +687,12 @@ function snapshot(battle, roster) {
 			// battle-start roster index across clones and forme changes.
 			const key = setKey(battle.sides[si].pokemon[pi].set);
 			q.rosterIndex = roster[si].findIndex(s => setKey(s) === key);
+			// The RAW set gender ('' if the set left it unspecified, else 'M'/'F'/'N').
+			// PS's `new Pokemon` rolls `sample(['M','F'])` at construction ONLY when the set
+			// gender is empty AND the species is dual-gender; an explicit set gender rolls
+			// nothing. The resolved `gender` above cannot distinguish the two cases, so record
+			// the set's own field for the seed-gate's construction-draw alignment.
+			q.setGender = battle.sides[si].pokemon[pi].set.gender ?? '';
 			return q;
 		});
 		// Synthesized: has this side spent its Terastallization? PS deletes `terastallized`

@@ -80,6 +80,20 @@ fn forced_tie_order() -> Option<bool> {
     FORCED_TIE_ORDER.with(|c| c.get())
 }
 
+thread_local! {
+    /// Cached both-side effective Speeds frozen at the start of the CURRENT move action, mirroring
+    /// PS's `pokemon.speed` — a stat refreshed by `updateSpeed()` only at turn start and once before
+    /// each move action (battle.ts:2942), NOT continuously. So a Speed change APPLIED DURING a move
+    /// (paralysis from Thunder Wave, a Speed-dropping secondary, a self-boost) does NOT affect that
+    /// same move's internal `eachEvent('Update')` speed-sorts (970/1024/2882) — they still sort on
+    /// the pre-move cached Speed. `run_move_action` sets this to `Some([spe1, spe2])` while a move
+    /// resolves; `actives_update_tie` uses it for the Speed comparison (liveness stays live). `None`
+    /// everywhere else (turn-start bracket, switch brackets, residual, replacement bracket) → the
+    /// live `effective_speed` is used, which is correct there (those are between-action Updates that
+    /// PS evaluates after an `updateSpeed`).
+    static MOVE_TIE_SPEEDS: std::cell::Cell<Option<[i32; 2]>> = const { std::cell::Cell::new(None) };
+}
+
 // ── Realized single-path multi-hit executor ────────────────────────────────────────────────
 //
 // A variable multi-hit move ([2,5] bulletseed/iciclespear/…, Population Bomb's 10 hits, Beat Up's
@@ -243,7 +257,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -290,6 +304,11 @@ pub(crate) struct Branch {
     /// damaging-move failure sites; committed to the side's `last_move_failed` once per move action
     /// in `run_move_action`. Defaults false ("succeeded"); reset implicitly each move.
     pub(crate) move_failed: bool,
+    /// Transient (NOT part of State): a self-switch (pivot) move already emitted its move action's
+    /// trailing runAction Update (2882) on the PRE-switch board (PS fires it before processing the
+    /// `switchFlag`), so `run_move_action` must NOT emit it again on the post-switch board. Set by
+    /// `emit_pivot_trailing_update` at the pivot apply site; reset each move in `run_move_action`.
+    pub(crate) pivot_update_done: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -525,11 +544,28 @@ fn actives_update_tie(state: &State, prefaint: bool) -> bool {
     } else {
         a.is_alive() && d.is_alive()
     };
-    live_ok && effective_speed(state, SideId::One) == effective_speed(state, SideId::Two)
+    // Mid-move Updates sort on the Speed cached at this move's start (PS's `pokemon.speed`), so a
+    // Speed change the move itself just applied (e.g. Thunder Wave's paralysis on a Speed-tied foe)
+    // does not break the tie for the SAME move's 970/1024/2882. Outside a move (`None`) → live Speed.
+    let (s1, s2) = match MOVE_TIE_SPEEDS.with(|c| c.get()) {
+        Some([a, b]) => (a, b),
+        None => (effective_speed(state, SideId::One), effective_speed(state, SideId::Two)),
+    };
+    live_ok && s1 == s2
 }
 
 /// Both actives alive and equal `effective_speed` (turn-order / commitChoices tie predicate).
 fn actives_speed_tied(state: &State) -> bool {
+    actives_update_tie(state, false)
+}
+
+/// Public tie predicate for the seed gate's post-KO replacement-switch bracket: PS resolves a
+/// forced replacement as a `switch` action whose `runAction` fires the switch bracket (switch-action
+/// runAction Update + `runSwitch` getAllActive speedSort + runSwitch runAction Update = 3
+/// `shuffle[2,0,2]`), each a `getAllActive()` speed-tie shuffle on the POST-swap board. The gate
+/// applies replacements via `switch_into` (state only), so it consumes this bracket separately —
+/// gated on exactly this predicate (both actives alive and equal `effective_speed`).
+pub fn replacement_bracket_tied(state: &State) -> bool {
     actives_update_tie(state, false)
 }
 
@@ -552,6 +588,17 @@ fn emit_switch_pre_update(b: &mut Branch) {
     if annotating() && actives_update_tie(&b.state, false) {
         draw(b, "shuffle", &[2, 0, 2], -1, "update");
     }
+}
+
+/// A self-switch (pivot) move's runAction Update (battle.ts:2882): PS fires it when the move
+/// action ends — BEFORE the `switchFlag` is processed as its own `switch`/`runSwitch` action — so
+/// it speed-sorts the board with the pivot USER STILL on the field. The engine applies the pivot
+/// switch inside `execute_move`, so this must be emitted (on the pre-switch board) at the pivot
+/// site and `run_move_action` told not to re-emit it on the post-switch board. Ground-truthed on
+/// d6 i25 (U-turn on a Garchomp==Pelipper speed tie: the trailing 2882 shuffles on `[user | foe]`).
+fn emit_pivot_trailing_update(b: &mut Branch) {
+    emit_update(b);
+    b.pivot_update_done = true;
 }
 
 /// Emit the per-hit `eachEvent('Update')` shuffle (battle-actions.ts:970) — fires once per
@@ -1280,7 +1327,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1366,7 +1413,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -1517,7 +1564,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -1786,7 +1833,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2187,9 +2234,18 @@ pub(crate) struct Action {
 /// (970) and post-hit-loop (1024) Updates are emitted inside `execute_move`; this adds the 2882.
 fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     let side = action.side;
-    // Fresh per-move outcome flag: this branch may carry a `move_failed` set by an earlier action
-    // this turn (sequence_two_moves reuses the branch for the second mover).
+    // Fresh per-move outcome flags: this branch may carry a `move_failed` / `pivot_update_done` set
+    // by an earlier action this turn (sequence_two_moves reuses the branch for the second mover).
     b.move_failed = false;
+    b.pivot_update_done = false;
+    // Freeze both actives' Speed at this move's start (PS's `updateSpeed()` before the move action)
+    // so the move's own internal Updates sort on the pre-move Speed — a paralysis/secondary Speed
+    // change the move applies does not retroactively break its own tie. Save/restore for called-move
+    // reentrancy (Dancer / Magic Bounce / Instruct re-execute a move within this one).
+    let prev_tie_speeds = MOVE_TIE_SPEEDS.with(|c| c.replace(Some([
+        effective_speed(&b.state, SideId::One),
+        effective_speed(&b.state, SideId::Two),
+    ])));
     let mut out = execute_move(b, action);
     if annotating() {
         for nb in &mut out {
@@ -2202,9 +2258,17 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
             if cur != nb.move_failed {
                 push(nb, Instruction::SetLastMoveFailed { side, previous: cur, new: nb.move_failed });
             }
-            emit_update(nb);
+            // A pivot move already emitted its trailing 2882 on the PRE-switch board at the pivot
+            // site (PS fires it before processing `switchFlag`); don't re-emit on the post-switch board.
+            if !nb.pivot_update_done {
+                emit_update(nb); // move action's trailing 2882 (uses the frozen pre-move Speed)
+            }
         }
     }
+    // Restore AFTER the trailing 2882 emit: PS's `updateSpeed` runs at the END of runAction
+    // (battle.ts:2942), so this move's 2882 still sorts on the pre-move Speed; the NEXT action
+    // snapshots afresh.
+    MOVE_TIE_SPEEDS.with(|c| c.set(prev_tie_speeds));
     out
 }
 
@@ -2263,7 +2327,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -3495,6 +3559,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
+        // PS `-notarget`: a status move that targets the foe POKEMON fails outright — no accuracy
+        // roll, no effect — when the foe active has fainted mid-turn (the second mover's Encore /
+        // Thunder Wave / Taunt into a foe that just self-KO'd, e.g. c2a3 t7: Regieleki Explosion
+        // faints itself, then Tinkaton's Encore has no target). `getMoveTargets` returns an empty
+        // list, so `useMoveInner` bails BEFORE `hitStepAccuracy` — the engine must emit no draw
+        // (an emitted always-true accuracy would silently offset the PRNG stream). Gated on the
+        // MoveTarget being a single foe (not User / FoeSide / All / AllySide): self moves
+        // (Substitute, Swords Dance), hazards (Spikes → FoeSide), and field moves (weather,
+        // screens) still resolve because their target — the user or a side — always persists.
+        // Annotation-gated: in the DP (Enumerate/Sample) state path no draws are emitted and the
+        // move is already state-neutral against a fainted foe, so this is purely a draw-suppression
+        // fix for the Replicate/differ streams — leaving the DP sweep byte-identical.
+        if annotating()
+            && matches!(md.target,
+                crate::data::MoveTarget::Normal | crate::data::MoveTarget::AdjacentFoe
+                    | crate::data::MoveTarget::Any | crate::data::MoveTarget::RandomNormal
+                    | crate::data::MoveTarget::Scripted)
+            && !b.state.side(foe).active().is_alive()
+        {
+            return vec![b];
+        }
         // Shed Tail: put up a Substitute (floor(maxHP/4) HP) at a cost of ceil(maxHP/2) HP, then
         // pivot out PASSING the Substitute to the incoming mon. Fails (no sub, no pivot) with no
         // switch target, an existing Substitute, or HP at/below the cost. Self-targeting — the
@@ -3513,7 +3598,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             push(&mut b, Instruction::ChangeSubstituteHp { side, amount: sub_hp });
             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Substitute });
             match pivot {
-                Pivot::Target(t) => apply_switch_pass_sub(&mut b, side, t),
+                Pivot::Target(t) => { emit_pivot_trailing_update(&mut b); apply_switch_pass_sub(&mut b, side, t); }
                 Pivot::Pause => push(&mut b, Instruction::PivotPending { side }),
                 Pivot::Stay => {}
             }
@@ -3608,7 +3693,24 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // tie), so this only affects tied boards. Detect a successful moveHit per-branch as "the
         // status resolution added ≥1 effect instruction" — a failed move applies none. Pure
         // protect-fail bookkeeping (only a `SetStallCounter` reset) is NOT a moveHit success.
-        if annotating() {
+        //
+        // The 970/1024 Updates fire only when PS enters the per-POKEMON `hitStepMoveHitLoop`
+        // (`spreadMoveHit`, battle-actions.ts). A status move that targets a SIDE or the FIELD
+        // (Reflect/Light Screen/Tailwind = allySide; Spikes/Stealth Rock = foeSide; weather/terrain/
+        // Trick Room = all; Heal Bell/Aromatherapy = allyTeam) resolves via the side/field `onHit`
+        // path and never enters that loop, so it fires NEITHER Update — only its runAction 2882
+        // (appended by `run_move_action`). Ground-truthed on c5a1 t12: Grimmsnarl's Prankster Reflect
+        // (allySide) ran first and produced zero move-internal Updates in the pinned PS trace, while
+        // the engine over-emitted 970+1024 → +2 leading shuffles → PRNG desync at the psychic
+        // accuracy roll. Self-targeting pokemon moves (Calm Mind = self) DO enter the loop and fire.
+        let hits_pokemon = !matches!(
+            md.target,
+            crate::data::MoveTarget::AllySide
+                | crate::data::MoveTarget::FoeSide
+                | crate::data::MoveTarget::All
+                | crate::data::MoveTarget::AllyTeam
+        );
+        if annotating() && hits_pokemon {
             for sb in &mut branches {
                 let did_something = sb.ins.len() > ins_before
                     && sb.ins[ins_before..]
@@ -3625,6 +3727,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             Pivot::Target(t) => {
                 for sb in &mut branches {
                     if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(sb); // move action's 2882 (pre-switch board)
                         apply_switch(sb, side, t);
                     }
                 }
@@ -3931,7 +4034,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         emit_modifydamage_shuffle(&mut hb);
         bust_disguise(&mut hb, foe);
         match pivot {
-            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { apply_switch(&mut hb, side, t); },
+            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { emit_pivot_trailing_update(&mut hb); apply_switch(&mut hb, side, t); },
             Pivot::Pause => if hb.state.side(side).active().is_alive() { push(&mut hb, Instruction::PivotPending { side }); },
             Pivot::Stay => {}
         }
@@ -4155,10 +4258,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // Both emitted before the pivot/drag switch changes the on-field mon (and its Speed).
             emit_update_hit(&mut sb);
             emit_update(&mut sb);
-            // Pivot move (U-turn): switch the user out now that it connected.
+            // Pivot move (U-turn): switch the user out now that it connected. PS fires the move
+            // action's runAction Update (2882) BEFORE processing the self-switch, so emit it here on
+            // the PRE-switch board (user still in) and mark it done so run_move_action doesn't re-emit.
             match pivot {
                 Pivot::Target(t) => {
                     if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(&mut sb);
                         apply_switch(&mut sb, side, t);
                     }
                 }
@@ -8577,10 +8683,38 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
     for side in [SideId::One, SideId::Two] {
         let s = state.side(side);
         let p = s.active();
+        let speed = effective_speed(state, side) as i64;
         if !p.is_alive() {
+            // A mon that fainted THIS turn is still in PS's `side.active`, so `fieldEvent('Residual')`
+            // collects its surviving residual handlers into the `speedSort` (the while-loop then skips
+            // EXECUTION for the fainted holder, but the SORT — hence the shuffle — already ran over it).
+            // `clearVolatile` on faint (pokemon.ts:1509) wipes volatiles + boosts but the ITEM and
+            // STATUS persist, so only the item/orb and status residuals survive to tie the foe's. This
+            // fires only while the fainted mon still occupies the active slot (before its replacement
+            // switches in) — the mid-turn-faint-then-residual window. Ground-truthed on c3/c4/c5/r6: a
+            // just-fainted Leftovers holder ties the surviving foe's Leftovers → one extra shuffle[2,0,2]
+            // (r6: two Cud Chew holders tie on the ABILITY residual → same). Only faint-surviving
+            // handlers (item / status / ability) are collected; every volatile/side/terrain residual is
+            // wiped by `clearVolatile` on faint.
+            let mut fpush = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
+            match p.item {
+                It::Leftovers | It::BlackSludge => fpush(5, 4),
+                It::ToxicOrb | It::FlameOrb | It::StickyBarb => fpush(28, 3),
+                _ => {}
+            }
+            match p.status {
+                St::Poison | St::Toxic => fpush(9, 0),
+                St::Burn => fpush(10, 0),
+                _ => {}
+            }
+            match p.ability {
+                Ab::Hydration => fpush(5, 3),
+                Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => fpush(28, 2),
+                Ab::HungerSwitch => fpush(29, 7),
+                _ => {}
+            }
             continue;
         }
-        let speed = effective_speed(state, side) as i64;
         let mut push = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
 
         // Grassy Terrain heals each active (per-active handler), regardless of grounding
