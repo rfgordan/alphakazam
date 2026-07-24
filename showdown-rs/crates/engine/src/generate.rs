@@ -113,6 +113,25 @@ pub fn set_realized_source(src: Option<RealizedSource>) {
     REALIZED_SOURCE.with(|c| *c.borrow_mut() = src);
 }
 
+thread_local! {
+    static BEATUP_ORDER: std::cell::RefCell<[Option<Vec<u8>>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// Install (or clear) the per-side Beat Up participant order: canonical party slots in PS's CURRENT
+/// `side.pokemon` array order (active-first, swap-tracked — `switchIn` swaps positions 0/j). Beat Up
+/// pairs each participant's base power with a distinct per-hit roll, so the array order changes the
+/// realized total. Only the seed gate installs this (from the recorded pre-state's `rosterIndex`
+/// order); Enumerate/Sample (sumset-DP) and the differ (draw kinds/args) are order-independent, so
+/// they leave it `None` and `beatup_calcs` falls back to canonical (teampreview) slot order.
+pub fn set_beatup_order(orders: [Option<Vec<u8>>; 2]) {
+    BEATUP_ORDER.with(|c| *c.borrow_mut() = orders);
+}
+
+fn beatup_order(side: SideId) -> Option<Vec<u8>> {
+    BEATUP_ORDER.with(|c| c.borrow()[side as usize].clone())
+}
+
 /// gen≥5 [2,5] hit-count table: `sample([2×7, 3×7, 4×3, 5×3])` (battle-actions.ts:864). Index → count.
 const MULTIHIT_COUNT_TABLE: [u8; 20] = [2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
@@ -4621,68 +4640,17 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             attacker.species.to_id().starts_with("giratina") && matches!(md.typ, Type::Ghost | Type::Dragon),
         _ => false,
     };
-    if type_item_boost || orb_boost {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Soul Dew: ×1.2 base power for Latias/Latios Psychic- and Dragon-type moves (PS `onBasePower`).
-    if attacker.item == Item::SoulDew
-        && matches!(attacker.species, sp if sp == crate::ids::Species::from_id("latias").unwrap_or(crate::ids::Species::None)
-            || sp == crate::ids::Species::from_id("latios").unwrap_or(crate::ids::Species::None))
-        && matches!(md.typ, Type::Psychic | Type::Dragon)
-    {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-
-    // Sheer Force: x1.3 base power for moves with any secondary (which is then removed).
-    if sheer_force_active {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Technician is an onBasePower modifier in PS.  This placement matters for rounding and
-    // for variable-power moves such as Triple Axel, whose 20/40/60-power hits are evaluated
-    // independently.  Applying it to Attack produces a different damage support.
-    if attacker.ability == Ab::Technician && base_power <= 60 {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Strong Jaw is an onBasePower modifier in PS. Applying it to Attack changes rounding
-    // support (caught by the exact Crunch kernel on Strong Jaw Bruxish).
-    if attacker.ability == Ab::StrongJaw && md.flag_bite {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Sharpness: ×1.5 base power for slicing moves (PS `onBasePower`). On base power, not the
-    // attack stat, so the floor lands where PS's does under a ×0.5 type matchup.
-    if attacker.ability == Ab::Sharpness && md.flag_slicing {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Iron Fist: ×1.2 base power for punch moves (PS `onBasePower`). Moved off the attack
-    // stat when a cosim Ice Hammer unit exposed the rounding difference.
-    if attacker.ability == Ab::IronFist && md.flag_punch {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
-    // rather than the attack stat so the floor lands where PS's does.
-    if attacker.ability == Ab::PunkRock && md.flag_sound {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Ogerpon masks (Hearthflame / Wellspring / Cornerstone) give ×1.2 base power to all of
-    // Ogerpon's moves (PS `onBasePower`). Only Ogerpon holds them.
-    if matches!(attacker.item, Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask) {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
-    // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
-    if attacker.ability == Ab::SupremeOverlord {
-        let fallen = b.state.side(side).pokemon.iter()
-            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
-            .count()
-            .min(5);
-        if fallen > 0 {
-            const POW: [i64; 6] = [4096, 4506, 4915, 5325, 5734, 6144];
-            base_power = crate::damage::modify(base_power as i64, POW[fallen], 4096) as u16;
-        }
-    }
-    // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
-    // The terrain is part of the projected state, so terrain-setting abilities/moves needn't
-    // be modeled here. Grounded ≈ not Flying and not Levitate (Air Balloon etc. unmodeled).
+    // Every MULTIPLICATIVE onBasePower handler in PS accumulates into a single `chainModify`
+    // modifier (in DESCENDING onBasePowerPriority), applied to the base power exactly ONCE at the
+    // end of the BasePower event (`relayVar = this.modify(relayVar, this.event.modifier)`). The
+    // engine used to apply each as its own `modify`, which re-rounds at every step and diverges
+    // once two stack — e.g. Technician ×1.5 (prio 30) + Black Glasses ×1.2 (prio 15) on a base
+    // power 14: sequential 14→17→26, PS's single chain 14→25. `bp_step` replicates PS's chainModify
+    // accumulation `((prev * next + 2048) >> 12)` (den is 4096 for every modifier here, so
+    // `next == num`); the final `modify` applies the accumulated modifier once. Technician's ≤60
+    // gate reads the base power with only HIGHER-priority mods applied — it is the highest (30), so
+    // it reads the raw base power. Same-priority handlers never co-occur (one ability + one item
+    // per holder). Reckless / Mega Launcher / Tough Claws stay on the attack stat (unchanged).
     use crate::ids::Terrain;
     let atk_grounded = !attacker.types.contains(&Type::Flying) && attacker.ability != Ab::Levitate;
     let def_grounded = !defender.types.contains(&Type::Flying) && defender.ability != Ab::Levitate;
@@ -4691,17 +4659,64 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             (b.state.terrain, md.typ),
             (Terrain::Electric, Type::Electric) | (Terrain::Grassy, Type::Grass) | (Terrain::Psychic, Type::Psychic)
         );
-    if terrain_boost {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Grassy Terrain halves the ground-shaking moves vs grounded targets; Misty Terrain
-    // halves Dragon moves vs grounded targets.
     let terrain_halve = (b.state.terrain == Terrain::Grassy
         && def_grounded
         && matches!(md.id.to_id(), "earthquake" | "bulldoze" | "magnitude"))
         || (b.state.terrain == Terrain::Misty && def_grounded && md.typ == Type::Dragon);
+    let soul_dew = attacker.item == Item::SoulDew
+        && matches!(attacker.species, sp if sp == crate::ids::Species::from_id("latias").unwrap_or(crate::ids::Species::None)
+            || sp == crate::ids::Species::from_id("latios").unwrap_or(crate::ids::Species::None))
+        && matches!(md.typ, Type::Psychic | Type::Dragon);
+    let bp_step = |acc: i64, num: i64| (acc * num + 2048) >> 12;
+    let mut bp_chain = 4096i64;
+    // 30: Technician (×1.5 for base power ≤ 60, gated on the pre-chain base power).
+    if attacker.ability == Ab::Technician && base_power <= 60 {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    // 23: Iron Fist (punch ×1.2).
+    if attacker.ability == Ab::IronFist && md.flag_punch {
+        bp_chain = bp_step(bp_chain, 4915);
+    }
+    // 21: Sheer Force (×1.3) / Supreme Overlord (×table, +10% per fallen ally) — one ability.
+    if sheer_force_active {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
+    if attacker.ability == Ab::SupremeOverlord {
+        let fallen = b.state.side(side).pokemon.iter()
+            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
+            .count()
+            .min(5);
+        if fallen > 0 {
+            const POW: [i64; 6] = [4096, 4506, 4915, 5325, 5734, 6144];
+            bp_chain = bp_step(bp_chain, POW[fallen]);
+        }
+    }
+    // 19: Strong Jaw (bite ×1.5) / Sharpness (slicing ×1.5).
+    if attacker.ability == Ab::StrongJaw && md.flag_bite {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    if attacker.ability == Ab::Sharpness && md.flag_slicing {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    // 15: type-boosting items / species orbs / Soul Dew / Ogerpon masks — all ×1.2, one item.
+    if type_item_boost || orb_boost || soul_dew
+        || matches!(attacker.item, Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask)
+    {
+        bp_chain = bp_step(bp_chain, 4915);
+    }
+    // 7: Punk Rock (sound ×1.3).
+    if attacker.ability == Ab::PunkRock && md.flag_sound {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
+    // 0: terrain boost (×1.3) then terrain halve (×0.5) — grounded user/target gated above.
+    if terrain_boost {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
     if terrain_halve {
-        base_power = crate::damage::modify(base_power as i64, 2048, 4096) as u16;
+        bp_chain = bp_step(bp_chain, 2048);
+    }
+    if bp_chain != 4096 {
+        base_power = crate::damage::modify(base_power as i64, bp_chain, 4096) as u16;
     }
     // Terastallization STAB floor: a terastallized mon's move matching its (post-Tera) type with
     // base power < 60 is raised to 60 — applied AFTER every onBasePower modifier. Excludes
@@ -6233,7 +6248,15 @@ fn apply_multihit_realized_ma(
 fn beatup_calcs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<DamageCalc> {
     let mut calcs: Vec<DamageCalc> = Vec::new();
     let s = b.state.side(side);
-    for i in 0..6usize {
+    // PS iterates `pokemon.side.pokemon` in its CURRENT array order (active-first, swap-tracked),
+    // NOT the fixed canonical/teampreview slot order the engine stores. Since each participant's
+    // base power is paired with a distinct per-hit roll, the order changes the realized total, so
+    // the seed gate installs PS's array order; without it we fall back to canonical slot order (the
+    // sumset-DP and differ don't observe the pairing).
+    let order: Vec<usize> = beatup_order(side)
+        .map(|o| o.into_iter().map(|x| x as usize).collect())
+        .unwrap_or_else(|| (0..6usize).collect());
+    for i in order {
         let p = &s.pokemon[i];
         if p.species == crate::ids::Species::None {
             continue;

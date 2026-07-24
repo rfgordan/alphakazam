@@ -112,6 +112,26 @@ fn consume_recorded(prng: &mut PsPrng, d: &Decision) {
     }
 }
 
+/// Per-side Beat Up participant order for a unit: the canonical party slots (`rosterIndex`) in the
+/// order PS serializes `side.pokemon` at the given pre-state — PS's current array order, which
+/// `switchIn` keeps active-first + swap-tracked. `beatup_calcs` iterates these to pair each
+/// member's base power with its hit's roll exactly as PS does.
+fn beatup_orders(pre: &Value) -> [Option<Vec<u8>>; 2] {
+    let mut out: [Option<Vec<u8>>; 2] = [None, None];
+    let Some(sides) = pre.get("sides").and_then(Value::as_array) else { return out };
+    for (si, side) in sides.iter().enumerate().take(2) {
+        if let Some(mons) = side.get("pokemon").and_then(Value::as_array) {
+            let order: Vec<u8> = mons.iter()
+                .filter_map(|p| p.get("rosterIndex").and_then(Value::as_i64).map(|r| r as u8))
+                .collect();
+            if !order.is_empty() {
+                out[si] = Some(order);
+            }
+        }
+    }
+    out
+}
+
 /// Replicate: select the single realized outcome by consuming `prng` at the engine's draw sites.
 /// Returns `(chosen_outcome_index, ambiguous)`. `ambiguous` is set when >1 outcome survives the
 /// filter (an unfilterable shuffle fork — move-order Speed tie).
@@ -235,6 +255,11 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
             && std::env::var("DBG_I").ok().and_then(|v| v.parse::<usize>().ok()).is_none_or(|di| di == i);
         DBG_UNIT.with(|c| c.set(dbg_on));
         if dbg_on { eprintln!("=== {name} d{i} t{} ===", dp.turn); }
+        // Beat Up pairs each participant's base power with a distinct per-hit roll, so its realized
+        // total depends on PS's CURRENT side.pokemon array order (active-first, swap-tracked). The
+        // engine stores a fixed canonical slot order, so feed it PS's array order (the recorded
+        // pre-state's `rosterIndex` sequence) for this unit.
+        engine::generate::set_beatup_order(beatup_orders(&t.decisions[i - 1].state_after));
         let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, sleep_clause, &mut prng) {
             Ok(x) => x,
             Err(label) => {
