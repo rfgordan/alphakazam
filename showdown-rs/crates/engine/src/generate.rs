@@ -1624,7 +1624,14 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // A traced / copied ability reverts on switch-out (Transform handles its own below).
     {
         let p = b.state.side(side).active();
-        if !p.transformed && p.ability != p.base_ability {
+        // Tera Shift's forme change (Terapagos-Normal -> Terapagos-Terastal, ability -> Tera Shell)
+        // is PERMANENT (PS `formeChange`, not a copied ability): the mon stays Terastal with Tera
+        // Shell when it switches out, so this revert must skip it (base_ability is still the stale
+        // Tera Shift). Every OTHER non-base ability on a non-transformed mon is a Trace/Role
+        // Play/Skill Swap copy that PS's clearVolatile reverts.
+        let terastal_forme = crate::ids::Species::from_id("terapagosterastal");
+        let is_forme_ability = Some(p.species) == terastal_forme && p.ability == crate::ids::Ability::TeraShell;
+        if !p.transformed && p.ability != p.base_ability && !is_forme_ability {
             let slot = previous;
             push(b, Instruction::ChangeAbility { side, slot, previous: p.ability, new: p.base_ability });
         }
