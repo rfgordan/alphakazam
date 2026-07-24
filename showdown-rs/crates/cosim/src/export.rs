@@ -142,7 +142,11 @@ fn volatiles_obj(side: &Side) -> Value {
         v.insert("stall".into(), json!({ "counter": counter, "duration": side.stall_turns }));
     }
     if vs.contains(ChoiceLock) {
-        simple(&mut v, "choicelock");
+        // PS's choicelock stores the locked move (= the last move used under the Choice item) in
+        // its effectState and re-disables the other slots from it each request. The engine derives
+        // the lock from last_used_move, so emit that as the choicelock `move`; without it PS can't
+        // reconstruct which slots to disable.
+        v.insert("choicelock".into(), json!({ "move": side.last_used_move.to_id() }));
     }
     if vs.contains(SaltCure) {
         simple(&mut v, "saltcure");
@@ -413,9 +417,14 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, arr_idx: usize, active: b
             b.insert((*k).into(), json!(side.boosts[i]));
         }
         m.insert("boosts".into(), Value::Object(b));
-        // lastMove: the id + a hitTargets that encodes `last_move_failed` (empty == failed).
+        // lastMove: PS's `pokemon.lastMove` is an ActiveMove serialized as an object. It MUST carry
+        // `hit` so PS's `isActiveMove` recognizes it on deserialize and rebuilds a Move-backed
+        // ActiveMove (with `.flags`, `.id`, ...); without it PS keeps a bare object and effects like
+        // Encore's onStart (`move.flags['failencore']`) crash. `hitTargets` empty encodes
+        // `last_move_failed` (what convert reads).
         if side.last_used_move != MoveId::None {
             let mut lm = Map::new();
+            lm.insert("hit".into(), json!(1));
             lm.insert("move".into(), json!(format!("[Move:{}]", side.last_used_move.to_id())));
             if side.last_move_failed {
                 lm.insert("hitTargets".into(), json!([]));

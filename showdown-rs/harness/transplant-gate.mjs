@@ -29,7 +29,7 @@ import { assertPsPinned, PS_DIR } from './check-ps-pin.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 assertPsPinned();
-const { Battle } = require(path.join(PS_DIR, 'dist/sim'));
+const { Battle, Teams } = require(path.join(PS_DIR, 'dist/sim'));
 const { State } = require(path.join(PS_DIR, 'dist/sim/state'));
 const { PRNG } = require(path.join(PS_DIR, 'dist/sim/prng'));
 const { Dex } = require(path.join(PS_DIR, 'dist/sim/dex'));
@@ -308,11 +308,22 @@ function diffProjections(a, b, pathStr, out) {
 
 function runGame(sample) {
 	const trace = loadTrace(sample.trace);
-	// Random-battle teams use spreads (0-IV special-attackers, randbats EV blocks) the exporter's
-	// iv=31 spread solver can't reconstruct, so a switched-in mon recomputes wrong stats. Documented
-	// residual — the custom-game corpus (fixed 31-IV sets) is fully solvable. Skip randbats.
+	// Random-battle teams use randbats spreads (0-IV special-attackers) the exporter's iv=31 solver
+	// can't reconstruct — so instead of the synthetic set, overlay the EXACT recorded set by
+	// regenerating the team deterministically from the seed (same as cosim.mjs) and keying by
+	// rosterIndex. PS's setSpecies then recomputes exact stats on switch-in.
 	if (trace.format && trace.format.includes('random')) {
-		return { name: sample.name, status: 'skip', reason: 'random-battle (spread residual)' };
+		const seedNum = trace.seed[0];
+		const realSets = [
+			Teams.unpack(Teams.pack(Teams.generate(trace.format, { seed: [0, 0, 0, seedNum * 2 + 1] }))),
+			Teams.unpack(Teams.pack(Teams.generate(trace.format, { seed: [0, 0, 0, seedNum * 2 + 2] }))),
+		];
+		for (const [si, side] of sample.exported.sides.entries()) {
+			for (const p of side.pokemon) {
+				const real = realSets[si][p.rosterIndex];
+				if (real) p.set = real;
+			}
+		}
 	}
 	const startI = sample.transplantDecisionIndex;
 	const maxRoster = trace.decisions[0].stateAfter.sides.reduce((m, s) => m + s.pokemon.length, 0);
