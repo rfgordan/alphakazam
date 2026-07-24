@@ -237,9 +237,14 @@ fn volatiles_obj(side: &Side) -> Value {
             v.insert("twoturnmove".into(), json!({ "move": mv.to_id() }));
         }
         PendingMove::Rampaging(mv, remaining) => {
+            // PS's lockedmove ends via `onAfterMove` when `duration === 1`; at a decision boundary
+            // the volatile's `duration` has always ticked to 1 (it is bumped back to 2 only DURING
+            // the next move by `onRestart`, when `trueDuration >= 2`). `trueDuration` (= the engine's
+            // `remaining`) then gates the end-of-rampage confusion. Emitting duration=2 made the
+            // transplant's rampage never end.
             v.insert(
                 "lockedmove".into(),
-                json!({ "move": mv.to_id(), "trueDuration": remaining, "duration": 2 }),
+                json!({ "move": mv.to_id(), "trueDuration": remaining, "duration": 1 }),
             );
         }
     }
