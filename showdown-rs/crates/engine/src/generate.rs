@@ -3511,10 +3511,23 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             && !md.flag_bypass_sub
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator
         {
+            // A status move whose ONLY landing effect is a major status (Toxic/Thunder Wave/
+            // Will-O-Wisp/Poison Powder/…) is failed by PS's `hitStepTryImmunity` BEFORE
+            // `hitStepAccuracy` when the target already carries a major status — `runStatusImmunity`
+            // rejects it, so no accuracy draw (d6 t58-62: Toxic on an already-paralyzed, subbed
+            // Garchomp → PS's only draw is Garchomp's own full-para check). A status move that also
+            // does something else (boost drop / volatile) still rolls behind the sub.
+            let status_only = md.status != Status::None
+                && md.target_boosts.iter().all(|&x| x == 0)
+                && md.target_volatile.is_none()
+                && !md.force_switch;
+            let target_already_statused = status_only
+                && b.state.side(foe).active().status != Status::None;
             if annotating()
                 && md.accuracy != 0
                 && !accuracy_forced_true(&b, side, &md)
                 && status_move_reaches_accuracy(&b, side, &md)
+                && !target_already_statused
             {
                 let acc = accuracy_arg(&b, side, &md);
                 let hp = accuracy_of(&b, side, &md);
