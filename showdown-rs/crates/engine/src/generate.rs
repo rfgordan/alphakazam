@@ -8618,10 +8618,38 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
     for side in [SideId::One, SideId::Two] {
         let s = state.side(side);
         let p = s.active();
+        let speed = effective_speed(state, side) as i64;
         if !p.is_alive() {
+            // A mon that fainted THIS turn is still in PS's `side.active`, so `fieldEvent('Residual')`
+            // collects its surviving residual handlers into the `speedSort` (the while-loop then skips
+            // EXECUTION for the fainted holder, but the SORT — hence the shuffle — already ran over it).
+            // `clearVolatile` on faint (pokemon.ts:1509) wipes volatiles + boosts but the ITEM and
+            // STATUS persist, so only the item/orb and status residuals survive to tie the foe's. This
+            // fires only while the fainted mon still occupies the active slot (before its replacement
+            // switches in) — the mid-turn-faint-then-residual window. Ground-truthed on c3/c4/c5/r6: a
+            // just-fainted Leftovers holder ties the surviving foe's Leftovers → one extra shuffle[2,0,2]
+            // (r6: two Cud Chew holders tie on the ABILITY residual → same). Only faint-surviving
+            // handlers (item / status / ability) are collected; every volatile/side/terrain residual is
+            // wiped by `clearVolatile` on faint.
+            let mut fpush = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
+            match p.item {
+                It::Leftovers | It::BlackSludge => fpush(5, 4),
+                It::ToxicOrb | It::FlameOrb | It::StickyBarb => fpush(28, 3),
+                _ => {}
+            }
+            match p.status {
+                St::Poison | St::Toxic => fpush(9, 0),
+                St::Burn => fpush(10, 0),
+                _ => {}
+            }
+            match p.ability {
+                Ab::Hydration => fpush(5, 3),
+                Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => fpush(28, 2),
+                Ab::HungerSwitch => fpush(29, 7),
+                _ => {}
+            }
             continue;
         }
-        let speed = effective_speed(state, side) as i64;
         let mut push = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
 
         // Grassy Terrain heals each active (per-active handler), regardless of grounding

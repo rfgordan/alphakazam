@@ -274,6 +274,17 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
                 return mk_fail(Some(format!("d{i}[t{}]:{label}", dp.turn)), decisions_ok, total, aligned);
             }
         };
+        if std::env::var("DRAWCMP").is_ok() {
+            let rec = rec_draw_labels(&unit);
+            if let Some(m) = first_draw_mismatch(&chosen_draws, &rec) {
+                let mid = unit.iter().any(|d| d.mid_turn);
+                let rs: Vec<String> = chosen_draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect();
+                let ps: Vec<String> = rec.iter().map(|r| r.label.clone()).collect();
+                eprintln!("[DRAWCMP] {name} d{i} t{} mid={mid}: {m}", dp.turn);
+                eprintln!("    rust[{}]: {}", rs.len(), rs.join(" "));
+                eprintln!("    ps  [{}]: {}", ps.len(), ps.join(" "));
+            }
+        }
         let target = &unit.last().unwrap().state_after;
         let state_target = match convert_state(target, &canon) {
             Ok(mut s) => { s.sleep_clause = sleep_clause; s }

@@ -5,6 +5,29 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Mid-turn-faint Update schedule — GROUND-TRUTHED TABLE (2026-07-24, tranche start at 93/111)
+
+Probed each mid-turn re-request unit in the 6 games with `harness/cosim_probe.mjs` (patched cosim
+recorder: wraps `prng.shuffle`, logs the dispatching `eachEvent`, the JS call-site frame, the live
+`getAllActive()` board, and the shuffle's handler `group`). **The engine already emits the correct
+LEADING brackets and the move's 970/1024 — the ONLY gap is exactly ONE trailing `shuffle[2,0,2]` per
+unit, from TWO distinct roots:**
+
+| game | unit | move | target | missing trailing shuffle — PS call site (probe) |
+|------|------|------|--------|--------------------------------------------------|
+| d6   | i25 t24 | p2 uturn (pivot, user survives) | p1 replacement survives | **uturn runAction Update (battle.js:2376=2882)** on the PRE-pivot board `[Garchomp\|Pelipper]` tied — the engine applies uturn's pivot switch INSIDE execute_move before `run_move_action`'s `emit_update`, so the 2882 sees the post-switch board (untied) and is dropped |
+| c3   | i45 t35 | p1 earthquake (KO) | p2 Toxapex faints | **Residual fieldEvent speedSort (battle.js:2344→333)** over `[leftovers/p1(o5,so4,spe106), leftovers/p2(o5,so4,spe106)]` — PS `fieldEvent('Residual')` iterates `side.active` (which still holds the just-fainted Toxapex, item retained, `clearVolatile` on faint wiped only volatiles) → 2 tied Leftovers → `shuffle[2,0,2]`. The engine's `residual_handlers` skips a fainted active → 1 Leftovers → no shuffle |
+| c4   | i30 t24 | earthquake (KO) | Toxapex faints | same Residual 2×Leftovers tie |
+| c5   | i70 t62 | saltcure (KO) | Toxapex faints | same Residual 2×Leftovers tie |
+| r6   | i20 t19 | p2 liquidation (KO) | p1 Tauros-Blaze faints | same Residual 2×Leftovers tie |
+
+PS `fieldEvent('Residual')` (battle.ts:487): the handler is collected for the fainted holder but the
+while-loop `if (handler.effectHolder.fainted) continue` SKIPS its execution — so the fainted mon's
+Leftovers contributes to the speed-SORT (the shuffle) but not to the heal. `getAllActive()` (excludes
+fainted) shows `[surviving-mon only]` at the shuffle, confirming the tie is over the residual HANDLER
+list (2 items), not the actives. c5a1's mid-turn i12 is a DIFFERENT class (`shuffle@generic` after a
+double-move, 3 unconsumed) and its later d18 is the thunderwave move-order class — left for the singles.
+
 ## Terminal state after the two Update-schedule tranches (93/111 = 83.8%)
 
 18 games remain non-exact. First-divergence classes (live seed gate):
