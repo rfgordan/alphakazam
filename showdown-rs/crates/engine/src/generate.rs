@@ -796,9 +796,14 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
     // A `terastallize` action (gen9, order 106) is queued for each side that teras AND moves. It
     // precedes the two move actions (order 200) in the commit `queue.sort()`, so it lengthens the
     // sorted list and shifts the move-tie group: for `k` tera actions the moves tie at [k, k+2) of
-    // a length-(k+2) list → `shuffle[k+2, k, k+2]`. Each tera action also runs its own `runAction`
-    // → an extra `eachEvent('Update')` shuffle (battle.ts:2882) on a Speed tie. (k=2 with two
-    // equal-Speed teras also ties the teras themselves at [0,2); left unmodeled — vanishingly rare.)
+    // a length-(k+2) list → `shuffle[k+2, k, k+2]`. (k=2 with two equal-Speed teras also ties the
+    // teras themselves at [0,2); left unmodeled — vanishingly rare.) Each tera action ALSO runs its
+    // own `runAction` → an `eachEvent('Update')` shuffle (battle.ts:2882), but a `switch` action
+    // (order 103) sorts BEFORE `terastallize` (106), so that Update speed-sorts the POST-switch
+    // board — it is emitted at the tera application site (step 1.5 of `generate_branches_ctx`),
+    // after any switch has been applied, not in this pre-switch bracket. (t2 d7: p1 switches
+    // Gothitelle→Skarmory while p2 teras; pre-swap Gothitelle-vs-Gothitelle ties, post-swap
+    // Skarmory-vs-Gothitelle does not — PS fires 3 shuffles, the pre-switch model fired 4.)
     let k = (tera[0] && matches!(s1, MoveChoice::Move(_))) as i32
         + (tera[1] && matches!(s2, MoveChoice::Move(_))) as i32;
     if commit_tie {
@@ -807,9 +812,6 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
     if speed_tie {
         draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 2. eachEvent('BeforeTurn')
         draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3. runAction Update (after beforeTurn)
-        for _ in 0..k {
-            draw(b, "shuffle", &[2, 0, 2], -1, "update"); // 3b. runAction Update after each tera action
-        }
     }
     if both_move && commit_tie {
         draw(b, "shuffle", &[3, 0, 2], -1, "update"); // 4. dynamic-speed re-sort (len-3 queue [move,move,residual])
@@ -1582,11 +1584,14 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
         }
     }
 
-    // 1.5) Terastallization happens at turn start (gen9), before moves, for staying mons.
+    // 1.5) Terastallization happens at turn start (gen9), before moves, for staying mons. The
+    //      `terastallize` action (order 106) sorts AFTER any `switch` (103), so its trailing
+    //      `runAction` `eachEvent('Update')` (battle.ts:2882) speed-sorts the POST-switch board.
     for (i, side) in [SideId::One, SideId::Two].into_iter().enumerate() {
         if tera[i] && matches!([s1, s2][i], MoveChoice::Move(_)) {
             for b in &mut branches {
                 apply_tera(b, side);
+                emit_update(b); // tera action runAction Update (2882)
             }
         }
     }
