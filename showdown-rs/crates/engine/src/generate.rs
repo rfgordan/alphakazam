@@ -8354,8 +8354,12 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
 
 /// The 16 damage rolls of a landing Future Sight / Doom Desire: computed at hit time from the
 /// stored caster's Special Attack vs the target's current Special Defense. (Approximation: no
-/// crit branch, no caster boosts.)
+/// caster boosts.)
 fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i16; 16] {
+    future_sight_rolls_crit(state, target_side, caster_slot, false)
+}
+
+fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, is_crit: bool) -> [i16; 16] {
     let src_side = target_side.other();
     let caster = &state.side(src_side).pokemon[(caster_slot as usize).min(5)];
     let target = state.side(target_side).active();
@@ -8373,7 +8377,7 @@ fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i
         defender_types: target.types,
         attack_stat: caster.stat(crate::ids::StatIndex::SpecialAttack),
         defense_stat: target.stat(crate::ids::StatIndex::SpecialDefense).max(1),
-        is_crit: false,
+        is_crit,
         attacker_burned: false,
         weather: state.weather,
         terastallized: caster.terastallized,
@@ -9242,24 +9246,64 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 if !target.is_alive() {
                     return vec![x];
                 }
-                let rolls = future_sight_rolls(&x.state, side, caster_slot);
+                // The delayed strike still runs a full damage calc: a type/ability-immune target
+                // (Psychic Future Sight vs a Dark mon, Steel Doom Desire vs an immune ability) makes
+                // it fail — no accuracy/crit/damage draws and no damage (c2b3 t8: Future Sight vs
+                // Dark Iron Jugulis). Gate the whole strike on connecting.
+                let (fs_type, _) = {
+                    let caster = &x.state.side(side.other()).pokemon[(caster_slot as usize).min(5)];
+                    let doom = caster.moves.iter().any(|m| m.id.to_id() == "doomdesire");
+                    if doom { (Type::Steel, 140u16) } else { (Type::Psychic, 120u16) }
+                };
+                let connects = crate::damage::type_multiplier(fs_type, target.types) != 0.0
+                    && !ability_immune(fs_type, target.ability);
+                if !connects {
+                    return vec![x];
+                }
                 let hp = target.hp;
                 let slot = x.state.side(side).active_index;
-                rolls
-                    .into_iter()
-                    .map(|r| {
-                        let mut nb = scaled(&x, 1.0 / 16.0);
-                        let dmg = r.min(hp).max(0);
-                        if dmg > 0 {
-                            push(&mut nb, Instruction::Damage { side, slot, amount: dmg });
-                            // The delayed strike counts as a hit for Rage Fist (PS `timesAttacked`).
-                            let cur = nb.state.side(side).active().times_hit;
-                            let new = cur.saturating_add(1).min(250);
-                            push(&mut nb, Instruction::SetTimesHit { side, slot, previous: cur, new });
-                        }
-                        nb
-                    })
-                    .collect::<Vec<_>>()
+                // Apply the 16 damage rolls (with the given crit flag) as sibling branches.
+                let strike = |base: &Branch, is_crit: bool| -> Vec<Branch> {
+                    let rolls = future_sight_rolls_crit(&base.state, side, caster_slot, is_crit);
+                    rolls
+                        .into_iter()
+                        .map(|r| {
+                            let mut nb = scaled(base, 1.0 / 16.0);
+                            // PS rolls the damage `random(16)` for the delayed strike.
+                            if annotating() {
+                                draw(&mut nb, "random", &[16], -1, "futuremove");
+                            }
+                            let dmg = r.min(hp).max(0);
+                            if dmg > 0 {
+                                push(&mut nb, Instruction::Damage { side, slot, amount: dmg });
+                                // The delayed strike counts as a hit for Rage Fist (PS `timesAttacked`).
+                                let cur = nb.state.side(side).active().times_hit;
+                                let new = cur.saturating_add(1).min(250);
+                                push(&mut nb, Instruction::SetTimesHit { side, slot, previous: cur, new });
+                            }
+                            nb
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if annotating() {
+                    // PS resolves the delayed strike as a full move at end of turn: accuracy (always
+                    // 100 — the strike bypasses invulnerability but PS still logs `randomChance(100,
+                    // 100)`), then the crit `randomChance(1,24)`, then the damage `random(16)`
+                    // (battle-actions.ts getDamage). Emit the realized stream so the differ / seed
+                    // gate match (c2a1 t8/t21). Enumerate/Sample keep the crit-free 16-way fold below.
+                    let mut x = x;
+                    draw(&mut x, "randomChance", &[100, 100], 1, "accuracy");
+                    let mut branches = Vec::new();
+                    let mut nc = scaled(&x, 23.0 / 24.0);
+                    draw(&mut nc, "randomChance", &[1, 24], 0, "futuremove");
+                    branches.extend(strike(&nc, false));
+                    let mut cr = scaled(&x, 1.0 / 24.0);
+                    draw(&mut cr, "randomChance", &[1, 24], 1, "futuremove");
+                    branches.extend(strike(&cr, true));
+                    branches
+                } else {
+                    strike(&x, false)
+                }
             })
             .collect();
     }
