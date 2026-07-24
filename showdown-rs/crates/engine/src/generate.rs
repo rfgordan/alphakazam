@@ -1626,13 +1626,23 @@ pub(crate) fn has_fainted_bench(state: &State, side: SideId) -> bool {
 /// Revival Blessing: restore a fainted party member (`slot`) to floor(maxHP/2) HP with healthy
 /// status, keeping it benched. PP is untouched. Reversible (Heal + status clears).
 pub(crate) fn apply_revive(b: &mut Branch, side: SideId, slot: u8) {
-    let (species, alive, max_hp, status, counter) = {
+    let (species, alive, max_hp, status, counter, was_tera, cur_types, base_types) = {
         let p = &b.state.side(side).pokemon[slot as usize];
-        (p.species, p.is_alive(), p.max_hp, p.status, p.status_counter)
+        (p.species, p.is_alive(), p.max_hp, p.status, p.status_counter, p.terastallized, p.types, p.base_types)
     };
     // Only a genuinely fainted party member is a legal target.
     if species == crate::ids::Species::None || alive || slot == b.state.side(side).active_index {
         return;
+    }
+    // PS `delete pokemon.terastallized` runs in faintMessages (battle.ts:2581), so a mon that
+    // fainted while Terastallized comes back to its BASE typing — a revived mon is never tera'd.
+    // The forward seed gate carries the pre-faint tera on the (hp=0) mon (a fainted mon's types
+    // aren't otherwise compared); revert it here so the revived mon matches PS's base form.
+    if was_tera {
+        if cur_types != base_types {
+            push(b, Instruction::ChangeTypes { side, slot, previous: cur_types, new: base_types });
+        }
+        push(b, Instruction::ToggleTerastallized { side, slot });
     }
     let heal = (max_hp / 2).max(1);
     push(b, Instruction::Heal { side, slot, amount: heal });

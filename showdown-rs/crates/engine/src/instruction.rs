@@ -389,9 +389,13 @@ impl State {
             ToggleTerastallized { side, slot } => {
                 let s = &mut self.sides[side.index()];
                 s.pokemon[slot as usize].terastallized = !s.pokemon[slot as usize].terastallized;
-                // Once-per-battle side flag. Recomputation is exact in both directions because
-                // the generator gates tera on !tera_used (a side toggles at most once).
-                s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
+                // Once-spent-forever side flag (PS: an ally's tera nulls `canTerastallize` team-
+                // wide and it never un-nulls). `any(terastallized)` sets it when a mon teras; keep
+                // it STICKY so an un-tera toggle (a Terastallized mon that faints and is revived by
+                // Revival Blessing — PS `delete pokemon.terastallized`) doesn't clear it. Reverse
+                // recomputes `any()`, which restores the exact prior value at every real toggle
+                // site (pre-state always has tera_used == any() there).
+                s.tera_used = s.tera_used || s.pokemon.iter().any(|p| p.terastallized);
             }
             PivotPending { .. } => {}
             RevivePending { .. } => {}
