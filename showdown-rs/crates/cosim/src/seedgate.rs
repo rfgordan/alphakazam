@@ -50,8 +50,13 @@ fn fixed_gender_set() -> std::collections::HashSet<&'static str> {
 /// explicit gender, so those mons don't roll — 0 construction draws. Custom-game corpora use
 /// fixed sets with (mostly) empty gender, so dual-gender species roll.
 ///
-/// The set-specified-gender case on directed custom teams is a documented residual (the set is
-/// not in the trace, so it cannot be distinguished from a rolled gender in the snapshot).
+/// A set that specifies its own gender (the recorded `setGender` roster field is non-empty)
+/// suppresses the construction roll: PS's `new Pokemon` uses `set.gender || species.gender ||
+/// sample(['M','F'])`, so an explicit set gender short-circuits before the sample. Directed
+/// custom teams (the c5 batch) fix genders in the packed set for deterministic Attract/Cute
+/// Charm legality, so those mons roll NOTHING at construction. Traces recorded before the
+/// recorder captured `setGender` lack the field entirely; those are treated as empty, preserving
+/// the original (empty-set-gender ⇒ roll for every dual-gender species) accounting.
 fn init_gender_rolls(t: &Trace) -> u32 {
     if t.format.contains("random") {
         return 0;
@@ -66,7 +71,10 @@ fn init_gender_rolls(t: &Trace) -> u32 {
                 .or_else(|| mon.get("species").and_then(Value::as_str))
                 .unwrap_or("");
             let sid = species_id_of_details(det);
-            if !fixed.contains(sid.as_str()) {
+            // Explicit set gender ⇒ no construction roll (PS short-circuits the sample).
+            let set_gender_explicit = mon.get("setGender").and_then(Value::as_str)
+                .map(|g| !g.is_empty()).unwrap_or(false);
+            if !fixed.contains(sid.as_str()) && !set_gender_explicit {
                 n += 1;
             }
         }
