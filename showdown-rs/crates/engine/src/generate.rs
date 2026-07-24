@@ -590,16 +590,24 @@ pub(crate) fn ability_is_traceable(ability: crate::ids::Ability) -> bool {
 }
 
 /// Whether a mon at party `slot` about to switch into `side` will fire Trace's `sample(1)` draw:
-/// its stored ability is Trace and the current foe active is alive with a traceable ability. Used
+/// its stored ability is Trace and the foe it will face is alive with a traceable ability. Used
 /// by the seed gate — a forced/post-turn replacement applied via `switch_into` (state only) skips
 /// this switch-in `onUpdate` draw, which PS still consumes (c3c2s82/s83: a Trace Gardevoir replaces
 /// a fainted mon and copies the foe's ability).
-pub fn trace_replacement_sample(state: &State, side: SideId, slot: u8) -> bool {
+///
+/// Trace is an `onUpdate` handler, so it fires at the first `eachEvent('Update')` at which a valid
+/// foe exists. In a SIMULTANEOUS both-sides replacement the foe slot is still fainted before the
+/// swaps are applied, so the foe must be resolved on the POST-swap board: `foe_replacement` is the
+/// party slot the OTHER side is replacing with (if any), else the foe's current active.
+pub fn trace_replacement_sample(state: &State, side: SideId, slot: u8, foe_replacement: Option<u8>) -> bool {
     let mon = &state.side(side).pokemon[slot as usize];
     if mon.ability != crate::ids::Ability::Trace {
         return false;
     }
-    let foe = state.side(side.other()).active();
+    let foe = match foe_replacement {
+        Some(fs) => &state.side(side.other()).pokemon[fs as usize],
+        None => state.side(side.other()).active(),
+    };
     foe.is_alive() && ability_is_traceable(foe.ability)
 }
 

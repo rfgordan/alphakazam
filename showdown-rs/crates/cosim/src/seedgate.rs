@@ -421,8 +421,20 @@ fn step_unit(
     // A replacement whose incoming mon has Trace fires a `sample(1)@trace` draw on switch-in that
     // `switch_into` (state only) skips — detect it BEFORE applying the swap (afterwards the ability
     // is already copied). PS consumes it during the replacement's runSwitch (c3c2s82/s83).
+    //
+    // Trace is an `onUpdate` handler (abilities.ts), so it fires at the first `eachEvent('Update')`
+    // where a valid foe EXISTS — which for a simultaneous both-sides replacement is AFTER the other
+    // side's replacement has entered. Evaluating the foe on the PRE-swap board sees the foe slot
+    // still fainted and wrongly skips the draw (c3c2s82 d31: Gardevoir and Phione replace two
+    // simultaneous faints; PS samples Phione for Trace). So resolve each side's foe against the
+    // POST-swap board: the foe's replacement mon if that side is also replacing, else its current
+    // active. `switch_into_pair` already models the same "both enter, then abilities fire" order
+    // for STATE; this brings the draw accounting in line.
     let trace_draws = replacements.iter()
-        .filter(|&&(side, slot)| engine::generate::trace_replacement_sample(state, side_id(side), slot))
+        .filter(|&&(side, slot)| {
+            let foe_replacement = replacements.iter().find(|&&(s2, _)| s2 != side).map(|&(_, sl)| sl);
+            engine::generate::trace_replacement_sample(state, side_id(side), slot, foe_replacement)
+        })
         .count();
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
