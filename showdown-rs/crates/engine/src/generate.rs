@@ -8224,7 +8224,18 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     // mis-ordered phaze/self-destruct cases outweigh the gains). Needs move-subtype-aware placement
     // plus a moveHit-ran signal.
     if miss_prob > 0.0 {
-        hits.push(scaled(&b, miss_prob));
+        let mut mb = scaled(&b, miss_prob);
+        // The accuracy roll came up a miss on this branch: flip the inherited hit-result (1) to 0
+        // so the seed-gate Replicate filter selects hit vs miss by the realized `randomChance`
+        // value — mirroring the damaging-move miss branch. Without this both branches carried
+        // result 1, leaving a real miss unselectable (the filter fell through and applied the
+        // status, e.g. Thunder Wave paralysing on a recorded miss — r6/d1/c3c1s73).
+        if mb.draws.last().is_some_and(|d| d.site == "accuracy") {
+            if let Some(d) = mb.draws.last_mut() {
+                d.result = 0;
+            }
+        }
+        hits.push(mb);
         hits
     } else {
         hits
