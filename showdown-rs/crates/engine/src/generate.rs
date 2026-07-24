@@ -7279,6 +7279,15 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
             apply_self_boost(b, side, BOOST_ORDER[i], delta);
         }
     }
+    // PS `move.selfBoost` (Clanging Scales def−1, …) is applied at battle-actions.ts:521
+    // (`if (move.selfBoost && moveResult) this.moveHit(pokemon, pokemon, move, move.selfBoost, …)`)
+    // with NO `random(100)` roll — distinct from `move.self.boosts`, which rolls in `selfDrops`.
+    // Emitted here (no draw) once the move connected.
+    for (i, &delta) in md.self_boost_only.iter().enumerate() {
+        if delta != 0 {
+            apply_self_boost(b, side, BOOST_ORDER[i], delta);
+        }
+    }
     // Secondary self-boosts (Trailblaze +Spe, Power-Up Punch +Atk) are SECONDARIES, so Sheer
     // Force removes them (in exchange for the ×1.3 base power it already applied).
     let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce

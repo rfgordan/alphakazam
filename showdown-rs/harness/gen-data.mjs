@@ -109,7 +109,11 @@ moves.forEach((m, i) => {
 	// boosts when target is self feed the user's PRIMARY boosts (Close Combat, Leaf Storm — these
 	// survive Sheer Force). A 100%-chance self-SECONDARY (Trailblaze spe, Power-Up Punch atk) is a
 	// secondary, so Sheer Force removes it — keep it in a separate field.
-	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, m.selfBoost && m.selfBoost.boosts, selfTarget ? m.boosts : null);
+	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, selfTarget ? m.boosts : null);
+		// `selfBoost.boosts` (Clanging Scales / Scale Shot / Clangorous Soulblaze) is a DISTINCT PS path:
+		// applied at battle-actions.ts:521 via `moveHit` with NO `random(100)` roll, unlike `self.boosts`
+		// above (which rolls in `selfDrops`). Own field so the engine applies it draw-free.
+		const selfBoostOnlyObj = m.selfBoost && m.selfBoost.boosts ? m.selfBoost.boosts : null;
 	const targetBoostsObj = !selfTarget ? m.boosts : null;
 	const fields = [
 		`id: MoveId(${idx})`,
@@ -126,6 +130,7 @@ moves.forEach((m, i) => {
 		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
 		`secondary_self_boosts: ${boostsRs(secSelfBoosts)}`,
+		`self_boost_only: ${boostsRs(selfBoostOnlyObj)}`,
 		`target_boosts: ${boostsRs(MANUAL_TARGET_BOOSTS[m.id] || targetBoostsObj)}`,
 		`secondary_chance: ${secChance}`,
 		`secondary_boosts: ${boostsRs(sec && sec.boosts)}`,

@@ -85,6 +85,10 @@ pub struct MoveData {
     /// User stat-stages from a 100%-chance self-SECONDARY (Trailblaze +Spe, Power-Up Punch +Atk).
     /// Being a secondary, Sheer Force removes these (and makes the move Sheer-Force-eligible).
     pub secondary_self_boosts: [i8; BoostIndex::COUNT],
+    /// User stat-stages from PS `move.selfBoost` (Clanging Scales/Scale Shot −Def, Clangorous
+    /// Soulblaze). Applied at battle-actions.ts:521 via `moveHit` — distinct from `self.boosts`
+    /// (which rolls a `random(100)` in `selfDrops`): `selfBoost` rolls NOTHING.
+    pub self_boost_only: [i8; BoostIndex::COUNT],
     /// Stat-stage changes a status move applies to the *target* (Growl, Charm, ...).
     pub target_boosts: [i8; BoostIndex::COUNT],
 
@@ -153,6 +157,7 @@ impl MoveData {
             force_switch: false,
             self_boosts: [0; BoostIndex::COUNT],
             secondary_self_boosts: [0; BoostIndex::COUNT],
+            self_boost_only: [0; BoostIndex::COUNT],
             target_boosts: [0; BoostIndex::COUNT],
             secondary_chance: 0,
             secondary_boosts: [0; BoostIndex::COUNT],
