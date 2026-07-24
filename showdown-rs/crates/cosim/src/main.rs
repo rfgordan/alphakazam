@@ -12,6 +12,7 @@ mod convert;
 mod diff;
 mod drawdiff;
 mod export;
+mod protocol_emit;
 mod replay;
 mod seedgate;
 mod trace;
@@ -77,6 +78,12 @@ fn main() -> ExitCode {
     // so `harness/transplant-gate.mjs` can drive the recorded remainder in pinned PS.
     if let Ok(outdir) = std::env::var("EXPORT_SAMPLE") {
         return run_export_sample(&args, &outdir);
+    }
+
+    // Protocol-log emitter: replay each recorded game through the engine and write its PS protocol
+    // log (for the replay player / log-parity gate). PROTOCOL_EMIT=<outdir> cosim <traces>.
+    if let Ok(outdir) = std::env::var("PROTOCOL_EMIT") {
+        return protocol_emit::run_protocol_emit(&args, &outdir);
     }
 
     let mut totals = Totals::default();
