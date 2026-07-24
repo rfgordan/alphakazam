@@ -11,6 +11,7 @@
 mod convert;
 mod diff;
 mod drawdiff;
+mod export;
 mod replay;
 mod seedgate;
 mod trace;
@@ -63,6 +64,12 @@ fn main() -> ExitCode {
     // Seed-driven full-battle Replicate gate (Phase 3 deliverable #2).
     if std::env::var("SEED_GATE").is_ok() {
         return crate::seedgate::run_seed_gate(&args);
+    }
+
+    // Exporter round-trip gate: for every corpus decision state S = convert(ps_snapshot), assert
+    // convert(export(S)) == S exactly. Certifies the State exporter is a right-inverse of convert.
+    if std::env::var("ROUNDTRIP_GATE").is_ok() {
+        return run_roundtrip_gate(&args);
     }
 
     let mut totals = Totals::default();
@@ -402,6 +409,118 @@ fn run_raw_draw_gate(args: &[String]) -> ExitCode {
     println!("RAW DRAW-STREAM GATE: {games_ok}/{games} games reproduce the full recorded draw stream ({total_draws} draws checked)");
     for f in fails.iter().take(30) { println!("  {f}"); }
     if games_ok == games { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Round-trip certification: `convert(export(convert(state_after))) == convert(state_after)` for
+/// every convertible decision state in the corpus. Headline is the `move`-request unit count.
+fn run_roundtrip_gate(args: &[String]) -> ExitCode {
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let mut ps_commit: Option<String> = None;
+    // (converted, exact) tallied per request-state class.
+    let mut per_class: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let mut convert_failed: BTreeMap<String, u32> = BTreeMap::new();
+    let mut mismatch_cats: BTreeMap<String, u32> = BTreeMap::new();
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        match &ps_commit {
+            None => ps_commit = Some(t.ps_commit.clone()),
+            Some(c) if *c != t.ps_commit => {
+                eprintln!("{path}: PS commit differs — refusing mixed corpus");
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        let Some(first) = t.decisions.first() else { continue };
+        let canon = match convert::Canonical::from_first_state(&first.state_after) {
+            Ok(c) => c,
+            Err(u) => { *convert_failed.entry(format!("canon:{}", u.0)).or_insert(0) += 1; continue; }
+        };
+        let name = path.rsplit('/').next().unwrap_or(path);
+        for d in &t.decisions {
+            let class = d.request_state.clone();
+            // Convert PS snapshot -> engine State (the input to the round-trip identity).
+            let state = match convert::convert_state(&d.state_after, &canon) {
+                Ok(s) => s,
+                Err(u) => {
+                    *convert_failed.entry(u.0.split([':', '[']).next().unwrap_or("?").to_string()).or_insert(0) += 1;
+                    continue;
+                }
+            };
+            // export -> convert back.
+            let json = export::export_state(&state, t.seed.unwrap_or([1, 2, 3, 4]));
+            let canon2 = match convert::Canonical::from_first_state(&json) {
+                Ok(c) => c,
+                Err(u) => {
+                    let e = per_class.entry(class.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    *mismatch_cats.entry(format!("export-canon:{}", u.0)).or_insert(0) += 1;
+                    mismatches.push(format!("{name} d{} t{} [{class}] export-canon: {}", d.index, d.turn, u.0));
+                    continue;
+                }
+            };
+            let back = match convert::convert_state(&json, &canon2) {
+                Ok(s) => s,
+                Err(u) => {
+                    let e = per_class.entry(class.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    *mismatch_cats.entry(format!("export-convert:{}", u.0.split([':', '[']).next().unwrap_or("?"))).or_insert(0) += 1;
+                    mismatches.push(format!("{name} d{} t{} [{class}] export-convert-failed: {}", d.index, d.turn, u.0));
+                    continue;
+                }
+            };
+            let e = per_class.entry(class.clone()).or_insert((0, 0));
+            e.0 += 1;
+            if back == state {
+                e.1 += 1;
+            } else {
+                let diffs = diff::diff_states(&state, &back);
+                for dd in &diffs {
+                    *mismatch_cats.entry(dd.category.clone()).or_insert(0) += 1;
+                }
+                let detail = diffs.iter().take(4).map(|d| d.detail.as_str()).collect::<Vec<_>>().join(" | ");
+                mismatches.push(format!("{name} d{} t{} [{class}] {detail}", d.index, d.turn));
+            }
+        }
+    }
+
+    println!("\n========== EXPORTER ROUND-TRIP GATE ==========");
+    if let Some(c) = &ps_commit { println!("(ps {c})"); }
+    let (mut tot_c, mut tot_e) = (0u32, 0u32);
+    for (class, (c, e)) in &per_class {
+        println!("  {class:12} converted {c:5}  exact {e:5}");
+        tot_c += c;
+        tot_e += e;
+    }
+    if let Some((c, e)) = per_class.get("move") {
+        println!("\nROUND-TRIP (move units): {e} / {c} exact");
+    }
+    println!("ROUND-TRIP (all states): {tot_e} / {tot_c} exact");
+    if !convert_failed.is_empty() {
+        println!("\nconvert-unsupported states (excluded from round-trip denominator):");
+        print_ranked("  reasons", &convert_failed);
+    }
+    if tot_e != tot_c {
+        println!("\nMISMATCH categories:");
+        print_ranked("  ", &mismatch_cats);
+        println!("\nfirst {} mismatches:", 30.min(mismatches.len()));
+        for m in mismatches.iter().take(30) {
+            println!("  {m}");
+        }
+        if verbose {
+            for m in mismatches.iter().skip(30) {
+                println!("  {m}");
+            }
+        }
+        ExitCode::FAILURE
+    } else {
+        println!("\nPASS: every convertible corpus state round-trips byte-exact.");
+        ExitCode::SUCCESS
+    }
 }
 
 fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {
