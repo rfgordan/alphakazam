@@ -12,6 +12,7 @@
 use engine::generate::{generate_instructions, MoveChoice};
 use engine::instruction::StateInstructions;
 use engine::narrate::narrate_turn;
+use engine::protocol::{protocol_turn, HpStyle};
 use engine::state::{SideId, State};
 use engine::team;
 use pyo3::prelude::*;
@@ -183,8 +184,10 @@ impl Battle {
     ///   done   — battle finished this turn
     ///   winner — -1 ongoing/draw, 0 Red, 1 Blue
     ///   lines  — natural-language commentary for the turn (empty unless `narrate=True`)
-    #[pyo3(signature = (action_red, action_blue, narrate = false))]
-    fn step(&mut self, action_red: u8, action_blue: u8, narrate: bool) -> (bool, i64, Vec<String>) {
+    ///   lines  — English commentary if `narrate=True`, else PS **protocol** lines if
+    ///            `protocol=True`, else empty (both off = zero cost on the hot path).
+    #[pyo3(signature = (action_red, action_blue, narrate = false, protocol = false))]
+    fn step(&mut self, action_red: u8, action_blue: u8, narrate: bool, protocol: bool) -> (bool, i64, Vec<String>) {
         let c1 = self.resolve(SideId::One, action_red);
         let c2 = self.resolve(SideId::Two, action_blue);
 
@@ -196,6 +199,10 @@ impl Battle {
         let idx = self.sample(&branches);
         let lines = if narrate {
             narrate_turn(&self.state, c1, c2, &branches[idx].instructions)
+        } else if protocol {
+            let mut out = Vec::new();
+            protocol_turn(&self.state, c1, c2, &branches[idx].instructions, HpStyle::Percent, &mut out);
+            out
         } else {
             Vec::new()
         };
@@ -203,6 +210,18 @@ impl Battle {
         self.state.turn += 1;
 
         (self.is_over(), self.winner(), lines)
+    }
+
+    /// Spot-check entry point (Rob's directive): serialize the current TRUE battle state as a PS
+    /// `State.deserializeBattle`-loadable snapshot (the same exporter the round-trip/transplant
+    /// gates certify). Drop the returned JSON into pinned Showdown to inspect the position live.
+    /// `seed` is the 4-limb PRNG seed written into the snapshot (default `[1,2,3,4]`).
+    #[pyo3(signature = (seed = None))]
+    fn export_state(&self, seed: Option<Vec<u16>>) -> String {
+        let s = seed
+            .and_then(|v| <[u16; 4]>::try_from(v).ok())
+            .unwrap_or([1, 2, 3, 4]);
+        cosim::export::export_state(&self.state, s).to_string()
     }
 
     /// The full *true* battle state (both sides, perfect information) as a JSON string, for
@@ -976,6 +995,17 @@ impl FlowVec {
     #[getter]
     fn pool_size(&self) -> usize {
         self.pool.as_ref().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Spot-check: env `i`'s current TRUE state as a PS `deserializeBattle`-loadable snapshot
+    /// (the certified exporter). Drop it into pinned Showdown to inspect the position live.
+    #[pyo3(signature = (env, seed = None))]
+    fn export_state(&self, env: usize, seed: Option<Vec<u16>>) -> PyResult<String> {
+        let f = self.flows.get(env).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={})", self.flows.len()))
+        })?;
+        let s = seed.and_then(|v| <[u16; 4]>::try_from(v).ok()).unwrap_or([1, 2, 3, 4]);
+        Ok(cosim::export::export_state(&f.state, s).to_string())
     }
 
     #[getter]
