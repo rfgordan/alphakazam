@@ -612,6 +612,67 @@ fn emit_update(b: &mut Branch) {
     }
 }
 
+/// PS `Field.setWeather` / `clearWeather` / `setTerrain` / `clearTerrain` each END with
+/// `eachEvent('WeatherChange')` / `eachEvent('TerrainChange')` (field.ts:87 / :97 / :155 / :165) —
+/// a `getAllActive()` speedSort, so exactly ONE `shuffle[2,0,2]` on a Speed-tied board. `eachEvent`
+/// sorts on the CACHED `pokemon.speed` (only `updateSpeed` refreshes it), so a weather-gated Speed
+/// ability (Swift Swim / Chlorophyll / Sand Rush / Slush Rush) does not change the tie at the
+/// instant the field flips — emit BEFORE the state change. Ground-truthed in the corpus:
+/// d6 d64 `shuffle[2,0,2]@drizzle` (Pelipper's Drizzle sets rain on a mid-turn switch-in) and
+/// r10 d32 `shuffle[2,0,2]@grassysurge`. Annotation-only; state-neutral.
+fn emit_field_change_shuffle(b: &mut Branch) {
+    if annotating() && actives_update_tie(&b.state, false) {
+        draw(b, "shuffle", &[2, 0, 2], -1, "fieldchange");
+    }
+}
+
+/// Would the weather's own per-mon `onWeather` handlers KO an active this upkeep? Only the
+/// damaging ones exist in gen9: the Sandstorm chip (1/16, skipped for Rock/Ground/Steel and the
+/// sand abilities) and Dry Skin's 1/8 sun burn. Mirrors the residual loop below; used to decide
+/// whether the recursive `eachEvent('Update')` inside `eachEvent('Weather')` still sees two
+/// actives in `getAllActive()`.
+fn weather_upkeep_faints(state: &State) -> bool {
+    use crate::ids::Ability as Ab;
+    [SideId::One, SideId::Two].into_iter().any(|side| {
+        let p = state.side(side).active();
+        if !p.is_alive() || p.ability == Ab::MagicGuard {
+            return false;
+        }
+        let dmg = if effective_weather(state) == Weather::Sand {
+            let immune = p.types.contains(&Type::Rock)
+                || p.types.contains(&Type::Ground)
+                || p.types.contains(&Type::Steel)
+                || matches!(p.ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat | Ab::SandStream);
+            if immune { 0 } else { (p.max_hp / 16).max(1) }
+        } else if p.ability == Ab::DrySkin && matches!(state.weather, Weather::Sun | Weather::HarshSun) {
+            (p.max_hp / 8).max(1)
+        } else {
+            0
+        };
+        dmg >= p.hp
+    })
+}
+
+/// The weather's own `onFieldResidual` (data/conditions.ts — EVERY weather: rain/sun/sand/snow and
+/// the primal trio) ends with `this.eachEvent('Weather')`, a `getAllActive()` speedSort; and
+/// `eachEvent` RECURSES into `eachEvent('Update')` for gen >= 7 (battle.ts:474), a second speedSort.
+/// So an active weather contributes TWO tie-gated `shuffle[2,0,2]` per end of turn, at residual
+/// order 1 (`onFieldResidualOrder: 1`) — immediately after the residual handler-list speedSort and
+/// before every other residual handler. PS skips them on the weather's FINAL turn: the residual
+/// loop (battle.ts:515) decrements the duration first and, at 0, calls `field.clearWeather()`
+/// instead of the handler (which fires one `WeatherChange` shuffle — see
+/// `emit_field_change_shuffle`). Ground-truthed: d6 d64 two `shuffle[2,0,2]@raindance`, r10
+/// d34/d35 two `shuffle[2,0,2]@snowscape` each, all directly after the `@generic` residual sort.
+fn emit_weather_upkeep_shuffles(b: &mut Branch) {
+    if !annotating() || !actives_update_tie(&b.state, false) {
+        return;
+    }
+    draw(b, "shuffle", &[2, 0, 2], -1, "weather"); // eachEvent('Weather')
+    if !weather_upkeep_faints(&b.state) {
+        draw(b, "shuffle", &[2, 0, 2], -1, "weather"); // recursive eachEvent('Update')
+    }
+}
+
 /// A turn-action `switch` runs its own `runAction` → post-action `eachEvent('Update')`
 /// (battle.ts:2881) on the PRE-swap board — the outgoing mon is still on the field when this
 /// Update speed-sorts, so the tie is evaluated BEFORE the incoming mon changes the Speed. Emit
@@ -2017,6 +2078,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     };
     if terrain != crate::ids::Terrain::None && b.state.terrain != terrain {
         let turns = if b.state.side(side).active().item == Item::TerrainExtender { 8 } else { 5 };
+        emit_field_change_shuffle(b); // setTerrain -> eachEvent('TerrainChange') (r10 d32 @grassysurge)
         push(b, Instruction::ChangeTerrain {
             previous: b.state.terrain,
             previous_turns: b.state.terrain_turns,
@@ -5477,6 +5539,7 @@ fn apply_post_damage(
                 // this.field.setTerrain — fails silently if already Grassy).
                 if b.state.terrain != crate::ids::Terrain::Grassy {
                     let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
+                    emit_field_change_shuffle(b); // setTerrain -> eachEvent('TerrainChange')
                     push(b, Instruction::ChangeTerrain {
                         previous: b.state.terrain,
                         previous_turns: b.state.terrain_turns,
@@ -7942,6 +8005,7 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         }
         let (prev_t, prev_tt) = (b.state.terrain, b.state.terrain_turns);
         if prev_t != crate::ids::Terrain::None {
+            emit_field_change_shuffle(&mut b); // clearTerrain -> eachEvent('TerrainChange')
             push(&mut b, Instruction::ChangeTerrain {
                 previous: prev_t,
                 previous_turns: prev_tt,
@@ -8496,8 +8560,10 @@ fn set_hp(b: &mut Branch, side: SideId, target_hp: i16) {
     }
 }
 
-/// Set the field weather (and its duration).
+/// Set the field weather (and its duration). PS's `Field.setWeather` / `clearWeather` end with
+/// `eachEvent('WeatherChange')` — one tie-gated `shuffle[2,0,2]`, emitted on the pre-change board.
 fn set_weather(b: &mut Branch, weather: Weather, turns: i8) {
+    emit_field_change_shuffle(b);
     push(b, Instruction::ChangeWeather {
         previous: b.state.weather,
         previous_turns: b.state.weather_turns,
@@ -8956,10 +9022,21 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // they are skipped on the weather's final turn — tick the weather here, before that loop. (The
     // Grassy Terrain heal is a separate per-mon handler that still fires on the terrain's final
     // turn, so the terrain duration is ticked AFTER the loop, below.)
-    if b.state.weather != Weather::None && b.state.weather_turns > 0 {
-        push(b, Instruction::DecrementWeatherTurns);
-        if b.state.weather_turns == 0 {
-            set_weather(b, Weather::None, 0);
+    if b.state.weather != Weather::None {
+        if b.state.weather_turns > 0 {
+            push(b, Instruction::DecrementWeatherTurns);
+            if b.state.weather_turns == 0 {
+                // Duration hit 0: PS calls `field.clearWeather()` INSTEAD of the handler — one
+                // `WeatherChange` shuffle, and no `eachEvent('Weather')` upkeep pair.
+                set_weather(b, Weather::None, 0);
+            } else {
+                emit_weather_upkeep_shuffles(b);
+            }
+        } else {
+            // Permanent weather (Primordial Sea / Desolate Land / Delta Stream, `duration: 0`):
+            // the residual loop's `handler.state?.duration` check is falsy, so the upkeep handler
+            // runs every turn.
+            emit_weather_upkeep_shuffles(b);
         }
     }
     // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
@@ -9320,6 +9397,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     if b.state.terrain != crate::ids::Terrain::None && b.state.terrain_turns > 0 {
         push(b, Instruction::DecrementTerrainTurns);
         if b.state.terrain_turns == 0 {
+            emit_field_change_shuffle(b); // clearTerrain -> eachEvent('TerrainChange')
             push(b, Instruction::ChangeTerrain {
                 previous: b.state.terrain,
                 previous_turns: 0,
