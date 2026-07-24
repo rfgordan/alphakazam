@@ -281,8 +281,15 @@ function resolveChoice(battle, sideId, rec, roster) {
 		return `switch ${pos + 1}`;
 	}
 	if (r.action === 'move') {
-		const active = battle.sides[n].active[0];
-		let idx = active.moveSlots.findIndex(m => m.id === r.moveId);
+		// Resolve the move index against the REQUEST's offered move list (what PS actually accepts),
+		// not the full moveSlots: when the mon is locked (rampage/recharge/two-turn) PS restricts the
+		// list to the single locked move, which is "move 1" regardless of its original slot.
+		const req = battle[sideId].activeRequest;
+		const offered = req && req.active && req.active[0] && req.active[0].moves;
+		let idx = offered ? offered.findIndex(m => m.id === r.moveId) : -1;
+		if (idx < 0) {
+			idx = battle.sides[n].active[0].moveSlots.findIndex(m => m.id === r.moveId);
+		}
 		if (idx < 0) idx = 0; // struggle / lost slot
 		return `move ${idx + 1}${r.tera ? ' terastallize' : ''}`;
 	}
