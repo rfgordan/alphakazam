@@ -74,6 +74,13 @@ pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: Hp
                 current_move = Some((side, move_id));
             }
         }
+        // Struggle has no PP slot (no DecrementPp), so announce it at its SetLastMove instead.
+        if let Instruction::SetLastMove { side, new, .. } = ins {
+            if new.to_id() == "struggle" {
+                emit_move(out, &s, side, new);
+                current_move = Some((side, new));
+            }
+        }
         // PS handles switch-OUT bookkeeping silently: boost/stat resets, and Regenerator's 1/3
         // heal on the outgoing mon. The engine emits explicit Boost/ClearBoosts/Heal deltas for
         // these. Suppress a Boost/ClearBoosts/Heal whose side's next event is a Switch (no
