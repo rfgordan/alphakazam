@@ -74,12 +74,15 @@ pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: Hp
                 current_move = Some((side, move_id));
             }
         }
-        // PS resets a mon's boosts SILENTLY when it switches out; the engine emits explicit Boost/
-        // ClearBoosts deltas to zero them. Suppress those — a Boost/ClearBoosts whose side's next
-        // event is a Switch (no intervening move for that side) is a switch-out reset, not a move.
-        let switch_reset = matches!(ins, Instruction::Boost { .. } | Instruction::ClearBoosts { .. })
-            && is_switch_out_reset(instructions, i);
-        if !switch_reset {
+        // PS handles switch-OUT bookkeeping silently: boost/stat resets, and Regenerator's 1/3
+        // heal on the outgoing mon. The engine emits explicit Boost/ClearBoosts/Heal deltas for
+        // these. Suppress a Boost/ClearBoosts/Heal whose side's next event is a Switch (no
+        // intervening move for that side) — it is switch-out bookkeeping, not a move/residual.
+        let switch_out = matches!(
+            ins,
+            Instruction::Boost { .. } | Instruction::ClearBoosts { .. } | Instruction::Heal { .. }
+        ) && is_switch_out_reset(instructions, i);
+        if !switch_out {
             emit_instruction(out, &s, ins, hp_style, &current_move);
         }
         s.apply_one(ins);
@@ -96,7 +99,9 @@ pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: Hp
 /// the same side's next relevant event is a `Switch` before any move (`DecrementPp`) for that side.
 fn is_switch_out_reset(instructions: &[Instruction], i: usize) -> bool {
     let side = match instructions[i] {
-        Instruction::Boost { side, .. } | Instruction::ClearBoosts { side, .. } => side,
+        Instruction::Boost { side, .. }
+        | Instruction::ClearBoosts { side, .. }
+        | Instruction::Heal { side, .. } => side,
         _ => return false,
     };
     for ins in &instructions[i + 1..] {
@@ -125,9 +130,10 @@ pub fn switch_line(state: &State, side: SideId, hp_style: HpStyle) -> String {
 fn emit_move(out: &mut Vec<String>, s: &State, side: SideId, move_id: crate::ids::MoveId) {
     use crate::data::MoveTarget::*;
     let user = ident_active(s, side);
+    // `AllAdjacent` (Surf, Earthquake, Muddy Water, …) hits the foe in singles → foe-directed.
     let foe_directed = matches!(
         move_data(move_id).target,
-        Normal | AdjacentFoe | AllAdjacentFoes | Any | RandomNormal | Scripted | FoeSide
+        Normal | AdjacentFoe | AllAdjacent | AllAdjacentFoes | Any | RandomNormal | Scripted | FoeSide
     );
     let target = if foe_directed { ident_active(s, side.other()) } else { user.clone() };
     out.push(format!("|move|{}|{}|{}", user, prettify(move_id.to_id()), target));
