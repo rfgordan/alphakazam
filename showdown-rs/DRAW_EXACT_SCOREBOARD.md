@@ -5,6 +5,75 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Finishing tranche — session 2026-07-24 (differ 98.93% → 98.98%; 2 classes; 63/111 games held)
+
+Resumed the differ-zero finishing tranche from HANDOFF_DRAW_EXACT.md. Landed two draw-COUNT
+classes (all rails green throughout: engine tests 12 suites, state-sweep **3831/3831**, smoke
+**18/18**, seed gate **63/111** with zero prior-exact regression — the selfBoost/diamondstorm
+changes only remove/add draw-and-discards and apply identical boosts):
+
+| step | differ | class landed | commit |
+|------|--------|--------------|--------|
+| S1 | 3790→3791 (98.96%) | **`selfBoost` moves emit NO self-drop roll** — PS `move.selfBoost` (Clanging Scales / Scale Shot / Clangorous Soulblaze) applies at battle-actions.ts:521 via `moveHit` with NO `random(100)`, DISTINCT from `move.self.boosts` (`selfDrops`, which rolls). `gen-data.mjs` conflated both into `self_boosts`, so the engine over-emitted a self-drop draw for the 3 `selfBoost` moves. **Extraction fix** (per lesson #4): new `self_boost_only` MoveData field, applied draw-free; regenerated gen.rs (exactly 3 moves' `self_boosts`→`self_boost_only`, audited). Clears c3b2s52 (clangingscales) + advances rd318 (scaleshot). | 34221ef |
+| S2 | 3791→3792 (98.98%) | **Diamond Storm empty-secondary second `random(100)`** — Diamond Storm has `self:{chance:50,boosts:{def:2}}` AND an empty `secondary:{}` (Sheer-Force marker); PS rolls TWO `random(100)` (self via `selfDrops`, empty secondary via `secondaries`). Engine emitted only the self roll; added `diamondstorm` to `extra_secondary_roll_move` (emits on both sub + non-sub paths). Clears r6 t2. **State caveat** (NOT draw): `self.chance:50` is unmodeled — the def+2 applies unconditionally; the sole corpus instance procs so the sweep stays exact. Diamond Storm is the ONLY move with `self.chance`. | b9f0791 |
+
+**The GRAV APPLE resume-point suspicion was a red herring** — its gen.rs entry is correct
+(`self_boosts` all-zero, def-1 as a target `secondary_boosts`). The actual over-emission at
+c3b2s52 t6 was **Clanging Scales** (`selfBoost`), KO'ing Flapple; the codegen mis-encoding was
+the `self` vs `selfBoost` conflation above.
+
+### Terminal state at pause: differ **3792/3831 = 98.98%** (39 units); seed gate **63/111** (56.8%)
+Mismatch categories: 20 unconsumed, 10 extra-draw, 5 args, 4 state-mismatch. **Every remaining
+game non-exact in the seed gate is now draw-work-asymptotic**: all four self-drop/cursedbody/trace
+games verified to diverge on STATE (HP/boosts) or earlier, so the remaining differ units yield
+**0 games** — they are draw-ORDERING residues or sit behind a state-computation divergence.
+
+**NAMED OPEN ITEMS — remaining 39 differ units (all genuinely-evidenced; each needs intricate/
+state-risky work with 0 game yield — NOT clean wins):**
+- **`shuffle[2,0,2]@generic` (19) + downstream cascades (`@snowscape` ×2, earthquake/flareblitz
+  wrong-order, `@psychic`/`@thunderwave`/`@update`/`shuffle[5,1,3]`, extra-accuracy — ≈29 units
+  total)** — the **first-mover no-draw Update / move-order-tie** class. On a Speed tie where the
+  first mover is a no-draw status/failed move, PS fires its runAction `eachEvent('Update')` (2882)
+  BEFORE the second move's draws; the engine's annotation can't shape-match either order. The
+  SEED_GATE already handles these via `forced_tie_order` (games exact), so this is a differ/
+  annotation-ordering residue in the turn-resolution path — INTRICATE, multi-session-deferred,
+  0 games. PS battle.ts:2881.
+- **`sample[1]@trace` (3, c3c2s82/s83)** — Trace's `onUpdate` re-trace `sample(1)` at an
+  end-of-turn Update (the holder picking its copy target). Needs Trace onUpdate timing modeling
+  (which Update, traceable-target gate). Both games diverge on STATE (HP) at/after the trace turn
+  → 0 games. abilities.ts Trace.
+- **`randomChance[3,10]@cursedbody` (1, r3 t19)** — Cursed Body is a per-hit `DamagingHit` handler;
+  PS fires it AFTER EACH hit of a multi-hit move (Scale Shot ×2 → 2 interleaved rolls). The engine
+  emits it once post-loop. Fix requires per-hit interleaving in the realized multi-hit executor
+  (`apply_multihit_realized` delegates the loop to the shared `apply_damage_hit` hot path — needs
+  cursor-threading or a duplicated loop, with the ModifyDamage-shuffle ordering). Regression risk to
+  the Scale Shot/Bullet Seed family (55 exact games) for 1 unit / 0 games. r3 diverges at d9/t8.
+- **`randomChance[3,10]@ficklebeam` (1, rd318 t4)** — Fickle Beam `onBasePower` rolls
+  `randomChance(3,10)` (30% DOUBLE power) between the crit and damage rolls in `getDamage`. Not
+  draw-and-discard: it branches the damage calc (2× base power), so it's a state-path mechanic
+  (regression risk to `compute_damage`) for 1 unit / 0 games (rd318 diverges at d2/t3). moves.ts:5227.
+- **`randomChance[1,24]@poltergeist` (1, r11 t18)** — PS skips Poltergeist's accuracy roll here
+  (mechanism not yet isolated — strengthsap's roll is also absent; likely a move-order/`onTry`
+  interaction). r11 state-blocked.
+- **`randomChance[1,24]@uturn` (1) / `randomChance[100,100]@uturn` (state, 1)** — U-turn pivot-hit
+  crit alignment + a state-mismatch (damage-calc). Downstream of the pivot/switch bracket.
+
+**STATE-COMPUTATION QUEUE (next campaign — mechanics, NOT draw work; ranked by seed-gate first
+divergence over the 48 non-exact games):**
+- **32 `draws-match/state-diff`** — draws align but HP/boosts diverge: the masked `compute_damage`
+  class (screen×multi-hit rounding like d4 t18; Beat Up per-member formula, c2a2/c2a5;
+  closecombat/uturn state-mismatch). These are per-move damage-calc items.
+- **4 `move-order-tie`** genuine forks; **~12** residual per-move draw items behind an earlier
+  state divergence (`@dragontail` drag `sample`, `@confusion`, `@wavecrash`, `@aeroblast`/
+  `@focusblast` accuracy args, `@frz` thaw boundary, `@slp`/`@par`/`@crit`).
+
+**Kill criteria: NOT triggered.** No fix revealed a new independent class; density still decayed
+(2 classes removed). The remaining climb to differ-zero is gated on the turn-resolution move-order
+class (intricate, 0 games) + per-move state-path mechanics — deferred deliberately to avoid
+destabilizing the shared multi-hit/turn-resolution paths for zero game yield.
+
+---
+
 ## Phase 3 — seed-driven full-battle Replicate gate (`crates/cosim/src/seedgate.rs`)
 
 The strategic pivot: annotation-mode scoreboarding (90.16% per-decision draw-exact) is done; the
