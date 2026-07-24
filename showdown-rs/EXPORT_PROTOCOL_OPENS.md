@@ -1,7 +1,27 @@
 # Exporter / Protocol — status & open-item specs (ps-export branch)
 
 Round-trip 4832/4832 · sweep 3831/3831 · smoke 18/18 · transplant **79/110** exact
-(1812 decisions) · protocol parity 27 games (c1 270→41 semantic).
+(1812 decisions) · protocol parity 27 games: **r5 semantic-ZERO, c1 = 2** (270→2),
+most games single-digit; 5 randbats outliers (r9/r19/r3/r10/r12) are engine-REPLAY
+divergences, not emitter gaps.
+
+## Protocol emitter — semantic-zero pass (generate.rs was free)
+Landed, all display-only (no state change; rails unaffected):
+- Feed switch-in hazard/ability instructions (via `switch_into` returning its `Vec`).
+- `Instruction::ClearBoosts` → `|-clearallboost|` (Haze); in the roundtrip property test.
+- Initial lead `|switch|`; skip `|-start|` for PS-unannounced volatiles.
+- Self/field vs foe move TARGET: User/All/AllySide/AllyTeam/Allies/AdjacentAllyOrSelf →
+  user; Normal/AdjacentFoe/AllAdjacent/AllAdjacentFoes/Any/RandomNormal/FoeSide → foe.
+- **Suppress switch-OUT bookkeeping** the engine emits but PS does silently: boost/stat
+  RESETS and Regenerator's 1/3 heal — a Boost/ClearBoosts/Heal whose side's next event is
+  a Switch before any move. (This alone took c1 from 23→2.)
+- Announce Struggle on its SetLastMove (no PP slot).
+
+Remaining c1 (2): a Struggle-announce edge (the engine excludes struggle from last-move
+tracking, so no SetLastMove fires) + one effectiveness attribution. The 5 outlier randbats
+games are engine-exactness (seed-gate replay) divergences — out of the emitter's scope.
+`|-crit|`/`|-miss|`/`|-fail|`/ability-`|-immune|` remain allowlisted-cosmetic (no state
+delta); emit-them-from-DrawEvents is a further nicety, not needed for semantic parity.
 
 ## Implemented this pass (generate.rs now free)
 
