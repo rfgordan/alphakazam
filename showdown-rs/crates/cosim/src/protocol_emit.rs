@@ -245,33 +245,19 @@ fn step_unit(
     let pre_end_turn = !replacements.is_empty() && unit.last().is_some_and(|d| d.turn == dp.turn);
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
-        engine::generate::switch_into_pair(
+        let pre = *state;
+        let ins = engine::generate::switch_into_pair(
             state,
             [(side_id(replacements[0].0), replacements[0].1), (side_id(replacements[1].0), replacements[1].1)],
         );
+        engine::protocol::emit_instructions(&pre, &ins, hp_style, out);
         replaced = [true, true];
-        for &(si, slot) in &replacements {
-            let p = &state.sides[si].pokemon[slot as usize];
-            out.push(format!(
-                "|switch|p{}a: {}|{}|{}",
-                si + 1,
-                prettify(p.species.to_id()),
-                prettify(p.species.to_id()),
-                hp_pub(p.hp, p.max_hp, hp_style)
-            ));
-        }
     } else {
         for &(side, slot) in &replacements {
-            engine::generate::switch_into(state, side_id(side), slot);
+            let pre = *state;
+            let ins = engine::generate::switch_into(state, side_id(side), slot);
+            engine::protocol::emit_instructions(&pre, &ins, hp_style, out);
             replaced[side] = true;
-            let p = &state.sides[side].pokemon[slot as usize];
-            out.push(format!(
-                "|switch|p{}a: {}|{}|{}",
-                side + 1,
-                prettify(p.species.to_id()),
-                prettify(p.species.to_id()),
-                hp_pub(p.hp, p.max_hp, hp_style)
-            ));
         }
     }
     for (side, was_replaced) in replaced.iter().enumerate() {
@@ -282,27 +268,6 @@ fn step_unit(
         }
     }
     Ok(())
-}
-
-fn hp_pub(cur: i16, max: i16, style: HpStyle) -> String {
-    if cur <= 0 {
-        return "0 fnt".into();
-    }
-    match style {
-        HpStyle::Exact => format!("{cur}/{max}"),
-        HpStyle::Percent => {
-            let m = max.max(1) as i32;
-            format!("{}/100", ((cur as i32 * 100 + m - 1) / m).clamp(1, 100))
-        }
-    }
-}
-
-fn prettify(id: &str) -> String {
-    let mut c = id.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
 }
 
 /// `PROTOCOL_EMIT=<outdir> cosim <traces>`: write `<name>.log` per game. `PROTOCOL_EXACT=1` for

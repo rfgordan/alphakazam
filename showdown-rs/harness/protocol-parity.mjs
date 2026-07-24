@@ -70,6 +70,9 @@ const COSMETIC_PREFIXES = [
 ];
 
 function isCosmetic(line) {
+	// Any `[silent]` line is PS ability/type bookkeeping (fallen/typechange/protosynthesis/…) with
+	// no state delta the flat instruction stream carries.
+	if (line.includes('[silent]')) return true;
 	return COSMETIC_PREFIXES.some(p => line === p || line.startsWith(p + '|') || line === p);
 }
 

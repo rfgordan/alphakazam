@@ -122,6 +122,10 @@ pub enum Instruction {
 
     // --- boosts (stat stages of the active Pokémon) ---
     Boost { side: SideId, stat: BoostIndex, amount: i8 },
+    /// Zero ALL of a side's active boost stages in one delta (Haze / Clear Smog). `previous`
+    /// holds the stages to restore on reversal. State-equivalent to a run of `Boost` deltas, but a
+    /// single event so the display layer can render PS's grouped `|-clearallboost|`.
+    ClearBoosts { side: SideId, previous: [i8; BoostIndex::COUNT] },
 
     // --- volatiles ---
     ApplyVolatile { side: SideId, volatile: VolatileStatus },
@@ -275,6 +279,9 @@ impl State {
             }
             Boost { side, stat, amount } => {
                 self.side_mut(side).boosts[stat as usize] += amount;
+            }
+            ClearBoosts { side, .. } => {
+                self.side_mut(side).boosts = [0; BoostIndex::COUNT];
             }
             ApplyVolatile { side, volatile } => {
                 self.side_mut(side).volatiles.insert(volatile);
@@ -447,6 +454,9 @@ impl State {
             }
             Boost { side, stat, amount } => {
                 self.side_mut(side).boosts[stat as usize] -= amount;
+            }
+            ClearBoosts { side, previous } => {
+                self.side_mut(side).boosts = previous;
             }
             ApplyVolatile { side, volatile } => {
                 self.side_mut(side).volatiles.remove(volatile);

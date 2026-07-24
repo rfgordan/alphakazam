@@ -1512,11 +1512,16 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// Apply a (forced) switch-in directly to `state`: reset the outgoing active's boosts
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.
-pub fn switch_into(state: &mut State, side: SideId, target: u8) {
+/// Switch `target` in as `side`'s active (faint replacement / landing). Returns the reversible
+/// instruction list applied — entry-hazard damage, switch-in ability/item effects, move-tracking
+/// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
+/// only want the state mutation may ignore the return value.
+pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
     let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
+    b.ins
 }
 
 /// Faint replacements resolve inside a pseudo-turn of their own in PS: after the switch-in
@@ -1778,7 +1783,9 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
 /// actives, then switch-in abilities in speed order of the INCOMING actives.
-pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
+/// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
+/// Returns the applied reversible instruction list (see [`switch_into`]).
+pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
     let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
@@ -1798,6 +1805,7 @@ pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
     }
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
+    b.ins
 }
 
 /// Zero all of a side's active-only state that resets on switch: consecutive-use tracking
@@ -7618,15 +7626,14 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         return vec![b];
     }
 
-    // Haze: reset every stat stage on both actives to 0.
+    // Haze: reset every stat stage on both actives to 0 (one grouped ClearBoosts per side, so the
+    // display renders PS's `|-clearallboost|`). State-equivalent to the per-stat Boost run.
     if md.id.to_id() == "haze" {
         let mut b = b;
         for s in [SideId::One, SideId::Two] {
-            for stat in BOOST_ORDER {
-                let cur = b.state.side(s).boost(stat);
-                if cur != 0 {
-                    push(&mut b, Instruction::Boost { side: s, stat, amount: -cur });
-                }
+            let prev = b.state.side(s).boosts;
+            if prev.iter().any(|&x| x != 0) {
+                push(&mut b, Instruction::ClearBoosts { side: s, previous: prev });
             }
         }
         return vec![b];

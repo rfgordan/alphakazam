@@ -53,11 +53,17 @@ pub fn protocol_turn(
 ) {
     out.push(format!("|turn|{}", pre.turn));
     let _ = (a1, a2);
+    emit_instructions(pre, instructions, hp_style, out);
+    out.push("|upkeep".to_string());
+}
 
-    // Walk the instruction stream, announcing each move at its `DecrementPp` (PS's move-use point):
-    // this marks exactly which move executed, in order, and never invents a move for a mon that was
-    // KO'd or blocked before acting — the move-BOUNDARY the flat stream provides. `current_move`
-    // tracks the acting side so damage lines can attribute type effectiveness.
+/// Walk an instruction list `pre -> …`, emitting the PS protocol lines for each state change (no
+/// `|turn|`/`|upkeep|` framing). Reused for a turn's body AND for a faint-replacement / landing
+/// switch-in stream (from `generate::switch_into`), which starts with a `Switch` and then carries
+/// entry-hazard `|-damage|` / switch-in-ability lines. Moves are announced at their `DecrementPp`
+/// (PS's move-use point) — the move BOUNDARY the flat stream provides — so a move is never invented
+/// for a mon KO'd or blocked before acting; `current_move` attributes type effectiveness.
+pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: HpStyle, out: &mut Vec<String>) {
     let mut s = *pre;
     let mut current_move: Option<(SideId, crate::ids::MoveId)> = None;
     for &ins in instructions {
@@ -77,7 +83,6 @@ pub fn protocol_turn(
             }
         }
     }
-    out.push("|upkeep".to_string());
 }
 
 /// A `|switch|pNa: Name|Details|HP` line for the mon at `side`'s active slot — used by the
@@ -167,6 +172,9 @@ fn emit_instruction(
         Boost { side, stat, amount } if amount != 0 => {
             let tag = if amount > 0 { "-boost" } else { "-unboost" };
             out.push(format!("|{}|{}|{}|{}", tag, ident_active(s, side), boost_id(stat), amount.abs()));
+        }
+        ClearBoosts { side, .. } => {
+            out.push(format!("|-clearallboost|{}", ident_active(s, side)));
         }
         ChangeWeather { new, .. } if new != Weather::None => {
             out.push(format!("|-weather|{}", weather_name(new)));

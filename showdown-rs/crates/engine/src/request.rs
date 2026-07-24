@@ -429,37 +429,30 @@ impl Flow {
                 _ => alive_bench(state, side).expect("Replace issued with no bench"),
             }
         };
-        match sides {
+        let pre = self.state;
+        let ins = match sides {
             [true, true] => {
                 let t1 = pick(&self.state, SideId::One, choices[0]);
                 let t2 = pick(&self.state, SideId::Two, choices[1]);
                 // Double replacement: both enter, hazards, then switch-in abilities in speed
                 // order — each ability sees the other fresh mon (PS semantics; distinct from a
                 // chosen double switch).
-                switch_into_pair(&mut self.state, [(SideId::One, t1), (SideId::Two, t2)]);
+                switch_into_pair(&mut self.state, [(SideId::One, t1), (SideId::Two, t2)])
             }
             [true, false] => {
                 let t = pick(&self.state, SideId::One, choices[0]);
-                crate::generate::switch_into(&mut self.state, SideId::One, t);
+                crate::generate::switch_into(&mut self.state, SideId::One, t)
             }
             [false, true] => {
                 let t = pick(&self.state, SideId::Two, choices[1]);
-                crate::generate::switch_into(&mut self.state, SideId::Two, t);
+                crate::generate::switch_into(&mut self.state, SideId::Two, t)
             }
             [false, false] => unreachable!("Replace with no sides"),
-        }
-        // Protocol: the incoming mon(s). (Entry-hazard `-damage` is applied inside `switch_into`
-        // and not surfaced as an instruction — the documented replace-switch hazard gap.)
-        if self.protocol_log.is_some() {
-            let style = crate::protocol::HpStyle::Percent;
-            if sides[0] {
-                let l = crate::protocol::switch_line(&self.state, SideId::One, style);
-                self.protocol_log.as_mut().unwrap().push(l);
-            }
-            if sides[1] {
-                let l = crate::protocol::switch_line(&self.state, SideId::Two, style);
-                self.protocol_log.as_mut().unwrap().push(l);
-            }
+        };
+        // Protocol: the switch-in(s) + entry-hazard damage / switch-in ability effects, in order,
+        // from `switch_into`'s returned instruction stream.
+        if let Some(log) = &mut self.protocol_log {
+            crate::protocol::emit_instructions(&pre, &ins, crate::protocol::HpStyle::Percent, log);
         }
         self.after_turn();
     }
