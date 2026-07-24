@@ -5,6 +5,18 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## State-computation queue — session 2026-07-24 (63/111 → 64/111; differ 98.98% → 99.01%)
+
+Resumed the state-computation queue (the `draws-match/state-diff` seed-gate class). First class landed:
+
+| step | games | differ | class landed | commit |
+|------|-------|--------|--------------|--------|
+| SC1 | **64/111** | 99.01% (3792→3793) | **Disguise / Ice Face single-hit bust crit+damage rolls** — PS's Disguise (`data/abilities.ts` mimikyu) and Ice Face (eiscue) are `onDamage`/`onCriticalHit`/`onEffectiveness` blocks, NOT `onTryHit` immunities: `getDamage` still rolls the crit `randomChance(1, critMult[critRatio])` (base critRatio=1 → den 24) and the damage `random(16)` — `onCriticalHit` returns false (forces no-crit) and `onEffectiveness` returns 0 (typeMod 0) AFTER the rolls, then `onDamage` returns 0 to zero the dealt damage and bust. The engine's SINGLE-HIT Disguise/Ice-Face branches (`generate.rs` ~3820/3843) short-circuited BEFORE those two rolls (multi-hit Ice Face already rolled them inside `apply_damage_hit`'s loop). So e.g. U-turn into an intact Mimikyu (rd298 d1) emitted only accuracy, under-emitting crit+damage by 2 and desyncing every later damage roll → d3's damage read the wrong PRNG slot (state-diff). Fix: emit the crit + damage draw-and-discards (result 0; state is bust regardless) + `emit_modifydamage_shuffle` before `bust_disguise`/`break_ice_face`, mirroring PS's getDamage order. Annotation-gated (`draw()` only fires under annotation) so Enumerate/Sample state path is byte-identical. Clears rd298. | (this commit) |
+
+Rails: engine tests 12 suites green, state-sweep **3831/3831** (0 diverged, 0 unsupported), distribution smoke **18/18**, VERBOSE exact-set diff shows **rd298 newly exact, zero regressions**.
+
+---
+
 ## Finishing tranche — session 2026-07-24 (differ 98.93% → 98.98%; 2 classes; 63/111 games held)
 
 Resumed the differ-zero finishing tranche from HANDOFF_DRAW_EXACT.md. Landed two draw-COUNT

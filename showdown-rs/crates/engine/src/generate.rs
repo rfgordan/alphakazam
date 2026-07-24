@@ -3823,6 +3823,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && md.hits_max == 1
     {
         let mut hb = scaled(&b, hit_prob);
+        // PS's Ice Face is an `onDamage`/`onCriticalHit`/`onEffectiveness` block: getDamage still
+        // rolls the crit `randomChance(1, critMult)` and the damage `random(16)` (onCriticalHit
+        // forces no-crit, onEffectiveness forces typeMod 0), then onDamage zeroes the result. Emit
+        // those two draw-and-discards so the from-seed stream advances exactly as PS's does.
+        let crit_den = ps_crit_den(&b, side, &md);
+        if crit_den > 0 {
+            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
+        }
+        draw(&mut hb, "random", &[16], 0, "damage-roll");
+        emit_modifydamage_shuffle(&mut hb);
         break_ice_face(&mut hb, foe);
         out.push(hb);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
@@ -3840,6 +3850,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && md.hits_max == 1
     {
         let mut hb = scaled(&b, hit_prob);
+        // PS's Disguise is an `onDamage`/`onCriticalHit`/`onEffectiveness` block (identical shape to
+        // Ice Face): getDamage still rolls the crit `randomChance(1, critMult)` and the damage
+        // `random(16)` before onDamage zeroes it. Emit those two draw-and-discards so the from-seed
+        // stream advances exactly as PS's does (a bare bust under-emitted 2 draws — e.g. U-turn into
+        // an intact Mimikyu — desyncing every later damage roll).
+        let crit_den = ps_crit_den(&b, side, &md);
+        if crit_den > 0 {
+            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
+        }
+        draw(&mut hb, "random", &[16], 0, "damage-roll");
+        emit_modifydamage_shuffle(&mut hb);
         bust_disguise(&mut hb, foe);
         match pivot {
             Pivot::Target(t) => if hb.state.side(side).active().is_alive() { apply_switch(&mut hb, side, t); },
