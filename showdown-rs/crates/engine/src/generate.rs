@@ -8902,6 +8902,16 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             // handlers (item / status / ability) are collected; every volatile/side/terrain residual is
             // wiped by `clearVolatile` on faint.
             let mut fpush = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
+            // Grassy Terrain's per-active heal is a FIELD handler collected per active
+            // (`findFieldEventHandlers(field, 'onResidual', undefined, active)`, battle.ts:503) —
+            // it lives on the terrain, not on the mon, so `clearVolatile` on faint does NOT remove
+            // it and the fainted active still contributes one to the speedSort. (r10 d32: Fire
+            // Blast KOs Rillaboom under its own Grassy Surge terrain; PS's residual list is
+            // [snowscape(1,5), grassy/p1(5,2), grassy/p2-fainted(5,2), grassy-field(27,7)] →
+            // `shuffle[4,1,3]`, which the engine dropped to a 3-handler untied list.)
+            if state.terrain == Terrain::Grassy {
+                fpush(5, 2);
+            }
             match p.item {
                 It::Leftovers | It::BlackSludge => fpush(5, 4),
                 It::ToxicOrb | It::FlameOrb | It::StickyBarb => fpush(28, 3),
