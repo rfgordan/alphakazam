@@ -18,7 +18,26 @@ Resumed the state-computation queue (the `draws-match/state-diff` seed-gate clas
 | SC3 | 67/111 | 99.01% | **Beat Up participant order = PS's `side.pokemon` array order** — PS iterates `pokemon.side.pokemon` (its CURRENT array; `switchIn` swaps positions 0↔j, keeping the active at index 0 and swap-tracking the rest) to assign each hit's base power `5+floor(baseAtk/10)`. Since each participant's base power pairs with a distinct per-hit roll, the order changes the realized total. The engine stores a fixed canonical (teampreview) slot order, so it paired the wrong base powers with the rolls (c2a2 d13: engine `[12,12,14,15]` vs PS `[14,15,12,12]`). The seed gate now installs PS's array order (the recorded pre-state's `rosterIndex` sequence, thread-local `set_beatup_order`) into `beatup_calcs`; the DP (state sweep) and differ are order-independent so they leave it unset. Alone this flips 0 games (needs SC4 too) but is a mandatory mechanic. | (SC3 commit) |
 | SC4 | **69/111** | 99.03% (3793→3794) | **onBasePower modifiers accumulate as ONE `chainModify`, applied once** — PS runs every multiplicative onBasePower handler in descending `onBasePowerPriority`, accumulating a single `event.modifier` (`((prev*next+2048)>>12)`), then applies it ONCE at the event's end (`modify(basePower, event.modifier)`). The engine applied each as its own `modify`, re-rounding every step — diverging once two stack (c2a2: Technician ×1.5 [prio 30] + Black Glasses ×1.2 [prio 15] on bp 14 → sequential 14→17→26, PS's chain 14→**25**). Reworked the item/ability/terrain base-power block into a priority-ordered `bp_step` chain (Technician 30, Iron Fist 23, Sheer Force/Supreme Overlord 21, Strong Jaw/Sharpness 19, type-items/orbs/Soul Dew/Ogerpon 15, Punk Rock 7, terrain 0); Technician's ≤60 gate reads the raw base power (it is highest-priority). Single-modifier results are unchanged where they don't cross a rounding boundary (why the sweep held); the chain now matches PS's exact `chainModify` rounding (e.g. a lone ×1.2 uses modifier 4916, PS's value, not 4915). Flips c2a2 + c2a5 (with SC3). | (SC4 commit) |
 
-Rails (SC1–SC4): engine tests 12 suites green, state-sweep **3831/3831** (0 diverged, 0 unsupported), distribution smoke **18/18**, differ **99.03%** (3794/3831, no over-emission), VERBOSE exact-set diff shows **rd298/c3a2s21/c3a2s23/d4/c2a2/c2a5 newly exact across the session, zero regressions**. c2a3 residual: a separate 1-HP Double Shock single-hit rounding diff, still open.
+Rails (SC1–SC4): engine tests 12 suites green, state-sweep **3831/3831** (0 diverged, 0 unsupported), distribution smoke **18/18**, differ **99.03%** (3794/3831, no over-emission), VERBOSE exact-set diff shows **rd298/c3a2s21/c3a2s23/d4/c2a2/c2a5 newly exact across the session, zero regressions**.
+
+### DIAGNOSED LEADS for the remaining state-diff queue (next session — roots identified, each ~1 game)
+The remaining `draws-match/state-diff` games are heterogeneous single-game roots (not a shared class):
+- **`@stompingtantrum` base-power doubling (r12 d42, +104 HP)** — Stomping Tantrum doubles BP when the
+  user's LAST move failed (PS `basePowerCallback` reads `pokemon.moveLastTurnResult === false`). PS
+  doubled it here (150 vs 75) but the engine's `last_move_failed` was false. Root: the engine's
+  per-side `last_move_failed` doesn't track PS's `moveLastTurnResult` across the prior turn (p2 used
+  Stomping Tantrum on d41 into a Substitute/switch and PS recorded that as a fail). Verify PS's
+  moveLastTurnResult semantics vs the engine's flag.
+- **switch-bracket shuffle desync (c4 d32, crit/roll differ)** — p2 switches, p1 Earthquakes the
+  switch-in; the engine's switch-Update `shuffle[2,0,2]` emission count desyncs the PRNG before the
+  Earthquake crit/damage rolls (engine crit0/roll0 vs PS crit1/roll15). The switch-before-move path
+  IS modelled (generate.rs step 1), so this is a switch-bracket equal-Speed-predicate mis-count.
+- **mid-turn re-fire targeting (c6a2s114 d47, +4 HP)** — a `midTurn:true` re-request where p1 switches
+  and p2 U-turns; the engine computes the move against the PRE-switch active (Psychic/Ghost) instead
+  of the switch-in (Palafin-Hero). Seed-gate pivot/mid-turn unit handling, not the normal turn path.
+- **c2a3 (Double Shock, +1 HP), c3/c5 (rolls differ → small desyncs), c3c2s82 (+8), c3c2s83 (+6)** —
+  per-turn desync/rounding, each needs the turn's draw-count walked. The `.volatiles`/`.types`/
+  `.ability`/`.boost`/`.active_index` first-divergences are separate non-damage classes.
 
 ---
 
