@@ -5,6 +5,31 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Seed-gate tail session 2026-07-24 (69/111 -> 83/111; +14 games, 5 commits)
+
+Worked the LEADS queue game-by-game. All rails held every commit: engine tests 12 suites,
+state-sweep **7662/0/0**, distribution smoke **18/18**, differ **99.03%** (3794/3831, no
+over-emission), SEED_GATE monotone by exact-set diff with **zero** prior-exact regression.
+
+| step | games | root cause + PS ref | commit |
+|------|-------|---------------------|--------|
+| 1 | **70** | **Stomping Tantrum last-move-failed tracking** — r12 t35 doubled ST (150 BP) because its t34 use was Ground-immune vs a Levitate Mismagius (empty hitTargets = PS `moveThisTurnResult === false`). Engine never tracked `last_move_failed` in forward play (only convert.rs derived it for the annotation prestate). New transient `Branch.move_failed` set at the damaging-move failure sites (immune/miss/no-target/dodge/Protect/Air Balloon/Psychic Terrain/Queenly Majesty; boosting absorbs stay null), committed once per move in `run_move_action` via a new `SetLastMoveFailed` instruction (PS nextTurn commit timing). Only ST reads it, only r12 uses it -> zero cross-game risk. | b3cf59f |
+| 2 | **74** | **Cursed Body randomChance proc encoding** — the disable roll annotated proc=0/noproc=3 (the `random(100)`-secondary threshold convention), but `replicate_select` only threshold-decodes `random[100]`; `randomChance` falls to exact-match against the realized boolean (0/1). So a no-proc value (0) exact-matched the proc branch (result 0), inverting selection — the engine applied a Cursed Body Disable PS never rolled on EVERY game where a move hits a CB holder and PS didn't proc. Fixed to the boolean convention (proc=1/noproc=0), matching crit/par/frz/Cute Charm/Poison Touch. Flips r20/r7/t5/t6. | 8ee3fb0 |
+| 3 | **75** | **Tera Shift forme ability persists across switch-out** — r4/r18: a benched Terapagos showed ability TeraShift (engine) vs TeraShell (PS). Tera Shift's forme change (`formeChange`) is PERMANENT, but the switch-out copied-ability revert (Trace/Role Play) treated TeraShell as a copy and reverted it to the stale base_ability. Guard the revert to skip the Terastal forme ability. Flips r4. | 3f0c83c |
+| 4 | **77** | **Seed-gate realized selection** — (a) `replicate_select` multi-way `random(100)` threshold: the proc decoder only handled the binary case; generalized to pick the branch whose threshold is the largest <= realized value (Effect Spore slp=0/par=11/psn=21/none=30). (b) `apply_drag` samples over PS's CURRENT `side.pokemon` array order (`getRandomSwitchable`), not canonical order — reuse the per-side order installed for Beat Up, guarded to only apply when still valid (dragged side didn't switch first this turn, d3). Flips c3a1s12/d5. | be968bd |
+| 5 | **83** | **Status-move miss branch accuracy result** — a foe-targeting status move that can miss built a miss branch but never flipped the inherited accuracy result (1=hit) to 0 (the damaging path does). Both branches carried result 1, so `replicate_select` could not select a real miss -> it applied the status on a recorded MISS (Thunder Wave paralysing / Sleep Powder sleeping / Yawn). Surfaced as 'move-order-tie' / 'rust-extra' labels. Flips c3c1s71/c3c1s72/c3c1s73/d1/r18/r5. | fcc1ba6 |
+
+### Remaining 22 aligned non-exact (+6 align=false blocked on set-gender init gap) — open items with evidence
+- **Per-move damage-calc state-diff (draws match, HP off a few)** — c2a3 (Double Shock STAB rounding, -1), c3, c3c2s82 (+8), c3c2s83 (+6), c4, c5, c6a2s114 (Palafin-Hero stat-spread approx, +4), r6, r11, t2, c1c(types), c7(boost). Each a bespoke `compute_damage`/stat item; masked by the DP in the sweep. Different signs/magnitudes -> NOT a single shared rounding root.
+- **Switch-bracket / inter-move Update-count PRNG offset** — d6 (switch+move: accuracy reads hit on a recorded miss), c4 (mid-turn KO: engine under-emits one trailing Update vs PS's 2), c6a2s112 (both-move Wave Crash tie: crit reads a shifted slot). PS's per-move 970/1024/2882 Update schedule interacts with mid-turn faints; the engine's count desyncs the crit/damage rolls. Intricate, state-risky.
+- **Move-order-tie genuine fork** — c2a1 (Future Sight + Meteor Beam, both order-branches share a draw stream).
+- **Per-hit Cursed Body interleaving** — r3 (Scale Shot x2 fires CB after EACH hit; engine emits once post-loop). Documented risky (Scale Shot family regression).
+- **args / under-emission singles** — c3b2s52 (Aeroblast accuracy 90 vs 95: a stage/evasion modifier, data value is correct), c3b2s53, t1 (same-turn frz thaw boundary), r2 (residual handler-length cosmetic), r10 (confusion secondary desync), rd318 (Effect Spore poison-immune value + drag), c6a2s112 wavecrash.
+
+**Kill-criterion: NOT triggered.** Density decayed with real structured classes (last-move-failed, CB encoding, forme-ability persistence, multi-way/drag realized selection, status-miss branch). The remaining climb is per-move damage-calc + the intricate inter-move Update-count schedule (0-to-few games each, state-risky).
+
+---
+
 ## State-computation queue — session 2026-07-24 (63/111 → 64/111; differ 98.98% → 99.01%)
 
 Resumed the state-computation queue (the `draws-match/state-diff` seed-gate class). First class landed:
