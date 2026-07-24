@@ -5,6 +5,31 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Seed-gate tail session 2026-07-24 (69/111 -> 83/111; +14 games, 5 commits)
+
+Worked the LEADS queue game-by-game. All rails held every commit: engine tests 12 suites,
+state-sweep **7662/0/0**, distribution smoke **18/18**, differ **99.03%** (3794/3831, no
+over-emission), SEED_GATE monotone by exact-set diff with **zero** prior-exact regression.
+
+| step | games | root cause + PS ref | commit |
+|------|-------|---------------------|--------|
+| 1 | **70** | **Stomping Tantrum last-move-failed tracking** — r12 t35 doubled ST (150 BP) because its t34 use was Ground-immune vs a Levitate Mismagius (empty hitTargets = PS `moveThisTurnResult === false`). Engine never tracked `last_move_failed` in forward play (only convert.rs derived it for the annotation prestate). New transient `Branch.move_failed` set at the damaging-move failure sites (immune/miss/no-target/dodge/Protect/Air Balloon/Psychic Terrain/Queenly Majesty; boosting absorbs stay null), committed once per move in `run_move_action` via a new `SetLastMoveFailed` instruction (PS nextTurn commit timing). Only ST reads it, only r12 uses it -> zero cross-game risk. | b3cf59f |
+| 2 | **74** | **Cursed Body randomChance proc encoding** — the disable roll annotated proc=0/noproc=3 (the `random(100)`-secondary threshold convention), but `replicate_select` only threshold-decodes `random[100]`; `randomChance` falls to exact-match against the realized boolean (0/1). So a no-proc value (0) exact-matched the proc branch (result 0), inverting selection — the engine applied a Cursed Body Disable PS never rolled on EVERY game where a move hits a CB holder and PS didn't proc. Fixed to the boolean convention (proc=1/noproc=0), matching crit/par/frz/Cute Charm/Poison Touch. Flips r20/r7/t5/t6. | 8ee3fb0 |
+| 3 | **75** | **Tera Shift forme ability persists across switch-out** — r4/r18: a benched Terapagos showed ability TeraShift (engine) vs TeraShell (PS). Tera Shift's forme change (`formeChange`) is PERMANENT, but the switch-out copied-ability revert (Trace/Role Play) treated TeraShell as a copy and reverted it to the stale base_ability. Guard the revert to skip the Terastal forme ability. Flips r4. | 3f0c83c |
+| 4 | **77** | **Seed-gate realized selection** — (a) `replicate_select` multi-way `random(100)` threshold: the proc decoder only handled the binary case; generalized to pick the branch whose threshold is the largest <= realized value (Effect Spore slp=0/par=11/psn=21/none=30). (b) `apply_drag` samples over PS's CURRENT `side.pokemon` array order (`getRandomSwitchable`), not canonical order — reuse the per-side order installed for Beat Up, guarded to only apply when still valid (dragged side didn't switch first this turn, d3). Flips c3a1s12/d5. | be968bd |
+| 5 | **83** | **Status-move miss branch accuracy result** — a foe-targeting status move that can miss built a miss branch but never flipped the inherited accuracy result (1=hit) to 0 (the damaging path does). Both branches carried result 1, so `replicate_select` could not select a real miss -> it applied the status on a recorded MISS (Thunder Wave paralysing / Sleep Powder sleeping / Yawn). Surfaced as 'move-order-tie' / 'rust-extra' labels. Flips c3c1s71/c3c1s72/c3c1s73/d1/r18/r5. | fcc1ba6 |
+
+### Remaining 22 aligned non-exact (+6 align=false blocked on set-gender init gap) — open items with evidence
+- **Per-move damage-calc state-diff (draws match, HP off a few)** — c2a3 (Double Shock STAB rounding, -1), c3, c3c2s82 (+8), c3c2s83 (+6), c4, c5, c6a2s114 (Palafin-Hero stat-spread approx, +4), r6, r11, t2, c1c(types), c7(boost). Each a bespoke `compute_damage`/stat item; masked by the DP in the sweep. Different signs/magnitudes -> NOT a single shared rounding root.
+- **Switch-bracket / inter-move Update-count PRNG offset** — d6 (switch+move: accuracy reads hit on a recorded miss), c4 (mid-turn KO: engine under-emits one trailing Update vs PS's 2), c6a2s112 (both-move Wave Crash tie: crit reads a shifted slot). PS's per-move 970/1024/2882 Update schedule interacts with mid-turn faints; the engine's count desyncs the crit/damage rolls. Intricate, state-risky.
+- **Move-order-tie genuine fork** — c2a1 (Future Sight + Meteor Beam, both order-branches share a draw stream).
+- **Per-hit Cursed Body interleaving** — r3 (Scale Shot x2 fires CB after EACH hit; engine emits once post-loop). Documented risky (Scale Shot family regression).
+- **args / under-emission singles** — c3b2s52 (Aeroblast accuracy 90 vs 95: a stage/evasion modifier, data value is correct), c3b2s53, t1 (same-turn frz thaw boundary), r2 (residual handler-length cosmetic), r10 (confusion secondary desync), rd318 (Effect Spore poison-immune value + drag), c6a2s112 wavecrash.
+
+**Kill-criterion: NOT triggered.** Density decayed with real structured classes (last-move-failed, CB encoding, forme-ability persistence, multi-way/drag realized selection, status-miss branch). The remaining climb is per-move damage-calc + the intricate inter-move Update-count schedule (0-to-few games each, state-risky).
+
+---
+
 ## State-computation queue — session 2026-07-24 (63/111 → 64/111; differ 98.98% → 99.01%)
 
 Resumed the state-computation queue (the `draws-match/state-diff` seed-gate class). First class landed:
@@ -15,7 +40,29 @@ Resumed the state-computation queue (the `draws-match/state-diff` seed-gate clas
 
 | SC2 | **67/111** | 99.01% (unchanged) | **Confusion self-hit damage roll inverted** — the confusion self-hit computed `bd * (85 + i) / 100` for branch `i` while emitting the `random(16)` draw with `result = i`. PS's `getConfusionDamage` uses `randomizer` = `tr(tr(bd * (100 - random(16))) / 100)` (battle.ts:2404) — SAME orientation as the main damage path (branch `result == roll`, higher roll → less damage). So for a recorded roll R the differ/gate selected the engine's branch `i == R`, which dealt `bd*(85+R)/100` instead of `bd*(100-R)/100` — over-dealing by `bd*(15-2R+... )` (e.g. c3a2s21 d6: PS roll 12 → `bd*88/100`, engine → `bd*97/100`, +7 HP). Fixed to `bd * (100 - i) / 100`. Clears c3a2s21, c3a2s23, AND **d4** (whose residual — previously mis-attributed in the scoreboard as a screen×multi-hit damage-rounding class — was this confusion inversion, not compute_damage rounding). The differ was already "draws-match" on these (it compares kinds/args, not the roll result the state encodes), so the differ % is unchanged; the gate state-count moved. | (this commit) |
 
-Rails (both SC1+SC2): engine tests 12 suites green, state-sweep **3831/3831** (0 diverged, 0 unsupported), distribution smoke **18/18**, VERBOSE exact-set diff shows **rd298/c3a2s21/c3a2s23/d4 newly exact, zero regressions**.
+| SC3 | 67/111 | 99.01% | **Beat Up participant order = PS's `side.pokemon` array order** — PS iterates `pokemon.side.pokemon` (its CURRENT array; `switchIn` swaps positions 0↔j, keeping the active at index 0 and swap-tracking the rest) to assign each hit's base power `5+floor(baseAtk/10)`. Since each participant's base power pairs with a distinct per-hit roll, the order changes the realized total. The engine stores a fixed canonical (teampreview) slot order, so it paired the wrong base powers with the rolls (c2a2 d13: engine `[12,12,14,15]` vs PS `[14,15,12,12]`). The seed gate now installs PS's array order (the recorded pre-state's `rosterIndex` sequence, thread-local `set_beatup_order`) into `beatup_calcs`; the DP (state sweep) and differ are order-independent so they leave it unset. Alone this flips 0 games (needs SC4 too) but is a mandatory mechanic. | (SC3 commit) |
+| SC4 | **69/111** | 99.03% (3793→3794) | **onBasePower modifiers accumulate as ONE `chainModify`, applied once** — PS runs every multiplicative onBasePower handler in descending `onBasePowerPriority`, accumulating a single `event.modifier` (`((prev*next+2048)>>12)`), then applies it ONCE at the event's end (`modify(basePower, event.modifier)`). The engine applied each as its own `modify`, re-rounding every step — diverging once two stack (c2a2: Technician ×1.5 [prio 30] + Black Glasses ×1.2 [prio 15] on bp 14 → sequential 14→17→26, PS's chain 14→**25**). Reworked the item/ability/terrain base-power block into a priority-ordered `bp_step` chain (Technician 30, Iron Fist 23, Sheer Force/Supreme Overlord 21, Strong Jaw/Sharpness 19, type-items/orbs/Soul Dew/Ogerpon 15, Punk Rock 7, terrain 0); Technician's ≤60 gate reads the raw base power (it is highest-priority). Single-modifier results are unchanged where they don't cross a rounding boundary (why the sweep held); the chain now matches PS's exact `chainModify` rounding (e.g. a lone ×1.2 uses modifier 4916, PS's value, not 4915). Flips c2a2 + c2a5 (with SC3). | (SC4 commit) |
+
+Rails (SC1–SC4): engine tests 12 suites green, state-sweep **3831/3831** (0 diverged, 0 unsupported), distribution smoke **18/18**, differ **99.03%** (3794/3831, no over-emission), VERBOSE exact-set diff shows **rd298/c3a2s21/c3a2s23/d4/c2a2/c2a5 newly exact across the session, zero regressions**.
+
+### DIAGNOSED LEADS for the remaining state-diff queue (next session — roots identified, each ~1 game)
+The remaining `draws-match/state-diff` games are heterogeneous single-game roots (not a shared class):
+- **`@stompingtantrum` base-power doubling (r12 d42, +104 HP)** — Stomping Tantrum doubles BP when the
+  user's LAST move failed (PS `basePowerCallback` reads `pokemon.moveLastTurnResult === false`). PS
+  doubled it here (150 vs 75) but the engine's `last_move_failed` was false. Root: the engine's
+  per-side `last_move_failed` doesn't track PS's `moveLastTurnResult` across the prior turn (p2 used
+  Stomping Tantrum on d41 into a Substitute/switch and PS recorded that as a fail). Verify PS's
+  moveLastTurnResult semantics vs the engine's flag.
+- **switch-bracket shuffle desync (c4 d32, crit/roll differ)** — p2 switches, p1 Earthquakes the
+  switch-in; the engine's switch-Update `shuffle[2,0,2]` emission count desyncs the PRNG before the
+  Earthquake crit/damage rolls (engine crit0/roll0 vs PS crit1/roll15). The switch-before-move path
+  IS modelled (generate.rs step 1), so this is a switch-bracket equal-Speed-predicate mis-count.
+- **mid-turn re-fire targeting (c6a2s114 d47, +4 HP)** — a `midTurn:true` re-request where p1 switches
+  and p2 U-turns; the engine computes the move against the PRE-switch active (Psychic/Ghost) instead
+  of the switch-in (Palafin-Hero). Seed-gate pivot/mid-turn unit handling, not the normal turn path.
+- **c2a3 (Double Shock, +1 HP), c3/c5 (rolls differ → small desyncs), c3c2s82 (+8), c3c2s83 (+6)** —
+  per-turn desync/rounding, each needs the turn's draw-count walked. The `.volatiles`/`.types`/
+  `.ability`/`.boost`/`.active_index` first-divergences are separate non-damage classes.
 
 ---
 

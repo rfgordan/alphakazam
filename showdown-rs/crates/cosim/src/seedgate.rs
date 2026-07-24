@@ -112,6 +112,26 @@ fn consume_recorded(prng: &mut PsPrng, d: &Decision) {
     }
 }
 
+/// Per-side Beat Up participant order for a unit: the canonical party slots (`rosterIndex`) in the
+/// order PS serializes `side.pokemon` at the given pre-state — PS's current array order, which
+/// `switchIn` keeps active-first + swap-tracked. `beatup_calcs` iterates these to pair each
+/// member's base power with its hit's roll exactly as PS does.
+fn beatup_orders(pre: &Value) -> [Option<Vec<u8>>; 2] {
+    let mut out: [Option<Vec<u8>>; 2] = [None, None];
+    let Some(sides) = pre.get("sides").and_then(Value::as_array) else { return out };
+    for (si, side) in sides.iter().enumerate().take(2) {
+        if let Some(mons) = side.get("pokemon").and_then(Value::as_array) {
+            let order: Vec<u8> = mons.iter()
+                .filter_map(|p| p.get("rosterIndex").and_then(Value::as_i64).map(|r| r as u8))
+                .collect();
+            if !order.is_empty() {
+                out[si] = Some(order);
+            }
+        }
+    }
+    out
+}
+
 /// Replicate: select the single realized outcome by consuming `prng` at the engine's draw sites.
 /// Returns `(chosen_outcome_index, ambiguous)`. `ambiguous` is set when >1 outcome survives the
 /// filter (an unfilterable shuffle fork — move-order Speed tie).
@@ -134,16 +154,16 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> (usize,
         if rep.kind == "shuffle" {
             live = cands;
         } else if rep.kind == "random" && rep.args == [100] {
-            // Binary proc/noproc secondary/flinch/self-drop: the engine annotates the proc branch
-            // with result 0 and the noproc branch with result = chance (a threshold, not the
-            // drawn value). Select proc iff `drawn < chance`, else noproc. (The differ compares
-            // only kinds/args, so these representative results are safe to reinterpret here.)
+            // Threshold-encoded proc split: the engine annotates each branch's result as the LOWER
+            // BOUND of the drawn-value range that selects it (binary secondary: proc=0, noproc=chance
+            // — drawn<chance -> proc; multi-way Effect Spore: slp=0, par=11, psn=21, none=30). The
+            // realized `res` selects the branch with the LARGEST threshold <= res. (The differ
+            // compares only kinds/args, so these representative results are safe to reinterpret.)
             let mut distinct: Vec<i64> = cands.iter().map(|&i| outcomes[i].draws[pos].result).collect();
             distinct.sort_unstable();
             distinct.dedup();
-            let filtered: Vec<usize> = if distinct.len() == 2 && distinct[0] == 0 && distinct[1] > 0 {
-                let chance = distinct[1];
-                let want = if res < chance { 0 } else { chance };
+            let filtered: Vec<usize> = if distinct.len() >= 2 && distinct[0] == 0 {
+                let want = *distinct.iter().rev().find(|&&t| t <= res).unwrap_or(&0);
                 cands.iter().copied().filter(|&i| outcomes[i].draws[pos].result == want).collect()
             } else {
                 // Single-branch draw-and-discard, or a multi-way split we can't threshold — try
@@ -235,6 +255,11 @@ fn run_game(path: &str, t: &Trace) -> GameResult {
             && std::env::var("DBG_I").ok().and_then(|v| v.parse::<usize>().ok()).is_none_or(|di| di == i);
         DBG_UNIT.with(|c| c.set(dbg_on));
         if dbg_on { eprintln!("=== {name} d{i} t{} ===", dp.turn); }
+        // Beat Up pairs each participant's base power with a distinct per-hit roll, so its realized
+        // total depends on PS's CURRENT side.pokemon array order (active-first, swap-tracked). The
+        // engine stores a fixed canonical slot order, so feed it PS's array order (the recorded
+        // pre-state's `rosterIndex` sequence) for this unit.
+        engine::generate::set_beatup_order(beatup_orders(&t.decisions[i - 1].state_after));
         let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, sleep_clause, &mut prng) {
             Ok(x) => x,
             Err(label) => {

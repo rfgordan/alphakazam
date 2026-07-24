@@ -113,6 +113,25 @@ pub fn set_realized_source(src: Option<RealizedSource>) {
     REALIZED_SOURCE.with(|c| *c.borrow_mut() = src);
 }
 
+thread_local! {
+    static BEATUP_ORDER: std::cell::RefCell<[Option<Vec<u8>>; 2]> =
+        const { std::cell::RefCell::new([None, None]) };
+}
+
+/// Install (or clear) the per-side Beat Up participant order: canonical party slots in PS's CURRENT
+/// `side.pokemon` array order (active-first, swap-tracked — `switchIn` swaps positions 0/j). Beat Up
+/// pairs each participant's base power with a distinct per-hit roll, so the array order changes the
+/// realized total. Only the seed gate installs this (from the recorded pre-state's `rosterIndex`
+/// order); Enumerate/Sample (sumset-DP) and the differ (draw kinds/args) are order-independent, so
+/// they leave it `None` and `beatup_calcs` falls back to canonical (teampreview) slot order.
+pub fn set_beatup_order(orders: [Option<Vec<u8>>; 2]) {
+    BEATUP_ORDER.with(|c| *c.borrow_mut() = orders);
+}
+
+fn beatup_order(side: SideId) -> Option<Vec<u8>> {
+    BEATUP_ORDER.with(|c| c.borrow()[side as usize].clone())
+}
+
 /// gen≥5 [2,5] hit-count table: `sample([2×7, 3×7, 4×3, 5×3])` (battle-actions.ts:864). Index → count.
 const MULTIHIT_COUNT_TABLE: [u8; 20] = [2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
@@ -224,7 +243,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -266,6 +285,11 @@ pub(crate) struct Branch {
     pub(crate) ins: Vec<Instruction>,
     /// Ordered PRNG draws that produced this branch (populated only under annotation).
     pub(crate) draws: Vec<DrawEvent>,
+    /// Transient (NOT part of State): did the move being resolved on this branch FAIL to connect
+    /// — immune / missed / no-target / blocked (PS `moveThisTurnResult === false`)? Set at the
+    /// damaging-move failure sites; committed to the side's `last_move_failed` once per move action
+    /// in `run_move_action`. Defaults false ("succeeded"); reset implicitly each move.
+    pub(crate) move_failed: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1256,7 +1280,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1342,7 +1366,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -1489,7 +1513,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -1600,7 +1624,14 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // A traced / copied ability reverts on switch-out (Transform handles its own below).
     {
         let p = b.state.side(side).active();
-        if !p.transformed && p.ability != p.base_ability {
+        // Tera Shift's forme change (Terapagos-Normal -> Terapagos-Terastal, ability -> Tera Shell)
+        // is PERMANENT (PS `formeChange`, not a copied ability): the mon stays Terastal with Tera
+        // Shell when it switches out, so this revert must skip it (base_ability is still the stale
+        // Tera Shift). Every OTHER non-base ability on a non-transformed mon is a Trace/Role
+        // Play/Skill Swap copy that PS's clearVolatile reverts.
+        let terastal_forme = crate::ids::Species::from_id("terapagosterastal");
+        let is_forme_ability = Some(p.species) == terastal_forme && p.ability == crate::ids::Ability::TeraShell;
+        if !p.transformed && p.ability != p.base_ability && !is_forme_ability {
             let slot = previous;
             push(b, Instruction::ChangeAbility { side, slot, previous: p.ability, new: p.base_ability });
         }
@@ -1748,7 +1779,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
 /// actives, then switch-in abilities in speed order of the INCOMING actives.
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2146,10 +2177,23 @@ pub(crate) struct Action {
 /// move action completes — hit, miss, immunity, or a fully-cancelled attempt — PS fires
 /// `eachEvent('Update')`, which shuffles on a surviving equal-Speed pair. The in-kernel per-hit
 /// (970) and post-hit-loop (1024) Updates are emitted inside `execute_move`; this adds the 2882.
-fn run_move_action(b: Branch, action: Action) -> Vec<Branch> {
+fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
+    let side = action.side;
+    // Fresh per-move outcome flag: this branch may carry a `move_failed` set by an earlier action
+    // this turn (sequence_two_moves reuses the branch for the second mover).
+    b.move_failed = false;
     let mut out = execute_move(b, action);
     if annotating() {
         for nb in &mut out {
+            // Commit PS's `moveLastTurnResult` for the acting side: a move that failed to connect
+            // (immune / miss / no-target / blocked) sets it `false` — the signal Stomping Tantrum's
+            // base-power doubler reads next turn. The read (BP calc) already happened inside
+            // execute_move against the PRIOR value, so committing here is PS's nextTurn semantics.
+            // Not diffed (engine-internal); annotation-gated so Enumerate/Sample stay byte-identical.
+            let cur = nb.state.side(side).last_move_failed;
+            if cur != nb.move_failed {
+                push(nb, Instruction::SetLastMoveFailed { side, previous: cur, new: nb.move_failed });
+            }
             emit_update(nb);
         }
     }
@@ -2211,7 +2255,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone() }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -3614,6 +3658,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // A blocked rampage ends its lock without confusion; a blocked first use never locks.
         end_rampage_on_fail(&mut b, side, move_id);
+        b.move_failed = true; // Protect-blocked → PS moveThisTurnResult false (doubles ST)
         return vec![b];
     }
 
@@ -3623,6 +3668,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && is_grounded(&b.state, foe)
         && b.state.side(foe).active().is_alive()
     {
+        b.move_failed = true; // blocked → moveThisTurnResult false
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
     }
 
@@ -3646,6 +3692,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
             if pri > 0 && !mb && !side_targeting {
+                b.move_failed = true; // blocked → moveThisTurnResult false
                 return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
             }
         }
@@ -3656,6 +3703,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && b.state.side(foe).active().item == Item::AirBalloon
         && b.state.side(foe).active().is_alive()
     {
+        b.move_failed = true; // blocked → moveThisTurnResult false
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
     }
 
@@ -3756,6 +3804,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
         }
         end_rampage_on_fail(&mut mb, side, move_id);
+        mb.move_failed = true; // missed → PS moveThisTurnResult false (doubles ST next turn)
         miss_out.push(mb);
     }
 
@@ -3764,6 +3813,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // No living target: the move fails outright — no rampage lock, no recharge.
         let mut hb = scaled(&b, hit_prob);
         end_rampage_on_fail(&mut hb, side, move_id);
+        hb.move_failed = true; // no target → moveThisTurnResult false
         out.push(hb);
         out.extend(miss_out);
         return out;
@@ -3772,6 +3822,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m)) {
         let mut hb = scaled(&b, hit_prob);
         end_rampage_on_fail(&mut hb, side, move_id);
+        hb.move_failed = true; // dodged (semi-invulnerable) → moveThisTurnResult false
         out.push(hb);
         out.extend(miss_out);
         return out;
@@ -3804,12 +3855,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let mut ib = scaled(&b, hit_prob);
         // Absorbing abilities that boost the holder on the negated hit: Well-Baked Body (+2 Def
         // vs Fire), Wind Rider (+1 Atk vs a wind move). Only when this ability caused the block.
-        if def_ab == crate::ids::Ability::WellBakedBody && md.typ == Type::Fire {
+        let well_baked = def_ab == crate::ids::Ability::WellBakedBody && md.typ == Type::Fire;
+        if well_baked {
             raise_boost(&mut ib, foe, BoostIndex::Defense, 2);
         }
         if wind_immune {
             raise_boost(&mut ib, foe, BoostIndex::Attack, 1);
         }
+        // Type-chart / Levitate immunity fails the move (PS `runImmunity` → hitResult false →
+        // moveThisTurnResult false → Stomping Tantrum doubles next turn). A boosting absorb
+        // (Well-Baked Body / Wind Rider) instead returns null → NOT a failure (no ST double).
+        ib.move_failed = !well_baked && !wind_immune;
         out.push(ib);
         // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
         // confusion) — route through the rampage/recoil tail rather than returning bare.
@@ -4621,68 +4677,17 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             attacker.species.to_id().starts_with("giratina") && matches!(md.typ, Type::Ghost | Type::Dragon),
         _ => false,
     };
-    if type_item_boost || orb_boost {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Soul Dew: ×1.2 base power for Latias/Latios Psychic- and Dragon-type moves (PS `onBasePower`).
-    if attacker.item == Item::SoulDew
-        && matches!(attacker.species, sp if sp == crate::ids::Species::from_id("latias").unwrap_or(crate::ids::Species::None)
-            || sp == crate::ids::Species::from_id("latios").unwrap_or(crate::ids::Species::None))
-        && matches!(md.typ, Type::Psychic | Type::Dragon)
-    {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-
-    // Sheer Force: x1.3 base power for moves with any secondary (which is then removed).
-    if sheer_force_active {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Technician is an onBasePower modifier in PS.  This placement matters for rounding and
-    // for variable-power moves such as Triple Axel, whose 20/40/60-power hits are evaluated
-    // independently.  Applying it to Attack produces a different damage support.
-    if attacker.ability == Ab::Technician && base_power <= 60 {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Strong Jaw is an onBasePower modifier in PS. Applying it to Attack changes rounding
-    // support (caught by the exact Crunch kernel on Strong Jaw Bruxish).
-    if attacker.ability == Ab::StrongJaw && md.flag_bite {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Sharpness: ×1.5 base power for slicing moves (PS `onBasePower`). On base power, not the
-    // attack stat, so the floor lands where PS's does under a ×0.5 type matchup.
-    if attacker.ability == Ab::Sharpness && md.flag_slicing {
-        base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-    }
-    // Iron Fist: ×1.2 base power for punch moves (PS `onBasePower`). Moved off the attack
-    // stat when a cosim Ice Hammer unit exposed the rounding difference.
-    if attacker.ability == Ab::IronFist && md.flag_punch {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Punk Rock: ×1.3 base power for sound moves (PS `onBasePower`). Applied to base power
-    // rather than the attack stat so the floor lands where PS's does.
-    if attacker.ability == Ab::PunkRock && md.flag_sound {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Ogerpon masks (Hearthflame / Wellspring / Cornerstone) give ×1.2 base power to all of
-    // Ogerpon's moves (PS `onBasePower`). Only Ogerpon holds them.
-    if matches!(attacker.item, Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask) {
-        base_power = crate::damage::modify(base_power as i64, 4915, 4096) as u16;
-    }
-    // Supreme Overlord: +10% base power per fallen ally — PS uses an exact 4096 lookup table
-    // (onBasePower), not 1+0.1·n, so this matches its rounding precisely.
-    if attacker.ability == Ab::SupremeOverlord {
-        let fallen = b.state.side(side).pokemon.iter()
-            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
-            .count()
-            .min(5);
-        if fallen > 0 {
-            const POW: [i64; 6] = [4096, 4506, 4915, 5325, 5734, 6144];
-            base_power = crate::damage::modify(base_power as i64, POW[fallen], 4096) as u16;
-        }
-    }
-    // Terrain base-power modifiers (gen9, grounded users/targets; ×1.3 = chainModify 5325).
-    // The terrain is part of the projected state, so terrain-setting abilities/moves needn't
-    // be modeled here. Grounded ≈ not Flying and not Levitate (Air Balloon etc. unmodeled).
+    // Every MULTIPLICATIVE onBasePower handler in PS accumulates into a single `chainModify`
+    // modifier (in DESCENDING onBasePowerPriority), applied to the base power exactly ONCE at the
+    // end of the BasePower event (`relayVar = this.modify(relayVar, this.event.modifier)`). The
+    // engine used to apply each as its own `modify`, which re-rounds at every step and diverges
+    // once two stack — e.g. Technician ×1.5 (prio 30) + Black Glasses ×1.2 (prio 15) on a base
+    // power 14: sequential 14→17→26, PS's single chain 14→25. `bp_step` replicates PS's chainModify
+    // accumulation `((prev * next + 2048) >> 12)` (den is 4096 for every modifier here, so
+    // `next == num`); the final `modify` applies the accumulated modifier once. Technician's ≤60
+    // gate reads the base power with only HIGHER-priority mods applied — it is the highest (30), so
+    // it reads the raw base power. Same-priority handlers never co-occur (one ability + one item
+    // per holder). Reckless / Mega Launcher / Tough Claws stay on the attack stat (unchanged).
     use crate::ids::Terrain;
     let atk_grounded = !attacker.types.contains(&Type::Flying) && attacker.ability != Ab::Levitate;
     let def_grounded = !defender.types.contains(&Type::Flying) && defender.ability != Ab::Levitate;
@@ -4691,17 +4696,64 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             (b.state.terrain, md.typ),
             (Terrain::Electric, Type::Electric) | (Terrain::Grassy, Type::Grass) | (Terrain::Psychic, Type::Psychic)
         );
-    if terrain_boost {
-        base_power = crate::damage::modify(base_power as i64, 5325, 4096) as u16;
-    }
-    // Grassy Terrain halves the ground-shaking moves vs grounded targets; Misty Terrain
-    // halves Dragon moves vs grounded targets.
     let terrain_halve = (b.state.terrain == Terrain::Grassy
         && def_grounded
         && matches!(md.id.to_id(), "earthquake" | "bulldoze" | "magnitude"))
         || (b.state.terrain == Terrain::Misty && def_grounded && md.typ == Type::Dragon);
+    let soul_dew = attacker.item == Item::SoulDew
+        && matches!(attacker.species, sp if sp == crate::ids::Species::from_id("latias").unwrap_or(crate::ids::Species::None)
+            || sp == crate::ids::Species::from_id("latios").unwrap_or(crate::ids::Species::None))
+        && matches!(md.typ, Type::Psychic | Type::Dragon);
+    let bp_step = |acc: i64, num: i64| (acc * num + 2048) >> 12;
+    let mut bp_chain = 4096i64;
+    // 30: Technician (×1.5 for base power ≤ 60, gated on the pre-chain base power).
+    if attacker.ability == Ab::Technician && base_power <= 60 {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    // 23: Iron Fist (punch ×1.2).
+    if attacker.ability == Ab::IronFist && md.flag_punch {
+        bp_chain = bp_step(bp_chain, 4915);
+    }
+    // 21: Sheer Force (×1.3) / Supreme Overlord (×table, +10% per fallen ally) — one ability.
+    if sheer_force_active {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
+    if attacker.ability == Ab::SupremeOverlord {
+        let fallen = b.state.side(side).pokemon.iter()
+            .filter(|p| p.species != crate::ids::Species::None && p.hp <= 0)
+            .count()
+            .min(5);
+        if fallen > 0 {
+            const POW: [i64; 6] = [4096, 4506, 4915, 5325, 5734, 6144];
+            bp_chain = bp_step(bp_chain, POW[fallen]);
+        }
+    }
+    // 19: Strong Jaw (bite ×1.5) / Sharpness (slicing ×1.5).
+    if attacker.ability == Ab::StrongJaw && md.flag_bite {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    if attacker.ability == Ab::Sharpness && md.flag_slicing {
+        bp_chain = bp_step(bp_chain, 6144);
+    }
+    // 15: type-boosting items / species orbs / Soul Dew / Ogerpon masks — all ×1.2, one item.
+    if type_item_boost || orb_boost || soul_dew
+        || matches!(attacker.item, Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask)
+    {
+        bp_chain = bp_step(bp_chain, 4915);
+    }
+    // 7: Punk Rock (sound ×1.3).
+    if attacker.ability == Ab::PunkRock && md.flag_sound {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
+    // 0: terrain boost (×1.3) then terrain halve (×0.5) — grounded user/target gated above.
+    if terrain_boost {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
     if terrain_halve {
-        base_power = crate::damage::modify(base_power as i64, 2048, 4096) as u16;
+        bp_chain = bp_step(bp_chain, 2048);
+    }
+    if bp_chain != 4096 {
+        base_power = crate::damage::modify(base_power as i64, bp_chain, 4096) as u16;
     }
     // Terastallization STAB floor: a terastallized mon's move matching its (post-Tera) type with
     // base power < 60 is raised to 60 — applied AFTER every onBasePower modifier. Excludes
@@ -6233,7 +6285,15 @@ fn apply_multihit_realized_ma(
 fn beatup_calcs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<DamageCalc> {
     let mut calcs: Vec<DamageCalc> = Vec::new();
     let s = b.state.side(side);
-    for i in 0..6usize {
+    // PS iterates `pokemon.side.pokemon` in its CURRENT array order (active-first, swap-tracked),
+    // NOT the fixed canonical/teampreview slot order the engine stores. Since each participant's
+    // base power is paired with a distinct per-hit roll, the order changes the realized total, so
+    // the seed gate installs PS's array order; without it we fall back to canonical slot order (the
+    // sumset-DP and differ don't observe the pairing).
+    let order: Vec<usize> = beatup_order(side)
+        .map(|o| o.into_iter().map(|x| x as usize).collect())
+        .unwrap_or_else(|| (0..6usize).collect());
+    for i in order {
         let p = &s.pokemon[i];
         if p.species == crate::ids::Species::None {
             continue;
@@ -6893,13 +6953,17 @@ fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec
     if !can_land {
         // Draw-and-discard: PS rolls, the disable no-ops. State validates, so no split.
         let mut b = b;
-        draw(&mut b, "randomChance", &[3, 10], 3, "cursedbody");
+        draw(&mut b, "randomChance", &[3, 10], 0, "cursedbody");
         return vec![b];
     }
+    // randomChance procs use the boolean convention (proc=1, noproc=0) — same as crit / par / frz /
+    // Cute Charm / Poison Touch — so the seed-gate `replicate_select` exact-matches the realized
+    // `random_chance` value (0/1). (The 0/chance encoding is only for the `random(100)` secondaries,
+    // which `replicate_select` threshold-decodes separately.)
     let mut proc = scaled(&b, 0.30);
-    draw(&mut proc, "randomChance", &[3, 10], 0, "cursedbody");
+    draw(&mut proc, "randomChance", &[3, 10], 1, "cursedbody");
     let mut noproc = scaled(&b, 0.70);
-    draw(&mut noproc, "randomChance", &[3, 10], 3, "cursedbody");
+    draw(&mut noproc, "randomChance", &[3, 10], 0, "cursedbody");
     push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Disable });
     let prev = proc.state.side(side).disable;
     // The attacker has already moved this turn -> full 4-turn disable (PS duration 5 - 1
@@ -8160,7 +8224,18 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
     // mis-ordered phaze/self-destruct cases outweigh the gains). Needs move-subtype-aware placement
     // plus a moveHit-ran signal.
     if miss_prob > 0.0 {
-        hits.push(scaled(&b, miss_prob));
+        let mut mb = scaled(&b, miss_prob);
+        // The accuracy roll came up a miss on this branch: flip the inherited hit-result (1) to 0
+        // so the seed-gate Replicate filter selects hit vs miss by the realized `randomChance`
+        // value — mirroring the damaging-move miss branch. Without this both branches carried
+        // result 1, leaving a real miss unselectable (the filter fell through and applied the
+        // status, e.g. Thunder Wave paralysing on a recorded miss — r6/d1/c3c1s73).
+        if mb.draws.last().is_some_and(|d| d.site == "accuracy") {
+            if let Some(d) = mb.draws.last_mut() {
+                d.result = 0;
+            }
+        }
+        hits.push(mb);
         hits
     } else {
         hits
@@ -8365,20 +8440,31 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
         return vec![b];
     }
     let sd = b.state.side(dragged);
-    let bench: Vec<u8> = (0..6u8)
-        .filter(|&i| {
-            i != sd.active_index
-                && sd.pokemon[i as usize].species != crate::ids::Species::None
-                && sd.pokemon[i as usize].is_alive()
-        })
-        .collect();
+    let alive_benched = |i: u8| i != sd.active_index
+        && sd.pokemon[i as usize].species != crate::ids::Species::None
+        && sd.pokemon[i as usize].is_alive();
+    // PS's `getRandomSwitchable` samples over `side.pokemon.slice(active.length)` — its CURRENT
+    // array order (active-first, swap-tracked by `switchIn`), NOT canonical teampreview order. So
+    // the drawn index maps into PS's array order. The seed gate installs the PRE-STATE array order
+    // (shared with Beat Up); Enumerate/Sample leave it None and fall back to canonical slot order.
+    //
+    // The installed order is only valid while the dragged side's active is still the pre-state
+    // active (array position 0). If that side switched EARLIER this turn (its own switch, before the
+    // drag), `switchIn` swapped a different mon to the front and the pre-state order is stale — its
+    // old active would wrongly appear at the head of the bench. Detect that (active_index no longer
+    // matches the order's head) and fall back to canonical order, which stays correct in the common
+    // no-intra-turn-reorder case (d3: p2 switched then got Whirlwind-dragged).
+    let order_valid = beatup_order(dragged).is_some_and(|o| o.first() == Some(&sd.active_index));
+    let bench: Vec<u8> = match beatup_order(dragged).filter(|_| order_valid) {
+        Some(order) => order.into_iter().filter(|&i| (i as usize) < 6 && alive_benched(i)).collect(),
+        None => (0..6u8).filter(|&i| alive_benched(i)).collect(),
+    };
     if bench.is_empty() {
         return vec![b];
     }
     // PS picks the drag target with `sample(possibleSwitches)` (battle.ts getRandomSwitchable):
-    // one `sample` draw over the bench in party order (`side.pokemon` from active.length, fainted
-    // skipped). Each branch carries the drawn index as its `sample` result so the Replicate filter
-    // selects the realized target. Annotation-only (state-neutral to Enumerate/Sample).
+    // one `sample` draw over the bench in party order. Each branch carries the drawn index as its
+    // `sample` result so the Replicate filter selects the realized target. Annotation-only.
     let n = bench.len() as i32;
     let p = 1.0 / bench.len() as f32;
     bench
