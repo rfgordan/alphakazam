@@ -7737,7 +7737,8 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         // rolls `randomChance(100, 100)` — but only after `hitStepTryImmunity` passes, so a
         // Ghost target (immune to `trapped`) fails first and never rolls. Special-cased above the
         // general status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits).
-        if alive && !ghost {
+        // Also skipped when accuracy is forced `true` (No Guard target / Glaive Rush).
+        if alive && !ghost && !accuracy_forced_true(&b, side, md) {
             draw(&mut b, "randomChance", &[100, 100], 1, "accuracy");
         }
         if alive
@@ -8056,7 +8057,7 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         // status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits). The arg is
         // post-`ModifyAccuracy`/stage: a +1-accuracy Trick user rolls `randomChance(133,100)`
         // (r10 t17). A fainted foe (no target) fails earlier and never rolls.
-        if annotating() && b.state.side(foe2).active().is_alive() {
+        if annotating() && b.state.side(foe2).active().is_alive() && !accuracy_forced_true(&b, side, md) {
             let acc = accuracy_arg(&b, side, md);
             draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
         }
@@ -8137,8 +8138,12 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
             // Strength Sap is a foe-targeting numeric-accuracy status move — PS `hitStepAccuracy`
             // rolls `randomChance(accuracy, 100)` before the drain/drop (accuracy post-ModifyAccuracy
             // / stages via `accuracy_arg`). (Special-cased above the general status accuracy branch.)
-            let acc = accuracy_arg(&b, side, md);
-            draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
+            // Skipped when accuracy is forced `true` — No Guard on the target (r11: Strength Sap
+            // into a No Guard Golurk), a Glaive Rush target, or weather-perfect accuracy.
+            if !accuracy_forced_true(&b, side, md) {
+                let acc = accuracy_arg(&b, side, md);
+                draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
+            }
             let atk_val = {
                 let t = b.state.side(foe).active();
                 let boost = b.state.side(foe).boost(BoostIndex::Attack);
