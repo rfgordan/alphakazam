@@ -243,7 +243,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -290,6 +290,11 @@ pub(crate) struct Branch {
     /// damaging-move failure sites; committed to the side's `last_move_failed` once per move action
     /// in `run_move_action`. Defaults false ("succeeded"); reset implicitly each move.
     pub(crate) move_failed: bool,
+    /// Transient (NOT part of State): a self-switch (pivot) move already emitted its move action's
+    /// trailing runAction Update (2882) on the PRE-switch board (PS fires it before processing the
+    /// `switchFlag`), so `run_move_action` must NOT emit it again on the post-switch board. Set by
+    /// `emit_pivot_trailing_update` at the pivot apply site; reset each move in `run_move_action`.
+    pub(crate) pivot_update_done: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -562,6 +567,17 @@ fn emit_switch_pre_update(b: &mut Branch) {
     if annotating() && actives_update_tie(&b.state, false) {
         draw(b, "shuffle", &[2, 0, 2], -1, "update");
     }
+}
+
+/// A self-switch (pivot) move's runAction Update (battle.ts:2882): PS fires it when the move
+/// action ends — BEFORE the `switchFlag` is processed as its own `switch`/`runSwitch` action — so
+/// it speed-sorts the board with the pivot USER STILL on the field. The engine applies the pivot
+/// switch inside `execute_move`, so this must be emitted (on the pre-switch board) at the pivot
+/// site and `run_move_action` told not to re-emit it on the post-switch board. Ground-truthed on
+/// d6 i25 (U-turn on a Garchomp==Pelipper speed tie: the trailing 2882 shuffles on `[user | foe]`).
+fn emit_pivot_trailing_update(b: &mut Branch) {
+    emit_update(b);
+    b.pivot_update_done = true;
 }
 
 /// Emit the per-hit `eachEvent('Update')` shuffle (battle-actions.ts:970) — fires once per
@@ -1290,7 +1306,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1376,7 +1392,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -1523,7 +1539,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -1789,7 +1805,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
 /// actives, then switch-in abilities in speed order of the INCOMING actives.
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2189,9 +2205,10 @@ pub(crate) struct Action {
 /// (970) and post-hit-loop (1024) Updates are emitted inside `execute_move`; this adds the 2882.
 fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     let side = action.side;
-    // Fresh per-move outcome flag: this branch may carry a `move_failed` set by an earlier action
-    // this turn (sequence_two_moves reuses the branch for the second mover).
+    // Fresh per-move outcome flags: this branch may carry a `move_failed` / `pivot_update_done` set
+    // by an earlier action this turn (sequence_two_moves reuses the branch for the second mover).
     b.move_failed = false;
+    b.pivot_update_done = false;
     let mut out = execute_move(b, action);
     if annotating() {
         for nb in &mut out {
@@ -2204,7 +2221,11 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
             if cur != nb.move_failed {
                 push(nb, Instruction::SetLastMoveFailed { side, previous: cur, new: nb.move_failed });
             }
-            emit_update(nb);
+            // A pivot move already emitted its trailing 2882 on the PRE-switch board at the pivot
+            // site (PS fires it before processing `switchFlag`); don't re-emit on the post-switch board.
+            if !nb.pivot_update_done {
+                emit_update(nb);
+            }
         }
     }
     out
@@ -2265,7 +2286,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -3536,7 +3557,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             push(&mut b, Instruction::ChangeSubstituteHp { side, amount: sub_hp });
             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Substitute });
             match pivot {
-                Pivot::Target(t) => apply_switch_pass_sub(&mut b, side, t),
+                Pivot::Target(t) => { emit_pivot_trailing_update(&mut b); apply_switch_pass_sub(&mut b, side, t); }
                 Pivot::Pause => push(&mut b, Instruction::PivotPending { side }),
                 Pivot::Stay => {}
             }
@@ -3665,6 +3686,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             Pivot::Target(t) => {
                 for sb in &mut branches {
                     if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(sb); // move action's 2882 (pre-switch board)
                         apply_switch(sb, side, t);
                     }
                 }
@@ -3971,7 +3993,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         emit_modifydamage_shuffle(&mut hb);
         bust_disguise(&mut hb, foe);
         match pivot {
-            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { apply_switch(&mut hb, side, t); },
+            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { emit_pivot_trailing_update(&mut hb); apply_switch(&mut hb, side, t); },
             Pivot::Pause => if hb.state.side(side).active().is_alive() { push(&mut hb, Instruction::PivotPending { side }); },
             Pivot::Stay => {}
         }
@@ -4195,10 +4217,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // Both emitted before the pivot/drag switch changes the on-field mon (and its Speed).
             emit_update_hit(&mut sb);
             emit_update(&mut sb);
-            // Pivot move (U-turn): switch the user out now that it connected.
+            // Pivot move (U-turn): switch the user out now that it connected. PS fires the move
+            // action's runAction Update (2882) BEFORE processing the self-switch, so emit it here on
+            // the PRE-switch board (user still in) and mark it done so run_move_action doesn't re-emit.
             match pivot {
                 Pivot::Target(t) => {
                     if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(&mut sb);
                         apply_switch(&mut sb, side, t);
                     }
                 }
