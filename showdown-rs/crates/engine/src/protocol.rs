@@ -66,7 +66,7 @@ pub fn protocol_turn(
 pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: HpStyle, out: &mut Vec<String>) {
     let mut s = *pre;
     let mut current_move: Option<(SideId, crate::ids::MoveId)> = None;
-    for &ins in instructions {
+    for (i, &ins) in instructions.iter().enumerate() {
         if let Instruction::DecrementPp { side, slot, move_index, .. } = ins {
             let move_id = s.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].id;
             if move_id != crate::ids::MoveId::None {
@@ -74,7 +74,14 @@ pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: Hp
                 current_move = Some((side, move_id));
             }
         }
-        emit_instruction(out, &s, ins, hp_style, &current_move);
+        // PS resets a mon's boosts SILENTLY when it switches out; the engine emits explicit Boost/
+        // ClearBoosts deltas to zero them. Suppress those — a Boost/ClearBoosts whose side's next
+        // event is a Switch (no intervening move for that side) is a switch-out reset, not a move.
+        let switch_reset = matches!(ins, Instruction::Boost { .. } | Instruction::ClearBoosts { .. })
+            && is_switch_out_reset(instructions, i);
+        if !switch_reset {
+            emit_instruction(out, &s, ins, hp_style, &current_move);
+        }
         s.apply_one(ins);
         if let Instruction::Damage { side, slot, .. } = ins {
             let p = &s.sides[side.index()].pokemon[slot as usize];
@@ -83,6 +90,23 @@ pub fn emit_instructions(pre: &State, instructions: &[Instruction], hp_style: Hp
             }
         }
     }
+}
+
+/// Is the boost instruction at `i` a switch-OUT reset (boosts zeroed as the mon leaves)? True when
+/// the same side's next relevant event is a `Switch` before any move (`DecrementPp`) for that side.
+fn is_switch_out_reset(instructions: &[Instruction], i: usize) -> bool {
+    let side = match instructions[i] {
+        Instruction::Boost { side, .. } | Instruction::ClearBoosts { side, .. } => side,
+        _ => return false,
+    };
+    for ins in &instructions[i + 1..] {
+        match ins {
+            Instruction::Switch { side: sw, .. } if *sw == side => return true,
+            Instruction::DecrementPp { side: mv, .. } if *mv == side => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A `|switch|pNa: Name|Details|HP` line for the mon at `side`'s active slot — used by the
