@@ -738,7 +738,11 @@ fn emit_trap_pokemon_shuffles(b: &mut Branch) {
     if !annotating() {
         return;
     }
+    // PS's `endTurn` per-active loop (battle.ts:1664) runs `runEvent('DisableMove', pokemon)`
+    // (:1688) and then `runEvent('TrapPokemon', pokemon)` (:1724) for the SAME mon before moving
+    // on to the next side's active — so the two shuffles interleave per side, not in two passes.
     for side in [SideId::One, SideId::Two] {
+        emit_disable_move_shuffle(b, side);
         let s = b.state.side(side);
         if !s.active().is_alive() {
             continue;
@@ -752,6 +756,44 @@ fn emit_trap_pokemon_shuffles(b: &mut Branch) {
             draw(b, "shuffle", &[n, 0, n], -1, "trappokemon");
         }
     }
+}
+
+/// Emit the `DisableMove` handler-tie shuffle PS makes in `endTurn` (battle.ts:1688,
+/// `runEvent('DisableMove', pokemon)` per active). The `onDisableMove` handlers in gen9 are:
+/// the CONDITIONS `choicelock` / `disable` / `encore` / `healblock` / `taunt` / `throatchop` /
+/// `torment` (subOrder 2), the ability `gorillatactics` (7) and the item `assaultvest` (8).
+/// `comparePriority` keys are (order false, priority 0, speed = the HOLDER's speed, subOrder) —
+/// all of a single mon's condition handlers therefore tie exactly, so a mon carrying ≥2 of them
+/// consumes one `shuffle[N, 0, k]` (N = its handler count, k = the tying condition count; the
+/// ability/item handlers sort strictly after at subOrder 7/8 and never tie). Ground-truthed with a
+/// PS shuffle-call-site probe on r2 d28 (Entei holds `choicelock` + `healblock`, both
+/// `o=false,p=0,s=201,so=2` → `shuffle[2,0,2]`, from `Battle.endTurn` → `runEvent`). The moves'
+/// own `onDisableMove` (Belch / Stuff Cheeks) go through `singleEvent` in the following moveSlot
+/// loop — no handler list, no sort. `gravity`'s field-level handler is not modeled (the engine has
+/// no Gravity state); it would sort at subOrder 5, speed 0, i.e. never inside the condition group.
+/// Annotation-only; state-neutral.
+fn emit_disable_move_shuffle(b: &mut Branch, side: SideId) {
+    let s = b.state.side(side);
+    if !s.active().is_alive() {
+        return;
+    }
+    let v = s.volatiles;
+    // Condition handlers (subOrder 2) — all tie on the holder's own speed.
+    let k = v.contains(VolatileStatus::ChoiceLock) as i32
+        + (s.disable.1 > 0) as i32
+        + (s.encore.1 > 0) as i32
+        + (s.heal_block_turns > 0) as i32
+        + (s.taunt_turns > 0) as i32
+        + (s.throat_chop_turns > 0) as i32
+        + v.contains(VolatileStatus::Torment) as i32;
+    if k < 2 {
+        return;
+    }
+    let p = s.active();
+    let n = k
+        + (p.ability == crate::ids::Ability::GorillaTactics) as i32
+        + (p.item == Item::AssaultVest) as i32;
+    draw(b, "shuffle", &[n, 0, k], -1, "disablemove");
 }
 
 /// Emit the turn-start Update bracket PS produces before any move executes, in queue order:
