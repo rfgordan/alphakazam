@@ -2871,7 +2871,11 @@ fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
     let bd = (lvl_factor * 40 * atk) / def / 50 + 2;
     let mut out = Vec::with_capacity(16);
     for i in 0..16i64 {
-        let mut dmg = bd * (85 + i) / 100;
+        // PS `randomizer`: tr(tr(bd * (100 - random(16))) / 100). Roll `i` maps to factor
+        // (100 - i)/100 — the SAME orientation as the main damage path (branch result == roll,
+        // higher roll → less damage). The old `85 + i` inverted this: the branch the differ/gate
+        // selected for a recorded roll R computed (85+R)/100 instead of (100-R)/100, over-dealing.
+        let mut dmg = bd * (100 - i) / 100;
         if burned {
             dmg /= 2;
         }
