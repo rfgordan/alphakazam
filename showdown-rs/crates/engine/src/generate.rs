@@ -909,11 +909,18 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                             && b.state.side(side).active().ability != crate::ids::Ability::OwnTempo
                         {
                             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
-                            consume_lum_if_statused(&mut b, side);
-                            if !b.state.side(side).volatiles.contains(VolatileStatus::Confusion) {
-                                return vec![b];
+                            // PS `confusion` `onStart` rolls the duration (`random(2,6)`) the instant
+                            // confusion is applied — BEFORE any berry's `onUpdate` can cure it. So a
+                            // Lum/Persim holder that snaps out immediately STILL consumes the duration
+                            // draw (rd292 t3, r19 t7: Outrage's final turn confuses a Lum-holding
+                            // Regidrago → PS logs `random[2,6]@confusion` then the berry cures it).
+                            // Emit the duration draw + counter first, then apply the cure per branch
+                            // (which resets the counter to 0 — all four branches converge to cured).
+                            let mut branches = branch_confusion_counter(b, side);
+                            for nb in &mut branches {
+                                consume_lum_if_statused(nb, side);
                             }
-                            return branch_confusion_counter(b, side);
+                            return branches;
                         }
                         vec![b]
                     }
