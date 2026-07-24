@@ -170,13 +170,24 @@ function projStatusState(status, ss) {
 	return o;
 }
 
+// Cosmetic-only formes (identical base stats/types/abilities — flower colour, pattern, sweet, …)
+// that the engine collapses to their base species. The recorded PS snapshot keeps the colour; the
+// transplant (via the engine's exported state) uses the base. Gameplay-identical → normalize.
+const COSMETIC_FORME_BASE = [
+	'florges', 'vivillon', 'alcremie', 'minior', 'sinistcha', 'poltchageist', 'squawkabilly',
+];
+function normSpecies(id) {
+	for (const base of COSMETIC_FORME_BASE) if (id.startsWith(base)) return base;
+	return id;
+}
+
 function projPokemon(p) {
 	// A fainted mon: PS serializes status as "fnt" OR "" depending on when the snapshot is taken
 	// relative to faint processing; convert.rs maps BOTH (and hp<=0) to Status::None, so normalize.
 	const fainted = p.hp <= 0 || p.status === 'fnt';
 	const status = fainted ? '' : (p.status || '');
 	return {
-		species: refId(p.species) || (p.details || '').split(',')[0],
+		species: normSpecies(toID(refId(p.species) || (p.details || '').split(',')[0])),
 		hp: p.hp, maxhp: p.maxhp,
 		status, statusState: fainted ? null : projStatusState(status, p.statusState || {}),
 		item: p.item || '',
