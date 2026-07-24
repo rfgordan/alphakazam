@@ -385,8 +385,12 @@ function runGame(sample) {
 		const diffs = [];
 		diffProjections(projT, projR, '', diffs);
 		if (diffs.length) {
+			// Root classification: the transplant now awaits a switch-phase the recording didn't
+			// (an extra mid-turn faint) — the true cause of the downstream turn/activeTurns diffs.
+			const extraFaint = battle.requestState === 'switch' && d.requestState !== 'switch' && !d.stateAfter.ended;
+			const tag = extraFaint ? ' [request-phase: extra mid-turn faint — turn-cascade root; per-decision damage divergence]' : '';
 			return { name: sample.name, status: 'diverge', initOffset,
-				reason: `d${i} t${d.turn} (${diffs.length} diffs)`, diffs: diffs.slice(0, 8), decisionsChecked };
+				reason: `d${i} t${d.turn} (${diffs.length} diffs)${tag}`, diffs: diffs.slice(0, 8), decisionsChecked };
 		}
 		decisionsChecked++;
 	}
