@@ -33,6 +33,7 @@ import { assertPsPinned, PS_DIR } from './check-ps-pin.mjs';
 const require = createRequire(import.meta.url);
 assertPsPinned();
 const { Battle, Teams } = require(path.join(PS_DIR, 'dist/sim'));
+const filters = process.argv.slice(2);
 
 // Reconstructible teamsets (exactly the packed sets cosim.mjs uses). Extend as needed.
 const TEAMS = {
@@ -61,6 +62,10 @@ const COSMETIC_PREFIXES = [
 	'|t:', '|player', '|teamsize', '|gametype', '|gen', '|tier', '|rule', '|clearpoke', '|poke',
 	'|teampreview', '|split', '|', '|j', '|l', '|c', '|inactive', '|inactiveoff', '|-endability',
 	'|upkeep', '|start', '|-end', // -end mostly [silent] volatile bookkeeping PS emits, engine omits
+	'|debug', '|-clearallboost', '|-clearboost', '|-clearnegativeboost', '|-copyboost', '|-swapboost',
+	'|-invertboost', '|-setboost', // Haze/Clear Smog/etc. clear as a group; engine emits per-stat unboost
+	'|-immune', // PS adds -immune for ABILITY immunities (Good as Gold, Levitate, Flash Fire, ...);
+	            // the flat instruction stream only carries type-0x damage, not ability-blocked moves
 	'|detailschange', '|-status', // status via secondary is often unannounced-order; treat as cosmetic-order
 ];
 
@@ -85,17 +90,18 @@ function normalize(line) {
 		const m = (parts[2] || '').match(/^(p[12][a-z]): (.+)$/);
 		return { cmd, key: `|switch|${m ? m[1] : parts[2]}` };
 	}
-	const norm = parts.map((p, i) => {
+	const norm = [];
+	for (const p of parts) {
+		// Drop PS source/annotation suffixes ([from] item: X, [silent], [of] Y, [still], ...).
+		if (p.startsWith('[')) continue;
 		const m = p.match(/^(p[12][a-z]): (.+)$/);
-		if (m) return `${m[1]}`; // ident position letter only (name allowlisted)
-		// HP fractions "cur/max" or "cur/100" (opt " fnt") -> alive/fnt bucket.
-		const hp = p.match(/^(\d+)\/(\d+)( fnt)?$/) || p.match(/^0 fnt$/);
-		if (hp) return p.includes('fnt') || p.startsWith('0') ? 'fnt' : 'hp';
-		return toID(p);
-	});
-	// Drop PS source/annotation suffixes ([from] item: X, [silent], [of] Y, [still], ...).
-	const key = norm.join('|').replace(/\|\[[a-z]+][^|]*/g, '');
-	return { cmd, key };
+		if (m) { norm.push(m[1]); continue; } // ident position letter only (name allowlisted)
+		// HP fractions "cur/max"/"cur/100" with optional status suffix (" psn"/" fnt"/...) -> bucket.
+		const hp = p.match(/^(\d+)\/(\d+)(\s+\w+)?$/) || p.match(/^0 fnt$/);
+		if (hp) { norm.push((p.includes('fnt') || /^0\b/.test(p)) ? 'fnt' : 'hp'); continue; }
+		norm.push(toID(p));
+	}
+	return { cmd, key: norm.join('|') };
 }
 
 // PS emits every private HP event as a |split|pN pair (private exact + public percent). Collapse
@@ -113,15 +119,32 @@ function collapseSplits(lines) {
 	return out;
 }
 
-function psLog(name) {
-	const teams = TEAMS[name];
-	if (!teams) return null;
+// Games we can reconstruct: embedded custom teams (TEAMS) OR any random-battle game (teams are
+// regenerated deterministically from the seed, same as cosim.mjs). Extend TEAMS for more customs.
+function reconstructable(name) {
+	if (TEAMS[name]) return true;
 	const trace = JSON.parse(zlib.gunzipSync(fs.readFileSync(`harness/cosim-traces/${name}.json.gz`)).toString());
+	return !!(trace.format && trace.format.includes('random'));
+}
+
+function psLog(name) {
+	const trace = JSON.parse(zlib.gunzipSync(fs.readFileSync(`harness/cosim-traces/${name}.json.gz`)).toString());
+	let p1team, p2team;
+	if (TEAMS[name]) {
+		p1team = Teams.pack(Teams.import(TEAMS[name][0].join(']')));
+		p2team = Teams.pack(Teams.import(TEAMS[name][1].join(']')));
+	} else if (trace.format && trace.format.includes('random')) {
+		const s = trace.seed[0];
+		p1team = Teams.pack(Teams.generate(trace.format, { seed: [0, 0, 0, s * 2 + 1] }));
+		p2team = Teams.pack(Teams.generate(trace.format, { seed: [0, 0, 0, s * 2 + 2] }));
+	} else {
+		return null;
+	}
 	const battle = new Battle({
 		formatid: 'gen9customgame',
 		seed: trace.seed,
-		p1: { name: 'Red', team: Teams.pack(Teams.import(teams[0].join(']'))) },
-		p2: { name: 'Blue', team: Teams.pack(Teams.import(teams[1].join(']'))) },
+		p1: { name: 'Red', team: p1team },
+		p2: { name: 'Blue', team: p2team },
 	});
 	const roster = battle.sides.map(s => s.pokemon.map(p => p.set));
 	for (const d of trace.decisions) {
@@ -141,13 +164,23 @@ function psLog(name) {
 }
 
 function main() {
-	let totalSem = 0, totalCos = 0, games = 0;
-	for (const name of Object.keys(TEAMS)) {
-		const enginePath = `harness/protocol-logs/${name}.log`;
-		if (!fs.existsSync(enginePath)) {
-			console.log(`  (skip ${name}: no engine log — run PROTOCOL_EMIT first)`);
-			continue;
+	// Games to certify: embedded custom teams + all random-battle games (up to a cap) whose engine
+	// log exists (generate with PROTOCOL_EMIT first). CLI args override the selection.
+	let names;
+	if (filters.length) {
+		names = filters;
+	} else {
+		names = [...Object.keys(TEAMS)];
+		for (const f of fs.readdirSync('harness/cosim-traces')) {
+			const n = f.replace('.json.gz', '');
+			if ((n.startsWith('rd') || n.startsWith('r')) && !names.includes(n)) names.push(n);
 		}
+	}
+	let totalSem = 0, totalCos = 0, games = 0;
+	for (const name of names) {
+		const enginePath = `harness/protocol-logs/${name}.log`;
+		if (!fs.existsSync(enginePath)) continue;
+		if (!reconstructable(name)) continue;
 		const ps = psLog(name);
 		const eng = fs.readFileSync(enginePath, 'utf8').split('\n');
 		// Compare as multisets of normalized "meaningful" lines (state-change events), classifying
@@ -158,12 +191,16 @@ function main() {
 		for (const l of engMeaningful) { const k = normalize(l).key; engKeys.set(k, (engKeys.get(k) || 0) + 1); }
 		let sem = 0, cos = 0;
 		const examples = [];
+		const buckets = {};
+		const bump = (tag, cmd) => { const k = `${tag} ${cmd}`; buckets[k] = (buckets[k] || 0) + 1; };
 		for (const l of psMeaningful) {
-			const { key } = normalize(l);
+			const { key, cmd } = normalize(l);
 			if (engKeys.get(key) > 0) { engKeys.set(key, engKeys.get(key) - 1); }
-			else { sem++; if (examples.length < 8) examples.push(`  PS-only : ${l}`); }
+			else { sem++; bump('PS-only', cmd); if (examples.length < 8) examples.push(`  PS-only : ${l}`); }
 		}
-		for (const [k, n] of engKeys) for (let i = 0; i < n; i++) { sem++; if (examples.length < 16) examples.push(`  ENG-only: ${k}`); }
+		for (const [k, n] of engKeys) for (let i = 0; i < n; i++) { sem++; bump('ENG-only', k.split('|')[1] || '?'); if (examples.length < 16) examples.push(`  ENG-only: ${k}`); }
+		const bkeys = Object.keys(buckets).sort((a, b) => buckets[b] - buckets[a]);
+		if (bkeys.length) console.log('  by cmd: ' + bkeys.map(k => `${k}×${buckets[k]}`).join(', '));
 		cos = ps.filter(isCosmetic).length;
 		games++;
 		totalSem += sem; totalCos += cos;

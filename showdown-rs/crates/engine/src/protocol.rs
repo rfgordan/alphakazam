@@ -13,11 +13,14 @@
 //! this layer emits every line that corresponds to a state change (`|move|`, `|switch|`/`|drag|`,
 //! `|-damage|`, `|-heal|`, `|-boost|`/`|-unboost|`, `|-status|`/`|-curestatus|`, `|-weather|`,
 //! `|-fieldstart|`/`|-fieldend|`, `|-sidestart|`/`|-sideend|`, `|-start|`/`|-end|`, `|-item|`/
-//! `|-enditem|`, `|-terastallize|`, `|faint|`, `|-supereffective|`/`|-resisted|`/`|-immune|`,
-//! `|win|`, `|turn|`, `|upkeep|`). Type effectiveness is recomputed from the type chart at damage
-//! time. Purely annotational lines that carry NO state delta — `|-crit|`, `|-miss|`, `|-fail|`,
-//! and the `|-activate|`/`|-anim|` flavor — are not represented in the instruction stream and are
-//! documented as the emitter's known gap (the log-parity gate's cosmetic/annotation allowlist).
+//! `|-enditem|`, `|-terastallize|`, `|faint|`, `|-supereffective|`/`|-resisted|`, `|win|`,
+//! `|turn|`, `|upkeep|`). Moves are announced at their `DecrementPp` — the stream's move-USE
+//! marker — so the move boundary, execution order, and self-vs-foe target are exact and a move is
+//! never invented for a mon KO'd or blocked before acting; type effectiveness is recomputed from
+//! the type chart at that move's damage. Lines that carry NO state delta and cannot be derived —
+//! `|-crit|`, `|-miss|`, `|-fail|`, ability-based `|-immune|`, `|-activate|`/`|-anim|` flavor, and
+//! PS's grouped `|-clearallboost|` (the engine clears boosts per-stat) — are the documented gap
+//! (the log-parity gate's cosmetic/annotation allowlist).
 //!
 //! Names use PS `toID` strings lightly prettified (a display-name table is future work); this is a
 //! documented cosmetic difference vs PS's proper species names.
@@ -49,33 +52,22 @@ pub fn protocol_turn(
     out: &mut Vec<String>,
 ) {
     out.push(format!("|turn|{}", pre.turn));
+    let _ = (a1, a2);
 
-    // Announce move actions in turn order (switches announce themselves at their Switch
-    // instruction). Priority first, then effective speed (Trick Room flips speed).
-    let mut movers: Vec<(SideId, MoveChoice)> = vec![(SideId::One, a1), (SideId::Two, a2)];
-    movers.sort_by(|&(sa, ca), &(sb, cb)| order_key(pre, sb, cb).cmp(&order_key(pre, sa, ca)));
-
+    // Walk the instruction stream, announcing each move at its `DecrementPp` (PS's move-use point):
+    // this marks exactly which move executed, in order, and never invents a move for a mon that was
+    // KO'd or blocked before acting — the move-BOUNDARY the flat stream provides. `current_move`
+    // tracks the acting side so damage lines can attribute type effectiveness.
     let mut s = *pre;
-    let mut announced = [false, false];
     let mut current_move: Option<(SideId, crate::ids::MoveId)> = None;
-
-    // Emit the earliest-acting mover's |move| before walking, then subsequent movers are announced
-    // lazily as their first instruction appears (keeps ordering close to PS without a full queue).
-    for &(side, choice) in &movers {
-        if let MoveChoice::Move(idx) = choice {
-            let p = pre.side(side).active();
-            let move_id = p.moves[idx as usize].id;
+    for &ins in instructions {
+        if let Instruction::DecrementPp { side, slot, move_index, .. } = ins {
+            let move_id = s.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].id;
             if move_id != crate::ids::MoveId::None {
-                emit_move(out, pre, side, move_id);
-                announced[side.index()] = true;
-                if current_move.is_none() {
-                    current_move = Some((side, move_id));
-                }
+                emit_move(out, &s, side, move_id);
+                current_move = Some((side, move_id));
             }
         }
-    }
-
-    for &ins in instructions {
         emit_instruction(out, &s, ins, hp_style, &current_move);
         s.apply_one(ins);
         if let Instruction::Damage { side, slot, .. } = ins {
@@ -86,13 +78,17 @@ pub fn protocol_turn(
         }
     }
     out.push("|upkeep".to_string());
-    let _ = announced;
 }
 
-/// Emit a `|move|USER|Move|TARGET` line and set up effectiveness context.
+/// Emit a `|move|USER|Move|TARGET`. Self-targeting moves (Roost, Swords Dance, …) target the user;
+/// everything else targets the foe's active (singles).
 fn emit_move(out: &mut Vec<String>, s: &State, side: SideId, move_id: crate::ids::MoveId) {
     let user = ident_active(s, side);
-    let target = ident_active(s, side.other());
+    let target = if move_data(move_id).target == crate::data::MoveTarget::User {
+        user.clone()
+    } else {
+        ident_active(s, side.other())
+    };
     out.push(format!("|move|{}|{}|{}", user, prettify(move_id.to_id()), target));
 }
 
@@ -115,7 +111,7 @@ fn emit_instruction(
                 hp_frac(p.hp, p.max_hp, hp_style)
             ));
         }
-        Damage { side, slot, amount } => {
+        Damage { side, slot, amount } if amount != 0 => {
             // Effectiveness line (recomputed from the type chart) precedes the damage, PS-style,
             // when this damage is attributable to the currently-announced attacking move.
             if let Some((atk_side, mv)) = current_move {
@@ -142,7 +138,7 @@ fn emit_instruction(
                 hp_frac(new_hp, p.max_hp, hp_style)
             ));
         }
-        Heal { side, slot, amount } => {
+        Heal { side, slot, amount } if amount != 0 => {
             let p = &s.sides[side.index()].pokemon[slot as usize];
             let new_hp = (p.hp + amount).min(p.max_hp);
             out.push(format!(
@@ -345,22 +341,6 @@ fn type_name(t: Type) -> String {
     }
 }
 
-/// Sort key for turn order: higher = acts first. (priority, effective speed).
-fn order_key(state: &State, side: SideId, choice: MoveChoice) -> (i16, i32) {
-    let priority = match choice {
-        MoveChoice::Switch(_) => 100,
-        MoveChoice::Move(idx) => {
-            let id = state.side(side).active().moves[idx as usize].id;
-            move_data(id).priority as i16
-        }
-    };
-    let mut speed = state.side(side).active().stat(crate::ids::StatIndex::Speed) as i32;
-    if state.trick_room {
-        speed = -speed;
-    }
-    (priority, speed)
-}
-
 /// "makeitrain" -> "Makeitrain". Cosmetic; a proper display-name table is future work.
 fn prettify(id: &str) -> String {
     let mut c = id.chars();
@@ -388,7 +368,9 @@ mod tests {
         s.sides[1].pokemon[0] = p;
         s.sides[1].active_index = 0;
         let mut out = Vec::new();
-        protocol_turn(&s, MoveChoice::Move(0), MoveChoice::Move(0), &[], HpStyle::Percent, &mut out);
+        // A move is announced at its DecrementPp (the move-use marker), not from the choice.
+        let ins = [Instruction::DecrementPp { side: SideId::One, slot: 0, move_index: 0, amount: 1 }];
+        protocol_turn(&s, MoveChoice::Move(0), MoveChoice::Move(0), &ins, HpStyle::Percent, &mut out);
         assert_eq!(out.first().unwrap(), "|turn|5");
         assert_eq!(out.last().unwrap(), "|upkeep");
         assert!(out.iter().any(|l| l.starts_with("|move|p1a: Blissey|Softboiled")));
