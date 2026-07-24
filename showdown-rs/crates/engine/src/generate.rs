@@ -681,7 +681,7 @@ fn has_proto(s: &crate::state::Side) -> bool {
 
 /// The stat Protosynthesis / Quark Drive boosts: the highest of atk/def/spa/spd/spe,
 /// matching PS's `bestStat` (first max in that order).
-fn proto_stat(p: &crate::state::Pokemon) -> crate::ids::StatIndex {
+pub fn proto_stat(p: &crate::state::Pokemon) -> crate::ids::StatIndex {
     use crate::ids::StatIndex::*;
     let candidates = [Attack, Defense, SpecialAttack, SpecialDefense, Speed];
     let mut best = Attack;

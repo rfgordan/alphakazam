@@ -90,7 +90,8 @@ fn stats_obj(stats: &[i16; 6], with_hp: bool) -> Value {
 
 /// Build the active mon's `volatiles` object from the side's volatile bitset + payload fields,
 /// mirroring `convert_volatiles` exactly (each PS key with the internals `convert` reads back).
-fn volatiles_obj(side: &Side) -> Value {
+fn volatiles_obj(side: &Side, weather_is_sun: bool, terrain_is_electric: bool) -> Value {
+    let p = side.active();
     let mut v = Map::new();
     let vs = side.volatiles;
     let simple = |m: &mut Map<String, Value>, k: &str| {
@@ -193,11 +194,31 @@ fn volatiles_obj(side: &Side) -> Value {
     if vs.contains(Truant) {
         simple(&mut v, "truant");
     }
+    // Protosynthesis / Quark Drive store the boosted stat in `bestStat`; PS's onModify*/onModifySpe
+    // read it to apply the ×1.3 (×1.5 for Speed) boost. Without it the boost silently doesn't apply.
+    // `fromBooster` marks a Booster-Energy source (kept when the weather/terrain condition lapses);
+    // sun/electric-terrain sources omit it.
+    let proto_internals = |active_p: &Pokemon, from_sun_terrain: bool| -> Value {
+        let stat = engine::generate::proto_stat(active_p);
+        let name = match stat {
+            engine::ids::StatIndex::Attack => "atk",
+            engine::ids::StatIndex::Defense => "def",
+            engine::ids::StatIndex::SpecialAttack => "spa",
+            engine::ids::StatIndex::SpecialDefense => "spd",
+            engine::ids::StatIndex::Speed => "spe",
+            _ => "atk",
+        };
+        if from_sun_terrain {
+            json!({ "bestStat": name })
+        } else {
+            json!({ "bestStat": name, "fromBooster": true })
+        }
+    };
     if vs.contains(Protosynthesis) {
-        simple(&mut v, "protosynthesis");
+        v.insert("protosynthesis".into(), proto_internals(p, weather_is_sun));
     }
     if vs.contains(QuarkDrive) {
-        simple(&mut v, "quarkdrive");
+        v.insert("quarkdrive".into(), proto_internals(p, terrain_is_electric));
     }
     if vs.contains(FocusEnergy) {
         simple(&mut v, "focusenergy");
@@ -254,7 +275,16 @@ fn volatiles_obj(side: &Side) -> Value {
 /// Serialize one Pokemon. `si`/`slot` locate it for reference synthesis; `active` marks the
 /// side's active mon; `foe_ref` is a `[Pokemon:...]` on the other side used for the sleep-clause
 /// source encoding.
-fn export_pokemon(p: &Pokemon, si: usize, slot: usize, arr_idx: usize, active: bool, side: &Side) -> Value {
+fn export_pokemon(
+    p: &Pokemon,
+    si: usize,
+    slot: usize,
+    arr_idx: usize,
+    active: bool,
+    side: &Side,
+    weather_is_sun: bool,
+    terrain_is_electric: bool,
+) -> Value {
     let mut m = Map::new();
     let species_id = p.species.to_id();
     let base_species_id = p.base_species.to_id();
@@ -436,7 +466,7 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, arr_idx: usize, active: b
             }
             m.insert("lastMove".into(), Value::Object(lm));
         }
-        m.insert("volatiles".into(), volatiles_obj(side));
+        m.insert("volatiles".into(), volatiles_obj(side, weather_is_sun, terrain_is_electric));
     } else {
         m.insert("volatiles".into(), json!({}));
     }
@@ -566,6 +596,8 @@ fn array_index_of(state: &State, si: usize, roster_slot: usize) -> usize {
 
 fn export_side(state: &State, si: usize) -> Value {
     let side = &state.sides[si];
+    let weather_is_sun = matches!(state.weather, engine::ids::Weather::Sun | engine::ids::Weather::HarshSun);
+    let terrain_is_electric = state.terrain == engine::ids::Terrain::Electric;
     let active_index = side.active_index as usize;
     let has_active = side.active_index != u8::MAX;
 
@@ -576,7 +608,7 @@ fn export_side(state: &State, si: usize) -> Value {
     for (arr_idx, &slot) in order.iter().enumerate() {
         let p = &side.pokemon[slot];
         let active = has_active && slot == active_index;
-        mons.push(export_pokemon(p, si, slot, arr_idx, active, side));
+        mons.push(export_pokemon(p, si, slot, arr_idx, active, side, weather_is_sun, terrain_is_electric));
     }
 
     // `team`: identity — the emitted array order is already the live order we want restored.
