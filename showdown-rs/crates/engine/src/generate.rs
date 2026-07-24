@@ -6875,19 +6875,26 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
             return vec![b];
         }
         let mut out = Vec::new();
-        let mut noproc_p = 0.70f32;
-        // PS rolls ONE `this.random(100)`: <11 slp, <21 par, <30 psn, else nothing — emitted on
-        // every branch out of this ability (draw-and-discard; result isn't compared, state is).
+        // PS rolls ONE `this.random(100)`: <11 slp, <21 par, <30 psn, else nothing. Each status
+        // range is a real threshold band the realized decoder maps a raw roll into — so a status
+        // that CAN'T land (type/ability immunity, field block, sleep clause) still occupies its
+        // band as a no-op branch (state unchanged) at that band's threshold `res`, rather than
+        // being folded into the noproc range. Folding it in shifts the thresholds and mis-decodes
+        // a raw roll (e.g. a psn-range 25 against a Steel target would otherwise select the par
+        // band 11). The status result value is a draw-and-discard for the DP path; the band is
+        // what the seed-gate/differ realized selection reads.
         for (p, status, res) in [(0.11, Status::Sleep, 0i64), (0.10, Status::Paralysis, 11), (0.09, Status::Poison, 21)] {
             let applies = status_applies(b.state.side(side).active(), status)
                 && !status_blocked_by_field(&b.state, side, status)
                 && !(status == Status::Sleep && sleep_clause_blocks(&b.state, side));
-            if !applies {
-                noproc_p += p; // the roll lands there but the status fails: no state change
-                continue;
-            }
             let mut proc = scaled(&b, p);
             draw(&mut proc, "random", &[100], res, "effectspore");
+            if !applies {
+                // The roll lands in this band but the status fails: no state change, but the band
+                // is retained so realized selection reads the correct threshold.
+                out.push(proc);
+                continue;
+            }
             let slot = proc.state.side(side).active_index;
             push(&mut proc, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
             if status == Status::Sleep {
@@ -6897,7 +6904,7 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
                 out.push(proc);
             }
         }
-        let mut np = scaled(&b, noproc_p);
+        let mut np = scaled(&b, 0.70);
         draw(&mut np, "random", &[100], 30, "effectspore");
         out.push(np);
         return out;
@@ -8561,15 +8568,20 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
     // the drawn index maps into PS's array order. The seed gate installs the PRE-STATE array order
     // (shared with Beat Up); Enumerate/Sample leave it None and fall back to canonical slot order.
     //
-    // The installed order is only valid while the dragged side's active is still the pre-state
-    // active (array position 0). If that side switched EARLIER this turn (its own switch, before the
-    // drag), `switchIn` swapped a different mon to the front and the pre-state order is stale — its
-    // old active would wrongly appear at the head of the bench. Detect that (active_index no longer
-    // matches the order's head) and fall back to canonical order, which stays correct in the common
-    // no-intra-turn-reorder case (d3: p2 switched then got Whirlwind-dragged).
-    let order_valid = beatup_order(dragged).is_some_and(|o| o.first() == Some(&sd.active_index));
-    let bench: Vec<u8> = match beatup_order(dragged).filter(|_| order_valid) {
-        Some(order) => order.into_iter().filter(|&i| (i as usize) < 6 && alive_benched(i)).collect(),
+    // If the dragged side switched EARLIER this turn (its own switch, before the drag), `switchIn`
+    // swapped the incoming mon to array position 0, so the pre-state order's head is stale. Mirror
+    // that single swap: the current active (`active_index`) sat at some position `j` in the
+    // pre-state order and PS moved it to the front via `swap(0, j)`. Reconstructing that yields PS's
+    // live array order to sample over (d3: p1 switched Tornadus in, then Dragon Tail dragged — the
+    // bench must be PS's post-switch array, not canonical). Without an intra-turn switch `j == 0`
+    // and the swap is a no-op, so the common case is unchanged.
+    let bench: Vec<u8> = match beatup_order(dragged) {
+        Some(mut order) => {
+            if let Some(j) = order.iter().position(|&r| r == sd.active_index) {
+                order.swap(0, j);
+            }
+            order.into_iter().filter(|&i| (i as usize) < 6 && alive_benched(i)).collect()
+        }
         None => (0..6u8).filter(|&i| alive_benched(i)).collect(),
     };
     if bench.is_empty() {
