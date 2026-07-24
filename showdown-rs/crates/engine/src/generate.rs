@@ -533,6 +533,16 @@ fn actives_speed_tied(state: &State) -> bool {
     actives_update_tie(state, false)
 }
 
+/// Public tie predicate for the seed gate's post-KO replacement-switch bracket: PS resolves a
+/// forced replacement as a `switch` action whose `runAction` fires the switch bracket (switch-action
+/// runAction Update + `runSwitch` getAllActive speedSort + runSwitch runAction Update = 3
+/// `shuffle[2,0,2]`), each a `getAllActive()` speed-tie shuffle on the POST-swap board. The gate
+/// applies replacements via `switch_into` (state only), so it consumes this bracket separately —
+/// gated on exactly this predicate (both actives alive and equal `effective_speed`).
+pub fn replacement_bracket_tied(state: &State) -> bool {
+    actives_update_tie(state, false)
+}
+
 /// Emit the post-action `eachEvent('Update')` shuffle (battle.ts:2882 runAction, post-residual,
 /// switch/tera brackets, and post-hit-loop 1024) — fires iff both actives are alive and tied.
 /// Annotation-only; state-neutral (PS logs the shuffle order as null, validated via `stateAfter`).

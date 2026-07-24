@@ -427,6 +427,30 @@ fn step_unit(
             state.sides[side].active_turns = state.sides[side].active_turns.saturating_sub(1);
         }
     }
+    // Post-turn (not same-turn) forced-replacement switches: `switch_into`/`switch_into_pair` apply
+    // state only, but PS resolves each replacement as a `switch` action whose runAction fires a
+    // 3-shuffle bracket — switch-action runAction Update (battle.ts:2882), `runSwitch` getAllActive
+    // speedSort (battle-actions.ts:182), runSwitch runAction Update (2882) — each a `getAllActive()`
+    // speed-tie shuffle on the POST-swap board. A bracket fires (3 draws) at the transition to a
+    // both-actives-alive-and-Speed-tied board: for a single replacement, or for the SECOND of a
+    // simultaneous both-sides replacement (the first runs while the other slot is still fainted, so
+    // getAllActive has one active → no shuffle). Ground-truthed on c5a1 t11 (Primarina replaces a
+    // fainted Alcremie vs a Speed-tied Grimmsnarl → exactly 3 shuffles; PS seed 46844→21739). The
+    // engine's annotated switch bracket (generate.rs) covers only VOLUNTARY move+switch pivots; this
+    // consumes the forced-replacement bracket the gate would otherwise skip (a state-neutral drift
+    // that only surfaces at the next Speed-sensitive roll). Off a tie: 0 draws → no effect.
+    if !pre_end_turn && !replacements.is_empty() && engine::generate::replacement_bracket_tied(state) {
+        let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
+            1 // simultaneous both-sides double faint: only the second switch sees both actives alive
+        } else {
+            replacements.len()
+        };
+        for _ in 0..brackets {
+            for _ in 0..3 {
+                let _ = consume(prng, "shuffle", &[2, 0, 2]);
+            }
+        }
+    }
     Ok((chosen_draws, ambiguous))
 }
 

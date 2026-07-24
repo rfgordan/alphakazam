@@ -5,6 +5,43 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Replacement-switch bracket tranche 2026-07-24 (90/111 -> 93/111; forced-switch draw gap)
+
+Root found by comparing PS's per-turn PRNG seed (probe `battle.prng.getSeed()`) against the gate's
+`prng.limbs()` at each decision start on c5a1: the gate's state at "t12-start" equalled PS's
+**t11-start** — the gate had under-consumed t11's forced-replacement switch draws, a state-neutral
+drift that only surfaced 2 turns later (t13 damage roll read the wrong PRNG slot: engine 11 vs PS 8).
+
+**The gap:** `seedgate.rs::step_unit` applies post-KO forced-replacement switches via
+`switch_into` / `switch_into_pair` (STATE only) and consumed ZERO PRNG draws for them. But PS
+resolves each replacement as a `switch` action whose runAction fires a **3-shuffle bracket** — probed
+on c5a1 t11 (Primarina replaces a fainted Alcremie vs Speed-tied Grimmsnarl, seed 46844→21739):
+
+| PS shuffle | call site | tie board |
+|-----------|-----------|-----------|
+| switch-action runAction Update | battle.js:2376 (=battle.ts:2882) | post-swap |
+| runSwitch getAllActive speedSort | battle-actions.js:178 (=:182) | post-swap |
+| runSwitch runAction Update | battle.js:2376 | post-swap |
+
+All three are `getAllActive()` speed-tie shuffles → 3 draws when both actives are alive & Speed-tied,
+0 otherwise. A bracket fires at the transition to a both-alive-tied board: once for a single
+replacement, and once for the SECOND of a simultaneous both-sides double faint (the first switch runs
+while the other slot is still fainted → getAllActive has one active → no shuffle). The engine's
+annotated switch bracket covers only VOLUNTARY move+switch pivots; forced replacements bypass it.
+
+**Fix** (seed-gate only; generate.rs adds only a `pub fn replacement_bracket_tied` wrapper over the
+existing `actives_update_tie(state,false)` predicate): after applying replacements in `step_unit`,
+consume 3 `shuffle[2,0,2]` draws per firing bracket, gated on `!pre_end_turn` (same-turn mid-move
+replacements have different timing, left untouched) and the post-swap tie. **Flips c3b2s52, c3b2s53,
+c6a2s112 exact; advances c5a1 d15[t13]->d18[t16]** (its new divergence is a `shuffle@thunderwave` vs
+`randomChance@par` move-order class, distinct). Safe by construction: a tied forced-replacement was
+ALWAYS broken before (the drift guaranteed a later desync), so no previously-exact game had one —
+consuming the tie-gated bracket only fixes (tied) or is neutral (off-tie: 0 draws). Rails: engine
+tests 12 suites, state-sweep 7662/0/0, smoke 18/18, differ 99.09% (unchanged — differ path untouched),
+seed gate 90->93 zero prior-exact regression (exact-set diff). Commit: (this tranche).
+
+---
+
 ## Update-schedule tranche 2026-07-24 (89/111 -> 90/111; inter-move Update-count schedule)
 
 The dedicated careful tranche for the shared turn-resolution `eachEvent('Update')` schedule.
