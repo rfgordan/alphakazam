@@ -95,15 +95,17 @@ pub fn switch_line(state: &State, side: SideId, hp_style: HpStyle) -> String {
     format!("|switch|{}|{}|{}", ident(state, side, slot), details(p), hp_frac(p.hp, p.max_hp, hp_style))
 }
 
-/// Emit a `|move|USER|Move|TARGET`. Self-targeting moves (Roost, Swords Dance, …) target the user;
-/// everything else targets the foe's active (singles).
+/// Emit a `|move|USER|Move|TARGET`. PS points the animation at the FOE only for foe-directed
+/// targets; self / field / all-targeting moves (Roost, Swords Dance, Haze, Trick Room, Perish
+/// Song, …) point at the user.
 fn emit_move(out: &mut Vec<String>, s: &State, side: SideId, move_id: crate::ids::MoveId) {
+    use crate::data::MoveTarget::*;
     let user = ident_active(s, side);
-    let target = if move_data(move_id).target == crate::data::MoveTarget::User {
-        user.clone()
-    } else {
-        ident_active(s, side.other())
-    };
+    let foe_directed = matches!(
+        move_data(move_id).target,
+        Normal | AdjacentFoe | AllAdjacentFoes | Any | RandomNormal | Scripted | FoeSide
+    );
+    let target = if foe_directed { ident_active(s, side.other()) } else { user.clone() };
     out.push(format!("|move|{}|{}|{}", user, prettify(move_id.to_id()), target));
 }
 
