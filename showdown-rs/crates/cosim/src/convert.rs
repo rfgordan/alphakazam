@@ -483,6 +483,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
                 // PS stores the denominator (3^n, capped 729); the engine stores n.
                 let c = i(vv, "counter").max(1);
                 side.stall_counter = (c as f64).log(3.0).round() as u8;
+                // The `stall` volatile's remaining `duration` (2 on the Protect turn, 1 the turn
+                // after) drives the Residual handler-list length, INDEPENDENT of the counter (which
+                // can be reset to 0 by a non-Protect move or rounded to 0 by log3 on the turn-after).
+                side.stall_turns = (i(vv, "duration").max(1)) as u8;
             }
             "choicelock" => { side.volatiles.insert(VolatileStatus::ChoiceLock); }
             "saltcure" => { side.volatiles.insert(VolatileStatus::SaltCure); }

@@ -1789,6 +1789,10 @@ fn reset_move_tracking(b: &mut Branch, side: SideId) {
     if stall != 0 {
         push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
     }
+    let stall_t = b.state.side(side).stall_turns;
+    if stall_t != 0 {
+        push(b, Instruction::SetStallTurns { side, previous: stall_t, new: 0 });
+    }
     if pending != crate::state::PendingMove::None {
         push(b, Instruction::SetPendingMove { side, previous: pending, new: crate::state::PendingMove::None });
     }
@@ -3533,7 +3537,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 let did_something = sb.ins.len() > ins_before
                     && sb.ins[ins_before..]
                         .iter()
-                        .any(|i| !matches!(i, Instruction::SetStallCounter { .. }));
+                        .any(|i| !matches!(i, Instruction::SetStallCounter { .. } | Instruction::SetStallTurns { .. }));
                 if did_something {
                     emit_update_hit(sb); // 970 (per-hit, pre-faint board)
                     emit_update(sb); // 1024 (post-hit-loop, alive-gated)
@@ -7397,6 +7401,12 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
             push(&mut sb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protect });
         }
         push(&mut sb, Instruction::SetStallCounter { side, previous: n, new: n.saturating_add(1) });
+        // The `stall` volatile is (re-)armed to duration 2 by a successful Protect (PS onStart/
+        // onRestart); it survives one turn past this one for the Residual handler list.
+        let prev_st = sb.state.side(side).stall_turns;
+        if prev_st != 2 {
+            push(&mut sb, Instruction::SetStallTurns { side, previous: prev_st, new: 2 });
+        }
         out.push(sb);
         // Failure branch (the move fails, breaking the chain) — only when failure is possible.
         if success_p < 1.0 {
@@ -8434,7 +8444,8 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
         if s.throat_chop_turns > 0 { push(22, 2); }
         if s.yawn_turns > 0 { push(23, 2); }
         if s.perish_turns > 0 { push(24, 2); }
-        if v.contains(V::Roost) { push(25, 2); }
+        if v.contains(V::Roosted) { push(25, 2); } // roost's end-of-turn type-restore volatile
+                                                    // (engine uses `Roosted`; `Roost` is never set)
         // Wish resolves as a slot condition on the occupant (order 4, subOrder 3).
         if s.wish.0 > 0 { push(4, 3); }
         // Items.
@@ -8463,17 +8474,21 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
         // protect volatile — on the turn AFTER a Protect (protect gone, stall still counting down)
         // PS still keeps the stall handler, giving a 1-longer list (`[5,2,4]` vs the engine's old
         // `[4,2,4]`). So the two handlers are gated INDEPENDENTLY: `protect` iff the Protect
-        // volatile is present (its own turn), `stall` iff the stall volatile is present. In the
-        // per-decision differ `stall_counter` is set from PS's stall volatile in the snapshot
-        // (convert.rs:485), so `stall_counter > 0` ⟺ the stall volatile is present — the exact
-        // predicate; both order "false", subOrder 2. (Stream-neutral for the from-seed gate — both
-        // list lengths consume one `random` over the same tie-group — so this only sharpens the
-        // differ's strict args comparison; no game's draw count changes.)
+        // volatile is present (its own turn), `stall` iff the stall volatile is present. The stall
+        // volatile's presence is `stall_turns` (its `duration`, decremented each end of turn), NOT
+        // `stall_counter` (the onStallMove 3^n denominator) — a non-Protect move resets the counter
+        // to 0 for the roll chain but the volatile persists to this turn's residual (t1 t17: golurk
+        // protects, then Shadow Punch next turn — PS still lists stall → `[3,0,2]`, engine dropped
+        // it → `[2,0,2]`), and log3 rounds the turn-after counter to 0 while the volatile lives.
+        // Both order "false", subOrder 2. (Stream-neutral for the from-seed gate — both list lengths
+        // consume one `random` over the same tie-group — so this only sharpens the differ's strict
+        // args comparison; no game's draw count changes.)
         if v.contains(V::Protect) {
             push(FALSE, 2); // protect (own-turn: duration-1 volatile)
         }
-        if s.stall_counter > 0 {
-            push(FALSE, 2); // stall (duration-2 volatile; survives one turn past protect)
+        if s.stall_turns > 0 {
+            push(FALSE, 2); // stall (duration-2 volatile; survives one turn past protect —
+                            // presence tracked by `stall_turns`, NOT the onStallMove `stall_counter`)
         }
     }
     hs
@@ -8910,6 +8925,15 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
         let stall = b.state.side(side).stall_counter;
         if stall != 0 && !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
             push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
+        }
+        // The `stall` volatile's duration ticks down every end of turn (a successful Protect this
+        // turn already re-armed it to 2 above). It stays in the Residual handler list until it
+        // reaches 0 — one turn PAST the Protect — matching PS's duration-2 lifetime. The residual
+        // shuffle was already emitted (top of this fn) off the pre-tick count, so this tick only
+        // affects NEXT turn's list length; state-neutral otherwise.
+        let st = b.state.side(side).stall_turns;
+        if st != 0 {
+            push(b, Instruction::SetStallTurns { side, previous: st, new: st - 1 });
         }
         for v in [VolatileStatus::Protect, VolatileStatus::Endure, VolatileStatus::Flinch] {
             if b.state.side(side).volatiles.contains(v) {

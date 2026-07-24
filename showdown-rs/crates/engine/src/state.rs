@@ -263,6 +263,15 @@ pub struct Side {
     /// Protect succeeds with probability 1/3^n; reset to 0 by any non-Protect action or a
     /// failed Protect. Reset on switch.
     pub stall_counter: u8,
+    /// Remaining duration of PS's `stall` volatile (duration 2, applied by a Protect-family use).
+    /// Tracked SEPARATELY from `stall_counter`: PS registers a Residual handler for the `stall`
+    /// volatile for as long as the volatile exists (its `getKey:'duration'` entry), which survives
+    /// ONE turn past the Protect (duration 2 → present through the next turn's residual even if the
+    /// holder used a non-Protect move that turn). `stall_counter` is the `onStallMove` success
+    /// denominator (3^n) and resets on any non-Protect action; it is the wrong signal for the
+    /// residual-handler-list length. Not compared by `diff_states` (engine-internal; PS carries it
+    /// as the volatile's `duration`). Reset on switch.
+    pub stall_turns: u8,
 
     /// This side has used its once-per-battle Terastallization. Derivable from
     /// `pokemon[].terastallized` during engine-only play, but stored explicitly because the
@@ -324,6 +333,7 @@ impl Side {
         last_move_failed: false,
         move_streak: 0,
         stall_counter: 0,
+        stall_turns: 0,
         tera_used: false,
         healing_wish: false,
         wish: (0, 0),

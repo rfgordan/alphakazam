@@ -149,6 +149,7 @@ pub enum Instruction {
     SetLastMove { side: SideId, previous: MoveId, new: MoveId },
     SetMoveStreak { side: SideId, previous: u8, new: u8 },
     SetStallCounter { side: SideId, previous: u8, new: u8 },
+    SetStallTurns { side: SideId, previous: u8, new: u8 },
 
     // --- multi-turn move state (active Pokémon; resets on switch) ---
     SetPendingMove { side: SideId, previous: PendingMove, new: PendingMove },
@@ -324,6 +325,9 @@ impl State {
             SetStallCounter { side, new, .. } => {
                 self.side_mut(side).stall_counter = new;
             }
+            SetStallTurns { side, new, .. } => {
+                self.side_mut(side).stall_turns = new;
+            }
             SetPendingMove { side, new, .. } => {
                 self.side_mut(side).pending_move = new;
             }
@@ -492,6 +496,9 @@ impl State {
             }
             SetStallCounter { side, previous, .. } => {
                 self.side_mut(side).stall_counter = previous;
+            }
+            SetStallTurns { side, previous, .. } => {
+                self.side_mut(side).stall_turns = previous;
             }
             SetPendingMove { side, previous, .. } => {
                 self.side_mut(side).pending_move = previous;
