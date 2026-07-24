@@ -5,6 +5,52 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Update-schedule tranche 2026-07-24 (89/111 -> 90/111; inter-move Update-count schedule)
+
+The dedicated careful tranche for the shared turn-resolution `eachEvent('Update')` schedule.
+Ground-truthed PS's EXACT per-turn Update-call table with a standalone PS probe (scratchpad
+`probe.mjs`: wraps `battle.prng.shuffle` + `eachEvent`/`runEvent`, replays a trace's recorded
+choices, logs every shuffle's dispatching event + call-site stack frame). All rails green: engine
+tests 12 suites, state-sweep **7662/0/0**, distribution smoke **18/18**, differ **99.03% -> 99.09%**
+(3794->3796, no over-emission increase), seed gate monotone by exact-set diff (zero prior-exact
+regression; remaining non-exact is a strict subset of the prior 22 minus c7).
+
+### THE GROUND-TRUTHED per-turn Update `shuffle[2,0,2]` schedule (probe-verified, c5a1 t12)
+For a turn on a Speed-tied board (both actives on-field, equal `effective_speed` — every Update
+speed-sorts `getAllActive()` so it shuffles iff the pair is tied), each **runAction** fires ONE
+trailing `eachEvent('Update')` (battle.js:2376 = battle.ts:2882), and each move ADDITIONALLY fires
+the moveHit-loop Updates ONLY if it enters the per-POKEMON loop. Mapping the c5a1 t12 stream
+(p1 Primarina psychic vs **p2 Grimmsnarl Prankster Reflect** — Reflect gets +1 priority so it runs
+FIRST despite the Speed tie; both actives Speed-tied so every Update shuffles):
+
+| PS pos | call site | what |
+|--------|-----------|------|
+| 0 | battle.js:2337 `eachEvent("BeforeTurn")` | beforeTurn action |
+| 1 | battle.js:2376 runAction Update | beforeTurn action's trailing 2882 |
+| 2 | battle.js:2376 runAction Update | **Reflect** action's trailing 2882 (NO move-internal Update) |
+| 3-6 | psychic accuracy/crit/damage/secondary | the damaging move's rolls |
+| 7 | battle-actions.js:843 per-hit `eachEvent("Update")` | psychic's moveHit-loop 970 |
+| 8 | battle-actions.js:888 post-hit-loop `eachEvent("Update")` | psychic's 1024 |
+| 9 | battle.js:2376 runAction Update | psychic action's trailing 2882 |
+| 10 | battle.js:2376 runAction Update | residual action's trailing 2882 |
+
+**Key fact: Reflect (target `allySide`) fired ZERO move-internal (843/888) Updates** — a
+side/field-targeting move resolves via the side/field `onHit` path and never enters
+`hitStepMoveHitLoop`. Self-targeting POKEMON moves (Calm Mind = `self`) DO enter the loop and fire
+970+1024 (confirmed by the existing calmmind schedule).
+
+### Fix landed
+The engine's status-move 970/1024 emission (`generate.rs` ~3624) gated on "the branch added ≥1
+effect instruction" — which is TRUE for side-condition moves (they push a SideCondition
+instruction) — so on a Speed-tied board it over-emitted 970+1024 for Reflect/screens/hazards/
+weather. Added a `hits_pokemon` gate excluding `MoveTarget::{AllySide, FoeSide, All, AllyTeam}`.
+These emits are `actives_update_tie`-gated (no-op off a Speed tie), so the change touches ONLY
+tied boards — minimal regression surface. **Flips c7 exact; advances c5a1 d14[t12]->d15[t13]**
+(c5a1's residual is now a `draws-match/state-diff` on `s1.boost.spa` — the same masked class as
+c3/c4/c5/r6, NOT the Update schedule). Commit: (this tranche).
+
+---
+
 ## Endgame-queue session 2026-07-24 (83/111 -> 89/111; +6 games, 2 fix commits)
 
 Worked the endgame queue. All rails held every commit: engine tests 12 suites, state-sweep

@@ -3621,7 +3621,24 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // tie), so this only affects tied boards. Detect a successful moveHit per-branch as "the
         // status resolution added ≥1 effect instruction" — a failed move applies none. Pure
         // protect-fail bookkeeping (only a `SetStallCounter` reset) is NOT a moveHit success.
-        if annotating() {
+        //
+        // The 970/1024 Updates fire only when PS enters the per-POKEMON `hitStepMoveHitLoop`
+        // (`spreadMoveHit`, battle-actions.ts). A status move that targets a SIDE or the FIELD
+        // (Reflect/Light Screen/Tailwind = allySide; Spikes/Stealth Rock = foeSide; weather/terrain/
+        // Trick Room = all; Heal Bell/Aromatherapy = allyTeam) resolves via the side/field `onHit`
+        // path and never enters that loop, so it fires NEITHER Update — only its runAction 2882
+        // (appended by `run_move_action`). Ground-truthed on c5a1 t12: Grimmsnarl's Prankster Reflect
+        // (allySide) ran first and produced zero move-internal Updates in the pinned PS trace, while
+        // the engine over-emitted 970+1024 → +2 leading shuffles → PRNG desync at the psychic
+        // accuracy roll. Self-targeting pokemon moves (Calm Mind = self) DO enter the loop and fire.
+        let hits_pokemon = !matches!(
+            md.target,
+            crate::data::MoveTarget::AllySide
+                | crate::data::MoveTarget::FoeSide
+                | crate::data::MoveTarget::All
+                | crate::data::MoveTarget::AllyTeam
+        );
+        if annotating() && hits_pokemon {
             for sb in &mut branches {
                 let did_something = sb.ins.len() > ins_before
                     && sb.ins[ins_before..]
