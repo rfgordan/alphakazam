@@ -28,6 +28,48 @@ fainted) shows `[surviving-mon only]` at the shuffle, confirming the tie is over
 list (2 items), not the actives. c5a1's mid-turn i12 is a DIFFERENT class (`shuffle@generic` after a
 double-move, 3 unconsumed) and its later d18 is the thunderwave move-order class — left for the singles.
 
+## RESULT — mid-turn-faint tranche (2026-07-24): 93/111 -> 98/111, differ 99.09% -> 99.27%, 3 commits
+
+Three ground-truthed, zero-regression mechanics landed (rails green each commit: engine tests 12
+suites, state-sweep **7662/0/0**, distribution smoke **18/18**, seed-gate non-exact set a strict
+subset every step). The "dominant remaining class" hypothesized above (turn-start-vs-switch-in
+bracket) was REFINED by call-site probing: the engine's leading brackets and move 970/1024 were
+ALREADY correct — the actual gap was one trailing shuffle per unit, from three distinct roots:
+
+1. **mid-turn-faint Residual handler tie** (e06d2bb; flips c3, c4, c5, r6, **t1**). A mon that
+   faints mid-turn stays in PS's `side.active`, so `fieldEvent('Residual')` speed-sorts its
+   faint-surviving residual handler (Leftovers / Cud Chew ability) — one extra `shuffle[2,0,2]` when
+   it ties the surviving foe's. `residual_handlers` now collects a fainted active's item/status/
+   ability residuals.
+2. **pivot move trailing 2882 on pre-switch board** (71de8a4; advances d6 d28->d66). PS fires a
+   self-switch move's runAction Update before processing `switchFlag`, so it sorts with the pivot
+   user still on-field; the engine applied the switch first and dropped it. New per-branch
+   `pivot_update_done` + `emit_pivot_trailing_update` at each pivot apply site.
+3. **mid-move Update ties use the frozen pre-move Speed** (360ea83; advances c5a1 d18->d31; differ
+   +7 units). PS's `getAllActive` speedSort reads the cached `pokemon.speed` (refreshed only at
+   turn start / before each move by `updateSpeed`), so a paralysis/secondary Speed change a move
+   applies does not break the SAME move's 970/1024/2882 tie. `run_move_action` snapshots both
+   Speeds into `MOVE_TIE_SPEEDS`; `actives_update_tie` uses them (liveness stays live).
+
+### Remaining 13 non-exact (all init-aligned) — characterized open items, each 1-game/state-risky
+- **d6** d66: weather-SETTING mid-turn switch-in Update schedule — a voluntary mid-turn switch that
+  triggers Drizzle fires `eachEvent('WeatherChange')` + `eachEvent('Weather')` speed-sorts the engine
+  doesn't model, plus a `FieldResidual` weather-handler tie (probed: 3 missing shuffles). Distinct
+  intricate class, 1 game.
+- **c5a1** d31 / **c2a1** d9 / **c1c**/**c3c2s82**/**c3c2s83**/**r10**/**r11**/**t2**/**rd318** —
+  per-move STATE-computation divergences (draws match; active_index / hp / types / confusion_turns /
+  status differ). Not draw work — each a bespoke `compute_damage`/switch-state/status item.
+- **c6a2s114** d36: `PS-unconsumed random[100]@curse` in a mid-turn Palafin re-fire — an extra
+  secondary the engine's mid-turn recompute drops (pivot midTurn Palafin-Hero recompute).
+- **r2** d7: `shuffle[5,3,5]` vs `[4,2,4]` — a stall-volatile-present residual-handler LIST-LENGTH
+  arg (draw-count-neutral); real fix needs a State stall-volatile flag distinct from `stall_counter`.
+- **r3** d23: per-hit Cursed Body (`randomChance[3,10]` after EACH multi-hit hit) — deferred (Scale
+  Shot family regression risk to 55 exact games).
+
+**Kill criteria: NOT triggered.** Three real structured shared-path roots landed (density still
+decaying). Remaining climb is per-move state-computation + the weather-switch-in schedule (intricate,
+state-risky, ~1 game each).
+
 ## Terminal state after the two Update-schedule tranches (93/111 = 83.8%)
 
 18 games remain non-exact. First-divergence classes (live seed gate):
