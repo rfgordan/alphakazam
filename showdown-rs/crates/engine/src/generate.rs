@@ -2998,6 +2998,16 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
             push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
             return branch_confusion_counter(b, foe);
         }
+        VolatileStatus::HealBlock => {
+            // PS's heal block `durationCallback` (moves.ts): Psychic Noise → 2, else 5 (Persistent
+            // ability → 7, absent from the corpus). The counter drives the end-of-turn duration
+            // decrement + expiry; the catch-all below applies only the bit, leaving turns=0 so the
+            // volatile never expires (r2 t8: Psychic Noise heal block stuck forever).
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            let dur = if md.id.to_id() == "psychicnoise" { 2 } else { 5 };
+            let prev = b.state.side(foe).heal_block_turns;
+            push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::HealBlock, previous: prev, new: dur });
+        }
         _ => {
             push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
         }
@@ -7581,6 +7591,15 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
             let foe = side.other();
             if v != VolatileStatus::PartiallyTrapped && !b.state.side(foe).volatiles.contains(v) {
                 push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
+                // Heal Block carries a duration counter the end-of-turn residual decrements and
+                // expires on; a damaging move that applies it (Psychic Noise, target_volatile
+                // HealBlock) must seed the counter or the volatile sticks forever (r2 t8). PS's
+                // `durationCallback`: Psychic Noise → 2, Heal Block move → 5.
+                if v == VolatileStatus::HealBlock {
+                    let dur = if md.id.to_id() == "psychicnoise" { 2 } else { 5 };
+                    let prev = b.state.side(foe).heal_block_turns;
+                    push(b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::HealBlock, previous: prev, new: dur });
+                }
             }
         }
         // Jaw Lock traps BOTH the user and the target (PS `onHit` adds `trapped` to each). Neither
