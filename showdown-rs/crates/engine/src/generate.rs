@@ -3487,6 +3487,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // Status moves handled specially.
     if md.category == MoveCategory::Status {
+        // PS `-notarget`: a status move that targets the foe POKEMON fails outright — no accuracy
+        // roll, no effect — when the foe active has fainted mid-turn (the second mover's Encore /
+        // Thunder Wave / Taunt into a foe that just self-KO'd, e.g. c2a3 t7: Regieleki Explosion
+        // faints itself, then Tinkaton's Encore has no target). `getMoveTargets` returns an empty
+        // list, so `useMoveInner` bails BEFORE `hitStepAccuracy` — the engine must emit no draw
+        // (an emitted always-true accuracy would silently offset the PRNG stream). Gated on the
+        // MoveTarget being a single foe (not User / FoeSide / All / AllySide): self moves
+        // (Substitute, Swords Dance), hazards (Spikes → FoeSide), and field moves (weather,
+        // screens) still resolve because their target — the user or a side — always persists.
+        // Annotation-gated: in the DP (Enumerate/Sample) state path no draws are emitted and the
+        // move is already state-neutral against a fainted foe, so this is purely a draw-suppression
+        // fix for the Replicate/differ streams — leaving the DP sweep byte-identical.
+        if annotating()
+            && matches!(md.target,
+                crate::data::MoveTarget::Normal | crate::data::MoveTarget::AdjacentFoe
+                    | crate::data::MoveTarget::Any | crate::data::MoveTarget::RandomNormal
+                    | crate::data::MoveTarget::Scripted)
+            && !b.state.side(foe).active().is_alive()
+        {
+            return vec![b];
+        }
         // Shed Tail: put up a Substitute (floor(maxHP/4) HP) at a cost of ceil(maxHP/2) HP, then
         // pivot out PASSING the Substitute to the incoming mon. Fails (no sub, no pivot) with no
         // switch target, an existing Substitute, or HP at/below the cost. Self-targeting — the
