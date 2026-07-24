@@ -72,6 +72,13 @@ fn main() -> ExitCode {
         return run_roundtrip_gate(&args);
     }
 
+    // Transplant sampler: for each trace, export the engine State at a mid-game turn-start `move`
+    // decision as a `deserializeBattle`-loadable snapshot, alongside the transplant decision index
+    // so `harness/transplant-gate.mjs` can drive the recorded remainder in pinned PS.
+    if let Ok(outdir) = std::env::var("EXPORT_SAMPLE") {
+        return run_export_sample(&args, &outdir);
+    }
+
     let mut totals = Totals::default();
     let mut ps_commit: Option<String> = None;
 
@@ -521,6 +528,74 @@ fn run_roundtrip_gate(args: &[String]) -> ExitCode {
         println!("\nPASS: every convertible corpus state round-trips byte-exact.");
         ExitCode::SUCCESS
     }
+}
+
+/// Dump one transplant sample per trace: the exported (deserializeBattle-loadable) engine State
+/// at a mid-game turn-start `move` decision, plus the decision index so the harness can drive the
+/// recorded remainder. Writes `<outdir>/<name>.json` = {trace, name, decisionIndex, turn, seed,
+/// exported}. Skips games with no eligible clean boundary.
+fn run_export_sample(args: &[String], outdir: &str) -> ExitCode {
+    if let Err(e) = std::fs::create_dir_all(outdir) {
+        eprintln!("mkdir {outdir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut written = 0u32;
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); continue; }
+        };
+        let Some(first) = t.decisions.first() else { continue };
+        let canon = match convert::Canonical::from_first_state(&first.state_after) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Transplant point: a turn-start (non-midTurn) `move` decision at/after the game's
+        // midpoint whose state converts cleanly, with recorded choices for BOTH sides (so the
+        // continuation is drivable) and at least one decision of remainder.
+        let mid_turn_threshold = t.result.turns / 2;
+        let mut chosen: Option<usize> = None;
+        for (i, d) in t.decisions.iter().enumerate() {
+            if d.request_state != "move" || d.mid_turn { continue; }
+            if d.turn < mid_turn_threshold { continue; }
+            if i + 1 >= t.decisions.len() { continue; }
+            if !d.choices.contains_key("p1") || !d.choices.contains_key("p2") { continue; }
+            if convert::convert_state(&d.state_after, &canon).is_err() { continue; }
+            chosen = Some(i);
+            break;
+        }
+        let Some(i) = chosen else {
+            eprintln!("{path}: no eligible transplant boundary");
+            continue;
+        };
+        // Export the PRE-decision state: the recorded state_after of the decision BEFORE i is the
+        // state at which the transplant decision is being made. Decision i's own state_after is
+        // AFTER i resolves. So transplant from decision (i-1).state_after and replay from i.
+        // Guard: i>=1 (i is a move decision at/after midpoint, so a prior decision exists).
+        let pre = &t.decisions[i - 1];
+        let state = match convert::convert_state(&pre.state_after, &canon) {
+            Ok(s) => s,
+            Err(_) => { eprintln!("{path}: pre-state convert failed"); continue; }
+        };
+        let exported = export::export_state(&state, t.seed.unwrap_or([1, 2, 3, 4]));
+        let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".json.gz").trim_end_matches(".json");
+        let out = serde_json::json!({
+            "trace": path,
+            "name": name,
+            "transplantDecisionIndex": i,
+            "preDecisionIndex": i - 1,
+            "turn": t.decisions[i].turn,
+            "seed": t.seed,
+            "exported": exported,
+        });
+        let dest = format!("{outdir}/{name}.json");
+        match std::fs::write(&dest, serde_json::to_string(&out).unwrap()) {
+            Ok(_) => { written += 1; }
+            Err(e) => eprintln!("write {dest}: {e}"),
+        }
+    }
+    println!("EXPORT_SAMPLE: wrote {written} transplant snapshots to {outdir}");
+    ExitCode::SUCCESS
 }
 
 fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {

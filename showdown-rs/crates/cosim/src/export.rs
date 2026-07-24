@@ -42,10 +42,20 @@ fn pokemon_ref(si: usize, pos: usize) -> String {
     format!("[Pokemon:p{}{}]", si + 1, POSITIONS[pos] as char)
 }
 
-/// The PS type id for a serialized `types`/`teraType` slot. `Type::None` -> "" (PS's typeless
-/// slot; `convert`'s `to_id` maps "" back to `Type::None`).
-fn type_id(t: Type) -> &'static str {
-    if t == Type::None { "" } else { t.to_id() }
+/// PS type NAME for a serialized type slot: the capitalized form PS stores in `pokemon.types`
+/// and compares at runtime (`hasType`/STAB use `"Poison"`, not the `"poison"` id — emitting the
+/// id silently drops STAB). `Type::None` -> "" (PS's typeless slot). `convert` lowercases via
+/// `to_id`, so the round-trip is unaffected.
+fn type_name(t: Type) -> String {
+    if t == Type::None {
+        return String::new();
+    }
+    let id = t.to_id();
+    let mut c = id.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Emit `types` the way PS's serialized array reads under `convert` (which walks slots
@@ -60,7 +70,7 @@ fn types_array(types: [Type; 2]) -> Value {
         None => a.push(Value::String(String::new())), // fully typeless (???): one empty slot
         Some(n) => {
             for t in types.iter().take(n + 1) {
-                a.push(Value::String(type_id(*t).to_string()));
+                a.push(Value::String(type_name(*t)));
             }
         }
     }
@@ -235,7 +245,7 @@ fn volatiles_obj(side: &Side) -> Value {
 /// Serialize one Pokemon. `si`/`slot` locate it for reference synthesis; `active` marks the
 /// side's active mon; `foe_ref` is a `[Pokemon:...]` on the other side used for the sleep-clause
 /// source encoding.
-fn export_pokemon(p: &Pokemon, si: usize, slot: usize, active: bool, side: &Side) -> Value {
+fn export_pokemon(p: &Pokemon, si: usize, slot: usize, arr_idx: usize, active: bool, side: &Side) -> Value {
     let mut m = Map::new();
     let species_id = p.species.to_id();
     let base_species_id = p.base_species.to_id();
@@ -251,12 +261,21 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, active: bool, side: &Side
     m.insert("species".into(), json!(format!("[Species:{species_id}]")));
     m.insert("baseSpecies".into(), json!(format!("[Species:{base_species_id}]")));
     m.insert("rosterIndex".into(), json!(slot));
-    m.insert("position".into(), json!(slot));
+    m.insert("position".into(), json!(arr_idx));
     m.insert("isActive".into(), json!(active));
 
     m.insert("gender".into(), json!(match p.gender { 1 => "M", 2 => "F", _ => "" }));
 
-    m.insert("types".into(), types_array(p.types));
+    // PS keeps the RAW (pre-tera) `types` array and applies Tera at lookup via `terastallized`.
+    // `convert` overwrites `State.types` to the effective [tera] for a non-Stellar Tera, so the
+    // raw types are recovered from `base_types` in that case (they coincide otherwise). `convert`
+    // re-derives the effective typing from `terastallized` on the way back, so this round-trips.
+    let raw_types = if p.terastallized && p.tera_type != Type::Stellar {
+        p.base_types
+    } else {
+        p.types
+    };
+    m.insert("types".into(), types_array(raw_types));
     m.insert("baseTypes".into(), types_array(p.base_types));
 
     if p.transformed {
@@ -310,6 +329,21 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, active: bool, side: &Side
     if p.cudchew_turns > 0 {
         ability_state.insert("counter".into(), json!(p.cudchew_turns));
     }
+    // Supreme Overlord snapshots `fallen = min(side.totalFainted, 5)` into abilityState AT
+    // switch-in and boosts base power by it. The engine recomputes it from the live fainted count
+    // (equal to the snapshot while no ally faints during this mon's stay — the corpus invariant),
+    // so we derive it here from the current fainted party members. Only the active attacker uses it.
+    if active && p.ability == engine::ids::Ability::SupremeOverlord {
+        let fallen = side
+            .pokemon
+            .iter()
+            .filter(|m| m.species != engine::ids::Species::None && m.hp <= 0)
+            .count()
+            .min(5);
+        if fallen > 0 {
+            ability_state.insert("fallen".into(), json!(fallen));
+        }
+    }
     if !ability_state.is_empty() {
         m.insert("abilityState".into(), Value::Object(ability_state));
     }
@@ -330,17 +364,29 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, active: bool, side: &Side
     }
     m.insert("moveSlots".into(), Value::Array(slots));
 
-    // Stats. `storedStats` has no `hp` key in PS; `convert` takes HP from `maxhp`.
+    // Stats. `storedStats` has no `hp` key in PS; `convert` takes HP from `maxhp`. `baseMaxhp`
+    // must be set too: PS's residual/heal maths (Leftovers, Recover, Leech Seed, ...) divide
+    // `baseMaxhp`, and left unset it defaults to the SYNTHETIC set's 0-EV HP — wrong. For a
+    // non-Dynamax singles mon baseMaxhp == maxhp.
     m.insert("maxhp".into(), json!(p.max_hp));
+    m.insert("baseMaxhp".into(), json!(p.max_hp));
     m.insert("hp".into(), json!(p.hp));
     m.insert("storedStats".into(), stats_obj(&p.stats, false));
     m.insert("baseStoredStats".into(), stats_obj(&p.base_stats, true));
 
     // Tera. PS serializes `terastallized` as the tera-type NAME when active, absent otherwise.
     if p.terastallized {
-        m.insert("terastallized".into(), json!(p.tera_type.to_id()));
+        m.insert("terastallized".into(), json!(type_name(p.tera_type)));
     }
-    m.insert("teraType".into(), json!(type_id(p.tera_type)));
+    m.insert("teraType".into(), json!(type_name(p.tera_type)));
+    // `canTerastallize`: PS nulls it for the WHOLE side once any ally teras (and for a mon that
+    // already tera'd). Without it the transplant's side reads as tera-available and can tera again
+    // — a cascade. Emit the tera type when the side still has its Tera, else null.
+    if side.tera_used || p.terastallized || p.tera_type == Type::None {
+        m.insert("canTerastallize".into(), Value::Null);
+    } else {
+        m.insert("canTerastallize".into(), json!(type_name(p.tera_type)));
+    }
 
     // Battle-long per-mon history.
     if p.ability_used {
@@ -387,9 +433,66 @@ fn export_pokemon(p: &Pokemon, si: usize, slot: usize, active: bool, side: &Side
     Value::Object(m)
 }
 
-/// A minimal, valid `PokemonSet` synthesized from modeled fields (placeholder EV/IV/nature —
-/// see the module header). Used by `deserializeBattle` to instantiate the mon; every stat is
-/// overwritten by the serialized `storedStats`/`baseStoredStats` immediately afterward.
+/// (nature name, plus stat index, minus stat index). Indices: 1=atk 2=def 3=spa 4=spd 5=spe.
+/// Neutral natures (plus==minus) are represented once as `Serious`.
+const NATURES: &[(&str, usize, usize)] = &[
+    ("Serious", 0, 0), // neutral
+    ("Adamant", 1, 3), ("Lonely", 1, 2), ("Brave", 1, 5), ("Naughty", 1, 4),
+    ("Bold", 2, 1), ("Impish", 2, 3), ("Relaxed", 2, 5), ("Lax", 2, 4),
+    ("Modest", 3, 1), ("Mild", 3, 2), ("Quiet", 3, 5), ("Rash", 3, 4),
+    ("Calm", 4, 1), ("Gentle", 4, 2), ("Sassy", 4, 5), ("Careful", 4, 3),
+    ("Timid", 5, 1), ("Hasty", 5, 2), ("Jolly", 5, 3), ("Naive", 5, 4),
+];
+
+/// PS `spreadModify` for one stat: `nature_mod` is +1 (×1.1), 0 (×1.0), or -1 (×0.9). Mirrors
+/// the exact truncation order in sim/pokemon.ts (`spreadModify`).
+fn ps_stat(base: i32, ev: i32, level: i32, is_hp: bool, nature_mod: i32) -> i32 {
+    let iv = 31;
+    let inner = 2 * base + iv + ev / 4;
+    if is_hp {
+        if base == 1 {
+            return 1; // Shedinja
+        }
+        return (inner + 100) * level / 100 + 10;
+    }
+    let v = inner * level / 100 + 5;
+    match nature_mod {
+        m if m > 0 => v * 11 / 10,
+        m if m < 0 => v * 9 / 10,
+        _ => v,
+    }
+}
+
+/// Find an EV in 0..=252 that makes `ps_stat` equal `target` for this stat, or `None`.
+fn solve_ev(base: i32, target: i32, level: i32, is_hp: bool, nature_mod: i32) -> Option<u8> {
+    (0..=252).find(|&ev| ps_stat(base, ev, level, is_hp, nature_mod) == target).map(|ev| ev as u8)
+}
+
+/// Recover a (nature, EVs, ivs=31) spread that makes PS's `spreadModify(species_base, set)`
+/// reproduce the exact target `stats` — so a switch-in / forme-change `setSpecies` (which
+/// recomputes `storedStats` FROM THE SET off the SPECIES DEX base stats) yields the same values
+/// the engine holds. The engine doesn't model the original spread (convert bakes it into
+/// storedStats), so we reconstruct any spread that hits the targets. Returns `None` if no single
+/// nature reproduces every stat (documented residual — falls back to a neutral 0-EV set, exact
+/// only until the mon switches in).
+fn solve_spread(species_base: &[u16; 6], stats: &[i16; 6], level: u8) -> Option<(&'static str, [u8; 6])> {
+    let lvl = level as i32;
+    'nat: for &(name, plus, minus) in NATURES {
+        let mut evs = [0u8; 6];
+        for s in 0..6 {
+            let nm = if s == plus && plus != 0 { 1 } else if s == minus && minus != 0 { -1 } else { 0 };
+            match solve_ev(species_base[s] as i32, stats[s] as i32, lvl, s == 0, nm) {
+                Some(ev) => evs[s] = ev,
+                None => continue 'nat,
+            }
+        }
+        return Some((name, evs));
+    }
+    None
+}
+
+/// A valid `PokemonSet` whose spread reproduces the exact `storedStats`/`baseStoredStats`, so PS
+/// `setSpecies` recompute (switch-in / forme change) matches the engine. See `solve_spread`.
 fn export_set(p: &Pokemon) -> Value {
     let moves: Vec<Value> = p
         .moves
@@ -397,20 +500,54 @@ fn export_set(p: &Pokemon) -> Value {
         .filter(|ms| ms.id != MoveId::None)
         .map(|ms| json!(ms.id.to_id()))
         .collect();
+    // Solve against the SPECIES DEX base stats (what `setSpecies`/`spreadModify` uses), targeting
+    // the engine's base-forme stats (which a switch-in `setSpecies(baseSpecies)` reproduces).
+    let species_base = engine::data::base_stats(p.base_species);
+    let (nature, evs) = solve_spread(&species_base, &p.base_stats, p.level).unwrap_or(("Serious", [0; 6]));
+    let ev_obj = json!({
+        "hp": evs[0], "atk": evs[1], "def": evs[2], "spa": evs[3], "spd": evs[4], "spe": evs[5],
+    });
     json!({
         "name": p.base_species.to_id(),
         "species": p.base_species.to_id(),
         "item": if p.item == Item::None { String::new() } else { p.item.to_id().to_string() },
         "ability": p.ability.to_id(),
         "moves": moves,
-        "nature": "Serious",
+        "nature": nature,
         // Explicit gender avoids a `sample(['M','F'])` construction draw for dual-gender species.
         "gender": match p.gender { 1 => "M", 2 => "F", _ => "N" },
-        "evs": { "hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0 },
+        "evs": ev_obj,
         "ivs": { "hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31 },
         "level": p.level,
-        "teraType": if p.tera_type == Type::None { String::from("Normal") } else { p.tera_type.to_id().to_string() },
+        "teraType": if p.tera_type == Type::None { String::from("Normal") } else { type_name(p.tera_type) },
     })
+}
+
+/// Roster slots in PS live-array order: ACTIVE mon first (field position 0), then the remaining
+/// non-empty roster slots ascending. PS indexes `slotConditions[position]` and requires the
+/// active mon at position 0, so the emitted array must be active-first (not roster order).
+fn emit_order(state: &State, si: usize) -> Vec<usize> {
+    let side = &state.sides[si];
+    let active_index = side.active_index as usize;
+    let has_active = side.active_index != u8::MAX;
+    let mut order = Vec::new();
+    if has_active && side.pokemon[active_index].species != engine::ids::Species::None {
+        order.push(active_index);
+    }
+    for slot in 0..6usize {
+        if has_active && slot == active_index {
+            continue;
+        }
+        if side.pokemon[slot].species != engine::ids::Species::None {
+            order.push(slot);
+        }
+    }
+    order
+}
+
+/// Array index (field position) of `roster_slot` on side `si` in the emitted active-first order.
+fn array_index_of(state: &State, si: usize, roster_slot: usize) -> usize {
+    emit_order(state, si).iter().position(|&s| s == roster_slot).unwrap_or(0)
 }
 
 fn export_side(state: &State, si: usize) -> Value {
@@ -418,30 +555,55 @@ fn export_side(state: &State, si: usize) -> Value {
     let active_index = side.active_index as usize;
     let has_active = side.active_index != u8::MAX;
 
-    // Emit non-empty roster slots in slot order; track the array index of each slot for refs.
+    // Emit in active-first order; each mon's `position` is its array index, `rosterIndex` its
+    // true (stable) roster slot — the field convert reads to place it back into the engine slot.
+    let order = emit_order(state, si);
     let mut mons = Vec::new();
-    let mut slot_to_arrayidx = [None; 6];
-    for slot in 0..6usize {
+    for (arr_idx, &slot) in order.iter().enumerate() {
         let p = &side.pokemon[slot];
-        if p.species == engine::ids::Species::None {
-            continue;
-        }
-        slot_to_arrayidx[slot] = Some(mons.len());
         let active = has_active && slot == active_index;
-        mons.push(export_pokemon(p, si, slot, active, side));
+        mons.push(export_pokemon(p, si, slot, arr_idx, active, side));
     }
 
-    // `team`: the /team-style ordering string PS uses to restore array order on deserialize.
-    // We already emit in canonical slot order, so it is the identity permutation.
+    // `team`: identity — the emitted array order is already the live order we want restored.
     let team: String = (1..=mons.len()).map(|n| n.to_string()).collect();
 
     let mut s = Map::new();
     s.insert("id".into(), json!(format!("p{}", si + 1)));
     s.insert("n".into(), json!(si));
     s.insert("name".into(), json!(if si == 0 { "Red" } else { "Blue" }));
+    // Back-reference to the opposing side. `start()`/`restart()` wire `foe`, but deserializeBattle
+    // runs `getRequests` (which reads `pokemon.foes()` -> `side.foe.allies()`) BEFORE the caller
+    // restarts — so it must be serialized. A full serializeBattle includes it (the recorder's
+    // snapshot drops it). Singles: no ally side.
+    s.insert("foe".into(), json!(format!("[Side:p{}]", (si ^ 1) + 1)));
+    s.insert("allySide".into(), Value::Null);
+    // `side.active` — references to the active mon(s). Deserialize resolves these to the Pokemon
+    // objects; without it PS leaves side.active = [null] and choice handling dereferences null.
+    // The active mon is emitted first (array index 0 == position 'a') in singles.
+    let active_ref = if has_active {
+        json!([pokemon_ref(si, 0)])
+    } else {
+        json!([Value::Null])
+    };
+    s.insert("active".into(), active_ref);
     s.insert("pokemon".into(), Value::Array(mons));
     s.insert("team".into(), json!(team));
     s.insert("teraUsed".into(), json!(side.tera_used));
+    // Faint accounting. `totalFainted` is load-bearing: a Supreme Overlord mon switching in during
+    // a continuation reads `side.totalFainted` in `onStart` to snapshot its `fallen` boost, and PS
+    // uses `pokemonLeft` for win detection. Cumulative `totalFainted` == current fainted count
+    // absent revival (a documented edge). `faintedLastTurn`/`faintedThisTurn` reset at a clean
+    // turn boundary.
+    let fainted = side.pokemon.iter().filter(|m| m.species != engine::ids::Species::None && m.hp <= 0).count();
+    let alive = side.pokemon.iter().filter(|m| m.species != engine::ids::Species::None && m.hp > 0).count();
+    s.insert("pokemonLeft".into(), json!(alive));
+    s.insert("totalFainted".into(), json!(fainted));
+    s.insert("faintedThisTurn".into(), Value::Null);
+    s.insert("faintedLastTurn".into(), Value::Null);
+    // `deserializeChoice` iterates `side.choice`'s keys — it must exist. A clean, no-pending-action
+    // choice (the canonical turn-start boundary) with an empty switchIns set.
+    s.insert("choice".into(), json!({ "switchIns": [] }));
 
     // Side conditions.
     let sc = &side.side_conditions;
@@ -496,18 +658,11 @@ fn export_side(state: &State, si: usize) -> Value {
         // `convert`: remaining = endingTurn + 2 - turn -> endingTurn = turn + remaining - 2.
         let ending = state.turn as i64 + side.future_sight.0 as i64 - 2;
         // The caster ref must point at the mon whose `rosterIndex` == future_sight.1. That mon is
-        // the Future Sight user, on the OPPOSITE side; find its array index for the position letter.
+        // the Future Sight user, on the OPPOSITE side; resolve_future_caster reads pokemon[pos]'s
+        // rosterIndex, so pos is the caster's array index in that side's active-first ordering.
         let caster_slot = side.future_sight.1 as usize;
         let caster_side = si ^ 1;
-        let caster_arrayidx = state.sides[caster_side]
-            .pokemon
-            .iter()
-            .take(caster_slot + 1)
-            .enumerate()
-            .filter(|(_, p)| p.species != engine::ids::Species::None)
-            .count()
-            .saturating_sub(1);
-        let source = pokemon_ref(caster_side, caster_arrayidx);
+        let source = pokemon_ref(caster_side, array_index_of(state, caster_side, caster_slot));
         slotcond.insert(
             "futuremove".into(),
             json!({ "id": "futuremove", "target": side_ref, "isSlotCondition": true, "endingTurn": ending, "source": source, "move": "futuresight" }),
@@ -530,21 +685,24 @@ fn export_side(state: &State, si: usize) -> Value {
 /// caller replaying with a forced-PRNG shim overrides the live PRNG anyway.
 pub fn export_state(state: &State, seed: [u16; 4]) -> Value {
     let mut field = Map::new();
-    let (weather_id, weather_dur) = (state.weather.to_id(), state.weather_turns);
+    // PS uses "" for absent weather/terrain (the engine's `None.to_id()` is "none").
+    let none_weather = state.weather == engine::ids::Weather::None;
+    let weather_id = if none_weather { "" } else { state.weather.to_id() };
     field.insert("weather".into(), json!(weather_id));
     field.insert(
         "weatherState".into(),
-        if state.weather == engine::ids::Weather::None {
+        if none_weather {
             json!({ "id": "", "effectOrder": 0 })
         } else {
-            json!({ "id": weather_id, "duration": weather_dur })
+            json!({ "id": weather_id, "duration": state.weather_turns })
         },
     );
-    let terrain_id = state.terrain.to_id();
+    let none_terrain = state.terrain == engine::ids::Terrain::None;
+    let terrain_id = if none_terrain { "" } else { state.terrain.to_id() };
     field.insert("terrain".into(), json!(terrain_id));
     field.insert(
         "terrainState".into(),
-        if state.terrain == engine::ids::Terrain::None {
+        if none_terrain {
             json!({ "id": "", "effectOrder": 0 })
         } else {
             json!({ "id": terrain_id, "duration": state.terrain_turns })
