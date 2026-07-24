@@ -10,6 +10,8 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 <div class="battle"></div><div class="battle-log"></div><div class="replay-controls"></div><div class="replay-controls-2"></div>
 <h1 style="font-weight:normal;text-align:center"><strong>c1</strong></h1>
 <script type="text/plain" class="battle-log-data">|start
+|switch|p1a: Greattusk|Greattusk|100/100
+|switch|p2a: Ironvaliant|Ironvaliant|100/100
 |turn|2
 |switch|p2a: Slowkinggalar|Slowkinggalar|100/100
 |move|p1a: Greattusk|Closecombat|p2a: Slowkinggalar
@@ -96,6 +98,9 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 |faint|p1a: Greattusk
 |-heal|p2a: Toxapex|77/100
 |upkeep
+|-boost|p1a: Greattusk|def|1
+|-boost|p1a: Greattusk|spd|1
+|-unboost|p1a: Greattusk|spe|1
 |switch|p1a: Kingambit|Kingambit|100/100
 |turn|11
 |-heal|p2a: Toxapex|100/100
@@ -126,7 +131,8 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 |-damage|p2a: Roaringmoon|0 fnt
 |faint|p2a: Roaringmoon
 |upkeep
-|switch|p2a: Toxapex|Toxapex|88/100
+|switch|p2a: Toxapex|Toxapex|100/100
+|-damage|p2a: Toxapex|88/100
 |turn|15
 |-unboost|p1a: Kingambit|atk|2
 |switch|p1a: Dragapult|Dragapult|100/100
@@ -154,7 +160,6 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 |upkeep
 |turn|19
 |move|p1a: Gholdengo|Focusblast|p2a: Toxapex
-|-start|p1a: Gholdengo|ChoiceLock
 |-resisted|p2a: Toxapex
 |-damage|p2a: Toxapex|82/100
 |move|p2a: Toxapex|Recover|p2a: Toxapex
@@ -292,7 +297,10 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 |-damage|p2a: Ironvaliant|0 fnt
 |faint|p2a: Ironvaliant
 |upkeep
-|switch|p2a: Slowkinggalar|Slowkinggalar|81/100
+|-unboost|p2a: Ironvaliant|spa|1
+|-boost|p2a: Ironvaliant|spd|1
+|switch|p2a: Slowkinggalar|Slowkinggalar|94/100
+|-damage|p2a: Slowkinggalar|81/100
 |turn|37
 |move|p1a: Dragapult|Shadowball|p2a: Slowkinggalar
 |-supereffective|p2a: Slowkinggalar
@@ -478,13 +486,15 @@ html,body {font-family:Verdana, sans-serif;font-size:10pt;margin:0;padding:0;}bo
 |-damage|p2a: Dragonite|0 fnt
 |faint|p2a: Dragonite
 |upkeep
-|switch|p2a: Toxapex|Toxapex|79/100
+|switch|p2a: Toxapex|Toxapex|91/100
+|-damage|p2a: Toxapex|79/100
 |turn|61
 |move|p1a: Kingambit|Kowtowcleave|p2a: Toxapex
 |-damage|p2a: Toxapex|0 fnt
 |faint|p2a: Toxapex
 |upkeep
-|switch|p2a: Slowkinggalar|Slowkinggalar|88/100
+|switch|p2a: Slowkinggalar|Slowkinggalar|100/100
+|-damage|p2a: Slowkinggalar|88/100
 |turn|63
 |move|p1a: Kingambit|Swordsdance|p1a: Kingambit
 |-boost|p1a: Kingambit|atk|2
