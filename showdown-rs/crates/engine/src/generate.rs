@@ -6946,13 +6946,17 @@ fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec
     if !can_land {
         // Draw-and-discard: PS rolls, the disable no-ops. State validates, so no split.
         let mut b = b;
-        draw(&mut b, "randomChance", &[3, 10], 3, "cursedbody");
+        draw(&mut b, "randomChance", &[3, 10], 0, "cursedbody");
         return vec![b];
     }
+    // randomChance procs use the boolean convention (proc=1, noproc=0) — same as crit / par / frz /
+    // Cute Charm / Poison Touch — so the seed-gate `replicate_select` exact-matches the realized
+    // `random_chance` value (0/1). (The 0/chance encoding is only for the `random(100)` secondaries,
+    // which `replicate_select` threshold-decodes separately.)
     let mut proc = scaled(&b, 0.30);
-    draw(&mut proc, "randomChance", &[3, 10], 0, "cursedbody");
+    draw(&mut proc, "randomChance", &[3, 10], 1, "cursedbody");
     let mut noproc = scaled(&b, 0.70);
-    draw(&mut noproc, "randomChance", &[3, 10], 3, "cursedbody");
+    draw(&mut noproc, "randomChance", &[3, 10], 0, "cursedbody");
     push(&mut proc, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Disable });
     let prev = proc.state.side(side).disable;
     // The attacker has already moved this turn -> full 4-turn disable (PS duration 5 - 1
