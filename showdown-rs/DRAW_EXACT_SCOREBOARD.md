@@ -5,6 +5,49 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## State-computation + drag/trace/no-guard tranche (2026-07-24): 98/111 -> 103/111 (+5, 4 commits)
+
+Worked the state-computation singles + realized-selection queue. All rails green each commit
+(engine tests 12 suites incl roundtrip, state-sweep **3831/3831** 0-diverged/0-unsupported,
+distribution smoke **18/18**, seed-gate exact-set strictly grew — zero prior-exact regression).
+
+| commit | games | root cause + PS ref |
+|--------|-------|---------------------|
+| Effect Spore immune-band + drag PS-array reconstruction | 98->**100** (rd318, c5a1) | (a) Effect Spore rolls ONE `random(100)` into bands slp/par/psn/none; a band whose status can't land (Steel-tera Hydrapple immune to the psn band's poison) was folded into the noproc branch at res=30, shifting the realized decoder's thresholds so a psn-band roll (25) selected the par band. Emit each band as a no-op branch at its own threshold. (b) Drag `getRandomSwitchable` samples PS's CURRENT `side.pokemon` array; if the dragged side switched earlier this turn, mirror PS's `swap(0,j)` to reconstruct the live order (was a canonical fallback picking the wrong mon). |
+| Revert Tera on faint (revived mon is base form) | 100->**101** (c1c) | PS `delete pokemon.terastallized` in faintMessages — a mon that faints Tera'd is revived (Revival Blessing) in BASE form. The forward gate carried the stale Tera on the hp=0 mon and showed it on revive. `apply_revive` reverts types+terastallized; `ToggleTerastallized` forward-apply now keeps `tera_used` sticky (reverse still recomputes) so the side flag stays spent. |
+| Skip accuracy roll for special-cased status moves vs No Guard | 101->**102** (r11) | Strength Sap / Trick / Octolock emitted `randomChance(acc,100)` unconditionally; PS forces accuracy `true` (no roll) vs a No Guard target. r11: Polteageist's Strength Sap into No Guard Golurk. Gated all three on `!accuracy_forced_true`. (The scoreboard's old "Poltergeist accuracy skip" diagnosis was WRONG — Poltergeist never emits accuracy; the extra draw was Strength Sap's.) |
+| Consume Trace switch-in sample for forced replacements | 102->**103** (c3c2s83) | A Trace replacement fires `sample(1)@trace` on switch-in; `switch_into` (state only) dropped it. step_unit consumes one per tracing replacement. Advances c3c2s82 d23->d33 (new divergence = a Leftovers-entangled compute_damage rounding, separate). |
+
+### Remaining 8 non-exact — re-characterized (some prior diagnoses corrected)
+- **d6** d64[t55]: weather-SETTING mid-turn switch schedule (item 1). Probed exactly: engine
+  emits 5 update shuffles, PS 8 — missing `shuffle[2,0,2]@drizzle` (SwitchIn WeatherChange when
+  Pelipper's Drizzle sets rain) + TWO `shuffle[2,0,2]@raindance` (FieldResidual). All tie-gated
+  `[2,0,2]`. Needs the mid-turn weather-set + weather-FieldResidual speedSort emissions.
+- **c6a2s114** d36[t31]: engine drops PS's trailing `random[100]@curse` — a Snorlax secondary in
+  the mid-turn recompute (item 2; fragile DP path).
+- **t2** d7[t8]: switch + tera + move Update-count — engine emits 4 `shuffle@update`, PS 3 (one
+  extra in the tera-action bracket). (NOT the stall residual `[3,0,2]` vs `[2,0,2]` at d5 — that
+  is stream-neutral: both consume one `random` over the same 2-tie-group.)
+- **r10** d38: confusion_turns — SYMPTOM of an earlier mid-turn desync (DRAWCMP shows d30
+  `PS-unconsumed shuffle@generic` mid-turn); the mid-turn-faint schedule class.
+- **c3c2s82** d33[t30]: Grass Knot / Mystical Fire damage each off ±1-2, entangled with both mons'
+  Leftovers end-of-turn heal — the masked compute_damage rounding class.
+- **c2a1** d9[t8]: Future Sight + Meteor Beam genuine move-order-tie ambiguous fork (item 4).
+- **r2** d7 / **r3** d23: parked (stall-volatile residual State flag needs a new State field;
+  per-hit Cursed Body carries Scale Shot regression risk).
+
+### Transplant gate (item 6): **79/110** OK (unchanged) — my flipped games c1c/c3c2s83/c5a1 now OK,
+but r11/c3c2s82/c6a2s114/r10 diverge in transplant at earlier per-decision points (mostly the
+`request-phase: extra mid-turn faint — turn-cascade` class, deferred per EXPORT_PROTOCOL_OPENS.md),
+so no net transplant delta from these seed-gate fixes.
+
+**Kill criterion: NOT triggered.** Four real structured roots landed (realized-band decoding,
+array-order drag, faint-Tera-revert, No-Guard accuracy skip, Trace-replacement draw). Remaining
+climb is the mid-turn/weather-schedule + compute-rounding classes — intricate, state-risky,
+PS-probe-gated, ~1 game each.
+
+---
+
 ## Mid-turn-faint Update schedule — GROUND-TRUTHED TABLE (2026-07-24, tranche start at 93/111)
 
 Probed each mid-turn re-request unit in the 6 games with `harness/cosim_probe.mjs` (patched cosim
