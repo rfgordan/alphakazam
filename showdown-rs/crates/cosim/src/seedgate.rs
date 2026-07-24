@@ -418,6 +418,12 @@ fn step_unit(
     state.apply_instructions(&outcomes[choice].instructions);
 
     let pre_end_turn = !replacements.is_empty() && unit.last().is_some_and(|d| d.turn == dp.turn);
+    // A replacement whose incoming mon has Trace fires a `sample(1)@trace` draw on switch-in that
+    // `switch_into` (state only) skips — detect it BEFORE applying the swap (afterwards the ability
+    // is already copied). PS consumes it during the replacement's runSwitch (c3c2s82/s83).
+    let trace_draws = replacements.iter()
+        .filter(|&&(side, slot)| engine::generate::trace_replacement_sample(state, side_id(side), slot))
+        .count();
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
         engine::generate::switch_into_pair(state, [
@@ -461,6 +467,12 @@ fn step_unit(
                 let _ = consume(prng, "shuffle", &[2, 0, 2]);
             }
         }
+    }
+    // Trace's switch-in `sample(1)` for each tracing replacement (after the switch bracket, in the
+    // replacement's runSwitch onUpdate). Consumed here because `switch_into` applies the copied
+    // ability to state but not the draw.
+    for _ in 0..trace_draws {
+        let _ = consume(prng, "sample", &[1]);
     }
     Ok((chosen_draws, ambiguous))
 }

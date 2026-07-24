@@ -569,6 +569,40 @@ pub fn replacement_bracket_tied(state: &State) -> bool {
     actives_update_tie(state, false)
 }
 
+/// Whether `ability` can be copied by Trace (PS `onUpdate` skips a `notrace`/self-referential
+/// ability — the copy never fires and no `sample` is drawn). Shared by the switch-in Trace copy
+/// and the seed gate's forced-replacement trace-draw accounting.
+pub(crate) fn ability_is_traceable(ability: crate::ids::Ability) -> bool {
+    use crate::ids::Ability::*;
+    !matches!(
+        ability,
+        None | Trace | AsOneGlastrier | AsOneSpectrier | Comatose | Disguise | FlowerGift
+            | Forecast | GulpMissile | HungerSwitch | IceFace | Illusion | Imposter
+            | Multitype | NeutralizingGas | PowerConstruct | PowerOfAlchemy | Receiver
+            | RKSSystem | Schooling | ShieldsDown | StanceChange | WonderGuard | ZenMode
+            | ZeroToHero | Commander
+            // PS `notrace` flag additions:
+            | BattleBond | EmbodyAspectCornerstone | EmbodyAspectHearthflame
+            | EmbodyAspectTeal | EmbodyAspectWellspring | Hospitality
+            | PoisonPuppeteer | Protosynthesis | QuarkDrive
+            | TeraShell | TeraShift | TeraformZero
+    )
+}
+
+/// Whether a mon at party `slot` about to switch into `side` will fire Trace's `sample(1)` draw:
+/// its stored ability is Trace and the current foe active is alive with a traceable ability. Used
+/// by the seed gate — a forced/post-turn replacement applied via `switch_into` (state only) skips
+/// this switch-in `onUpdate` draw, which PS still consumes (c3c2s82/s83: a Trace Gardevoir replaces
+/// a fainted mon and copies the foe's ability).
+pub fn trace_replacement_sample(state: &State, side: SideId, slot: u8) -> bool {
+    let mon = &state.side(side).pokemon[slot as usize];
+    if mon.ability != crate::ids::Ability::Trace {
+        return false;
+    }
+    let foe = state.side(side.other()).active();
+    foe.is_alive() && ability_is_traceable(foe.ability)
+}
+
 /// Emit the post-action `eachEvent('Update')` shuffle (battle.ts:2882 runAction, post-residual,
 /// switch/tera brackets, and post-hit-loop 1024) — fires iff both actives are alive and tied.
 /// Annotation-only; state-neutral (PS logs the shuffle order as null, validated via `stateAfter`).
@@ -2045,19 +2079,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     if ability == Trace {
         let foe = side.other();
         let fa = b.state.side(foe).active().ability;
-        let untraceable = matches!(
-            fa,
-            None | Trace | AsOneGlastrier | AsOneSpectrier | Comatose | Disguise | FlowerGift
-                | Forecast | GulpMissile | HungerSwitch | IceFace | Illusion | Imposter
-                | Multitype | NeutralizingGas | PowerConstruct | PowerOfAlchemy | Receiver
-                | RKSSystem | Schooling | ShieldsDown | StanceChange | WonderGuard | ZenMode
-                | ZeroToHero | Commander
-                // PS `notrace` flag additions:
-                | BattleBond | EmbodyAspectCornerstone | EmbodyAspectHearthflame
-                | EmbodyAspectTeal | EmbodyAspectWellspring | Hospitality
-                | PoisonPuppeteer | Protosynthesis | QuarkDrive
-                | TeraShell | TeraShift | TeraformZero
-        );
+        let untraceable = !ability_is_traceable(fa);
         if b.state.side(foe).active().is_alive() && !untraceable {
             // PS Trace `onUpdate` picks its target via `this.sample(possibleTargets)` — the
             // traceable adjacent foes (battle abilities.ts). In singles that list is length 1, so
