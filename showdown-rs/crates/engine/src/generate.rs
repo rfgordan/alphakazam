@@ -1105,6 +1105,22 @@ fn accuracy_arg(b: &Branch, side: SideId, md: &crate::data::MoveData) -> i32 {
     accuracy_numerator(b, side, md)
 }
 
+/// Counter-family damage-return moves (Counter / Mirror Coat / Metal Burst / Comeuppance) fail at
+/// PS `onTry` — BEFORE `hitStepAccuracy` — when no qualifying damage was taken this turn, so PS
+/// makes NO accuracy draw (nor crit/damage; the fixed-damage path emits none of those anyway). The
+/// engine otherwise reaches the accuracy branch and rolls a phantom `randomChance(100,100)`. Gate
+/// the accuracy annotation on this so the failing move emits nothing (annotation-only; the failing
+/// move already deals 0 damage, so state is unchanged).
+fn counter_family_ontry_fails(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    let s = b.state.side(side);
+    match md.id.to_id() {
+        "counter" => s.physical_damage_taken <= 0,
+        "mirrorcoat" => s.special_damage_taken <= 0,
+        "metalburst" | "comeuppance" => s.physical_damage_taken <= 0 && s.special_damage_taken <= 0,
+        _ => false,
+    }
+}
+
 /// Whether PS overrides a move's accuracy to `true` (bypassing the `hitStepAccuracy` roll
 /// entirely) via an `Accuracy`/`ModifyMove` event, as opposed to a numeric accuracy that merely
 /// evaluates to 100. A `true` override means PS makes NO accuracy draw — but a later crit /
@@ -3652,7 +3668,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Annotate on `b` so both the hit and miss branches inherit this draw. (Accuracy/evasion
     // stages and modifiers shift the recorded arg; unmodeled here — the differ flags them.)
     let mut acc_draw_pushed = false;
-    if annotating() && md.accuracy != 0 && !accuracy_forced_true(&b, side, &md) {
+    if annotating() && md.accuracy != 0 && !accuracy_forced_true(&b, side, &md)
+        && !counter_family_ontry_fails(&b, side, &md)
+    {
         let reaches_accuracy = {
             let foe_alive = b.state.side(foe).active().is_alive();
             let semi_invuln = matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m));

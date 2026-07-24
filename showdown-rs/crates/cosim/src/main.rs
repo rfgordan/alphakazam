@@ -234,6 +234,7 @@ fn main() -> ExitCode {
 
 fn run_draw_diff(args: &[String]) -> ExitCode {
     let verbose = std::env::var("VERBOSE").is_ok();
+    let diff_label = std::env::var("DIFF_LABEL").ok();
     let mut board = drawdiff::DrawScoreboard::default();
     let mut ps_commit: Option<String> = None;
     for path in args {
@@ -257,7 +258,14 @@ fn run_draw_diff(args: &[String]) -> ExitCode {
                     match &u.class {
                         drawdiff::DrawClass::Exact => ex += 1,
                         drawdiff::DrawClass::Unsupported(_) => un += 1,
-                        drawdiff::DrawClass::Mismatch { .. } => mm += 1,
+                        drawdiff::DrawClass::Mismatch { label, detail, .. } => {
+                            mm += 1;
+                            if let Some(f) = &diff_label {
+                                if label.contains(f.as_str()) {
+                                    println!("MM {path} t{} | {label} | {detail}", u.turn);
+                                }
+                            }
+                        }
                     }
                 }
                 if verbose {

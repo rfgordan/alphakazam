@@ -239,6 +239,25 @@ fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonic
     let rec = rec_draws_of(unit);
     let pre_end_turn = !replacements.is_empty() && unit.last().is_some_and(|d| d.turn == dp.turn);
 
+    if let Ok(want) = std::env::var("DUMP_TURN") {
+        if want.parse::<u32>() == Ok(turn) {
+            eprintln!("=== DUMP turn {turn} mc={:?} outcomes={} ===", mc, outcomes.len());
+            eprintln!("  ps  ={:?}", rec.iter().map(|r| r.label.clone()).collect::<Vec<_>>());
+            for (oi, o) in outcomes.iter().enumerate() {
+                let mut cand = state_before;
+                cand.apply_instructions(&o.instructions);
+                for &(side, slot) in &replacements {
+                    engine::generate::switch_into(&mut cand, crate::convert::side_id(side), slot);
+                }
+                let sd = diff_states(&cand, &state_target);
+                let sm = sd.is_empty();
+                if oi < 4 && !sm { eprintln!("      state_diff[{oi}]={:?}", sd.iter().map(|x| x.detail.clone()).collect::<Vec<_>>()); }
+                eprintln!("  [{oi}] p={:.3} state_match={sm} draws={:?}", o.percentage,
+                    o.draws.iter().map(|d| format!("{}{:?}@{}", d.kind, d.args, d.site)).collect::<Vec<_>>());
+            }
+        }
+    }
+
     // Materialize each outcome's final state exactly as replay does; find one matching `target`.
     // Draw *shapes* are invariant across the roll values that lead to a given state, so the
     // first state-matching outcome's draw log is representative.
