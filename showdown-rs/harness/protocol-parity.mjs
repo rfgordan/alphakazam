@@ -62,6 +62,7 @@ const COSMETIC_PREFIXES = [
 	'|t:', '|player', '|teamsize', '|gametype', '|gen', '|tier', '|rule', '|clearpoke', '|poke',
 	'|teampreview', '|split', '|', '|j', '|l', '|c', '|inactive', '|inactiveoff', '|-endability',
 	'|upkeep', '|start', '|-end', // -end mostly [silent] volatile bookkeeping PS emits, engine omits
+	'|-hitcount', // multi-hit hit-count annotation (Icicle Spear x5, …) — no state delta
 	'|debug', '|-clearallboost', '|-clearboost', '|-clearnegativeboost', '|-copyboost', '|-swapboost',
 	'|-invertboost', '|-setboost', // Haze/Clear Smog/etc. clear as a group; engine emits per-stat unboost
 	'|-immune', // PS adds -immune for ABILITY immunities (Good as Gold, Levitate, Flash Fire, ...);

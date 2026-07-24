@@ -330,10 +330,13 @@ fn condition_name(c: SideConditionId) -> &'static str {
 /// handles via other lines) carry no PS event and are skipped.
 fn ps_announces_volatile(v: crate::volatile::VolatileStatus) -> bool {
     use crate::volatile::VolatileStatus::*;
+    // ChoiceLock, Protosynthesis/QuarkDrive (announced by PS as [silent]/-activate, not -start),
+    // and the single-turn / internal bookkeeping volatiles carry no engine-visible PS -start line.
     !matches!(
         v,
         StatsRaisedThisTurn | StatsLoweredThisTurn | TypeShifted | Roosted | Protect | Endure
-            | Flinch | Charge | MustRecharge | LockedMove | Unburden
+            | Flinch | Charge | MustRecharge | LockedMove | Unburden | ChoiceLock
+            | Protosynthesis | QuarkDrive
     )
 }
 

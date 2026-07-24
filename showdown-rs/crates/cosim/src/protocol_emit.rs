@@ -146,6 +146,12 @@ fn emit_game(t: &Trace, hp_style: HpStyle) -> Result<Vec<String>, String> {
 
     let mut out = Vec::new();
     out.push("|start".to_string());
+    // Initial lead switch-ins (PS emits |switch| for both leads at battle start).
+    for side in [engine::state::SideId::One, engine::state::SideId::Two] {
+        if state.side(side).active_index != u8::MAX {
+            out.push(engine::protocol::switch_line(&state, side, hp_style));
+        }
+    }
 
     let mut i = 1usize;
     while i < t.decisions.len() {
