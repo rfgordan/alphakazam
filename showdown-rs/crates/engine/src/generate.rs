@@ -565,8 +565,24 @@ fn actives_speed_tied(state: &State) -> bool {
 /// `shuffle[2,0,2]`), each a `getAllActive()` speed-tie shuffle on the POST-swap board. The gate
 /// applies replacements via `switch_into` (state only), so it consumes this bracket separately —
 /// gated on exactly this predicate (both actives alive and equal `effective_speed`).
-pub fn replacement_bracket_tied(state: &State) -> bool {
-    actives_update_tie(state, false)
+///
+/// `replaced[i]` marks a side whose active JUST entered via this replacement. PS's Update speedSort
+/// reads the CACHED `pokemon.speed`, refreshed only by `updateSpeed()` — which runs in
+/// `commitChoices` (battle.ts:3020) over `getAllActive()`, i.e. BEFORE the replacement switches in,
+/// and skips the fainted slot entirely. So the incoming mon's cached speed predates its switch-in,
+/// and any Speed change applied ON ENTRY (Sticky Web's −1) is invisible to this bracket's tie.
+/// Ground-truthed on c3c2s82 d49: Iron Crown replaces a fainted Grimmsnarl into Sticky Web
+/// (stored Spe 324, boosted to 216 — exactly the foe Deoxys-Defense's 216), yet PS consumes ZERO
+/// draws — its cached speed is still 324. (Other stale-cache deltas — a mon last active under a
+/// weather Speed ability, Slow Start's active-turn window — are not modeled; no corpus instance.)
+pub fn replacement_bracket_tied(state: &State, replaced: [bool; 2]) -> bool {
+    let mut st = *state;
+    for i in 0..2 {
+        if replaced[i] {
+            st.sides[i].boosts[BoostIndex::Speed as usize] = 0;
+        }
+    }
+    actives_update_tie(&st, false)
 }
 
 /// Whether `ability` can be copied by Trace (PS `onUpdate` skips a `notrace`/self-referential

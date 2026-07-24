@@ -468,7 +468,7 @@ fn step_unit(
     // engine's annotated switch bracket (generate.rs) covers only VOLUNTARY move+switch pivots; this
     // consumes the forced-replacement bracket the gate would otherwise skip (a state-neutral drift
     // that only surfaces at the next Speed-sensitive roll). Off a tie: 0 draws → no effect.
-    if !pre_end_turn && !replacements.is_empty() && engine::generate::replacement_bracket_tied(state) {
+    if !pre_end_turn && !replacements.is_empty() && engine::generate::replacement_bracket_tied(state, replaced) {
         let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
             1 // simultaneous both-sides double faint: only the second switch sees both actives alive
         } else {
