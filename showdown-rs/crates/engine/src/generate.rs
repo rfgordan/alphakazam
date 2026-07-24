@@ -243,7 +243,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -285,6 +285,11 @@ pub(crate) struct Branch {
     pub(crate) ins: Vec<Instruction>,
     /// Ordered PRNG draws that produced this branch (populated only under annotation).
     pub(crate) draws: Vec<DrawEvent>,
+    /// Transient (NOT part of State): did the move being resolved on this branch FAIL to connect
+    /// — immune / missed / no-target / blocked (PS `moveThisTurnResult === false`)? Set at the
+    /// damaging-move failure sites; committed to the side's `last_move_failed` once per move action
+    /// in `run_move_action`. Defaults false ("succeeded"); reset implicitly each move.
+    pub(crate) move_failed: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1275,7 +1280,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1361,7 +1366,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -1508,7 +1513,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -1767,7 +1772,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
 /// actives, then switch-in abilities in speed order of the INCOMING actives.
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new() };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2165,10 +2170,23 @@ pub(crate) struct Action {
 /// move action completes — hit, miss, immunity, or a fully-cancelled attempt — PS fires
 /// `eachEvent('Update')`, which shuffles on a surviving equal-Speed pair. The in-kernel per-hit
 /// (970) and post-hit-loop (1024) Updates are emitted inside `execute_move`; this adds the 2882.
-fn run_move_action(b: Branch, action: Action) -> Vec<Branch> {
+fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
+    let side = action.side;
+    // Fresh per-move outcome flag: this branch may carry a `move_failed` set by an earlier action
+    // this turn (sequence_two_moves reuses the branch for the second mover).
+    b.move_failed = false;
     let mut out = execute_move(b, action);
     if annotating() {
         for nb in &mut out {
+            // Commit PS's `moveLastTurnResult` for the acting side: a move that failed to connect
+            // (immune / miss / no-target / blocked) sets it `false` — the signal Stomping Tantrum's
+            // base-power doubler reads next turn. The read (BP calc) already happened inside
+            // execute_move against the PRIOR value, so committing here is PS's nextTurn semantics.
+            // Not diffed (engine-internal); annotation-gated so Enumerate/Sample stay byte-identical.
+            let cur = nb.state.side(side).last_move_failed;
+            if cur != nb.move_failed {
+                push(nb, Instruction::SetLastMoveFailed { side, previous: cur, new: nb.move_failed });
+            }
             emit_update(nb);
         }
     }
@@ -2230,7 +2248,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone() }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -3633,6 +3651,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // A blocked rampage ends its lock without confusion; a blocked first use never locks.
         end_rampage_on_fail(&mut b, side, move_id);
+        b.move_failed = true; // Protect-blocked → PS moveThisTurnResult false (doubles ST)
         return vec![b];
     }
 
@@ -3642,6 +3661,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && is_grounded(&b.state, foe)
         && b.state.side(foe).active().is_alive()
     {
+        b.move_failed = true; // blocked → moveThisTurnResult false
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
     }
 
@@ -3665,6 +3685,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
             if pri > 0 && !mb && !side_targeting {
+                b.move_failed = true; // blocked → moveThisTurnResult false
                 return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
             }
         }
@@ -3675,6 +3696,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && b.state.side(foe).active().item == Item::AirBalloon
         && b.state.side(foe).active().is_alive()
     {
+        b.move_failed = true; // blocked → moveThisTurnResult false
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
     }
 
@@ -3775,6 +3797,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
         }
         end_rampage_on_fail(&mut mb, side, move_id);
+        mb.move_failed = true; // missed → PS moveThisTurnResult false (doubles ST next turn)
         miss_out.push(mb);
     }
 
@@ -3783,6 +3806,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // No living target: the move fails outright — no rampage lock, no recharge.
         let mut hb = scaled(&b, hit_prob);
         end_rampage_on_fail(&mut hb, side, move_id);
+        hb.move_failed = true; // no target → moveThisTurnResult false
         out.push(hb);
         out.extend(miss_out);
         return out;
@@ -3791,6 +3815,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m)) {
         let mut hb = scaled(&b, hit_prob);
         end_rampage_on_fail(&mut hb, side, move_id);
+        hb.move_failed = true; // dodged (semi-invulnerable) → moveThisTurnResult false
         out.push(hb);
         out.extend(miss_out);
         return out;
@@ -3823,12 +3848,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let mut ib = scaled(&b, hit_prob);
         // Absorbing abilities that boost the holder on the negated hit: Well-Baked Body (+2 Def
         // vs Fire), Wind Rider (+1 Atk vs a wind move). Only when this ability caused the block.
-        if def_ab == crate::ids::Ability::WellBakedBody && md.typ == Type::Fire {
+        let well_baked = def_ab == crate::ids::Ability::WellBakedBody && md.typ == Type::Fire;
+        if well_baked {
             raise_boost(&mut ib, foe, BoostIndex::Defense, 2);
         }
         if wind_immune {
             raise_boost(&mut ib, foe, BoostIndex::Attack, 1);
         }
+        // Type-chart / Levitate immunity fails the move (PS `runImmunity` → hitResult false →
+        // moveThisTurnResult false → Stomping Tantrum doubles next turn). A boosting absorb
+        // (Well-Baked Body / Wind Rider) instead returns null → NOT a failure (no ST double).
+        ib.move_failed = !well_baked && !wind_immune;
         out.push(ib);
         // A rampage move (Outrage/Thrash) that hits an immune target ENDS the lock (without
         // confusion) — route through the rampage/recoil tail rather than returning bare.

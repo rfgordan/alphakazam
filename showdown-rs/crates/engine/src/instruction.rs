@@ -147,6 +147,10 @@ pub enum Instruction {
 
     // --- consecutive-use tracking (active Pokémon; resets on switch) ---
     SetLastMove { side: SideId, previous: MoveId, new: MoveId },
+    /// PS `moveLastTurnResult === false` — the side's active's move last turn FAILED (immune /
+    /// missed / no-target / blocked). Read only by Stomping Tantrum's base-power doubler. Committed
+    /// once per move action (annotation path); engine-internal, not diffed.
+    SetLastMoveFailed { side: SideId, previous: bool, new: bool },
     SetMoveStreak { side: SideId, previous: u8, new: u8 },
     SetStallCounter { side: SideId, previous: u8, new: u8 },
     SetStallTurns { side: SideId, previous: u8, new: u8 },
@@ -319,6 +323,9 @@ impl State {
             SetLastMove { side, new, .. } => {
                 self.side_mut(side).last_used_move = new;
             }
+            SetLastMoveFailed { side, new, .. } => {
+                self.side_mut(side).last_move_failed = new;
+            }
             SetMoveStreak { side, new, .. } => {
                 self.side_mut(side).move_streak = new;
             }
@@ -490,6 +497,9 @@ impl State {
             }
             SetLastMove { side, previous, .. } => {
                 self.side_mut(side).last_used_move = previous;
+            }
+            SetLastMoveFailed { side, previous, .. } => {
+                self.side_mut(side).last_move_failed = previous;
             }
             SetMoveStreak { side, previous, .. } => {
                 self.side_mut(side).move_streak = previous;
