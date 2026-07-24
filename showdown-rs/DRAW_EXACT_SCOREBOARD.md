@@ -5,6 +5,31 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+## Terminal state after the two Update-schedule tranches (93/111 = 83.8%)
+
+18 games remain non-exact. First-divergence classes (live seed gate):
+- **mid-turn re-request / faint Update schedule (c3, c4, c5, r6, d6; + c5a1's later thunderwave
+  divergence)** — THE dominant remaining class. A `midTurn:true` unit (a mon faints mid-turn, its
+  side switches in a replacement, the other side's move then resolves) whose Update shuffle schedule
+  the gate mis-counts: `step_unit` resolves the mid-turn switch as a pivot and emits a fresh
+  turn-start bracket instead of PS's mid-turn switch-in bracket (d6 idx25 ground-truthed: switch
+  runAction Update + runSwitch getAllActive speedSort battle-actions:178 + runSwitch runAction Update,
+  then the other side's move 970/1024). SHARED turn-resolution/faint path — HIGH regression risk;
+  reserved for a dedicated careful tranche (see HANDOFF diagnostic method: prng.getSeed vs
+  prng.limbs() drift-localization + call-site probe).
+- **c5a1 thunderwave move-order** (d18[t16]: PS `shuffle[2,0,2]@thunderwave` vs rust
+  `randomChance[1,4]@par`) — a status-move Update / move-order interleaving.
+- **c2a1** move-order-tie genuine fork; **c3c2s82/s83** Trace onUpdate re-fire; **c6a2s114** mid-turn
+  Palafin re-fire + curse; **d6** rust-extra crit (mid-turn); **r10** confusion; **r11** Poltergeist
+  accuracy skip; **r2** stall-volatile cosmetic; **r3** per-hit Cursed Body; **rd318** Fickle Beam;
+  **t1** frz thaw boundary; **t2** / **c1c** state-diff. (Per the ledger below.)
+
+**Kill criteria: NOT triggered.** Both landed classes were real structured shared-path roots
+(density still decaying); the remaining climb is gated on the mid-turn-faint schedule (intricate,
+state-risky) + per-move state-path items.
+
+---
+
 ## Replacement-switch bracket tranche 2026-07-24 (90/111 -> 93/111; forced-switch draw gap)
 
 Root found by comparing PS's per-turn PRNG seed (probe `battle.prng.getSeed()`) against the gate's
