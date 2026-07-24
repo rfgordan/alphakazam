@@ -7816,12 +7816,14 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         let (mine, theirs) = (b.state.side(side).active().item, b.state.side(foe2).active().item);
         let sticky = b.state.side(foe2).active().ability == crate::ids::Ability::StickyHold;
         // Trick / Switcheroo are foe-targeting numeric-accuracy (100) status moves: PS
-        // `hitStepAccuracy` rolls `randomChance(100,100)` (they reach it — Sticky Hold blocks the
-        // item swap later at `onTakeItem`, not before accuracy). Special-cased above the general
-        // status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits). A fainted
-        // foe (no target) fails earlier and never rolls.
+        // `hitStepAccuracy` rolls `randomChance(accuracy,100)` (they reach it — Sticky Hold blocks
+        // the item swap later at `onTakeItem`, not before accuracy). Special-cased above the general
+        // status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits). The arg is
+        // post-`ModifyAccuracy`/stage: a +1-accuracy Trick user rolls `randomChance(133,100)`
+        // (r10 t17). A fainted foe (no target) fails earlier and never rolls.
         if annotating() && b.state.side(foe2).active().is_alive() {
-            draw(&mut b, "randomChance", &[100, 100], 1, "accuracy");
+            let acc = accuracy_arg(&b, side, md);
+            draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
         }
         if b.state.side(foe2).active().is_alive() && !sticky && (mine != Item::None || theirs != Item::None) {
             let my_slot = b.state.side(side).active_index;
