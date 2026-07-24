@@ -8429,20 +8429,31 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
         return vec![b];
     }
     let sd = b.state.side(dragged);
-    let bench: Vec<u8> = (0..6u8)
-        .filter(|&i| {
-            i != sd.active_index
-                && sd.pokemon[i as usize].species != crate::ids::Species::None
-                && sd.pokemon[i as usize].is_alive()
-        })
-        .collect();
+    let alive_benched = |i: u8| i != sd.active_index
+        && sd.pokemon[i as usize].species != crate::ids::Species::None
+        && sd.pokemon[i as usize].is_alive();
+    // PS's `getRandomSwitchable` samples over `side.pokemon.slice(active.length)` — its CURRENT
+    // array order (active-first, swap-tracked by `switchIn`), NOT canonical teampreview order. So
+    // the drawn index maps into PS's array order. The seed gate installs the PRE-STATE array order
+    // (shared with Beat Up); Enumerate/Sample leave it None and fall back to canonical slot order.
+    //
+    // The installed order is only valid while the dragged side's active is still the pre-state
+    // active (array position 0). If that side switched EARLIER this turn (its own switch, before the
+    // drag), `switchIn` swapped a different mon to the front and the pre-state order is stale — its
+    // old active would wrongly appear at the head of the bench. Detect that (active_index no longer
+    // matches the order's head) and fall back to canonical order, which stays correct in the common
+    // no-intra-turn-reorder case (d3: p2 switched then got Whirlwind-dragged).
+    let order_valid = beatup_order(dragged).is_some_and(|o| o.first() == Some(&sd.active_index));
+    let bench: Vec<u8> = match beatup_order(dragged).filter(|_| order_valid) {
+        Some(order) => order.into_iter().filter(|&i| (i as usize) < 6 && alive_benched(i)).collect(),
+        None => (0..6u8).filter(|&i| alive_benched(i)).collect(),
+    };
     if bench.is_empty() {
         return vec![b];
     }
     // PS picks the drag target with `sample(possibleSwitches)` (battle.ts getRandomSwitchable):
-    // one `sample` draw over the bench in party order (`side.pokemon` from active.length, fainted
-    // skipped). Each branch carries the drawn index as its `sample` result so the Replicate filter
-    // selects the realized target. Annotation-only (state-neutral to Enumerate/Sample).
+    // one `sample` draw over the bench in party order. Each branch carries the drawn index as its
+    // `sample` result so the Replicate filter selects the realized target. Annotation-only.
     let n = bench.len() as i32;
     let p = 1.0 / bench.len() as f32;
     bench

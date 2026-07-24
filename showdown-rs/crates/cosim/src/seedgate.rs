@@ -154,16 +154,16 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> (usize,
         if rep.kind == "shuffle" {
             live = cands;
         } else if rep.kind == "random" && rep.args == [100] {
-            // Binary proc/noproc secondary/flinch/self-drop: the engine annotates the proc branch
-            // with result 0 and the noproc branch with result = chance (a threshold, not the
-            // drawn value). Select proc iff `drawn < chance`, else noproc. (The differ compares
-            // only kinds/args, so these representative results are safe to reinterpret here.)
+            // Threshold-encoded proc split: the engine annotates each branch's result as the LOWER
+            // BOUND of the drawn-value range that selects it (binary secondary: proc=0, noproc=chance
+            // — drawn<chance -> proc; multi-way Effect Spore: slp=0, par=11, psn=21, none=30). The
+            // realized `res` selects the branch with the LARGEST threshold <= res. (The differ
+            // compares only kinds/args, so these representative results are safe to reinterpret.)
             let mut distinct: Vec<i64> = cands.iter().map(|&i| outcomes[i].draws[pos].result).collect();
             distinct.sort_unstable();
             distinct.dedup();
-            let filtered: Vec<usize> = if distinct.len() == 2 && distinct[0] == 0 && distinct[1] > 0 {
-                let chance = distinct[1];
-                let want = if res < chance { 0 } else { chance };
+            let filtered: Vec<usize> = if distinct.len() >= 2 && distinct[0] == 0 {
+                let want = *distinct.iter().rev().find(|&&t| t <= res).unwrap_or(&0);
                 cands.iter().copied().filter(|&i| outcomes[i].draws[pos].result == want).collect()
             } else {
                 // Single-branch draw-and-discard, or a multi-way split we can't threshold — try
