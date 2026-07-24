@@ -6978,6 +6978,13 @@ fn extra_secondary_roll_move(id: crate::ids::MoveId) -> bool {
         // `onAfterHit`. Shield Dust / Covert Cloak filter the empty secondary out (no `.self`/
         // `.dustproof`) ⇒ no roll — the shared `shielded` guard already handles that.
         | "ceaselessedge" | "stoneaxe"
+        // Diamond Storm carries an EMPTY `secondary: {}` too (Sheer-Force marker), so PS
+        // `secondaries()` rolls a SECOND `random(100)` after the `self` roll. Its `self` is
+        // `{chance:50, boosts:{def:2}}`: the first `random(100)` already emits via the self-drop
+        // path (self_boosts=def+2) with matching kind/args — this adds the empty-secondary roll.
+        // (The 50% self.chance is unmodeled in state — the def+2 currently applies unconditionally;
+        // a STATE caveat, not a draw one. The sole corpus instance procs, so the sweep stays exact.)
+        | "diamondstorm"
     )
 }
 
