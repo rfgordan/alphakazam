@@ -10366,18 +10366,6 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             }
             push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Roosted });
         }
-
-        // Advance the active mon's turn counter (used by Fake Out / First Impression / Slow
-        // Start). Caps so it can't overflow in a long stall.
-        let cur = b.state.side(side).active_turns;
-        if cur < 250 {
-            push(b, Instruction::SetActiveCounter {
-                side,
-                which: crate::instruction::ActiveCounter::ActiveTurns,
-                previous: cur,
-                new: cur + 1,
-            });
-        }
     }
 
     // Safety net for the linked `trapped` release: a trap source that died to a RESIDUAL (burn,
@@ -10773,6 +10761,37 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 }
             })
             .collect();
+    }
+    // Advance the active mon's turn counter (Fake Out / First Impression / Slow Start / Stakeout).
+    // PS does this in `nextTurn()` (battle.ts:1762) — NOT in the residual phase — which is reached
+    // only after the whole turn survives to `endTurn()`. Two consequences the residual-phase
+    // placement got wrong:
+    //   * a faint that ENDS the battle stops the turn where it happens (`runAction` returns on
+    //     `this.ended` right after `faintMessages()`, battle.ts:2857), so `nextTurn` never runs and
+    //     NO active is advanced — including the winner's;
+    //   * `nextTurn` skips a fainted active (`if (pokemon.fainted) continue`, battle.ts:1756). A
+    //     mon that faints to a residual is replaced first (`checkFainted` → `makeRequest('switch')`
+    //     at battle.ts:2864/2933 returns before `endTurn`), and its replacement enters at
+    //     `activeTurns = 0` (battle-actions.ts:137) to be advanced by the `nextTurn` that follows.
+    // Caps so it can't overflow in a long stall.
+    for nb in &mut out {
+        if battle_over(&nb.state) {
+            continue;
+        }
+        for side in [SideId::One, SideId::Two] {
+            if !nb.state.side(side).active().is_alive() {
+                continue;
+            }
+            let cur = nb.state.side(side).active_turns;
+            if cur < 250 {
+                push(nb, Instruction::SetActiveCounter {
+                    side,
+                    which: ActiveCounter::ActiveTurns,
+                    previous: cur,
+                    new: cur + 1,
+                });
+            }
+        }
     }
     // runAction Update after the `residual` action completes (battle.ts:2882): one `shuffle[2,0,2]`
     // on a surviving equal-Speed pair. Emitted last, after every residual draw (incl. Future Sight).
