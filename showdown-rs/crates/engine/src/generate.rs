@@ -5247,6 +5247,19 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             let stages: i16 = b.state.side(side).boosts.iter().map(|&x| (x.max(0)) as i16).sum();
             base_power = (20 + 20 * stages as u16).max(20);
         }
+        // Avalanche / Revenge: x2 base power when the TARGET already damaged the user this
+        // turn. PS `basePowerCallback`: `pokemon.attackedBy.some(p => p.source === target &&
+        // p.damage > 0 && p.thisTurn)`. The engine's per-side `physical_damage_taken` /
+        // `special_damage_taken` are exactly that record (set by the foe's connecting move, and
+        // cleared in the residual block), so their union is the flag. rb1067 t3: Arceus-Poison's
+        // Extreme Speed hits first and Avalugg-Hisui's Avalanche should be 120 BP (PS 183
+        // damage, engine 93 — exactly half).
+        "avalanche" | "revenge"
+            if b.state.side(side).physical_damage_taken > 0
+                || b.state.side(side).special_damage_taken > 0 =>
+        {
+            base_power = base_power.saturating_mul(2);
+        }
         // Collision Course / Electro Drift: ~x1.33 when super effective.
         "collisioncourse" | "electrodrift"
             if crate::damage::type_multiplier(md.typ, b.state.side(side.other()).active().types) > 1.0 =>
@@ -5780,8 +5793,15 @@ fn apply_post_damage(
                 push(b, Instruction::Damage { side, slot: aslot, amount: rec });
             }
         }
+        // Magic Guard blocks EVERY non-Move damage source, not just move recoil:
+        // `onDamage(damage, target, source, effect) { if (effect.effectType !== 'Move') return
+        // false; }`. Life Orb's recoil is `onAfterMoveSecondarySelf` with the ITEM as the
+        // effect, Rough Skin / Iron Barbs / Aftermath pass the ABILITY and Rocky Helmet the
+        // ITEM — all four are blocked. rb1318 t2 / rb1174 t3: a Life Orb Magic Guard Reuniclus
+        // takes the engine's 33 HP of orb recoil and none of PS's.
+        let magic_guard = b.state.side(side).active().ability == Ab::MagicGuard;
         // Life Orb recoil: 10% of the attacker's max HP, once after a damaging move.
-        if life_orb {
+        if life_orb && !magic_guard {
             let atk = b.state.side(side).active();
             if atk.is_alive() {
                 let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
@@ -5791,7 +5811,7 @@ fn apply_post_damage(
         // Contact punishers: Rough Skin / Iron Barbs (1/8, ability onDamagingHit) AND Rocky
         // Helmet (1/6, item) — PS runs BOTH when the holder has ability + item (the c5
         // directed traces caught the engine applying only one).
-        if md.flag_contact && !hit_sub {
+        if md.flag_contact && !hit_sub && !magic_guard {
             if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
                 let atk = b.state.side(side).active();
                 if atk.is_alive() {
@@ -5860,6 +5880,7 @@ fn apply_post_damage(
         && def_ability == Ab::Aftermath
         && !b.state.side(foe).active().is_alive()
         && b.state.side(side).active().is_alive()
+        && b.state.side(side).active().ability != Ab::MagicGuard
     {
         let aslot = b.state.side(side).active_index;
         let atk = b.state.side(side).active();
