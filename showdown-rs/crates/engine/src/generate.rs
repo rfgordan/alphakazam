@@ -2659,14 +2659,16 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
     let maxhp = p.max_hp;
     let grounded = is_grounded(&b.state, side);
 
-    // Heavy-Duty Boots negate *all* entry hazards for the holder.
-    if p.item == Item::HeavyDutyBoots {
-        return;
-    }
+    // Heavy-Duty Boots are NOT one blanket early-return: each hazard's `onSwitchIn` carries its
+    // own `pokemon.hasItem('heavydutyboots')` check, and Toxic Spikes' sits BELOW the Poison-type
+    // absorb (`data/moves.ts:19780-19791`) — so a grounded Poison type in boots still SOAKS the
+    // layers even though it takes nothing from them. rb1336 t6: Grafaiai (Poison/Normal,
+    // Heavy-Duty Boots) switches in and PS's `toxicspikes` is gone.
+    let boots = p.item == Item::HeavyDutyBoots;
     let magic_guard = p.ability == crate::ids::Ability::MagicGuard;
 
     // Stealth Rock — hits everything, scaled by Rock effectiveness (Magic Guard blocks it).
-    if s.side_conditions.stealth_rock && !magic_guard {
+    if s.side_conditions.stealth_rock && !magic_guard && !boots {
         let mult = type_multiplier(Type::Rock, p.types);
         let dmg = ((maxhp as f32 / 8.0) * mult).floor() as i16;
         let dmg = dmg.max(1).min(p.hp);
@@ -2676,7 +2678,7 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
     }
     // Spikes — grounded only (Magic Guard blocks it).
     let layers = b.state.side(side).side_conditions.spikes;
-    if grounded && layers > 0 && !magic_guard {
+    if grounded && layers > 0 && !magic_guard && !boots {
         let frac = match layers { 1 => 8, 2 => 6, _ => 4 };
         let p = b.state.side(side).active();
         let dmg = (p.max_hp / frac).max(1).min(p.hp);
@@ -2700,14 +2702,18 @@ fn apply_entry_hazards(b: &mut Branch, side: SideId) {
             });
         } else {
             let status = if tspikes >= 2 { Status::Toxic } else { Status::Poison };
-            if status_applies(p, status) && !status_blocked_by_field(&b.state, side, status) {
+            if !boots
+                && !p.types.contains(&Type::Steel)
+                && status_applies(p, status)
+                && !status_blocked_by_field(&b.state, side, status)
+            {
                 push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: status });
                 consume_lum_if_statused(b, side);
             }
         }
     }
     // Sticky Web — grounded: −1 Speed on entry.
-    if grounded && b.state.side(side).side_conditions.sticky_web {
+    if grounded && !boots && b.state.side(side).side_conditions.sticky_web {
         if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
             react_to_stat_drop(b, side);
         }
@@ -3825,6 +3831,21 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             md.typ = Type::Fire;
         } else if sid == "taurospaldeaaqua" {
             md.typ = Type::Water;
+        }
+    }
+    // Ivy Cudgel's type follows the Ogerpon mask (PS `onModifyType` switching on
+    // `pokemon.species.name`, listing BOTH the plain and the `-Tera` forme of each mask; plain
+    // Ogerpon / Ogerpon-Teal-Tera stay Grass). rb1230 t7: a tera-Rock Ogerpon-Cornerstone-Tera
+    // Ivy Cudgel into Abomasnow — 164 in PS, 30 in the engine, which is exactly the Grass-vs-
+    // Grass/Ice x0.25 and the 1.5 STAB instead of Rock's x1 and the double-Tera x2.
+    if md.id.to_id() == "ivycudgel" {
+        let sid = attacker.species.to_id();
+        if sid.starts_with("ogerponwellspring") {
+            md.typ = Type::Water;
+        } else if sid.starts_with("ogerponhearthflame") {
+            md.typ = Type::Fire;
+        } else if sid.starts_with("ogerponcornerstone") {
+            md.typ = Type::Rock;
         }
     }
     // Weather Ball takes the type of the active weather (PS onModifyType); its base-power
