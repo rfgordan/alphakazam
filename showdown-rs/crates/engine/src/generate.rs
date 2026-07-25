@@ -3916,6 +3916,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             return vec![b];
         }
+        // Lightning Rod / Storm Drain / Motor Drive: like the absorbing abilities above these are
+        // PS `onTryHit` handlers that `return null` — they run in `hitStepTryHitEvent`, which
+        // precedes `hitStepAccuracy` in `trySpreadMoveHit`'s step list, so a move they block makes
+        // NO accuracy roll at all. The engine knew the type immunity (`ability_immune`) but not the
+        // stat boost, and for a STATUS move of that type it fell through to the accuracy draw —
+        // a `rust-extra randomChance@accuracy` over-emission (rb1211 t18 and rb1350 t30: Thunder
+        // Wave into a Lightning Rod Rhydon / Raichu, where PS's whole unit draws NOTHING).
+        // Mold Breaker bypasses (all three are `breakable`).
+        let redirect_boost = match (md.typ, fa) {
+            (Type::Electric, A::LightningRod) | (Type::Water, A::StormDrain) => Some(BoostIndex::SpecialAttack),
+            (Type::Electric, A::MotorDrive) => Some(BoostIndex::Speed),
+            _ => None,
+        };
+        if affects_foe_mon && !mb && b.state.side(foe).active().is_alive() {
+            if let Some(stat) = redirect_boost {
+                raise_boost(&mut b, foe, stat, 1);
+                return vec![b];
+            }
+        }
         // Sap Sipper: a Grass move targeting the holder is nullified and raises its Attack
         // one stage (PS `onTryHitPriority 1` -> `boost({atk: 1})`).
         if affects_foe_mon
