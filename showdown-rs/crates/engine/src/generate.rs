@@ -168,6 +168,7 @@ fn consume_shape(p: &mut crate::psprng::PsPrng, kind: &str, args: &[i32]) {
 
 /// A positioned reader over the realized source: peeks successive draws in PS call form and returns
 /// the realized result under PS's interpretation (randomChance → 0/1, random/sample → value/index).
+#[derive(Clone)]
 enum RealizedCursor {
     Prng(crate::psprng::PsPrng),
     Recorded { results: std::rc::Rc<Vec<i64>>, idx: usize },
@@ -257,7 +258,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -309,6 +310,13 @@ pub(crate) struct Branch {
     /// `switchFlag`), so `run_move_action` must NOT emit it again on the post-switch board. Set by
     /// `emit_pivot_trailing_update` at the pivot apply site; reset each move in `run_move_action`.
     pub(crate) pivot_update_done: bool,
+    /// Transient (NOT part of State): the realized multi-hit executor already fired this move's
+    /// per-hit `DamagingHit` ability rolls (Cursed Body / Toxic Chain / the contact-status set)
+    /// INSIDE its hit loop, exactly where PS's `spreadMoveHit` runs `runEvent('DamagingHit')`.
+    /// The post-hit-loop block must then not fire them a second time. Only ever set on the
+    /// realized (seed-gate / differ) path; the DP path leaves it false and keeps the once-per-move
+    /// application, which is exact for a single-hit move and is what Enumerate/Sample verify.
+    pub(crate) per_hit_procs_done: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1589,7 +1597,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1676,7 +1684,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -1830,7 +1838,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -2105,7 +2113,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2504,6 +2512,7 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     // by an earlier action this turn (sequence_two_moves reuses the branch for the second mover).
     b.move_failed = false;
     b.pivot_update_done = false;
+    b.per_hit_procs_done = false;
     // Freeze both actives' Speed at this move's start (PS's `updateSpeed()` before the move action)
     // so the move's own internal Updates sort on the pre-move Speed — a paralysis/secondary Speed
     // change the move applies does not retroactively break its own tie. Save/restore for called-move
@@ -2593,7 +2602,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -4532,6 +4541,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_pinch_berry(&mut hb, side);
         // A Substitute blocks the target's own secondaries (boosts/status) and contact
         // abilities; otherwise split on the move's secondary, then the contact-status ability.
+        // CONSUME the realized per-hit flag here: it is a per-MOVE transient (the branch is reused
+        // for the turn's second mover, so a leftover `true` would silence that mon's own
+        // once-per-move DamagingHit roll — rb1341 t13: Triple Axel, then Hyper Voice into the
+        // Froslass whose Cursed Body PS still rolls).
+        let per_hit_done = std::mem::replace(&mut hb.per_hit_procs_done, false);
         let branches = if hit_sub {
             // PS `spreadMoveHit` sets `targets[i] = null` on a Substitute hit (battle-actions.ts:1085),
             // and `secondaries()` skips only `target === false` (`null !== false`), so it STILL rolls
@@ -4543,14 +4557,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             vec![hb]
         } else {
             apply_burning_jealousy(&mut hb, side, &md);
+            // A realized multi-hit branch already fired the `DamagingHit` ability rolls per hit
+            // (PS runs the event inside `spreadMoveHit`, once per connecting hit) — don't fire them
+            // a second time here. The DP path never sets the flag and keeps the once-per-move
+            // application, which is exact for the single-hit moves Enumerate/Sample verify.
             apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
                 .flat_map(|sb| apply_direclaw_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
-                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -5315,7 +5333,23 @@ fn break_ice_face(b: &mut Branch, foe: SideId) {
     });
 }
 
+/// Where `apply_damage_hit_rolls` gets each hit's crit + damage roll.
+enum HitRolls<'a> {
+    /// Enumerate / Sample (DP) path: the caller already chose the `(roll, crit)` pair per hit.
+    Fixed(&'a [(u8, bool)]),
+    /// Realized path (seed gate / differ): peel each hit's crit + damage roll off the cursor
+    /// INSIDE the loop, so the per-hit `DamagingHit` ability roll PS fires after each connecting
+    /// hit (Cursed Body / Toxic Chain / the contact-status set) interleaves into the stream at
+    /// exactly the position `spreadMoveHit` puts it, instead of being appended once after the
+    /// whole hit loop.
+    Realized { count: usize, cur: &'a mut RealizedCursor },
+}
+
 fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)], crit_den: i32) -> bool {
+    apply_damage_hit_rolls(b, side, md, HitRolls::Fixed(hits), crit_den)
+}
+
+fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData, mut rolls: HitRolls, crit_den: i32) -> bool {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let initial_calc = compute_damage(b, side, md);
@@ -5329,7 +5363,11 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
     let mut hits_executed: u8 = 0;
-    for &(roll, crit) in hits {
+    let n_hits = match &rolls {
+        HitRolls::Fixed(h) => h.len(),
+        HitRolls::Realized { count, .. } => *count,
+    };
+    for hit_i in 0..n_hits {
         // PS's `hitStepMoveHitLoop` checks `targets.every(!hp)` at the TOP of each iteration,
         // BEFORE that hit's crit/damage rolls (which happen inside `spreadMoveHit` → `getDamage`).
         // So once the target has fainted, no further crit/damage draws are rolled. Emit the
@@ -5340,14 +5378,28 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
         if b.state.side(foe).active().hp <= 0 {
             break;
         }
+        let (roll, crit) = match &mut rolls {
+            HitRolls::Fixed(h) => h[hit_i],
+            HitRolls::Realized { cur, .. } => {
+                let c = crit_den > 0 && cur.peek("randomChance", &[1, crit_den]) != 0;
+                let r = (cur.peek("random", &[16]) as u8) & 0x0F;
+                (r, c)
+            }
+        };
         if crit_den > 0 {
             draw(b, "randomChance", &[1, crit_den], crit as i64, "crit");
         }
         draw(b, "random", &[16], roll as i64, "damage-roll");
         // ModifyDamage screen-tie shuffle (per getDamage, after the damage roll).
         emit_modifydamage_shuffle(b);
-        let rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
-        let raw = rolls[roll as usize];
+        if let HitRolls::Realized { cur, .. } = &mut rolls {
+            // The `draw`/`emit_*` calls above advance the branch's log and (for the seed gate) the
+            // real prng, not this peek clone — step it over the shuffle just emitted.
+            let k = modifydamage_screen_count(b);
+            cur.consume_shuffle(k);
+        }
+        let dmg_rolls = if crit { &calc.rolls_crit } else { &calc.rolls_nocrit };
+        let raw = dmg_rolls[roll as usize];
         // Route to the Substitute if the target has one up (it absorbs the whole hit).
         // Sound moves and Infiltrator users go straight through it.
         let bypass_sub = md.flag_sound
@@ -5393,6 +5445,13 @@ fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hi
             total_dealt += dmg as i32;
             hits_landed += 1;
             hits_executed += 1;
+        }
+        // PS `spreadMoveHit` runs `runEvent('DamagingHit', damagedTargets, ...)` at the END of
+        // EVERY hit (battle-actions.ts:1142) — inside the loop, not after it. On the realized path
+        // fire it here so Cursed Body / Toxic Chain / the contact-status abilities interleave into
+        // the stream between this hit and the next hit's crit roll.
+        if let HitRolls::Realized { cur, .. } = &mut rolls {
+            realized_per_hit_damaging_hit(b, side, md, cur);
         }
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
@@ -6563,25 +6622,18 @@ fn apply_multihit_realized(
     } else {
         lo
     };
-    // Peek each hit's crit + damage roll in PS order; `apply_damage_hit` emits them (and the
-    // per-hit ModifyDamage shuffle) and applies with KO/Substitute-break termination — a hit past
-    // a faint never executes, so its peeked (over-read) values are simply unused.
+    // Each hit's crit + damage roll is peeled off the cursor INSIDE `apply_damage_hit_rolls`'s
+    // loop, not up front: PS's `spreadMoveHit` fires `runEvent('DamagingHit')` after every hit, so
+    // a Cursed Body / Toxic Chain / contact-status roll sits between hit n's damage roll and hit
+    // n+1's crit roll, and an up-front peek would read that ability slot as the next hit's crit.
+    // The loop also steps the cursor over the inter-hit `ModifyDamage` screen shuffle it emits.
     let crit_den = ps_crit_den(&hb, side, md);
-    // The inter-hit `ModifyDamage` screen shuffle `apply_damage_hit` emits between hits (when
-    // ≥2 screens are on the field) sits between each hit's damage roll and the next hit's crit
-    // roll in PS's stream, so the peek cursor must step over it or every hit past the first
-    // reads the shuffle's slot as its crit/damage. (Non-screened moves: k<2 → no-op.)
-    let screen_k = modifydamage_screen_count(&hb);
-    let mut hits: Vec<(u8, bool)> = Vec::with_capacity(count);
-    for i in 0..count {
-        let crit = crit_den > 0 && cur.peek("randomChance", &[1, crit_den]) != 0;
-        let roll = cur.peek("random", &[16]) as u8;
-        hits.push((roll & 0x0F, crit));
-        if i + 1 < count {
-            cur.consume_shuffle(screen_k);
-        }
-    }
-    let hit_sub = apply_damage_hit(&mut hb, side, md, &hits, crit_den);
+    let hit_sub = apply_damage_hit_rolls(
+        &mut hb, side, md, HitRolls::Realized { count, cur: &mut cur }, crit_den,
+    );
+    // The per-hit hook already ran every DamagingHit ability roll for this move; suppress the
+    // post-hit-loop once-per-move application in `execute_move_inner`.
+    hb.per_hit_procs_done = true;
     vec![(hb, hit_sub)]
 }
 
@@ -6684,9 +6736,13 @@ fn apply_multihit_realized_ma(
             hits_landed += 1;
             hits_executed += 1;
         }
+        // PS `spreadMoveHit` runs `runEvent('DamagingHit')` after EVERY hit — Fezandipiti's Beat Up
+        // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`.
+        realized_per_hit_damaging_hit(&mut hb, side, md, &mut cur);
     }
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
     apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
+    hb.per_hit_procs_done = true;
     vec![(hb, hit_sub)]
 }
 
@@ -7362,6 +7418,74 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     draw(&mut noproc, "random", &[100], (pct as i64).max(1), "flinch");
     push(&mut proc, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Flinch });
     vec![proc, noproc]
+}
+
+/// The per-hit `DamagingHit` ability rolls, realized off a cursor (seed gate / differ only).
+///
+/// PS fires `runEvent('DamagingHit')` inside `spreadMoveHit` (battle-actions.ts:1142), i.e. ONCE
+/// PER CONNECTING HIT of `hitStepMoveHitLoop` — not once per move. The handlers that roll are
+/// Cursed Body (`randomChance(3,10)` on the target), Toxic Chain (`onSourceDamagingHit`,
+/// `randomChance(3,10)` on the attacker) and the contact-status set (Static / Flame Body / Poison
+/// Point / Poison Touch / Cute Charm / Effect Spore). The engine's enumerate path applies them once
+/// after the whole hit loop, which is exact for a single-hit move and wrong for a multi-hit one:
+/// r3 d23 (Koraidon Scale Shot into Froslass) has PS rolling `cursedbody` after EACH hit's
+/// crit+damage pair, and rb1049 (Fezandipiti's Beat Up) has `[crit, dmg, toxicchain] x 6`.
+///
+/// This reuses the very same `apply_contact_secondaries` / `apply_cursed_body` fork functions the
+/// post-hit-loop block uses (no second implementation to drift), then collapses the fork to the one
+/// branch the cursor's stream dictates and steps the cursor over exactly the draws that branch
+/// appended — so hit n+1's crit peek lands on hit n+1's crit, not in hit n's ability slot.
+fn realized_per_hit_damaging_hit(
+    b: &mut Branch, side: SideId, md: &crate::data::MoveData, cur: &mut RealizedCursor,
+) {
+    let base = b.draws.len();
+    let cands: Vec<Branch> = apply_contact_secondaries(b.clone(), side, md)
+        .into_iter()
+        .flat_map(|sb| apply_cursed_body(sb, side, md))
+        .collect();
+    // Nothing rolled and nothing applied: the common case, no cursor movement.
+    if cands.len() == 1 && cands[0].draws.len() == base {
+        *b = cands.into_iter().next().unwrap();
+        return;
+    }
+    // Pick the candidate whose appended draws reproduce the cursor's stream. Every candidate is
+    // probed against a CLONE, so a failed probe costs nothing; the winner's draws then advance the
+    // real cursor.
+    // Prefer the candidate whose appended RESULTS reproduce the cursor's stream. Fall back to the
+    // first candidate when none does: a fork that can't actually land its effect collapses to a
+    // single "draw-and-discard" branch whose recorded result is the placeholder 0, while PS's raw
+    // draw may well have been `true` (rb1152 t7: Fezandipiti's Beat Up into a target Toxic Chain
+    // cannot badly-poison — PS rolls 0,1,0,0,0,1 and the engine's discard branch always says 0).
+    // Either way the cursor must advance by the chosen branch's draw SHAPES, because PS's prng
+    // consumed those draws regardless of the outcome; skipping them desyncs every later hit.
+    let mut chosen: usize = 0;
+    for (i, c) in cands.iter().enumerate() {
+        let mut probe = cur.clone();
+        let mut ok = true;
+        for d in &c.draws[base..] {
+            if d.kind == "shuffle" {
+                probe.consume_shuffle(d.args[0]);
+                continue;
+            }
+            if probe.peek(d.kind, &d.args) != d.result {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            chosen = i;
+            break;
+        }
+    }
+    let c = cands.into_iter().nth(chosen).expect("candidate list is non-empty");
+    for d in &c.draws[base..] {
+        if d.kind == "shuffle" {
+            cur.consume_shuffle(d.args[0]);
+        } else {
+            cur.peek(d.kind, &d.args);
+        }
+    }
+    *b = c;
 }
 
 /// Cursed Body (defender): 30% chance to Disable the move that just hit it.
