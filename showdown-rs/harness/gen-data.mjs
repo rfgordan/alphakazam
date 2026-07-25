@@ -129,6 +129,7 @@ moves.forEach((m, i) => {
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
+		`self_boost_chance: ${(m.self && m.self.boosts && m.self.chance) || 0}`,
 		`secondary_self_boosts: ${boostsRs(secSelfBoosts)}`,
 		`self_boost_only: ${boostsRs(selfBoostOnlyObj)}`,
 		`target_boosts: ${boostsRs(MANUAL_TARGET_BOOSTS[m.id] || targetBoostsObj)}`,

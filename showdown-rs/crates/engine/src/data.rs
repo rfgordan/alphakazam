@@ -82,6 +82,10 @@ pub struct MoveData {
     /// Stat-stage changes applied to the *user* (Close Combat self-drop, Swords Dance). These are
     /// primary effects and survive Sheer Force.
     pub self_boosts: [i8; BoostIndex::COUNT],
+    /// PS `move.self.chance`: `selfDrops` always rolls one `random(100)` for a `self.boosts`
+    /// payload, but applies it only when `chance` is undefined or the roll came in under it.
+    /// `0` = no chance field = always applies. Diamond Storm (50) is the only gen9 move with one.
+    pub self_boost_chance: u8,
     /// User stat-stages from a 100%-chance self-SECONDARY (Trailblaze +Spe, Power-Up Punch +Atk).
     /// Being a secondary, Sheer Force removes these (and makes the move Sheer-Force-eligible).
     pub secondary_self_boosts: [i8; BoostIndex::COUNT],
@@ -164,6 +168,7 @@ impl MoveData {
             self_switch: false,
             force_switch: false,
             self_boosts: [0; BoostIndex::COUNT],
+            self_boost_chance: 0,
             secondary_self_boosts: [0; BoostIndex::COUNT],
             self_boost_only: [0; BoostIndex::COUNT],
             target_boosts: [0; BoostIndex::COUNT],

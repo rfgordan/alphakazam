@@ -4566,6 +4566,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         apply_multihit_dp(&b, side, &md, hits_min, hits_max, hit_prob)
     };
+    // PS `selfDrops` rolls one `random(100)` for a `move.self.boosts` payload and applies it only
+    // when `self.chance` is undefined or the roll came in under it. Diamond Storm is the one gen9
+    // move with a chance (50, +2 Def), so the drop has to FORK — hence the split out of
+    // `apply_damage_secondaries` (which cannot branch): the roll and the boost live here, and
+    // everything downstream sees the post-drop branch.
+    let damaged: Vec<(Branch, bool)> = damaged
+        .into_iter()
+        .flat_map(|(hb, hit_sub)| {
+            apply_self_drop(hb, side, &md).into_iter().map(move |x| (x, hit_sub)).collect::<Vec<_>>()
+        })
+        .collect();
     for (mut hb, hit_sub) in damaged {
         apply_damage_secondaries(&mut hb, side, &md, hit_sub);
         // Double Shock: the connecting hit strips the user's Electric type (PS `self.onHit`
@@ -8002,24 +8013,44 @@ fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData)
     out
 }
 
-/// A damaging move's deterministic on-hit effects: user self-boosts and any target
-/// volatile (Salt Cure, etc.).
-fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
-    // PS `selfDrops` (battle-actions.ts): a connecting move with `move.self.boosts` (Close
-    // Combat −Def/−SpD, Draco Meteor −SpA, Rapid Spin +Spe, Make It Rain −SpA, …) rolls a
-    // `random(100)` draw-and-discard even at a guaranteed 100% self-drop (these have no
-    // `self.chance`, so the boost always applies regardless of the roll). The roll is consumed
-    // after the damage rolls and *before* the target secondaries (`selfDrops` precedes
-    // `secondaries` in `spreadMoveHit`). Self-boosts apply even through a Substitute.
-    if md.self_boosts.iter().any(|&x| x != 0) {
-        draw(b, "random", &[100], 0, "self-drop");
+/// PS `selfDrops` (battle-actions.ts): a connecting move with `move.self.boosts` (Close Combat
+/// −Def/−SpD, Draco Meteor −SpA, Rapid Spin +Spe, Make It Rain −SpA, …) rolls ONE `random(100)`
+/// and applies the boost when `typeof self.chance === 'undefined' || roll < self.chance`. Almost
+/// every such move has no `chance`, so the roll is a pure draw-and-discard; Diamond Storm's
+/// `self: {chance: 50, boosts: {def: 2}}` is the single gen9 exception and genuinely FORKS.
+/// The roll is consumed after the damage rolls and before the target secondaries (`selfDrops`
+/// precedes `secondaries` in `spreadMoveHit`). Self-boosts apply even through a Substitute.
+fn apply_self_drop(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    if !md.self_boosts.iter().any(|&x| x != 0) {
+        return vec![b];
     }
-    // Self-boosts apply even through a Substitute (they affect the attacker).
-    for (i, &delta) in md.self_boosts.iter().enumerate() {
-        if delta != 0 {
-            apply_self_boost(b, side, BOOST_ORDER[i], delta);
+    let apply = |nb: &mut Branch| {
+        for (i, &delta) in md.self_boosts.iter().enumerate() {
+            if delta != 0 {
+                apply_self_boost(nb, side, BOOST_ORDER[i], delta);
+            }
         }
+    };
+    let pct = md.self_boost_chance;
+    if pct == 0 || pct >= 100 {
+        let mut b = b;
+        draw(&mut b, "random", &[100], 0, "self-drop");
+        apply(&mut b);
+        return vec![b];
     }
+    let chance = pct as f32 / 100.0;
+    let mut proc = scaled(&b, chance);
+    draw(&mut proc, "random", &[100], 0, "self-drop");
+    apply(&mut proc);
+    let mut noproc = scaled(&b, 1.0 - chance);
+    draw(&mut noproc, "random", &[100], pct as i64, "self-drop");
+    vec![proc, noproc]
+}
+
+/// A damaging move's remaining deterministic on-hit effects (`move.selfBoost`, 100%-chance self
+/// secondaries, target volatiles). The `move.self.boosts` self-drop is handled by
+/// [`apply_self_drop`], which runs immediately before this and may fork.
+fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
     // PS `move.selfBoost` (Clanging Scales def−1, …) is applied at battle-actions.ts:521
     // (`if (move.selfBoost && moveResult) this.moveHit(pokemon, pokemon, move, move.selfBoost, …)`)
     // with NO `random(100)` roll — distinct from `move.self.boosts`, which rolls in `selfDrops`.
@@ -8511,7 +8542,14 @@ fn execute_status_move(
     if md.id.to_id() == "defog" {
         let mut b = b;
         let foe2 = side.other();
-        if b.state.side(foe2).active().is_alive() {
+        // PS `defog` `onHit` (data/moves.ts:3458): `if (!target.volatiles['substitute'] ||
+        // move.infiltrates) success = !!this.boost({evasion: -1})`. Defog's `bypasssub` flag lets
+        // the move REACH `onHit` through a Substitute, but the evasion drop itself is still blocked
+        // by one — only an Infiltrator user gets through. The hazard/screen/terrain clears below
+        // are outside that guard and happen either way.
+        let sub_blocks = b.state.side(foe2).volatiles.contains(VolatileStatus::Substitute)
+            && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator;
+        if b.state.side(foe2).active().is_alive() && !sub_blocks {
             if apply_boost_clamped(&mut b, foe2, BoostIndex::Evasion, -1) < 0 {
                 react_to_stat_drop(&mut b, foe2);
             }
