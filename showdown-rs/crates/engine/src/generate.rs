@@ -884,6 +884,59 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
     }
 }
 
+/// Recompute a mon's stats for a NEW base-stat spread, preserving its own EV/IV/nature.
+///
+/// PS's forme changes go through `Pokemon.setSpecies` -> `spreadModify(species.baseStats, this.set)`,
+/// i.e. the mon's ACTUAL set is re-applied to the new base stats. The engine's `State` bakes the
+/// spread into `stats` (convert.rs stores `nature: Serious, evs: 0` — "spreads are baked into
+/// storedStats"), so the spread is recovered by inverting each stat against the CURRENT species'
+/// base stat: `stat = floor(floor((2*base + d) * level/100 + 5) * nature)` with
+/// `d = IV + floor(EV/4)`. Corpus sets (custom + randombattle) all use 31 IVs, so `d ∈ [31, 94]`,
+/// and the nature multiplier is tried neutral-first (1.0, then 1.1, then 0.9) — the first (n, d)
+/// pair reproducing the current stat wins.
+///
+/// Verified against PS on the c6a2 Palafin (Jolly, 252 Atk / 4 SpD / 252 Spe):
+/// Zero -> Hero gives atk 239->419, def 180->230, spa 127->223, spd 161->211, spe 328->328,
+/// exactly PS's `storedStats`. The previous hard-coded random-battle spread (31 IV / 85 EV /
+/// neutral) produced def 251 instead of 230 — a 4-point U-turn damage error at c6a2s114 d47.
+/// HP (index 0) is never re-derived: every battle-only forme shares its base forme's HP base, and
+/// PS keeps `maxhp` across the change.
+fn respread_stats(old_base: [u16; 6], new_base: [u16; 6], old: [i16; 6], level: u8) -> [i16; 6] {
+    let mut out = old;
+    let stat_of = [
+        crate::ids::StatIndex::Hp, crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
+        crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
+        crate::ids::StatIndex::Speed,
+    ];
+    for i in 1..6usize {
+        let apply = |base: u16, d: i32, n: f32| -> i16 {
+            let inner = (2 * base as i32 + d) * level as i32 / 100;
+            (((inner + 5) as f32) * n).floor() as i16
+        };
+        'search: for &n in &[1.0f32, 1.1, 0.9] {
+            // Every `d` reproducing the current stat under this nature multiplier. Below level 100
+            // the `* level / 100` truncation makes several `d` collide, so accept the inversion
+            // only when they all agree on the NEW stat; otherwise fall back to the random-battle
+            // spread (31 IV / 85 EV / neutral), which is exact for every randombattle set.
+            let mut vals: Vec<i16> = (31..=94i32)
+                .filter(|&d| apply(old_base[i], d, n) == old[i])
+                .map(|d| apply(new_base[i], d, n))
+                .collect();
+            if vals.is_empty() {
+                continue;
+            }
+            vals.dedup();
+            out[i] = if vals.len() == 1 {
+                vals[0]
+            } else {
+                crate::damage::compute_stat(new_base[i], 31, 85, level, crate::ids::Nature::Serious, stat_of[i])
+            };
+            break 'search;
+        }
+    }
+    out
+}
+
 /// Whether the active Pokémon has a Protosynthesis / Quark Drive boost active.
 fn has_proto(s: &crate::state::Side) -> bool {
     s.volatiles.contains(VolatileStatus::Protosynthesis) || s.volatiles.contains(VolatileStatus::QuarkDrive)
@@ -1876,7 +1929,8 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     revert_battle_only_forme(b, side);
     // Zero to Hero (Palafin): on switch-out, the base forme transforms into Palafin-Hero
     // (higher offensive stats; HP base is unchanged so max HP carries). One-way — once Hero it
-    // stays Hero. Random-battle spread (31 IV / 85 EV / neutral) assumed for the stat recompute.
+    // stays Hero. PS's `setSpecies` re-runs `spreadModify(species.baseStats, this.set)`, so the
+    // mon's OWN EV/IV/nature spread carries — recovered by `respread_stats`.
     {
         let p = b.state.side(side).active();
         let palafin = crate::ids::Species::from_id("palafin");
@@ -1884,17 +1938,12 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
         // stays in its base forme.
         if !replacing_fainted && p.ability == crate::ids::Ability::ZeroToHero && Some(p.species) == palafin {
             if let Some(hero) = crate::ids::Species::from_id("palafinhero") {
-                let level = p.level;
-                let base = crate::data::base_stats(hero);
-                let mut stats = [0i16; 6];
-                stats[0] = p.stats[0];
-                for (si, stat) in [
-                    crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
-                    crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
-                    crate::ids::StatIndex::Speed,
-                ].into_iter().enumerate() {
-                    stats[si + 1] = crate::damage::compute_stat(base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat);
-                }
+                let stats = respread_stats(
+                    crate::data::base_stats(p.species),
+                    crate::data::base_stats(hero),
+                    p.stats,
+                    p.level,
+                );
                 let prev_data = transform_data_of(&b.state, side);
                 let mut new = prev_data;
                 new.species = hero;
@@ -5963,8 +6012,8 @@ fn apply_spirit_shackle(b: &mut Branch, side: SideId, md: &crate::data::MoveData
 
 /// Relic Song: after a successful hit, an untransformed Meloetta swaps between its Aria and
 /// Pirouette formes (PS `onAfterMoveSecondarySelf` + `formeChange`); the formes share HP but
-/// differ in every other base stat. Random-battle spread (31 IV / 85 EV / neutral) assumed
-/// for the recompute — directed teamsets must use that spread.
+/// differ in every other base stat. The recompute re-applies the mon's OWN spread via
+/// `respread_stats` (PS `setSpecies` -> `spreadModify(baseStats, this.set)`).
 fn apply_relic_song_forme(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
     if md.id.to_id() != "relicsong" {
         return;
@@ -5982,18 +6031,12 @@ fn apply_relic_song_forme(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
     } else {
         return;
     };
-    let level = p.level;
-    let base = crate::data::base_stats(target_forme);
-    let mut stats = p.stats;
-    for (si, stat) in [
-        crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
-        crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
-        crate::ids::StatIndex::Speed,
-    ].into_iter().enumerate() {
-        stats[si + 1] = crate::damage::compute_stat(
-            base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat,
-        );
-    }
+    let stats = respread_stats(
+        crate::data::base_stats(p.species),
+        crate::data::base_stats(target_forme),
+        p.stats,
+        p.level,
+    );
     let previous = transform_data_of(&b.state, side);
     let mut new = previous;
     new.species = target_forme;
