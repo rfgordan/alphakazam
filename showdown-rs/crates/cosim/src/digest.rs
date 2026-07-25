@@ -24,10 +24,16 @@
 //! | per-mon tail skipped iff either side fainted | skipped iff own hp ≤ 0 | an hp disagreement is already encoded |
 //!
 //! The one place `diff_states` is *asymmetrically* lenient is the terminal sentinel: a finished
-//! battle drops the loser's fainted active from PS's serialization, so `convert` yields
-//! `active_index == u8::MAX` and `diff_states` skips the index compare. The encoder mirrors it
-//! deterministically on both sides — a side with **no living Pokémon** (or an already-sentinel
-//! index) encodes the sentinel and no active block — which is the only shape that state occurs in.
+//! battle can leave a side with no serialized active (PS drops `isActive`), so `convert` yields
+//! `active_index == u8::MAX` and `diff_states` skips BOTH the index compare and the whole active
+//! block for that side. Which side that happens to depends on how the battle ended — information
+//! the engine's own carried-forward state does not have. So the mask is DATA, not a guess: the
+//! fixture stores PS's `active_index == u8::MAX` bits (`noActive`, false almost everywhere) next
+//! to the digest, and the gate digests the engine state under the same mask. That reproduces
+//! `diff_states`' leniency exactly — no more, no less. Guessing it instead (e.g. "a side with no
+//! living Pokemon means the battle is over, mask both") silently swallows real terminal-state
+//! divergences: it turned 9 games with genuine `active_turns` / `encore` / `volatiles` /
+//! `pending_move` diffs — one of them a `rust-extra shuffle@disablemove` OVER-EMISSION — green.
 //!
 //! Consequence: `state_digest(a) == state_digest(b)` ⟺ `diff_states(a, b).is_empty()`, up to a
 //! 2⁻¹²⁸ collision. Certified empirically: the slim gate reproduces the full gate's exact-game
@@ -91,7 +97,17 @@ impl Default for Digester {
 /// `u8::MAX` in the encoding: "this side has no comparable active slot" (terminal state).
 const NO_ACTIVE: u8 = u8::MAX;
 
+/// PS's per-side "no comparable active slot" bits, read off a CONVERTED PS state. Stored in the
+/// fixture and replayed onto the engine state at gate time (see the module doc).
+pub fn ps_active_mask(ps: &State) -> [bool; 2] {
+    [ps.sides[0].active_index == NO_ACTIVE, ps.sides[1].active_index == NO_ACTIVE]
+}
+
 pub fn state_digest(s: &State) -> u128 {
+    state_digest_masked(s, [false, false])
+}
+
+pub fn state_digest_masked(s: &State, no_active: [bool; 2]) -> u128 {
     let mut d = Digester::new();
     d.u8(s.weather as u8);
     if s.weather != engine::ids::Weather::None {
@@ -102,15 +118,14 @@ pub fn state_digest(s: &State) -> u128 {
         d.i8(s.terrain_turns);
     }
     d.b(s.trick_room);
-    for side in &s.sides {
-        digest_side(&mut d, side);
+    for (si, side) in s.sides.iter().enumerate() {
+        digest_side(&mut d, side, no_active[si]);
     }
     d.finish()
 }
 
-fn digest_side(d: &mut Digester, a: &Side) {
-    let wiped = a.active_index == NO_ACTIVE || a.pokemon.iter().all(|p| !p.is_alive());
-    let ai = if wiped { NO_ACTIVE } else { a.active_index };
+fn digest_side(d: &mut Digester, a: &Side, masked: bool) {
+    let ai = if masked || a.active_index == NO_ACTIVE { NO_ACTIVE } else { a.active_index };
     d.u8(ai);
 
     if ai != NO_ACTIVE && a.pokemon[ai as usize].is_alive() {

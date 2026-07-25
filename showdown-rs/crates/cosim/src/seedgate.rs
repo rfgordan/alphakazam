@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::convert::{convert_state, side_id, species_id_of_details, Canonical};
-use crate::digest::{parse_hex, state_digest};
+use crate::digest::{parse_hex, ps_active_mask, state_digest_masked};
 use crate::fixture::Fixture;
 use crate::replay::{active_fainted, resolve_choice};
 use crate::trace::{ChoiceRec, Trace};
@@ -39,28 +39,34 @@ use crate::trace::{ChoiceRec, Trace};
 /// One decision, reduced to exactly what the seed gate reads — the union of what a full v2 trace
 /// and a slim `.fx.json` fixture can supply. Both kinds funnel through `run_game`, so the slim
 /// gate IS the full gate (certified: identical exact-game sets on the 111-trace corpus).
-pub(crate) struct GateDecision {
+pub(crate) struct GateDecision<'a> {
     pub turn: u32,
-    pub request_state: String,
-    #[allow(dead_code)]
+    pub request_state: &'a str,
     pub mid_turn: bool,
-    pub choices: BTreeMap<String, ChoiceRec>,
-    pub draws: Vec<Value>,
+    pub choices: &'a BTreeMap<String, ChoiceRec>,
+    pub draws: &'a [Value],
+    /// PS's full serialized post-state, when the input carries it (a full v2 trace / sidecar).
+    /// The gate never needs it — the digest decides — but on a MISMATCH it upgrades the report
+    /// from "state-digest" to the actual differing field. This is the sidecar workflow: point the
+    /// gate at `harness/seed-sidecars/rbNNNN.json.gz` instead of the fixture to get the diff.
+    pub state_after: Option<&'a Value>,
     /// PS's live `side.pokemon` order (roster indices) at this decision's post-state — Beat Up's
     /// participant order for the NEXT decision.
     pub roster_order: [Option<Vec<u8>>; 2],
     /// Was each side's active fainted at this decision (replacement) or not (pivot)?
     pub active_fainted: [bool; 2],
-    /// Canonical digest of `convert(stateAfter)`, or the converter's complaint.
+    /// PS's per-side terminal `active_index == u8::MAX` bits (see `digest.rs`).
+    pub no_active: [bool; 2],
+    /// Canonical digest of `convert(stateAfter)` under `no_active`, or the converter's complaint.
     pub digest: Result<u128, String>,
 }
 
-pub(crate) struct GateInput {
-    pub format: String,
+pub(crate) struct GateInput<'a> {
+    pub format: &'a str,
     pub seed: Option<[u16; 4]>,
     /// PS's full serialized state after the FIRST (teampreview) decision.
-    pub init_state: Value,
-    pub decisions: Vec<GateDecision>,
+    pub init_state: &'a Value,
+    pub decisions: Vec<GateDecision<'a>>,
 }
 
 fn roster_order_of(state: &Value) -> [Option<Vec<u8>>; 2] {
@@ -79,45 +85,50 @@ fn roster_order_of(state: &Value) -> [Option<Vec<u8>>; 2] {
     out
 }
 
-impl GateInput {
+impl<'a> GateInput<'a> {
     /// From a full v2 trace: digests are computed here, through the same `convert_state` the
     /// gate compares against, so a full-trace run and a fixture run are the same computation.
-    pub(crate) fn from_trace(t: &Trace) -> Result<GateInput, String> {
+    pub(crate) fn from_trace(t: &'a Trace) -> Result<GateInput<'a>, String> {
         let first = t.decisions.first().ok_or_else(|| "empty-trace".to_string())?;
         let canon = Canonical::from_first_state(&first.state_after)
             .map_err(|u| format!("canon:{}", u.0))?;
         let decisions = t.decisions.iter().map(|d| GateDecision {
             turn: d.turn,
-            request_state: d.request_state.clone(),
+            request_state: &d.request_state,
             mid_turn: d.mid_turn,
-            choices: d.choices.clone(),
-            draws: d.draws.clone(),
+            choices: &d.choices,
+            draws: &d.draws,
+            state_after: Some(&d.state_after),
             roster_order: roster_order_of(&d.state_after),
             active_fainted: [
                 active_fainted(&d.state_after, 0, d, "p1"),
                 active_fainted(&d.state_after, 1, d, "p2"),
             ],
+            no_active: convert_state(&d.state_after, &canon)
+                .map(|s| ps_active_mask(&s)).unwrap_or([false, false]),
             digest: convert_state(&d.state_after, &canon)
-                .map(|s| state_digest(&s))
+                .map(|s| { let m = ps_active_mask(&s); state_digest_masked(&s, m) })
                 .map_err(|u| u.0),
         }).collect();
         Ok(GateInput {
-            format: t.format.clone(),
+            format: &t.format,
             seed: t.seed,
-            init_state: first.state_after.clone(),
+            init_state: &first.state_after,
             decisions,
         })
     }
 
-    pub(crate) fn from_fixture(f: &Fixture) -> Result<GateInput, String> {
+    pub(crate) fn from_fixture(f: &'a Fixture) -> Result<GateInput<'a>, String> {
         let decisions = f.decisions.iter().map(|d| GateDecision {
             turn: d.turn,
-            request_state: d.request_state.clone(),
+            request_state: &d.request_state,
             mid_turn: d.mid_turn,
-            choices: d.choices.clone(),
-            draws: d.draws.clone(),
+            choices: &d.choices,
+            draws: &d.draws,
+            state_after: None,
             roster_order: d.roster_order.clone(),
             active_fainted: d.active_fainted,
+            no_active: d.no_active,
             digest: match (&d.digest, &d.digest_err) {
                 (Some(h), _) => parse_hex(h).ok_or_else(|| format!("bad-digest:{h}")),
                 (None, Some(e)) => Err(e.clone()),
@@ -125,9 +136,9 @@ impl GateInput {
             },
         }).collect();
         Ok(GateInput {
-            format: f.format.clone(),
+            format: &f.format,
             seed: f.seed,
-            init_state: f.init_state.clone(),
+            init_state: &f.init_state,
             decisions,
         })
     }
@@ -157,12 +168,12 @@ fn fixed_gender_set() -> std::collections::HashSet<&'static str> {
 /// Charm legality, so those mons roll NOTHING at construction. Traces recorded before the
 /// recorder captured `setGender` lack the field entirely; those are treated as empty, preserving
 /// the original (empty-set-gender ⇒ roll for every dual-gender species) accounting.
-fn init_gender_rolls(g: &GateInput) -> u32 {
+fn init_gender_rolls(g: &GateInput<'_>) -> u32 {
     if g.format.contains("random") {
         return 0;
     }
     let fixed = fixed_gender_set();
-    let st = &g.init_state;
+    let st = g.init_state;
     let mut n = 0u32;
     for side in st["sides"].as_array().into_iter().flatten() {
         for mon in side["pokemon"].as_array().into_iter().flatten() {
@@ -210,8 +221,8 @@ fn consume(prng: &mut PsPrng, kind: &str, args: &[i32]) -> i64 {
 
 /// Consume the recorded draws of a decision purely for their PRNG-stream shape (used for the
 /// teampreview action, which the engine does not model — it only advances the stream).
-fn consume_recorded(prng: &mut PsPrng, d: &GateDecision) {
-    for dr in &d.draws {
+fn consume_recorded(prng: &mut PsPrng, d: &GateDecision<'_>) {
+    for dr in d.draws {
         let kind = dr.get("kind").and_then(Value::as_str).unwrap_or("");
         let args: Vec<i32> = dr.get("args").and_then(Value::as_array).map(|a| {
             a.iter().filter_map(Value::as_i64).map(|x| x as i32).collect()
@@ -290,7 +301,7 @@ struct GameResult {
     aligned: bool,
 }
 
-fn run_game(path: &str, g: &GateInput) -> GameResult {
+fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
     let mk_fail = |first: Option<String>, ok: u32, total: u32, aligned: bool| GameResult {
         name: name.clone(), exact: false, decisions_ok: ok, total_decisions: total,
@@ -306,7 +317,7 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
     if first.request_state != "teampreview" {
         return mk_fail(Some(format!("first-{}", first.request_state)), 0, 0, false);
     }
-    let canon = match Canonical::from_first_state(&g.init_state) {
+    let canon = match Canonical::from_first_state(g.init_state) {
         Ok(c) => c,
         Err(u) => return mk_fail(Some(format!("canon:{}", u.0)), 0, 0, false),
     };
@@ -319,7 +330,7 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
     }
     consume_recorded(&mut prng, first);
 
-    let mut state = match convert_state(&g.init_state, &canon) {
+    let mut state = match convert_state(g.init_state, &canon) {
         Ok(mut s) => { s.sleep_clause = sleep_clause; s }
         Err(u) => return mk_fail(Some(format!("convert0:{}", u.0)), 0, 0, aligned),
     };
@@ -332,7 +343,7 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
         if dp.request_state != "move" {
             return mk_fail(Some(format!("unexpected-{}", dp.request_state)), decisions_ok, total, aligned);
         }
-        let mut unit: Vec<&GateDecision> = vec![dp];
+        let mut unit: Vec<&GateDecision<'_>> = vec![dp];
         let mut j = i + 1;
         while j < g.decisions.len() && g.decisions[j].request_state == "switch" {
             unit.push(&g.decisions[j]);
@@ -365,15 +376,25 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
                 eprintln!("    ps  [{}]: {}", ps.len(), ps.join(" "));
             }
         }
-        let want = match &unit.last().unwrap().digest {
+        let last = unit.last().unwrap();
+        let want = match &last.digest {
             Ok(h) => *h,
             Err(u) => return mk_fail(Some(format!("d{i}:convert-target:{u}")), decisions_ok, total, aligned),
         };
-        if state_digest(&state) != want {
-            if std::env::var("DBG_DIFF").is_ok() && dbg_on {
-                eprintln!("  DIGEST engine={} fixture={}",
-                    crate::digest::hex(state_digest(&state)), crate::digest::hex(want));
-            }
+        if state_digest_masked(&state, last.no_active) != want {
+            // Upgrade "state-digest" to the actual differing field when PS's full state is on
+            // hand (full trace / sidecar). Fixtures report the digest class and the draw label.
+            let field = last.state_after
+                .and_then(|target| convert_state(target, &canon).ok())
+                .map(|mut tgt| {
+                    tgt.sleep_clause = sleep_clause;
+                    let diffs = crate::diff::diff_states(&state, &tgt);
+                    if std::env::var("DBG_DIFF").is_ok() && dbg_on {
+                        for dd in &diffs { eprintln!("  DIFF {}: {}", dd.category, dd.detail); }
+                    }
+                    diffs.first().map(|d0| d0.category.clone()).unwrap_or_else(|| "digest-only".into())
+                })
+                .unwrap_or_else(|| "state-digest".into());
             // Attribute the divergence to its draw-class: the first point where the engine's
             // chosen-outcome draw stream diverges from PS's recorded draws for this unit (the
             // input matched by construction — every prior decision was state-exact).
@@ -384,7 +405,7 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
                 } else {
                     "draws-match/state-diff".to_string()
                 });
-            return mk_fail(Some(format!("d{i}[t{}]:{} | state-digest", dp.turn, draw_label)),
+            return mk_fail(Some(format!("d{i}[t{}]:{} | {field}", dp.turn, draw_label)),
                 decisions_ok, total, aligned);
         }
         decisions_ok += 1;
@@ -398,7 +419,7 @@ fn run_game(path: &str, g: &GateInput) -> GameResult {
 /// replacement switches from the recorded choices. Errors return a short label.
 fn step_unit(
     state: &mut State,
-    unit: &[&GateDecision],
+    unit: &[&GateDecision<'_>],
     canon: &Canonical,
     _sleep_clause: bool,
     prng: &mut PsPrng,
@@ -419,7 +440,7 @@ fn step_unit(
     let mut pivots: [Option<u8>; 2] = [None, None];
     let mut replacements: Vec<(usize, u8)> = Vec::new();
     for sw in unit.iter().skip(1) {
-        for (side_key, choice) in &sw.choices {
+        for (side_key, choice) in sw.choices {
             let si = if side_key == "p1" { 0 } else { 1 };
             let slot = if let Some(ri) = choice.resolved.roster_index {
                 ri
@@ -567,10 +588,10 @@ fn step_unit(
 /// Recorded PS draws of a unit, reduced to (kind, args, semantic label) for draw-class triage.
 struct RecLabel { kind: String, args: Vec<i64>, label: String }
 
-fn rec_draw_labels(unit: &[&GateDecision]) -> Vec<RecLabel> {
+fn rec_draw_labels(unit: &[&GateDecision<'_>]) -> Vec<RecLabel> {
     let mut out = Vec::new();
     for d in unit {
-        for v in &d.draws {
+        for v in d.draws {
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
             let args = v.get("args").and_then(Value::as_array).map(|a| {
                 a.iter().filter_map(Value::as_i64).collect::<Vec<_>>()
@@ -612,11 +633,11 @@ fn first_draw_mismatch(rust: &[DrawEvent], rec: &[RecLabel]) -> Option<String> {
 
 /// Diagnostic: does the recorded full strong-draw stream reproduce with the modeled init offset?
 /// (Independent of the engine — pure PsPrng vs recorded results; localizes init misalignment.)
-fn alignment_ok(g: &GateInput, limbs: [u16; 4]) -> bool {
+fn alignment_ok(g: &GateInput<'_>, limbs: [u16; 4]) -> bool {
     let mut prng = PsPrng::from_limbs(limbs);
     for _ in 0..init_gender_rolls(g) { let _ = prng.next(); }
     for d in &g.decisions {
-        for dr in &d.draws {
+        for dr in d.draws {
             let kind = dr.get("kind").and_then(Value::as_str).unwrap_or("");
             let args: Vec<i32> = dr.get("args").and_then(Value::as_array).map(|a| {
                 a.iter().filter_map(Value::as_i64).map(|x| x as i32).collect()
@@ -699,19 +720,24 @@ fn run_games_parallel(args: &[String]) -> Result<(Vec<GameResult>, Option<String
 /// Load one gate input (full v2 trace or slim seed fixture) and run it, returning its PS commit.
 fn load_any(path: &str) -> Result<(String, GameResult), String> {
     let name = path.rsplit('/').next().unwrap_or(path).to_string();
-    let (commit, input) = if crate::fixture::is_fixture_path(path) {
+    let fail = |commit: String, e: String| (commit, GameResult {
+        name: name.clone(), exact: false, decisions_ok: 0, total_decisions: 0,
+        first_divergence: Some(e), aligned: false,
+    });
+    if crate::fixture::is_fixture_path(path) {
         let f = crate::fixture::load_fixture(path)?;
-        (f.ps_commit.clone(), GateInput::from_fixture(&f))
+        let commit = f.ps_commit.clone();
+        Ok(match GateInput::from_fixture(&f) {
+            Ok(g) => (commit, run_game(path, &g)),
+            Err(e) => fail(commit, e),
+        })
     } else {
         let t = crate::trace::load_trace(path)?;
-        (t.ps_commit.clone(), GateInput::from_trace(&t))
-    };
-    match input {
-        Ok(g) => Ok((commit, run_game(path, &g))),
-        Err(e) => Ok((commit, GameResult {
-            name, exact: false, decisions_ok: 0, total_decisions: 0,
-            first_divergence: Some(e), aligned: false,
-        })),
+        let commit = t.ps_commit.clone();
+        Ok(match GateInput::from_trace(&t) {
+            Ok(g) => (commit, run_game(path, &g)),
+            Err(e) => fail(commit, e),
+        })
     }
 }
 

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::convert::{convert_state, Canonical};
-use crate::digest::{hex, state_digest};
+use crate::digest::{hex, ps_active_mask, state_digest_masked};
 use crate::trace::{ChoiceRec, Trace, TraceResult};
 
 pub const FIXTURE_SUFFIX: &str = ".fx.json";
@@ -86,7 +86,12 @@ pub struct FxDecision {
     /// JSON so the fixture need not ship requests. Meaningless on `move` decisions.
     #[serde(rename = "activeFainted", default)]
     pub active_fainted: [bool; 2],
-    /// Canonical digest of `convert(stateAfter)`; absent iff the state did not convert.
+    /// PS's per-side `active_index == u8::MAX` bits at this state — the terminal sentinel
+    /// `diff_states` is lenient about. Replayed onto the engine state before digesting so the
+    /// digest reproduces `diff_states` exactly (see `digest.rs`). False almost everywhere.
+    #[serde(rename = "noActive", default)]
+    pub no_active: [bool; 2],
+    /// Canonical digest of `convert(stateAfter)` under `noActive`; absent iff it did not convert.
     #[serde(default)]
     pub digest: Option<String>,
     #[serde(rename = "digestErr", default)]
@@ -150,9 +155,12 @@ pub fn build_fixture(t: &Trace) -> Result<Fixture, String> {
 
     let mut decisions = Vec::with_capacity(t.decisions.len());
     for d in &t.decisions {
-        let (digest, digest_err) = match convert_state(&d.state_after, &canon) {
-            Ok(s) => (Some(hex(state_digest(&s))), None),
-            Err(u) => (None, Some(u.0)),
+        let (no_active, digest, digest_err) = match convert_state(&d.state_after, &canon) {
+            Ok(s) => {
+                let m = ps_active_mask(&s);
+                (m, Some(hex(state_digest_masked(&s, m))), None)
+            }
+            Err(u) => ([false, false], None, Some(u.0)),
         };
         let active_fainted = [
             crate::replay::active_fainted(&d.state_after, 0, d, "p1"),
@@ -166,6 +174,7 @@ pub fn build_fixture(t: &Trace) -> Result<Fixture, String> {
             draws: d.draws.clone(),
             roster_order: roster_order(&d.state_after),
             active_fainted,
+            no_active,
             digest,
             digest_err,
         });
