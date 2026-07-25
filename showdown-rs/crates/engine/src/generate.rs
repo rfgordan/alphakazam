@@ -9815,11 +9815,17 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                     let rolls = future_sight_rolls_crit(&base.state, side, caster_slot, is_crit);
                     rolls
                         .into_iter()
-                        .map(|r| {
+                        .enumerate()
+                        .map(|(roll, r)| {
                             let mut nb = scaled(base, 1.0 / 16.0);
-                            // PS rolls the damage `random(16)` for the delayed strike.
+                            // PS rolls the damage `random(16)` for the delayed strike. `damage_rolls`
+                            // is indexed BY the drawn roll (index 0 = factor 100/100), so annotate the
+                            // branch with its roll index — otherwise Replicate cannot filter the
+                            // 16-way fan-out and every roll survives as an "ambiguous fork", picking
+                            // the highest-probability branch instead of the realized one (c2a1 t8:
+                            // PS `random[16]=8@futuresight`, engine damage 7 HP short).
                             if annotating() {
-                                draw(&mut nb, "random", &[16], -1, "futuremove");
+                                draw(&mut nb, "random", &[16], roll as i64, "futuremove");
                             }
                             let dmg = r.min(hp).max(0);
                             if dmg > 0 {
