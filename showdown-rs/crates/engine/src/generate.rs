@@ -6076,6 +6076,27 @@ fn apply_post_damage(
             Ab::GrimNeigh | Ab::AsOneSpectrier => {
                 raise_boost(b, side, BoostIndex::SpecialAttack, 1);
             }
+            // Battle Bond (gen9): `onSourceAfterFaint` gives Greninja-Bond +1 Atk / SpA / Spe
+            // when its own MOVE knocks a foe out, provided it is untransformed and the foe still
+            // has Pokemon left. rb1299 t6.
+            //
+            // NOT MODELLED: PS's once-only guard `source.abilityState.battleBondTriggered`.
+            // `abilityState` is re-inited on every `switchIn` (`battle-actions.ts:142`), so it is
+            // once per STINT, not once per battle — and the engine has no per-stint slot for it.
+            // `ability_used` is NOT that slot: `convert.rs` derives it from PS's
+            // `swordBoost || shieldBoost` and `diff_states` compares it, so writing it here
+            // produces a false `ability_used` divergence (measured on rb1299). A faithful fix
+            // needs the same treatment `ProtoBooster` got — explicit engine state read by
+            // `convert` from `abilityState.battleBondTriggered` and written back by `export`.
+            Ab::BattleBond
+                if !b.state.side(side).active().transformed
+                    && Some(b.state.side(side).active().species)
+                        == crate::ids::Species::from_id("greninjabond") =>
+            {
+                raise_boost(b, side, BoostIndex::Attack, 1);
+                raise_boost(b, side, BoostIndex::SpecialAttack, 1);
+                raise_boost(b, side, BoostIndex::Speed, 1);
+            }
             _ => {}
         }
     }
@@ -9067,6 +9088,11 @@ fn execute_status_move(
         }
         let slot = b.state.side(side).active_index;
         push(&mut b, Instruction::Damage { side, slot, amount: cost });
+        // Clangorous Soul is a SOUND move, and Throat Spray is `onAfterMoveSecondarySelf` —
+        // fired by `useMoveInner` for any move that succeeded. This branch returns before the
+        // shared status tail, so it needs its own call (the two failure returns above do NOT:
+        // `useMoveInner` reaches `MoveFail` instead). rb1089 t2.
+        apply_throat_spray(&mut b, side, md);
         return vec![b];
     }
     // Court Change: swap BOTH sides' entry-hazard / screen / Tailwind side conditions wholesale
@@ -9431,6 +9457,14 @@ fn execute_status_move(
         for x in hits.iter_mut() {
             apply_post_status_self_destruct(x, side, md);
         }
+    }
+
+    // Throat Spray is `onAfterMoveSecondarySelf`, which `useMoveInner` fires after ANY move that
+    // succeeded — a self-targeting STATUS sound move counts. The engine only ran it on the
+    // damaging-hit path. rb1089 t2: Kommo-o's Clangorous Soul leaves PS at +2 SpA with the spray
+    // consumed, the engine at +1 still holding it.
+    for x in hits.iter_mut() {
+        apply_throat_spray(x, side, md);
     }
 
     // NOTE: a connecting status move runs `moveHit`, after which PS fires the per-hit
