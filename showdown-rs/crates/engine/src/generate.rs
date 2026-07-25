@@ -2824,6 +2824,14 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive,
     // Flash Fire's activation ends on switch-out (PS ability `onEnd` removes the volatile).
     VolatileStatus::FlashFire,
+    // Unburden likewise: the ability's `onEnd` removes the volatile when its holder leaves the
+    // field, and nothing re-adds it on entry (PS only adds it from `onAfterUseItem`/`onTakeItem`,
+    // so a mon that re-enters already itemless does NOT get the Speed doubling back). The engine
+    // kept it across the switch and then read a doubled Speed for whatever entered next — 10
+    // extension games, e.g. rb1062: Hawlucha's White Herb is eaten by the turn-1 Intimidate drop,
+    // granting `unburden`; it pivots to Politoed and PS's volatiles go empty while the engine's
+    // stayed at bit 28.
+    VolatileStatus::Unburden,
     // Truant's loaf marker is a PS volatile — cleared on switch-out; the mon acts on its
     // first attempt after re-entering. `statsRaisedThisTurn` is a per-Pokémon PS field, but
     // only the active can have raised a stat this turn, so the volatile model is exact.
