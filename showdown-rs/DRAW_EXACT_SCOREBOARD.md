@@ -1,7 +1,199 @@
 # DRAW-EXACT — Phase 1 first scoreboard
 
 Reproduce: `cargo build --release -p cosim && DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz`
-PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
+PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
+`gen9randombattle` seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) — 512 games total.
+
+---
+
+# ==== PHASE-3 SEED EXTENSION — certification (2026-07-25) ====
+
+**HEADLINE: 286 / 512 full games byte-exact from seed (55.9%); init-aligned 512 / 512.**
+The ORIGINAL 111 are unchanged at **110 / 111** with the same single R1 (Cursed Body) exception —
+zero regression at every step, judged by exact-SET diff, never by the count.
+
+The extension is 401 fresh **gen9randombattle** full games (seeds 1000-1400, no `--max-decisions`,
+no `--distributions`). Its purpose was to break things, and it did: the c-corpus's 110/111 is a
+statement about the mechanic surface that corpus covers, not about randbats. Read the two numbers
+separately — 110/111 on the audited corpus, 286/512 on audited + fresh.
+
+```
+# extended gate (slim fixtures — the committed, cheap path)
+SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz
+# same run against the sidecars, which upgrades each divergence label to the differing FIELD
+bash harness/record-seeds.sh 1000 1400          # regenerate the sidecars (resumable, ~2 min)
+SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-sidecars/*.json.gz
+```
+
+## Gate scaling
+
+| | before | after |
+|---|---|---|
+| seed gate, 111 traces | 6.4 s (serial) | **1.9 s** (rayon, 10 cores) |
+| seed gate, 512 slim fixtures | — | **7.7 s** |
+
+Games are independent and every ambient generation hook the gate touches (`ANNOTATE_DRAWS`,
+`FORCED_TIE_ORDER`, `REALIZED_SOURCE`, `BEATUP_ORDER`, `DBG_UNIT`) is a `thread_local` set inside
+`run_game`'s own unit loop, so a whole game runs on one worker with no cross-talk. Trace load
+(gunzip + parse) went into the parallel map — it was most of the wall time. Output is
+byte-deterministic (indexed `map().collect()` preserves argument order). `GATE_THREADS=n` caps the
+pool; peak RSS is ~threads x parsed-trace size.
+
+## The slim fixture format (`harness/seed-fixtures/*.fx.json.gz`)
+
+| | full v2 trace | slim fixture |
+|---|---|---|
+| 111 audited games | 12 MB | 872 KB |
+| 401 extension games | 57 MB (sidecars, gitignored) | **3.4 MB committed** (mean 7.4 KB) |
+
+A fixture carries the battle seed, format, teamset, the **packed teams** (resolved + set genders),
+the **full PS state of the first (teampreview) decision only**, and per decision: the choices with
+`rosterIndex`, the recorded PRNG draws (1% of the bytes, and they carry the entire init-alignment
+check plus every first-divergence draw label), PS's live `side.pokemon` `rosterOrder` (Beat Up's
+participant order), a precomputed `activeFainted` pair (replacement-vs-pivot, from the request
+JSON), PS's `noActive` terminal-sentinel bits, and the canonical **state DIGEST**. Dropped: every
+non-first serialized state and every request JSON — ~97% of the bytes.
+
+`digest.rs` defines the encoding: it walks the SAME manifest `diff::diff_states` compares, in a
+fixed order, into FNV-1a/128. Where `diff_states` gates on a JOINT predicate the encoder uses the
+corresponding SELF predicate, which is equivalent because a disagreement on the predicate itself
+always shows in a field the encoder covers (six cases, tabulated in the module doc).
+
+**The one thing that is not derivable and must be DATA: the terminal sentinel.** A finished battle
+can leave a side with no serialized active, so `convert` yields `active_index == u8::MAX` and
+`diff_states` skips that side's index compare and whole active block — and which side that is
+depends on how the battle ended. The fixture therefore stores PS's `active_index == u8::MAX` bits
+and the gate digests the engine state under the same mask. Guessing it instead ("a side with no
+living Pokemon means the battle is over, mask both") looked right — it fixed the 4 genuinely
+lenient games — but ALSO turned 9 games with real terminal divergences green: `active_turns`,
+`encore`, `volatiles`, `pending_move`, and in rb1148 a `rust-extra shuffle[2,0,2]@disablemove`
+**over-emission**. A digest that is lenient in a place `diff_states` is not is a false-green
+generator; the shortcut was reverted.
+
+Certified at 512 games: the slim-fixture gate's output equals the sidecar gate's output game for
+game, modulo the field-name suffix (the fixture reports `state-digest`, the sidecar reports the
+field). Zero `digest-only` games — no game where the digest differs and `diff_states` is empty.
+
+Both kinds funnel through one `GateInput` -> `run_game`, so the slim gate IS the full gate. On a
+digest mismatch, re-run against `harness/seed-sidecars/` for the field-level diff (`DBG_DIFF=1
+DBG_GAME=rbNNNN`). Sidecars are gitignored and regenerate byte-identically from the seed —
+verified on 7 sampled seeds.
+
+**Fixtures are only as good as the `convert.rs` that built them: regenerate with
+`MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`
+whenever the converter changes.** They do NOT depend on the engine.
+
+## Roots found and FIXED by the extension (266 -> 286, four commits, zero regression)
+
+1. **gen9 species-locked items were wrong in both directions** (+5). `item_removable`'s comment
+   asserted "Arceus plates are locked only to Arceus, which is outside the randbats pool" — false
+   at this pin (arceusfire/bug/water/dark all appear). The real gen9 set, enumerated off the dex
+   (every item with an `onTakeItem`): Arceus plates (493), Silvally memories (773), Genesect
+   drives (649), Adamant Crystal / Lustrous Globe / Griseous Core (483/484/487), Rusted
+   Sword/Shield (888/889), Ogerpon masks, Blue Orb (Kyogre), Red Orb (Groudon). The engine ALSO
+   blocked the plain Adamant / Lustrous / Griseous Orb, which have no `onTakeItem` in gen9 — Knock
+   Off both boosts on and removes a Palkia's Lustrous Orb. PS's `num ===` guards are SYMMETRIC
+   (`(source && source.num === N) || pokemon.num === N`), so an Arceus attacker cannot Knock Off a
+   Plate either; the `baseSpecies.baseSpecies ===` guards (masks, Blue/Red Orb) look only at the
+   holder. `item_lock` + `item_removable_from(holder, item, source)`, wired into Knock Off's
+   basePowerCallback, Knock Off's removal, Magician and Pickpocket.
+2. **`onTryImmunity` runs BEFORE `hitStepAccuracy`** (+8). A move its own `onTryImmunity` rejects
+   makes NO accuracy draw at all — even a 100-accuracy move, which would otherwise still roll
+   `randomChance(100,100)`. The engine had these as EFFECT gates (Attract's gender check sits in
+   `apply_status_target_volatile`, after the roll) or not at all — Leech Seed's Grass immunity was
+   missing outright, so the engine seeded Grass types AND rolled accuracy at them
+   (`rust-extra randomChance[90,100]@accuracy`). `status_try_immunity_fails` covers the gen9 status
+   set: Leech Seed (Grass), Attract/Captivate (opposite genders), Trick/Switcheroo (Sticky Hold —
+   `hasAbility`, so Mold Breaker bypasses), Worry Seed (Truant/Insomnia — PS reads `target.ability`
+   RAW, so Mold Breaker does NOT), Octolock (Ghost is trap-immune).
+3. **White Herb is an `onUpdate`, so it clears SWITCH-IN drops too** (+3). Its nine call sites were
+   all move-secondary paths; Sticky Web's -1 Speed and Intimidate's -1 Attack go through
+   `react_to_stat_drop`, which knew Defiant and Competitive but not the herb. Fixed there, after
+   those two (PS runs them as `onAfterEachBoost`, inside the boost; the herb waits for the Update).
+4. **Unburden's volatile ends on switch-out** (+4). PS adds it only from
+   `onAfterUseItem`/`onTakeItem` and its `onEnd` removes it on leaving; nothing re-adds it on
+   entry. `ALL_VOLATILES` was missing it, so the engine carried a stale bit 28 and read a doubled
+   Speed for whatever entered next. rb1062: Hawlucha's White Herb is eaten by the turn-1
+   Intimidate, granting `unburden`; it pivots and PS's volatiles go empty while the engine's did
+   not — and PS's own later re-entries of Hawlucha confirm it never comes back.
+
+## The 226 still-open extension games, triaged (evidence, not guesses)
+
+First-divergence draw class (the gate's own ranking):
+
+| n | class | reading |
+|---|---|---|
+| 144 | `draws-match/state-diff` | the engine's draw stream equals PS's for the unit; the STATE differs |
+| 14 | `PS-unconsumed sample@sleeptalk` | **S1** below |
+| 8 | `move-order-tie` | unfilterable shuffle fork (both order-branches share a draw stream) |
+| 5 | `PS randomChance@ficklebeam` | **S2** |
+| 5 | `PS shuffle@generic` | a bracket/schedule shuffle the engine does not emit |
+| 4 | `PS-unconsumed random@slp` / `PS random@slp` (+4 more) | **S3** |
+| 4 | `args randomChance@toxicchain` | **S4** |
+| 4 | `rust-extra randomChance@accuracy` | residual accuracy over-emission (not Leech Seed) |
+| 2 | `convert-target:volatile:magnetrise` | **S6** |
+| ~20 | singletons (`@curse`, `@fakeout`, `@fireblast`, `@harvest`, `@par`, `@flamebody`, `@icehammer`, `@throatchop`, `@dragontail`, `@icebeam`, `@shadowball`, `@powerwhip`, `@struggle`, `@hypervoice`, `@bravebird`, `@headlongrush`, `@willowisp`, `@disablemove`, `@roar`, `@confusion`, `@lockedmove`) | bespoke |
+
+Field split of the 144 `draws-match/state-diff` games: 53 `hp`, 19 `volatiles`, 12 `species`,
+11+8+8+3+3 boosts, 6 `active_turns`, 5 `wish`, tail. Of the 131 hp deltas, **121 exceed 10 HP** —
+these are wrong MECHANICS, not damage rounding; only 10 are within 2 (the true rounding class,
+see S7).
+
+Named shared roots, each with its evidence:
+
+- **S1 — Sleep Talk is not modeled (14 games, the largest single class).** PS's `sleeptalk`
+  `onHit` does `this.battle.sample(moves)` over the user's other moves and then `useMove`s the
+  pick; recorded as `sample[3]@sleeptalk`. The engine emits no draw and calls no move. Evidence:
+  rb1002 d45 (Snorlax asleep, PS `sample[3]`, engine's stream ends), and 13 more with the same
+  label and a `moveN.pp` or `hp` diff. Fixing it needs called-move re-entrancy (the same machinery
+  Metronome/Copycat/Assist would want), so it is a feature, not a patch. Emitting the draw alone
+  would be a half-fix: the stream would align and the state would not.
+- **S2 — Fickle Beam's doubling roll (5).** PS rolls `randomChance(3,10)@ficklebeam` BEFORE the
+  damage roll; the engine's next draw is the `random[16]@damage-roll`. Consistent with the
+  campaign's known Fickle Beam ORDERING note — it is now a first-divergence class in its own right.
+- **S3 — sleep-duration `random(2,5)` position (8 across `@slp` labels).** Half report
+  `PS-unconsumed random[2,5]@slp` (PS rolls a duration the engine never does), half report PS's
+  `random[2,5]@slp` where the engine emitted `randomChance[100,100]@accuracy` — i.e. the engine
+  rolls accuracy for Hypnosis/Sleep Powder at a point where PS has already moved on to the sleep
+  counter. One schedule, two faces.
+- **S4 — Toxic Chain fires per CONNECTING HIT, not per move (4).** rb1049: Fezandipiti's Beat Up,
+  PS's stream is `[crit, dmg, randomChance[3,10]@toxicchain] x 6`; the engine emits the six
+  crit/damage pairs back-to-back. This is structurally the SAME root as the campaign's one
+  remaining c-corpus open (**R1**, per-hit Cursed Body inside a multi-hit): an `onSourceDamagingHit`
+  /`onDamagingHit` ability roll that the realized multi-hit executor does not step its
+  `RealizedCursor` over. R1's fix spec in the terminal certification above covers both — do them
+  together, and note the engine ALSO gates Toxic Chain on contact, which PS does not.
+- **S5 — Terastallization forme changes (7).** Ogerpon's four formes gain
+  `EmbodyAspect{Teal,Wellspring,Hearthflame,Cornerstone}` (and the matching +1 stat) on
+  terastallizing; Terapagos-Terastal becomes Terapagos-Stellar with `TeraformZero`. The engine
+  keeps the base ability and base species: `engine=Sturdy ps=EmbodyAspectCornerstone`,
+  `engine=TeraShell ps=TeraformZero`. Also in the `species` bucket: Cramorant's Gulp Missile formes
+  and Eiscue's Ice Face.
+- **S6 — `convert.rs` has no `magnetrise` volatile (2).** `d1:convert-target:volatile:magnetrise`.
+  The engine's `State` HAS `VolatileStatus::MagnetRise`; the converter does not map PS's. Cheap,
+  but it touches the exporter round-trip gate, so it wants its own commit.
+- **S7 — modifier-chain rounding (10 games, |hp delta| <= 2).** PS accumulates every damage
+  modifier in 4096 fixed point and applies `tr((base * mod + 2048) / 4096)` once; sequential
+  rounding differs by 1. rb1008 (Perrserker, Tough Claws + Choice Band + Knock Off x1.5) is the
+  clean instance: 250 vs 249.
+- **S8 — Protosynthesis re-derivation (3).** The engine re-adds the volatile on switch-in where PS
+  does not (`engine=Volatiles(33554432) ps=Volatiles(0)`), i.e. the Booster Energy / sun activation
+  condition or its timing is off.
+- **Bespoke tail (~20 singletons).** `@roar`'s `sample[n]` (PS picks the forced-out replacement
+  with a sample the engine renders as a residual shuffle, 2 games), Throat Spray (2), Leppa/Lum/
+  Chesto/Sitrus berry timing (~6), Light Clay, and the per-move accuracy singletons. Each has a
+  recorded first-divergence label in the gate output; none is shared.
+
+**Kill criterion: still NEVER triggered.** Every landed root this session was PS-source-grounded
+and monotone; no fix was speculative, and the newly-non-exact set was EMPTY at all four steps.
+
+## Extended CI gate
+
+Add to the seven gates listed in the terminal certification above:
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 286 / 512**, and the non-exact SET must be a subset of the previous one. 8 s.
+   Diff the exact-game set (`VERBOSE=1`, then `sed -n '/^exact games:/,$p'`), never the count.
 
 ---
 

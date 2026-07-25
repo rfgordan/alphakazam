@@ -1,11 +1,36 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**PHASE 3 (2026-07-25): 286/512 full games byte-exact from seed; init-aligned 512/512. The
+original 111 stay at 110/111 with the same single R1 exception.** The corpus is now 111 audited
+traces + **401 fresh gen9randombattle seed fixtures** (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.45% (3810/3831); sweep 3831/3831; smoke 18/18; round-trip PASS. Kill criteria NEVER
+triggered.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-3 SEED EXTENSION" — before
+anything else.** It carries: the gate-scaling numbers (rayon: 6.4 s -> 1.9 s on 111; 7.7 s on
+512), the SLIM FIXTURE format and why its digest is exactly `diff_states` (including the terminal
+sentinel that must be data, not a guess — guessing it silently greened 9 real divergences), the
+four roots this phase fixed, and the **triaged taxonomy of the 226 still-open extension games**
+(S1 Sleep Talk 14, S2 Fickle Beam 5, S3 sleep-duration 8, S4 Toxic Chain per-hit 4 — same root as
+R1, S5 tera formes 7, S6 magnetrise converter gap 2, S7 modifier-chain rounding 10, S8
+Protosynthesis 3, plus ~20 bespoke singletons). The section after it is the campaign's TERMINAL
+CERTIFICATION for the audited 111 (R1's fix spec + six other evidenced opens + the CI gate list).
+
+Practical notes for the next session:
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE (skips seeds whose sidecar already gunzips clean). Sidecars are
+  gitignored; rebuild fixtures with `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim
+  harness/seed-sidecars/*.json.gz`. **Regenerate fixtures whenever `convert.rs` changes** — they
+  bake in its digests. They do NOT depend on the engine.
+- Diagnosis: the fixture gate reports the decision + the first divergent DRAW; re-run the same
+  game against its sidecar (`DBG_DIFF=1 DBG_GAME=rbNNNN SEED_GATE=1 cosim
+  harness/seed-sidecars/rbNNNN.json.gz`) to get the differing FIELD.
+- Judge every commit by the exact-SET diff on BOTH corpora, never by the count.
+
+--- historical (pre-Phase-3) below ---
+
 **TERMINAL (2026-07-25): 110/111 full games byte-exact from seed (99.1%); ALL 111 init-aligned;
 differ 99.45% (3810/3831); sweep 3831/3831; smoke 18/18; round-trip 4832/4832; transplant 79/110.**
-Kill criteria NEVER triggered. **The campaign's TERMINAL CERTIFICATION — final numbers, the one
-remaining open (R1: per-hit Cursed Body inside a multi-hit move, r3) with its fix spec, six other
-evidenced opens, and the recommended CI gate for future engine commits — is the first section of
-`DRAW_EXACT_SCOREBOARD.md`.** Read that first; everything below this line is historical.
 
 --- historical (pre-terminal) below ---
 
