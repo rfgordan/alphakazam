@@ -3746,7 +3746,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // Annotation-gated: in the DP (Enumerate/Sample) state path no draws are emitted and the
         // move is already state-neutral against a fainted foe, so this is purely a draw-suppression
         // fix for the Replicate/differ streams — leaving the DP sweep byte-identical.
+        //
+        // CURSE is the one move whose static `target` lies: PS's `onModifyMove` retargets it to its
+        // `nonGhostTarget: 'self'` for a non-Ghost user (moves.ts), and `onModifyMove` runs BEFORE
+        // `getMoveTargets`. So a non-Ghost Curse into a foe that fainted earlier this turn still
+        // resolves fully — self-boosts plus the `random(100)` self-drop discard. (c6a2s114 d36:
+        // Victreebel faints to its own Life Orb recoil after Sludge Bomb, then Snorlax's Curse
+        // still fires; the engine bailed here, dropping PS's `random[100]@curse` AND the boosts.)
+        let retargets_self = md.id.to_id() == "curse"
+            && !b.state.side(side).active().types.contains(&Type::Ghost);
         if annotating()
+            && !retargets_self
             && matches!(md.target,
                 crate::data::MoveTarget::Normal | crate::data::MoveTarget::AdjacentFoe
                     | crate::data::MoveTarget::Any | crate::data::MoveTarget::RandomNormal
