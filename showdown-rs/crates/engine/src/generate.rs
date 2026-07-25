@@ -4461,21 +4461,41 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let mut v = Vec::new();
         let crit_p = crit_chance(&b, side, &md);
         let crit_den = ps_crit_den(&b, side, &md);
-        for combo in HitCombos::new(hits_min) {
-            let mut prob = hit_prob;
-            for &(_, crit) in &combo {
-                prob *= (1.0 / 16.0) * if crit { crit_p } else { 1.0 - crit_p };
-            }
-            if prob <= 0.0 {
+        // PS runs `runEvent('BasePower')` BETWEEN the crit roll and the damage roll
+        // (battle-actions.ts:1653, "happens after crit calculation"). Fickle Beam's `onBasePower`
+        // rolls `randomChance(3, 10)` there and `chainModify(2)` on a proc, so its draw sits INSIDE
+        // the per-hit crit/damage pair — not before it and not after it — and the doubling feeds
+        // that same hit's damage. Enumerate both outcomes; `apply_damage_hit` emits the draw in
+        // position. (Fickle Beam is the only gen9 move with a random `onBasePower`.)
+        let bp_outcomes: [(f32, Option<bool>); 2] = if md.id.to_id() == "ficklebeam" {
+            [(0.70, Some(false)), (0.30, Some(true))]
+        } else {
+            [(1.0, None), (0.0, None)]
+        };
+        for (bp_p, bp_roll) in bp_outcomes {
+            if bp_p <= 0.0 {
                 continue;
             }
-            let mut hb = scaled(&b, prob);
-            // Per-hit crit+damage draws are emitted INSIDE the hit loop (KO-terminating), so a
-            // multi-hit move that faints the target early stops rolling exactly where PS does
-            // (`hitStepMoveHitLoop`: the top-of-loop `targets.every(!hp)` break precedes the next
-            // hit's crit/damage rolls). See `apply_damage_hit`.
-            let hit_sub = apply_damage_hit(&mut hb, side, &md, &combo, crit_den);
-            v.push((hb, hit_sub));
+            let mut md_bp = md;
+            if bp_roll == Some(true) {
+                md_bp.base_power = md.base_power.saturating_mul(2);
+            }
+            for combo in HitCombos::new(hits_min) {
+                let mut prob = hit_prob * bp_p;
+                for &(_, crit) in &combo {
+                    prob *= (1.0 / 16.0) * if crit { crit_p } else { 1.0 - crit_p };
+                }
+                if prob <= 0.0 {
+                    continue;
+                }
+                let mut hb = scaled(&b, prob);
+                // Per-hit crit+damage draws are emitted INSIDE the hit loop (KO-terminating), so a
+                // multi-hit move that faints the target early stops rolling exactly where PS does
+                // (`hitStepMoveHitLoop`: the top-of-loop `targets.every(!hp)` break precedes the
+                // next hit's crit/damage rolls). See `apply_damage_hit`.
+                let hit_sub = apply_damage_hit(&mut hb, side, &md_bp, &combo, crit_den, bp_roll);
+                v.push((hb, hit_sub));
+            }
         }
         v
     } else if ice_face_is_intact(&b, foe, &md) {
@@ -5345,11 +5365,13 @@ enum HitRolls<'a> {
     Realized { count: usize, cur: &'a mut RealizedCursor },
 }
 
-fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)], crit_den: i32) -> bool {
-    apply_damage_hit_rolls(b, side, md, HitRolls::Fixed(hits), crit_den)
+fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)], crit_den: i32, bp_roll: Option<bool>) -> bool {
+    apply_damage_hit_rolls(b, side, md, HitRolls::Fixed(hits), crit_den, bp_roll)
 }
 
-fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData, mut rolls: HitRolls, crit_den: i32) -> bool {
+/// `bp_roll`: the enumerated outcome of a random `onBasePower` handler (Fickle Beam), emitted
+/// between this hit's crit roll and its damage roll — PS's `runEvent('BasePower')` position.
+fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData, mut rolls: HitRolls, crit_den: i32, bp_roll: Option<bool>) -> bool {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let initial_calc = compute_damage(b, side, md);
@@ -5388,6 +5410,9 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         };
         if crit_den > 0 {
             draw(b, "randomChance", &[1, crit_den], crit as i64, "crit");
+        }
+        if let Some(v) = bp_roll {
+            draw(b, "randomChance", &[3, 10], v as i64, "ficklebeam");
         }
         draw(b, "random", &[16], roll as i64, "damage-roll");
         // ModifyDamage screen-tie shuffle (per getDamage, after the damage roll).
@@ -6629,7 +6654,7 @@ fn apply_multihit_realized(
     // The loop also steps the cursor over the inter-hit `ModifyDamage` screen shuffle it emits.
     let crit_den = ps_crit_den(&hb, side, md);
     let hit_sub = apply_damage_hit_rolls(
-        &mut hb, side, md, HitRolls::Realized { count, cur: &mut cur }, crit_den,
+        &mut hb, side, md, HitRolls::Realized { count, cur: &mut cur }, crit_den, None,
     );
     // The per-hit hook already ran every DamagingHit ability roll for this move; suppress the
     // post-hit-loop once-per-move application in `execute_move_inner`.
