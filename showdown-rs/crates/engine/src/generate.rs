@@ -2288,17 +2288,6 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     reset_move_tracking(b, side);
     push(b, Instruction::Switch { side, previous, next: target });
 
-    // A matured Wish can linger while its slot is empty.  When a faint replacement finally
-    // enters that slot, PS removes the stale slot condition without healing the replacement
-    // (the healing event belonged to the earlier residual).  Keeping it for another residual
-    // incorrectly lets the new occupant receive an expired Wish.
-    if replacing_fainted {
-        let wish = b.state.side(side).wish;
-        if wish.0 == 1 {
-            push(b, Instruction::SetWish { side, previous: wish, new: (0, 0) });
-        }
-    }
-
     apply_entry_hazards(b, side);
     // Toxic's damage stage resets whenever the badly-poisoned mon re-enters.
     {
@@ -10450,6 +10439,30 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     use crate::instruction::ActiveCounter;
     let mut yawn_fired = [false; 2];
     for side in [SideId::One, SideId::Two] {
+        // Wish (PS `onResidualOrder: 4`, data/moves.ts:20945) is a SLOT condition, and
+        // `fieldEvent('Residual')` runs slot-condition handlers even when the slot's occupant has
+        // fainted: `if ((handler.effectHolder as Pokemon).fainted) { if (!(handler.state
+        // ?.isSlotCondition)) continue; }` (sim/battle.ts:512-514). So the tick is unconditional —
+        // it sits ahead of the fainted-active guard below — and PS's own bookkeeping is date-based
+        // (`getOverflowedTurnCount() <= startingTurn` → not yet), so nothing can defer it.
+        // On maturity the handler calls `removeSlotCondition` unconditionally; only the HEAL is
+        // gated on a live occupant (`onEnd(target) { if (target && !target.fainted) heal }`). A
+        // Wish that matures over a fainted slot is therefore CONSUMED with no heal — it does not
+        // linger to a later end of turn.
+        let wish = b.state.side(side).wish;
+        if wish.0 > 0 {
+            let landed = wish.0 == 1;
+            let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
+            push(b, Instruction::SetWish { side, previous: wish, new });
+            if landed {
+                let p = b.state.side(side).active();
+                if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
+                    let amt = wish.1.min(p.max_hp - p.hp);
+                    let slot = b.state.side(side).active_index;
+                    push(b, Instruction::Heal { side, slot, amount: amt });
+                }
+            }
+        }
         if !b.state.side(side).active().is_alive() {
             continue;
         }
@@ -10507,27 +10520,6 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             if y == 1 {
                 push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Yawn });
                 yawn_fired[side.index()] = true;
-            }
-        }
-        // Wish: ticks each end of turn; heals the slot's occupant when it lands. PS's
-        // residual handler doesn't run for an empty/fainted slot, so a matured wish
-        // LINGERS until an end-of-turn where the slot has a live occupant.
-        let wish = b.state.side(side).wish;
-        if wish.0 > 0 {
-            let landed = wish.0 == 1;
-            if landed && !b.state.side(side).active().is_alive() {
-                // linger: try again next end of turn
-            } else {
-                let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
-                push(b, Instruction::SetWish { side, previous: wish, new });
-                if landed {
-                    let p = b.state.side(side).active();
-                    if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
-                        let amt = wish.1.min(p.max_hp - p.hp);
-                        let slot = b.state.side(side).active_index;
-                        push(b, Instruction::Heal { side, slot, amount: amt });
-                    }
-                }
             }
         }
         if b.state.side(side).volatiles.contains(VolatileStatus::PerishSong) {
