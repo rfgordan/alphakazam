@@ -1,6 +1,15 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**CURRENT STATE (2026-07-24): 93/111 full games byte-exact from seed (83.8%); ALL 111
+**TERMINAL (2026-07-25): 110/111 full games byte-exact from seed (99.1%); ALL 111 init-aligned;
+differ 99.45% (3810/3831); sweep 3831/3831; smoke 18/18; round-trip 4832/4832; transplant 79/110.**
+Kill criteria NEVER triggered. **The campaign's TERMINAL CERTIFICATION — final numbers, the one
+remaining open (R1: per-hit Cursed Body inside a multi-hit move, r3) with its fix spec, six other
+evidenced opens, and the recommended CI gate for future engine commits — is the first section of
+`DRAW_EXACT_SCOREBOARD.md`.** Read that first; everything below this line is historical.
+
+--- historical (pre-terminal) below ---
+
+**(2026-07-24): 93/111 full games byte-exact from seed (83.8%); ALL 111
 init-aligned; draw-consumption differ 99.09% (3796/3831).** Kill criteria NEVER triggered.
 DRAW_EXACT_SCOREBOARD.md is the source of truth (this file's older sections below are historical).
 

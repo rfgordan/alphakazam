@@ -5,6 +5,141 @@ PS pin: `b9dc987d`. Corpus: 111 traces / 3831 move units.
 
 ---
 
+# ==== TERMINAL CERTIFICATION — draw-exact campaign (2026-07-25) ====
+
+**HEADLINE: 110 / 111 full games byte-exact from seed (99.1%).** All 111 init-aligned.
+ONE named open item remains, with full PS evidence and a fix spec (below).
+
+## Final gate numbers (all re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate (full battle from seed) | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **110 / 111 exact (99.1%)**; init-aligned **111 / 111** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim …` | **3810 / 3831 = 99.45%** (21 mismatches: 13 unconsumed, 4 args, 3 state-despite-draw-match, 1 not-next) |
+| State sweep (mechanics rail) | `cosim …` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** (100% exactness, 100% coverage) |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **4832 / 4832** states, **3829 / 3829** move units |
+| Transplant continuation | `node harness/transplant-gate.mjs` | **79 / 110 OK**, 17 diverge, 0 fail, 14 skip; **1812** continuation decisions state-exact |
+| Protocol log-parity | `PROTOCOL_EMIT=harness/protocol-logs cosim …` then `node harness/protocol-parity.mjs` | 27 games, **525 semantic**, 4808 cosmetic (c1 = 2, r5 = **0**; 5 outliers r9 115 / r19 96 / r3 49 / r10 49 / r12 39 carry ~70%) |
+
+Over-emission (the hard invariant — never emit a draw PS does not) is **ZERO**: no
+`rust extra <draw>` entry remains in the differ; the single `rust-requested-draw-not-next-in-log`
+is an ORDERING case (Fickle Beam), not an extra draw.
+
+## The 21 remaining differ mismatches are NOT 21 engine gaps
+
+They sit in 15 games — **14 of which are byte-exact from seed**. Three known accounting shapes:
+
+1. **Gate-consumed-outside-`chosen_draws`** (12 × `shuffle[2,0,2]@generic`, 3 × `sample[1]@trace`).
+   The seed gate consumes the forced-replacement 3-shuffle bracket and Trace's switch-in
+   `sample(1)` in `step_unit`, *after* `replicate_select` returns, so they are absent from the
+   `chosen_draws` the differ compares against the recorded unit. Verified case-by-case on
+   c3c2s82 d19/d30, r10 d30 and c6a2s114: PS's stream and the gate's PRNG agree
+   (`battle.prng.getSeed()` vs `prng.limbs()` match at the next unit start).
+2. **Stream-neutral arg pair** (`shuffle[3,0,2]` vs `[2,0,2]`, t2 d5): both shuffle a 2-element
+   tie group, i.e. both consume exactly one `random(start,end)` — a LIST-LENGTH cosmetic that
+   needs a State stall-volatile flag distinct from `stall_counter` to render exactly.
+3. **Real, in the one non-exact game** (r3 d23, item R1 below).
+
+## THE ONE OPEN ITEM — R1: per-hit Cursed Body inside a multi-hit move (r3, 1 game)
+
+**PS evidence.** `Cursed Body` is `onDamagingHit`, fired inside `spreadMoveHit`, i.e. ONCE PER
+CONNECTING HIT of `hitStepMoveHitLoop` — not once per move. Recorded r3 d23 t19 (Koraidon
+Scale Shot into Froslass), PS's exact stream:
+
+```
+randomChance[90,100]=true@scaleshot  sample[20]={idx 17 -> 5 hits}@scaleshot
+randomChance[1,24]=false@scaleshot   random[16]=10@scaleshot   randomChance[3,10]=false@cursedbody
+randomChance[1,24]=false@scaleshot   random[16]=7@scaleshot    randomChance[3,10]=true@cursedbody
+```
+(only 2 of the 5 hits execute — Froslass faints — and the 2nd Cursed Body roll procs, leaving
+Koraidon with the `disable` volatile). The engine emits:
+```
+acc  sample[20]  crit roll  crit roll  randomChance[3,10]@cursedbody
+```
+— one trailing roll, because `apply_cursed_body` is called once from the post-hit-loop block
+(generate.rs ~4482) while the multi-hit realized executor (`apply_multihit_realized`,
+generate.rs ~6465) peeks every hit's crit+damage back-to-back.
+
+**Fix spec** (deliberately NOT attempted here — it is the shared Scale-Shot-family path, and the
+regression surface is the 21 currently-exact multi-hit games):
+- In `apply_multihit_realized` / `apply_multihit_realized_ma`, step the `RealizedCursor` over one
+  `randomChance(3,10)` between hits whenever the target has Cursed Body and the roll gate holds
+  (`move != Struggle`, source not already Disabled) — exactly as it already steps over the
+  inter-hit `ModifyDamage` screen shuffle via `cur.consume_shuffle(screen_k)`. Without this the
+  cursor reads hit *n+1*'s crit out of hit *n*'s Cursed Body slot.
+- Emit the roll per hit inside `apply_damage_hit`'s per-hit application (a per-hit hook), and stop
+  rolling once a roll procs (PS's gate re-reads `source.volatiles['disable']`, so a proc silences
+  every later hit).
+- Judge: the seed-gate exact-set must stay monotone and the multi-hit distribution smoke must stay
+  18/18; the Scale Shot / Bullet Seed / Icicle Spear / Population Bomb / Triple Axel families are
+  the blast radius.
+
+## Other evidenced opens (NOT blocking the 110; each has PS evidence, none is "neutral")
+
+- **O1 — switch-in ability field change fires too early (stream-neutral).** The engine emits the
+  `eachEvent('TerrainChange'/'WeatherChange')` shuffle at the switch application site; PS fires it
+  inside `runSwitch`, AFTER the `battle-actions.ts:178` `getAllActive` speedSort. Probed at r10 d32.
+  Same count, same args (`shuffle[2,0,2]`), so the PRNG stream is identical — a pure ordering nicety.
+- **O2 — weather/terrain expiry `clearWeather`/`clearTerrain` position.** Both are now emitted
+  (field.ts:97 / :165), the weather one at residual order 1 (exact) and the terrain one at the
+  engine's terrain tick, which sits between Cud Chew (order 28) and Harvest (order 28) rather than
+  at PS's terrain order 27. No corpus instance discriminates; if one appears, move the terrain tick
+  ahead of the order-28 ability residuals.
+- **O3 — cached-speed model is partial.** `replacement_bracket_tied` now zeroes a just-entered
+  side's Speed BOOST (PS's `updateSpeed()` in `commitChoices` runs before the replacement enters, so
+  Sticky Web's −1 is invisible to that bracket — c3c2s82 d49). Other stale-cache deltas (a mon last
+  active under Swift Swim/Chlorophyll/Sand Rush/Slush Rush; Slow Start's active-turn window; a
+  Choice Scarf acquired while benched) are still evaluated live. A full model needs a per-mon
+  `cached_speed` field in `State`.
+- **O4 — forme-change spread inversion is ambiguous below level 100.** `respread_stats` inverts
+  `stat = floor(floor((2*base + d) * level/100 + 5) * nature)` for `d = IV + floor(EV/4) ∈ [31,94]`,
+  nature-neutral first. Under level 100 the `* level / 100` truncation makes several `d` collide; when
+  they disagree on the new stat the code falls back to the random-battle spread (31 IV / 85 EV /
+  neutral), which is exact for every randombattle set. Exact fix: carry `nature` + `evs` + `ivs`
+  through `convert.rs` instead of baking spreads into `stats`.
+- **O5 — protocol log-parity is NOT part of the draw-exact contract.** 525 semantic diffs across
+  27 games; c1 = 2, r5 = 0, and 5 randbats outliers carry ~70%. Owned by
+  `EXPORT_PROTOCOL_OPENS.md` (move-execution ordering + effectiveness attribution).
+- **O6 — transplant 79/110** is unchanged by this campaign; its two open classes
+  (`per-decision unmodeled-field` and `mid-turn-faint turn-cascade`) are specified in
+  `EXPORT_PROTOCOL_OPENS.md` sections A and B.
+- **O7 — `PROTOCOL_EMIT` fails on 6 traces** (`resolve:choice:move-not-on-set`, e.g. r2
+  `tripleaxel`, rd318 `scaleshot`): the emitter path resolves recorded choices against the mon's
+  set and cannot resolve a locked/called move. Emitter-side, pre-existing.
+
+## CI-gate recommendation for future engine commits
+
+Run in this order; each is cheap enough for a per-commit hook except the last two.
+
+1. `cargo test --release -p engine -j 2` — **12 suites must be green** (includes the
+   apply/reverse instruction round-trip property test).
+2. `target/release/cosim harness/cosim-traces/*.json.gz` — **must print 3831 / 3831 matched,
+   0 diverged, 0 unsupported.** This is the mechanics-drift rail; it is the ONLY gate that
+   catches a state regression in the DP (Enumerate/Sample) path.
+3. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay ≥ 110/111,
+   and the non-exact SET must be a subset of the previous one.** Diff the exact-game set, never
+   the count alone; the VERBOSE listing is truncated and unusable for regression judgment.
+4. `DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay ≥ 99.45%**, and
+   the label list must contain **no `rust extra …` entry** (zero over-emission is the hard
+   invariant; a new one means the engine invented a draw PS does not make).
+5. `ROUNDTRIP_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **4832 / 4832**.
+   Required for any change to `State`, `Instruction`, or `convert.rs`.
+6. `bash harness/run-distribution-smoke.sh` — **18 / 18**. Required after any structural change to
+   branch generation (it is the only gate that checks the branch PROBABILITIES, not just the set).
+7. `node harness/transplant-gate.mjs` — **≥ 79 / 110**, 0 fail. Required for exporter changes.
+
+Notes for whoever picks this up: (a) the differ and the seed gate disagree by construction on
+gate-consumed draws — always trust the seed gate for "is this game exact"; (b) a realized-cursor
+desync masquerades as a damage-rounding bug, so before touching `compute_damage`, bisect
+`battle.prng.getSeed()` (PS) against `prng.limbs()` (gate) per unit — that method found three of
+this session's six roots; (c) `diff_states` does NOT compare stored stats, so a forme/stat bug is
+invisible to it and only the seed gate's downstream damage will show it.
+
+**Kill criterion: NEVER triggered.** Every tranche landed structured, PS-source-grounded roots.
+
+---
+
 ## State-computation + drag/trace/no-guard tranche (2026-07-24): 98/111 -> 103/111 (+5, 4 commits)
 
 Worked the state-computation singles + realized-selection queue. All rails green each commit
