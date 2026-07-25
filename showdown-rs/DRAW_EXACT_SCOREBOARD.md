@@ -6,6 +6,134 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== PHASE-5 EXTENSION BURN-DOWN — certification (2026-07-25) ====
+
+**HEADLINE: 372 / 512 full games byte-exact from seed (72.7%), up from 333; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Nine commits, every one PS-source-grounded, every one monotone: the newly-non-exact set was
+EMPTY at all nine steps (judged by exact-SET diff on both corpora, never by the count). Two of
+the three parked items are CLOSED (S5 tera formes, S6 magnetrise); S7 is landed with a named
+residue.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **372 / 512 (72.7%)**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | all suites green |
+
+## The roots landed (in commit order)
+
+| # | class | games | PS reference |
+|---|-------|-------|--------------|
+| 1 | **Adaptability after Terastallizing** | 333 -> 335 | `battle-actions.ts:1762-1796` + `data/abilities.ts:44` |
+| 1 | **Fur Coat / Marvel Scale key on the STAT** | (same) | `onModifyDef` + `Pokemon#calculateStat` |
+| 1 | **Destiny Bond `onFaint`** and its **non-stackability** | (same) | `data/moves.ts` destinybond `onFaint` / `onPrepareHit` / `onBeforeMove` |
+| 2 | **crash-damage moves crash on EVERY MoveFail** | 335 -> 341 | `battle-actions.ts:526` vs the `:511` no-target return |
+| 2 | **Knock Off beats the target's HP berry** | (same) | `eachEvent('Update')` at `battle-actions.ts:970` vs `onAfterHit` at `:1144` |
+| 3 | **Freeze-Dry's `onEffectiveness`** | 341 -> 345 | `data/moves.ts:6167` — `if (type === 'Water') return 1` |
+| 3 | crash on the `onTryHit` absorbs; Heal Block gates the berry EAT | (same) | `data/items.ts:5752` `sitrusberry.onTryEatItem` |
+| 4 | **Magic Guard blocks every non-Move damage** | 345 -> 352 | `onDamage`: `effect.effectType !== 'Move'` |
+| 4 | **Avalanche / Revenge `basePowerCallback`** | (same) | `pokemon.attackedBy … p.thisTurn` |
+| 5 | **Download's tie goes to SpA** | 352 -> 359 | `data/abilities.ts` `totaldef >= totalspd` |
+| 5 | **S5 — the Tera forme changes** (Ogerpon masks + Terapagos) | (same) | `battle-actions.ts:1935` `terastallize` |
+| 6 | **S6 — Magnet Rise, end to end** | 359 -> 361 | `data/moves.ts:10854` |
+| 7 | **S7 — the stat chains accumulate into ONE `event.modifier`** | 361 -> 364 | `battle.ts:2334` `chainModify` + `:932` |
+| 8 | **Ivy Cudgel's mask type** | 364 -> 370 | `data/moves.ts:9775` `onModifyType` |
+| 8 | **Heavy-Duty Boots is a PER-HAZARD check** | (same) | `data/moves.ts:19780-19791` (Poison absorb precedes it) |
+| 9 | **Battle Bond's KO boost; Throat Spray on status sound moves** | 370 -> 372 | `battlebond.onSourceAfterFaint`, `throatspray.onAfterMoveSecondarySelf` |
+
+### Method notes worth keeping
+
+- **The exact-SET diff earned its keep twice this session.** The naive S7 accumulation refactor
+  scored +1/-1, and the lost game (rb1311) is what proved that Reckless / Tough Claws /
+  Mega Launcher / Toxic Boost / Flare Boost sit in `onBasePower`, not in the stat chain. The
+  Destiny Bond `onFaint` commit likewise cost the audited r3 until its `onPrepareHit`
+  non-stackability rule was added — the audited corpus is a live jury, not a formality.
+- **The state-diff divergence CAUSES draw-class mislabels.** Four games that read as
+  `move-order-tie` flipped on the crash-damage fix alone. Do not treat the draw-class histogram
+  as a partition of independent roots.
+- **`DBG_GAME=rb` + `GATE_THREADS=1`** dumps every game's first divergent block in one pass;
+  joining that to the VERBOSE gate listing by decision index is the whole triage loop.
+
+## The 140 still-open games, re-triaged
+
+| n | class | reading |
+|---|-------|---------|
+| 95 | `draws-match/state-diff` | the draw stream matches for the unit; the STATE differs |
+| 6 | `PS shuffle@generic` | a bracket/schedule shuffle the engine does not emit |
+| 3+2 | `random@confusion` | rampage-end / Confuse Ray duration position |
+| 3 | `rust-extra randomChance@accuracy` | over-emission; the Focus Punch `beforeMoveCallback` root is still open |
+| 2 | `PS random@curse` / `@lockedmove` / `PS sample@roar` / `args @par` / `args @struggle` / `args @hypervoice` | bespoke |
+| ~20 | singletons | `@fakeout` `@thunderbolt` `@fireblast` `@heavyslam` `@discharge` `@icehammer` `@throatchop` `@freezedry` `@icebeam` `@shadowball` `@trace` `@bravebird` `@harvest` `@powerwhip` `@crit` `@disablemove` |
+
+Field split of the 95 `draws-match/state-diff` games: **36 `hp`**, 14 `volatiles`,
+11 `active_turns`, 7 `wish`, 8 `boosts`, 4 `item`/`status`, 3 `species`, tail. Across ALL draw
+classes 55 games have an `hp` first-divergence field: **39 exceed 10 HP** (wrong mechanics),
+5 sit in 4-10, and **11 are within 3** (the rounding residue below).
+
+## Named opens carried forward
+
+- **`active_turns` (11 games) and `wish` (7 games) are ONE root: the mid-turn re-request
+  schedule.** Every instance is a turn whose unit was split by a mid-turn faint/pivot
+  re-request. `active_turns` is uniformly engine = PS + 1; `wish` is uniformly engine = PS + 1
+  ticks remaining (i.e. the engine ran one FEWER end-of-turn tick). The two point in opposite
+  directions, which is exactly what a residual phase attributed to the wrong unit looks like.
+  Evidence: rb1180 d41/d42 (turn 31, Palkia faints at turn 30, Skarmory replaces it and PS has
+  `activeTurns` 1 while the engine has 2) and rb1203 d10/d11 (Wish cast in a MID-TURN unit at
+  turn 8; `convert.rs` maps `turn <= startingTurn + 1 ? 2 : 1`, PS's compared state is turn 9 so
+  1, the engine still holds 2). This is the same mid-turn schedule the pre-Phase-3 handoff flags
+  as HIGH regression risk; it needs its own tranche with `battle.prng.getSeed()` vs
+  `prng.limbs()` bisection, not a bolt-on.
+- **S7 residue: eleven games with `|hp| <= 3`, six of them exactly 1**
+  (rb1008 rb1052 rb1105 rb1145 rb1282 rb1327). The stat chains are no longer the cause — they
+  accumulate correctly now. rb1008 (tera-Fighting Perrserker, Tough Claws + Choice Band Knock
+  Off into a switching-in Empoleon, 29 in PS vs 28 in the engine) is still the cleanest bisect
+  target. The next place to look is Knock Off's `basePowerCallback`, which returns
+  `move.basePower * 1.5` as a NON-integer before `clampIntRange` floors it, and the
+  `getDamage` truncation ladder around it.
+- **The berry `Update` must run AFTER the move's secondaries.** PS's order inside
+  `spreadMoveHit` is damage -> onHit -> selfDrops -> secondaries -> DamagingHit -> onAfterHit,
+  and only then `eachEvent('Update')` at `battle-actions.ts:970`. The engine's berry site is
+  inside `apply_post_damage`, ahead of the secondary. rb1003 (Psychic Noise heal-blocks a Cheek
+  Pouch Dedenne in the same hit that drops it under half — PS keeps the berry) and rb1204 /
+  rb1347 (a Lum / Chesto that PS eats and the engine does not) are the instances. This is the
+  single largest remaining `hp` root by delta.
+- **Terapagos-Stellar's FAINT regression** — it would move max HP on a fainted mon and
+  `Instruction::Transform`'s `hp += delta` carry-over has no invertible definition at hp 0
+  (PS: `hp = this.hp <= 0 ? 0 : max(1, …)`). Ogerpon's regression is implemented because its
+  four formes share base stats.
+- **Battle Bond's once-per-stint guard** (`abilityState.battleBondTriggered`, reset by
+  `switchIn` at `battle-actions.ts:142`) needs the `ProtoBooster` treatment: explicit engine
+  state read by `convert` and written by `export`. `ability_used` is NOT usable — `convert`
+  derives it from `swordBoost || shieldBoost` and `diff_states` compares it.
+- **Gulp Missile (rb1288, rb1367)** — `engine=cramorant ps=cramorantgorging`; the forme change
+  after Surf/Dive and its retaliation are unmodelled. **Ice Face's RESTORE (rb1253)** —
+  `iceface.onStart` / `onWeatherChange` turn Eiscue-Noice back into Eiscue under snow.
+  **Leppa Berry (rb1130, rb1389)** — unmodelled.
+- **Magnet Rise's `onTry` failure** against `smackdown` / `ingrain` or under Gravity is not
+  modelled; the engine has neither Smack Down nor Gravity.
+- **The 4 `rust-extra randomChance@accuracy` roots** and the `shuffle@generic` /
+  `move-order-tie` classes are unchanged from Phase 4, except that the crash-damage fix removed
+  four games from the tie class. rb1231 t12 shows the shape of the remaining accuracy
+  over-emission: a mid-turn unit where the foe U-turns away before Struggle resolves, so PS's
+  Struggle has no target and draws nothing.
+- **Kill criterion: still NEVER triggered.**
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 372 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== PHASE-4 EXTENSION BURN-DOWN — certification (2026-07-25) ====
 
 **HEADLINE: 333 / 512 full games byte-exact from seed (65.0%); init-aligned 512 / 512.

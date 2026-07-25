@@ -1,35 +1,51 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**PHASE 4 (2026-07-25): 333/512 full games byte-exact from seed; init-aligned 512/512. The
-audited 111 are now 111/111 — R1 (per-hit Cursed Body) is CLOSED and the campaign has NO named
-open item left on the audited corpus.** Corpus: 111 audited traces + 401 fresh gen9randombattle
-seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400). Differ 99.50% (3812/3831), zero
-`rust extra` and an EMPTY `rust-requested-draw-not-next-in-log` category; sweep 3831/3831;
-smoke 18/18; round-trip PASS. Kill criteria NEVER triggered.
+**PHASE 5 (2026-07-25): 372/512 full games byte-exact from seed (72.7%), up from 333;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS.
+Kill criteria NEVER triggered.
 
-**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-4 EXTENSION BURN-DOWN" — before
-anything else.** It carries the nine roots this phase landed (with PS file:line for each), the
-R1/S4 verdict and its regression-jury result, the re-triaged 179 open games, and the three
-explicitly-parked items: **S7 modifier-chain rounding (9 games, |hp| <= 3), S5 tera formes
-(Ogerpon/Terapagos), S6 magnetrise (2 games, blocked at the converter)**. The section after it is
-the Phase-3 certification (fixture format, gate scaling); the one after that is the campaign's
-terminal certification for the audited 111 (O1-O7).
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-5 EXTENSION BURN-DOWN" — before
+anything else.** It carries the fifteen roots this phase landed (with PS file:line for each),
+the re-triaged 140 open games, and the named opens. **S5 (tera formes) and S6 (magnetrise) are
+CLOSED. S7 (chainModify accumulation) is landed** — the ModifyAtk/ModifySpA and
+ModifyDef/ModifySpD chains now accumulate into one `event.modifier` — with an eleven-game
+`|hp| <= 3` residue that is NOT the stat chains.
 
-Practical notes for the next session:
+The three biggest remaining levers, in order:
+
+1. **The mid-turn re-request schedule — 18 games in one root.** `active_turns` (11) is
+   uniformly engine = PS + 1 and `wish` (7) is uniformly one tick behind; both only occur in
+   turns split by a mid-turn faint/pivot re-request, and they point in OPPOSITE directions,
+   which is what a residual phase attributed to the wrong unit looks like. rb1180 d41/d42 and
+   rb1203 d10/d11 are the clean instances. Bisect with PS's `battle.prng.getSeed()` against the
+   gate's `prng.limbs()` per unit. HIGH regression risk — its own tranche, with call-site
+   ground-truthing.
+2. **The defender's HP-berry `Update` must run AFTER the move's secondaries.** PS's order in
+   `spreadMoveHit` is damage -> onHit -> selfDrops -> secondaries -> DamagingHit -> onAfterHit,
+   then `eachEvent('Update')` at `battle-actions.ts:970`; the engine's berry site sits inside
+   `apply_post_damage`, ahead of the secondary. rb1003, rb1204, rb1347.
+3. **The remaining hp > 10 games (39).** Same loop that produced this phase: they are wrong
+   MECHANICS, one shared root at a time.
+
+Practical notes:
 - Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
   for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
   `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
-  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests (the S8 commit
-  moved 22 of 401). They do NOT depend on the engine.
-- Diagnosis: the fixture gate reports the decision + the first divergent DRAW; re-run the same game
-  against its sidecar (`DBG_DIFF=1 DBG_GAME=rbNNNN SEED_GATE=1 cosim
-  harness/seed-sidecars/rbNNNN.json.gz`) to get the differing FIELD. `DBG_GAME` is a
-  `starts_with` prefix; the DIFF lines go to stderr.
-- The single biggest remaining lever is the `draws-match/state-diff` bucket (129 games): 57 hp
-  (43 of them > 10 HP = wrong mechanics, 9 within 3 = S7 rounding), 14 volatiles, 12 boosts.
-- Judge every commit by the exact-SET diff on BOTH corpora, never by the count.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests (the S6
+  magnetrise commit moved exactly 3 of 401; justify every moved digest).
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved); join it to `VERBOSE=1 SEED_GATE=1 …` by
+  decision index. `DBG_GAME` is a `starts_with` prefix; DIFF lines go to stderr.
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.** It caught a
+  real regression twice this session (r3 on Destiny Bond, rb1311 on the S7 refactor), and both
+  times the lost game named the missing PS rule.
+- The state divergence itself creates draw-class mislabels: four `move-order-tie` games flipped
+  on a pure damage fix. Never treat the draw-class histogram as a partition of roots.
 
---- historical (pre-Phase-3) below ---
+--- historical (pre-Phase-5) below ---
 
 **TERMINAL (2026-07-25): 110/111 full games byte-exact from seed (99.1%); ALL 111 init-aligned;
 differ 99.45% (3810/3831); sweep 3831/3831; smoke 18/18; round-trip 4832/4832; transplant 79/110.**
