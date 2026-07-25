@@ -1054,6 +1054,44 @@ fn effective_weather(state: &State) -> Weather {
     state.weather
 }
 
+/// PS Shields Down (abilities.ts:4194): Minior swaps between its Meteor shell and its coloured
+/// core. The check is NOT continuous — it runs at `onStart` (switch-in, `onSwitchInPriority: -1`)
+/// and at `onResidual` (`onResidualOrder: 29`), and only there: above half HP the mon is
+/// `Minior-Meteor`, at or below half it reverts to `pokemon.set.species` (the coloured core the
+/// team was packed with — `Minior`, `Minior-Blue`, `Minior-Orange`, …, which the engine keeps in
+/// `base_species` because `Instruction::Transform` does not touch that field).
+///
+/// The base stats differ (Meteor 60/60/100/60/100/60 vs core 60/100/60/100/60/120) so the change
+/// respreads through `respread_stats`, which recovers the mon's own EV/IV/nature spread; HP base is
+/// 60 either way, so current/max HP are untouched. Types are Rock/Flying in both formes.
+/// Makes no PRNG draw.
+fn shields_down_forme(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if p.ability != crate::ids::Ability::ShieldsDown || !p.is_alive() || p.transformed {
+        return;
+    }
+    let Some(meteor) = crate::ids::Species::from_id("miniormeteor") else { return };
+    let core = p.base_species;
+    if core == crate::ids::Species::None || !core.to_id().starts_with("minior") {
+        return;
+    }
+    let want = if (p.hp as i32) * 2 > p.max_hp as i32 { meteor } else { core };
+    if p.species == want {
+        return;
+    }
+    let level = p.level;
+    let old_base = crate::data::base_stats(p.species);
+    let new_base = crate::data::base_stats(want);
+    let stats = respread_stats(old_base, new_base, p.stats, level);
+    let previous = transform_data_of(&b.state, side);
+    let mut new = previous;
+    new.species = want;
+    new.stats = stats;
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = b.state.side(side).active().base_moves;
+    push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+}
+
 /// PS's Protosynthesis `onWeatherChange` / Quark Drive `onTerrainChange` (abilities.ts:3473 and
 /// :3563): whenever the field condition changes, EVERY holder already on the field re-evaluates —
 /// `isWeather('sunnyday')` (resp. `isTerrain('electricterrain')`) ADDS the volatile, and anything
@@ -2330,6 +2368,9 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
         }
     }
+    // Shields Down (Minior): PS `onStart` at `onSwitchInPriority: -1` picks the forme from the
+    // entering mon's HP — Meteor above half, the packed core at or below.
+    shields_down_forme(b, side);
     // Dauntless Shield / Intrepid Sword: +1 Def / +1 Atk, once per battle.
     if matches!(ability, DauntlessShield | IntrepidSword) && !b.state.side(side).active().ability_used {
         let stat = if ability == DauntlessShield { BoostIndex::Defense } else { BoostIndex::Attack };
@@ -3378,10 +3419,18 @@ fn revert_battle_only_forme(b: &mut Branch, side: SideId) {
     }
     let pirouette = crate::ids::Species::from_id("meloettapirouette").unwrap_or(crate::ids::Species::None);
     let hangry = crate::ids::Species::from_id("morpekohangry").unwrap_or(crate::ids::Species::None);
+    let meteor = crate::ids::Species::from_id("miniormeteor").unwrap_or(crate::ids::Species::None);
     let (base, restat) = if p.species == pirouette {
         (crate::ids::Species::from_id("meloetta").unwrap_or(crate::ids::Species::None), true)
     } else if p.species == hangry {
         (crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None), false)
+    } else if p.species == meteor && p.ability == crate::ids::Ability::ShieldsDown {
+        // PS `clearVolatile` ends every switch-out with `setSpecies(this.baseSpecies)`, and a
+        // Minior's `baseSpecies` is the SET's coloured core — so a Meteor that leaves the field
+        // goes back to its core on the BENCH, whatever its HP was (rb1328: a Minior that shelled up
+        // at full HP is `minior` again in every later `stateAfter`). Shields Down re-picks the
+        // forme from HP the moment it re-enters.
+        (p.base_species, true)
     } else {
         return;
     };
@@ -6999,6 +7048,15 @@ fn status_applies_src(p: &crate::state::Pokemon, status: Status, source_corrosio
     if p.ability == Ab::Comatose || (!breaker && p.ability == Ab::PurifyingSalt) {
         return false;
     }
+    // Shields Down: a Minior in its Meteor shell takes no status at all — PS's `onSetStatus`
+    // (abilities.ts:4221) returns `false` unconditionally once `species.id === 'miniormeteor'`
+    // (the `-immune` message is the only part gated on the effect being a move), and its
+    // `onTryAddVolatile` additionally refuses Yawn (rb1334: the engine's Meteor Minior carried a
+    // `yawn` volatile PS never gave it). Shields Down has no `breakable` flag, so Mold Breaker
+    // does NOT pierce this.
+    if p.ability == Ab::ShieldsDown && !p.transformed && p.species.to_id() == "miniormeteor" {
+        return false;
+    }
     let ab = if breaker { Ab::None } else { p.ability };
     match status {
         Status::Burn => !p.types.contains(&Type::Fire) && !matches!(ab, Ab::WaterVeil | Ab::WaterBubble | Ab::ThermalExchange),
@@ -10166,7 +10224,17 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             })
             .collect();
     }
-    let branches_after_harvest = out_h;
+    // Shields Down (Minior) re-picks its forme at `onResidualOrder: 29` — after Harvest (28).
+    // State-only, no draw.
+    let branches_after_harvest = out_h
+        .into_iter()
+        .map(|mut b| {
+            for side in [SideId::One, SideId::Two] {
+                shields_down_forme(&mut b, side);
+            }
+            b
+        })
+        .collect::<Vec<_>>();
 
     // Shed Skin: 33% chance each end of turn to cure the holder's status (branches).
     let mut out = branches_after_harvest;
