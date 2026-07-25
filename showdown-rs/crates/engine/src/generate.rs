@@ -7127,6 +7127,14 @@ fn react_to_stat_drop(b: &mut Branch, target: SideId) {
         Ab::Competitive => raise_boost(b, target, BoostIndex::SpecialAttack, 2),
         _ => {}
     }
+    // White Herb is PS's `onUpdate`, so it clears the negative stages left by ANY drop — not
+    // just the move-secondary drops the explicit `apply_white_herb` call sites cover. The
+    // switch-in ones were missing: Sticky Web's −1 Speed and Intimidate's −1 Attack both go
+    // through `react_to_stat_drop` and left the herb unconsumed (rb1146/rb1219/rb1358 — PS ends
+    // the switch with item None and boosts back at 0, the engine with WhiteHerb and −1).
+    // Defiant/Competitive first: PS runs them as `onAfterEachBoost`, inside the boost, while
+    // the herb waits for the Update. Idempotent — the second call finds no item and no negative.
+    apply_white_herb(b, target);
 }
 
 /// Split a contact hit on a contact-triggered status ability (30%): the defender's Flame
