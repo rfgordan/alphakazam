@@ -331,23 +331,67 @@ fn ability_immune(move_type: Type, ability: crate::ids::Ability) -> bool {
     }
 }
 
-/// Whether `item` can be removed from a mon of `species` by Knock Off / Magician /
-/// Pickpocket (PS `onTakeItem` returning false). Species-locked items can never be taken
-/// from their signature holder: Rusted Sword/Shield (Zacian/Zamazenta), the Ogerpon masks,
-/// and the Origin orbs/crystals (Dialga/Palkia/Giratina). Arceus plates are locked only to
-/// Arceus, which is outside the randbats pool.
-fn item_removable(species: crate::ids::Species, item: Item) -> bool {
-    let sid = species.to_id();
-    !match item {
-        Item::RustedSword => sid.starts_with("zacian"),
-        Item::RustedShield => sid.starts_with("zamazenta"),
-        Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask => sid.starts_with("ogerpon"),
-        Item::AdamantCrystal | Item::AdamantOrb => sid.starts_with("dialga"),
-        Item::LustrousGlobe | Item::LustrousOrb => sid.starts_with("palkia"),
-        Item::GriseousCore | Item::GriseousOrb => sid.starts_with("giratina"),
-        Item::None => true, // "removable" is meaningless without an item
-        _ => false,
+/// A species-locked item's guard: the `baseSpecies` id prefix it is locked to, and whether the
+/// lock is SYMMETRIC (PS's `num ===` guards fire when EITHER the holder or the move's source is
+/// that species; the `baseSpecies.baseSpecies ===` guards only look at the holder).
+///
+/// Read off the pinned gen9 dex (`Dex.forGen(9).items` with an `onTakeItem`); the groups are
+/// exactly: Arceus plates (num 493), Silvally memories (773), Genesect drives (649), the ORIGIN
+/// forms of the creation-trio items (Adamant Crystal 483 / Lustrous Globe 484 / Griseous Core
+/// 487), Zacian's Rusted Sword (888) and Zamazenta's Rusted Shield (889), the Ogerpon masks, and
+/// Kyogre's Blue Orb / Groudon's Red Orb.
+///
+/// NOT locked in gen9: the plain **Adamant / Lustrous / Griseous Orb** — those lost their
+/// `onTakeItem` when the Origin items were introduced, so Knock Off both boosts on and removes a
+/// Palkia's Lustrous Orb. (The engine used to block them, which cost rb1090 and friends.)
+fn item_lock(item: Item) -> Option<(&'static str, bool)> {
+    Some(match item {
+        Item::DracoPlate | Item::DreadPlate | Item::EarthPlate | Item::FistPlate
+        | Item::FlamePlate | Item::IciclePlate | Item::InsectPlate | Item::IronPlate
+        | Item::MeadowPlate | Item::MindPlate | Item::PixiePlate | Item::SkyPlate
+        | Item::SplashPlate | Item::SpookyPlate | Item::StonePlate | Item::ToxicPlate
+        | Item::ZapPlate => ("arceus", true),
+        Item::BugMemory | Item::DarkMemory | Item::DragonMemory | Item::ElectricMemory
+        | Item::FairyMemory | Item::FightingMemory | Item::FireMemory | Item::FlyingMemory
+        | Item::GhostMemory | Item::GrassMemory | Item::GroundMemory | Item::IceMemory
+        | Item::PoisonMemory | Item::PsychicMemory | Item::RockMemory | Item::SteelMemory
+        | Item::WaterMemory => ("silvally", true),
+        Item::BurnDrive | Item::ChillDrive | Item::DouseDrive | Item::ShockDrive => ("genesect", true),
+        Item::AdamantCrystal => ("dialga", true),
+        Item::LustrousGlobe => ("palkia", true),
+        Item::GriseousCore => ("giratina", true),
+        Item::RustedSword => ("zacian", true),
+        Item::RustedShield => ("zamazenta", true),
+        Item::HearthflameMask | Item::WellspringMask | Item::CornerstoneMask => ("ogerpon", false),
+        Item::BlueOrb => ("kyogre", false),
+        Item::RedOrb => ("groudon", false),
+        _ => return None,
+    })
+}
+
+/// Whether `item` can be removed from a mon of `holder` by Knock Off / Magician / Pickpocket /
+/// Thief (PS's `onTakeItem` returning false blocks it). `source` is the species on the OTHER end
+/// of the transfer, which the symmetric (`num ===`) guards also test.
+fn item_removable_from(
+    holder: crate::ids::Species,
+    item: Item,
+    source: Option<crate::ids::Species>,
+) -> bool {
+    if item == Item::None {
+        return true; // "removable" is meaningless without an item
     }
+    let Some((prefix, symmetric)) = item_lock(item) else { return true };
+    if holder.to_id().starts_with(prefix) {
+        return false;
+    }
+    if symmetric {
+        if let Some(src) = source {
+            if src.to_id().starts_with(prefix) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Moves with the `defrost` flag at the pin: their frozen user thaws with no `randomChance` roll.
@@ -4906,7 +4950,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // holder has Sticky Hold (PS's basePowerCallback runs the TakeItem event first).
     let mut base_power = if md.id.to_id() == "knockoff"
         && defender.item != Item::None
-        && item_removable(defender.species, defender.item)
+        && item_removable_from(defender.species, defender.item, Some(attacker.species))
         && def_ab != Ab::StickyHold // breakable → def_ab is already Mold-Breaker-suppressed
     {
         crate::damage::modify(md.base_power as i64, 3, 2) as u16
@@ -5707,7 +5751,7 @@ fn apply_post_damage(
         let f = b.state.side(foe).active();
         if f.is_alive()
             && f.item != Item::None
-            && item_removable(f.species, f.item)
+            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
             && def_ability != Ab::StickyHold
         {
             let (prev, fslot) = (f.item, b.state.side(foe).active_index);
@@ -5729,7 +5773,10 @@ fn apply_post_damage(
         && md.category != MoveCategory::Status
     {
         let f = b.state.side(foe).active();
-        if f.item != Item::None && item_removable(f.species, f.item) && def_ability != Ab::StickyHold {
+        if f.item != Item::None
+            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
+            && def_ability != Ab::StickyHold
+        {
             let stolen = f.item;
             let fslot = b.state.side(foe).active_index;
             let aslot = b.state.side(side).active_index;
@@ -5756,7 +5803,7 @@ fn apply_post_damage(
     {
         let a = b.state.side(side).active();
         if a.item != Item::None
-            && item_removable(a.species, a.item)
+            && item_removable_from(a.species, a.item, Some(b.state.side(foe).active().species))
             && a.ability != Ab::StickyHold
         {
             let stolen = a.item;
@@ -7823,6 +7870,50 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
 /// `ignoreImmunity`): powder immunity (Grass / Overcoat / Safety Goggles for a `flag_powder` move)
 /// and type immunity for Thunder Wave (the lone `ignoreImmunity:false` status move). Used to gate
 /// the accuracy roll when the move is later blocked by a Substitute (PS rolls accuracy first).
+/// PS `hitStepTryImmunity`: a move's own `onTryImmunity` callback runs BEFORE `hitStepAccuracy`,
+/// so a move it rejects makes **no accuracy draw at all** and applies nothing — even a
+/// 100-accuracy move, which would otherwise still roll `randomChance(100, 100)`.
+///
+/// The gen9 set (read off the pinned dex — every move with an `onTryImmunity`) splits into status
+/// moves, handled here, and three damaging ones (Dream Eater's asleep-or-Comatose target,
+/// Endeavor's `source.hp < target.hp`, Synchronoise's shared-type target) which sit on the
+/// damaging accuracy path and are NOT wired yet (no corpus instance; named open in the scoreboard).
+///
+/// Note where the engine already implements the same predicate as an EFFECT gate: Attract's
+/// gender check lives in `apply_status_target_volatile`, i.e. after the roll. That is right for
+/// the state and wrong for the stream — PS decides immunity first. Leech Seed's Grass immunity
+/// was missing entirely (the engine seeded Grass types), which is why `leechseed` carried the
+/// `rust-extra randomChance[90,100]@accuracy` class.
+fn status_try_immunity_fails(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    let a = b.state.side(side).active();
+    let t = b.state.side(side.other()).active();
+    if !t.is_alive() {
+        return false;
+    }
+    // `hasAbility` respects `ignoringAbility()`, so Mold Breaker & co. bypass the ability-reading
+    // guards. Worry Seed reads `target.ability` RAW in PS, so Mold Breaker does not bypass it.
+    let mold_breaker = matches!(
+        a.ability,
+        Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze
+    );
+    match md.id.to_id() {
+        // onTryImmunity(target) { return !target.hasType('Grass'); }
+        "leechseed" => t.types.contains(&Type::Grass),
+        // opposite genders only (0 = genderless never qualifies)
+        "attract" | "captivate" => {
+            !((a.gender == 1 && t.gender == 2) || (a.gender == 2 && t.gender == 1))
+        }
+        // return !target.hasAbility('stickyhold')
+        "trick" | "switcheroo" => !mold_breaker && t.ability == Ab::StickyHold,
+        // if (target.ability === 'truant' || target.ability === 'insomnia') return false
+        "worryseed" => matches!(t.ability, Ab::Truant | Ab::Insomnia),
+        // return this.dex.getImmunity('trapped', target)  — Ghost is immune to trapping
+        "octolock" => t.types.contains(&Type::Ghost),
+        _ => false,
+    }
+}
+
 fn status_move_reaches_accuracy(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
     use crate::ids::Ability as Ab;
     let t = b.state.side(side.other()).active();
@@ -7835,6 +7926,9 @@ fn status_move_reaches_accuracy(b: &Branch, side: SideId, md: &crate::data::Move
         return false;
     }
     if md.id.to_id() == "thunderwave" && crate::damage::type_multiplier(md.typ, t.types) == 0.0 {
+        return false;
+    }
+    if status_try_immunity_fails(b, side, md) {
         return false;
     }
     true
@@ -8431,6 +8525,10 @@ fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, 
         if foe_p.is_alive() && crate::damage::type_multiplier(md.typ, foe_p.types) == 0.0 {
             return vec![b];
         }
+    }
+    // PS `hitStepTryImmunity` — before `hitStepAccuracy`, so no draw and no effect.
+    if status_try_immunity_fails(&b, side, md) {
+        return vec![b];
     }
 
     let hit_prob = accuracy_of(&b, side, md);
