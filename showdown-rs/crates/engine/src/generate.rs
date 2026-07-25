@@ -1713,6 +1713,143 @@ pub(crate) fn apply_tera(b: &mut Branch, side: SideId) {
     push(b, Instruction::ToggleTerastallized { side, slot });
     // Hidden-info: Terastallizing reveals the Tera type to the foe.
     reveal(b, side, 0, crate::state::Reveal::TERA);
+    apply_tera_forme(b, side);
+}
+
+/// The two species whose Terastallization is also a PERMANENT forme change
+/// (`battle-actions.ts:1935` `terastallize`, right after `pokemon.terastallized = type`):
+///
+/// * every Ogerpon mask becomes `<forme>tera` (plain Ogerpon becomes `ogerpontealtera`), gaining
+///   `Embody Aspect (...)`. That ability's `onStart` fires here because `formeChange` calls
+///   `setAbility(ability, null, null, /* isTransform */ true)` and `singleEvent('Start')` runs
+///   for `!isTransform || ability.flags['notransform']` — EmbodyAspect carries `notransform`.
+///   The boost is +1 Spe / SpD / Atk / Def for Teal / Wellspring / Hearthflame / Cornerstone,
+///   once (`effectState.embodied`), and the four Ogerpon formes share base stats so no respread
+///   is observable.
+/// * `Terapagos-Terastal` becomes `Terapagos-Stellar`, which is a real stat change (base HP
+///   90 -> 160, and every other base stat rises). `formeChange`'s `updateMaxHp` keeps the damage
+///   taken: `hp = max(1, newMaxHP - (maxhp - hp))` — exactly what `Instruction::Transform` does
+///   with a changed `stats[0]`. Its ability becomes Teraform Zero, whose `onAfterTerastallization`
+///   (`data/abilities.ts`) clears weather AND terrain when either is up — PS fires it via
+///   `runEvent('AfterTerastallization')` at the very end of `terastallize`.
+/// The stat `Embody Aspect (...)`'s `onStart` raises, or `None` for any other ability.
+fn embody_aspect_stat(ability: crate::ids::Ability) -> Option<BoostIndex> {
+    use crate::ids::Ability as A;
+    match ability {
+        A::EmbodyAspectTeal => Some(BoostIndex::Speed),
+        A::EmbodyAspectWellspring => Some(BoostIndex::SpecialDefense),
+        A::EmbodyAspectHearthflame => Some(BoostIndex::Attack),
+        A::EmbodyAspectCornerstone => Some(BoostIndex::Defense),
+        _ => None,
+    }
+}
+
+/// One of the four `Ogerpon-*-Tera` formes.
+fn species_is_ogerpon_tera(species: crate::ids::Species) -> bool {
+    ["ogerpontealtera", "ogerponwellspringtera", "ogerponhearthflametera", "ogerponcornerstonetera"]
+        .iter()
+        .any(|n| crate::ids::Species::from_id(n) == Some(species))
+}
+
+/// A `formeRegression` forme (set by the Tera forme change) reverts when its holder FAINTS:
+/// `battle.ts:2571` restores `baseSpecies`/`baseAbility` from the SET before `clearVolatile`,
+/// whose `setSpecies(this.baseSpecies)` then puts the mask Ogerpon back on the bench. rb1135 t7
+/// and rb1276 t10 both show PS's fainted Ogerpon back in its non-Tera forme while the engine
+/// kept `-Tera`. Ogerpon's four formes share base stats, so this is a pure species/ability swap
+/// with no max-HP move (Terapagos-Stellar's regression WOULD move max HP and is NOT handled
+/// here — `Instruction::Transform`'s hp carry-over is not defined for a fainted mon).
+fn regress_fainted_tera_formes(b: &mut Branch) {
+    for side in [SideId::One, SideId::Two] {
+        for slot in 0..6u8 {
+            let p = &b.state.side(side).pokemon[slot as usize];
+            if p.is_alive() || p.transformed || !species_is_ogerpon_tera(p.species) {
+                continue;
+            }
+            let previous = crate::instruction::TransformData {
+                species: p.species,
+                stats: p.stats,
+                types: p.types,
+                ability: p.ability,
+                moves: p.moves,
+                transformed: p.transformed,
+                times_hit: p.times_hit,
+            };
+            let mut new = previous;
+            new.species = p.base_species;
+            new.ability = p.base_ability;
+            if new.species == previous.species && new.ability == previous.ability {
+                continue;
+            }
+            let previous_base_moves = p.base_moves;
+            push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+        }
+    }
+}
+
+fn apply_tera_forme(b: &mut Branch, side: SideId) {
+    use crate::ids::Ability as A;
+    use crate::ids::Species as Sp;
+    let (species, level, stats) = {
+        let p = b.state.side(side).active();
+        (p.species, p.level, p.stats)
+    };
+    let sid = |name: &str| Sp::from_id(name).unwrap_or(Sp::None);
+    let ogerpon: Option<(Sp, A, BoostIndex)> = if species == sid("ogerpon") {
+        Some((sid("ogerpontealtera"), A::EmbodyAspectTeal, BoostIndex::Speed))
+    } else if species == sid("ogerponwellspring") {
+        Some((sid("ogerponwellspringtera"), A::EmbodyAspectWellspring, BoostIndex::SpecialDefense))
+    } else if species == sid("ogerponhearthflame") {
+        Some((sid("ogerponhearthflametera"), A::EmbodyAspectHearthflame, BoostIndex::Attack))
+    } else if species == sid("ogerponcornerstone") {
+        Some((sid("ogerponcornerstonetera"), A::EmbodyAspectCornerstone, BoostIndex::Defense))
+    } else {
+        None
+    };
+    let (new_species, new_ability, boost) = match ogerpon {
+        Some(x) => x,
+        None if species == sid("terapagosterastal") => {
+            (sid("terapagosstellar"), A::TeraformZero, BoostIndex::Attack)
+        }
+        None => return,
+    };
+    if new_species == Sp::None {
+        return;
+    }
+    let previous = transform_data_of(&b.state, side);
+    let mut new = previous;
+    new.species = new_species;
+    let (old_base, new_base) = (crate::data::base_stats(species), crate::data::base_stats(new_species));
+    new.stats = respread_stats(old_base, new_base, stats, level);
+    // `respread_stats` never re-derives HP (every battle-only forme shares its base forme's HP
+    // base) — but Terapagos-Stellar does NOT: base HP 90 -> 160. PS's `formeChange` calls
+    // `updateMaxHp`, which recomputes maxhp and preserves the damage taken; the engine's
+    // `Instruction::Transform` does the same when `stats[0]` moves. Random-battle spread
+    // (31 IV / 85 EV / neutral), exactly as the Tera Shift entry forme change assumes.
+    if new_base[0] != old_base[0] {
+        new.stats[0] = crate::damage::compute_hp(new_base[0], 31, 85, level);
+    }
+    new.ability = new_ability;
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = b.state.side(side).active().base_moves;
+    push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+    if new_ability == A::TeraformZero {
+        // Teraform Zero clears BOTH field effects, and only when one is up.
+        if b.state.weather != Weather::None {
+            set_weather(b, Weather::None, 0);
+        }
+        if b.state.terrain != crate::ids::Terrain::None {
+            emit_field_change_shuffle(b);
+            push(b, Instruction::ChangeTerrain {
+                previous: b.state.terrain,
+                previous_turns: b.state.terrain_turns,
+                new: crate::ids::Terrain::None,
+                new_turns: 0,
+            });
+            refresh_proto_quark(b);
+        }
+    } else {
+        raise_boost(b, side, boost, 1);
+    }
 }
 
 /// Like [`generate_instructions`], but `pivot` gives each side's switch-in target for a
@@ -2042,8 +2179,19 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
         // Shell when it switches out, so this revert must skip it (base_ability is still the stale
         // Tera Shift). Every OTHER non-base ability on a non-transformed mon is a Trace/Role
         // Play/Skill Swap copy that PS's clearVolatile reverts.
+        // Same for the Terastallization formes: `formeChange(..., isPermanent)` writes
+        // `baseAbility = ability`, so Embody Aspect / Teraform Zero survive the switch-out that
+        // `clearVolatile`'s `ability = baseAbility` would otherwise revert.
         let terastal_forme = crate::ids::Species::from_id("terapagosterastal");
-        let is_forme_ability = Some(p.species) == terastal_forme && p.ability == crate::ids::Ability::TeraShell;
+        let is_forme_ability = (Some(p.species) == terastal_forme && p.ability == crate::ids::Ability::TeraShell)
+            || matches!(
+                p.ability,
+                crate::ids::Ability::EmbodyAspectTeal
+                    | crate::ids::Ability::EmbodyAspectWellspring
+                    | crate::ids::Ability::EmbodyAspectHearthflame
+                    | crate::ids::Ability::EmbodyAspectCornerstone
+                    | crate::ids::Ability::TeraformZero
+            );
         if !p.transformed && p.ability != p.base_ability && !is_forme_ability {
             let slot = previous;
             push(b, Instruction::ChangeAbility { side, slot, previous: p.ability, new: p.base_ability });
@@ -2382,6 +2530,17 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     if ability == Imposter {
         apply_transform(b, side);
     }
+    // Embody Aspect re-fires on EVERY switch-in, not just at Terastallization: its once-only
+    // guard is `this.effectState.embodied`, and `battle-actions.ts:142` re-inits
+    // `pokemon.abilityState` on each `switchIn`. The other guards are `baseSpecies.name` being
+    // the `-Tera` forme and `pokemon.terastallized`. rb1142 t20: a Wellspring Ogerpon that
+    // pivots out and back takes a second +1 SpD in PS.
+    if let Some(stat) = embody_aspect_stat(ability) {
+        let p = b.state.side(side).active();
+        if p.terastallized && species_is_ogerpon_tera(p.species) {
+            raise_boost(b, side, stat, 1);
+        }
+    }
     // Wind Rider: +1 Atk on switch-in while the holder's own Tailwind is active (PS onStart).
     if ability == WindRider && b.state.side(side).side_conditions.tailwind > 0 {
         raise_boost(b, side, BoostIndex::Attack, 1);
@@ -2437,13 +2596,24 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
         let slot = b.state.side(side).active_index;
         push(b, Instruction::SetAbilityUsed { side, slot, previous: false, new: true });
     }
-    // Download: +1 Atk if the foe's Defense ≤ Special Defense, else +1 SpA.
+    // Download (`data/abilities.ts`):
+    //   if (totaldef && totaldef >= totalspd) boost({spa: 1}); else if (totalspd) boost({atk: 1});
+    // — the TIE goes to Special Attack, and the stats are `getStat(x, false, true)`: boosts
+    // applied, ability/item modifiers not. The engine had the comparison inverted (`def <= spd
+    // -> Atk`), which is only observable on the tie — and a tie is exactly what an equal-defence
+    // species gives. rb1063 t2: Porygon-Z enters on a Scrafty (base 115/115) and PS takes +1 SpA.
     if ability == Download {
         let foe = side.other();
         if b.state.side(foe).active().is_alive() {
-            let f = b.state.side(foe).active();
-            let (def, spd) = (f.stat(crate::ids::StatIndex::Defense), f.stat(crate::ids::StatIndex::SpecialDefense));
-            let stat = if def <= spd { BoostIndex::Attack } else { BoostIndex::SpecialAttack };
+            let fs = b.state.side(foe);
+            let f = fs.active();
+            let def = boosted_stat(f.stat(crate::ids::StatIndex::Defense) as i64, fs.boost(BoostIndex::Defense));
+            let spd = boosted_stat(f.stat(crate::ids::StatIndex::SpecialDefense) as i64, fs.boost(BoostIndex::SpecialDefense));
+            let stat = if def > 0 && def >= spd {
+                BoostIndex::SpecialAttack
+            } else {
+                BoostIndex::Attack
+            };
             raise_boost(b, side, stat, 1);
         }
     }
@@ -5887,6 +6057,9 @@ fn apply_post_damage(
         let dmg = (atk.max_hp / 4).max(1).min(atk.hp);
         push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
     }
+
+    // A Tera forme that just fainted regresses to its set forme (PS `faintMessages`).
+    regress_fainted_tera_formes(b);
 
     // Destiny Bond: a foe that faints to this move takes the attacker with it. PS
     // `data/moves.ts` `destinybond.condition.onFaint(target, source, effect)` — it fires for
@@ -9743,6 +9916,8 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::SetPhysicalDamageTaken { side, previous: prevp, new: 0 });
         }
     }
+    // A Tera forme that fainted to a residual (poison, Leech Seed, ...) also regresses.
+    regress_fainted_tera_formes(b);
     // Hunger Switch (Morpeko): the forme toggles every end of turn (PS `onResidual` order
     // 29) unless Terastallized. Both formes share stats and typing, so this is exactly a
     // species-id swap; Aura Wheel reads the forme at use time.
