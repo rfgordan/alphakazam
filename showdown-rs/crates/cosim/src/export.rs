@@ -198,7 +198,7 @@ fn volatiles_obj(side: &Side, weather_is_sun: bool, terrain_is_electric: bool) -
     // read it to apply the ×1.3 (×1.5 for Speed) boost. Without it the boost silently doesn't apply.
     // `fromBooster` marks a Booster-Energy source (kept when the weather/terrain condition lapses);
     // sun/electric-terrain sources omit it.
-    let proto_internals = |active_p: &Pokemon, from_sun_terrain: bool| -> Value {
+    let proto_internals = |active_p: &Pokemon, _from_sun_terrain: bool| -> Value {
         let stat = engine::generate::proto_stat(active_p);
         let name = match stat {
             engine::ids::StatIndex::Attack => "atk",
@@ -208,10 +208,14 @@ fn volatiles_obj(side: &Side, weather_is_sun: bool, terrain_is_electric: bool) -
             engine::ids::StatIndex::Speed => "spe",
             _ => "atk",
         };
-        if from_sun_terrain {
-            json!({ "bestStat": name })
-        } else {
+        // `fromBooster` is now carried explicitly by the `ProtoBooster` companion volatile
+        // (set where the Booster Energy is consumed, read by `refresh_proto_quark`), rather than
+        // inferred from "the field condition isn't up right now" — the inference was ambiguous for
+        // a Booster-sourced boost that outlived a spell of sun / Electric Terrain.
+        if vs.contains(ProtoBooster) {
             json!({ "bestStat": name, "fromBooster": true })
+        } else {
+            json!({ "bestStat": name })
         }
     };
     if vs.contains(Protosynthesis) {

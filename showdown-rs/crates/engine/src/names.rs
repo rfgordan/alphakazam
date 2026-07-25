@@ -181,4 +181,5 @@ id_map!(VolatileStatus {
     StatsRaisedThisTurn => "statsraisedthisturn",
     StatsLoweredThisTurn => "statsloweredthisturn",
     MagnetRise => "magnetrise",
+    ProtoBooster => "protobooster",
 });

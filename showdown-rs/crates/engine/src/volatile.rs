@@ -56,6 +56,12 @@ pub enum VolatileStatus {
     StatsRaisedThisTurn, // PS `pokemon.statsRaisedThisTurn` (Burning Jealousy's burn gate)
     StatsLoweredThisTurn, // PS `pokemon.statsLoweredThisTurn` (Lash Out's ×2 gate)
     MagnetRise,          // Magnet Rise: 5-turn Ground immunity / ungrounding
+    /// PS's `fromBooster` flag on the `protosynthesis` / `quarkdrive` condition: the boost came
+    /// from a consumed Booster Energy rather than from the field. A field-sourced boost is removed
+    /// the moment the sun / Electric Terrain lapses (`onWeatherChange` / `onTerrainChange`); a
+    /// Booster-sourced one is kept forever (until switch-out). Companion bit to
+    /// `Protosynthesis` / `QuarkDrive` — only ever set alongside one of them.
+    ProtoBooster,
 }
 
 /// A packed set of active-Pokémon volatile statuses.

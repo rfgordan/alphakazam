@@ -512,8 +512,21 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
             "flashfire" => { side.volatiles.insert(VolatileStatus::FlashFire); }
             "truant" => { side.volatiles.insert(VolatileStatus::Truant); }
-            "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
-            "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
+            // `fromBooster` marks a Booster-Energy-sourced boost: PS's `onWeatherChange` /
+            // `onTerrainChange` removes a FIELD-sourced boost the moment the sun / Electric Terrain
+            // lapses but keeps a Booster one, so the flag is load-bearing state, not cosmetics.
+            "protosynthesis" => {
+                side.volatiles.insert(VolatileStatus::Protosynthesis);
+                if vv.get("fromBooster").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    side.volatiles.insert(VolatileStatus::ProtoBooster);
+                }
+            }
+            "quarkdrive" => {
+                side.volatiles.insert(VolatileStatus::QuarkDrive);
+                if vv.get("fromBooster").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    side.volatiles.insert(VolatileStatus::ProtoBooster);
+                }
+            }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }
             "unburden" => { side.volatiles.insert(VolatileStatus::Unburden); }
             "mustrecharge" => {

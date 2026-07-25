@@ -1054,6 +1054,45 @@ fn effective_weather(state: &State) -> Weather {
     state.weather
 }
 
+/// PS's Protosynthesis `onWeatherChange` / Quark Drive `onTerrainChange` (abilities.ts:3473 and
+/// :3563): whenever the field condition changes, EVERY holder already on the field re-evaluates —
+/// `isWeather('sunnyday')` (resp. `isTerrain('electricterrain')`) ADDS the volatile, and anything
+/// else REMOVES it unless it carries `fromBooster`, which PS keeps for the rest of the mon's stay.
+/// The engine only re-derived the volatile at switch-in, so a mon already in neither gained the
+/// boost when the sun came out (rb1018 t4: Walking Wake, Sunny Day goes up on the turn it is
+/// already active) nor lost it when the sun lapsed (rb1167 t6 / rb1244 t6 / rb1024 t6: Gouging Fire
+/// and Sandy Shocks keep a stale bit 25 once the weather runs out).
+///
+/// State-only — PS's handlers make no PRNG draw, so the draw stream is untouched. Note the sun test
+/// is exactly `'sunnyday'`: `Field.isWeather` compares the effective weather id, so Desolate Land
+/// does NOT activate Protosynthesis, and Air Lock / Cloud Nine (which zero `effectiveWeather`) DO
+/// switch it off — both of which `effective_weather` already models.
+fn refresh_proto_quark(b: &mut Branch) {
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let (ability, on) = match p.ability {
+            crate::ids::Ability::Protosynthesis => {
+                (VolatileStatus::Protosynthesis, effective_weather(&b.state) == Weather::Sun)
+            }
+            crate::ids::Ability::QuarkDrive => {
+                (VolatileStatus::QuarkDrive, b.state.terrain == crate::ids::Terrain::Electric)
+            }
+            _ => continue,
+        };
+        let has = b.state.side(side).volatiles.contains(ability);
+        if on {
+            if !has {
+                push(b, Instruction::ApplyVolatile { side, volatile: ability });
+            }
+        } else if has && !b.state.side(side).volatiles.contains(VolatileStatus::ProtoBooster) {
+            push(b, Instruction::RemoveVolatile { side, volatile: ability });
+        }
+    }
+}
+
 /// A mon's weight after ability modifiers (Light Metal ×0.5, Heavy Metal ×2).
 fn modified_weight_hg(p: &crate::state::Pokemon) -> u32 {
     let w = crate::data::species_weight_hg(p.species);
@@ -2260,6 +2299,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             new: terrain,
             new_turns: turns,
         });
+        refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
     }
     // Tera Shift: Terapagos becomes its Terastal forme on entry (new base stats incl. max
     // HP — damage taken carries over — and the Tera Shell ability). Random-battle spread
@@ -2380,6 +2420,8 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             push(b, Instruction::ChangeItem { side, slot, previous: Item::BoosterEnergy, new: Item::None });
             on_item_lost(b, side);
             push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Protosynthesis });
+            // PS `fromBooster`: a Booster-Energy boost survives every later field change.
+            push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::ProtoBooster });
         }
     }
     if ability == QuarkDrive {
@@ -2392,6 +2434,7 @@ fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
             push(b, Instruction::ChangeItem { side, slot, previous: Item::BoosterEnergy, new: Item::None });
             on_item_lost(b, side);
             push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::QuarkDrive });
+            push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::ProtoBooster });
         }
     }
 }
@@ -2838,7 +2881,7 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // Protosynthesis / Quark Drive end on switch-out (PS ability `onEnd` deletes the volatile);
     // they are re-derived on switch-in in `apply_switch_in_ability` (weather/terrain, else the
     // one-shot Booster Energy). A mon that stays in never reaches this path, so its boost persists.
-    VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive,
+    VolatileStatus::Protosynthesis, VolatileStatus::QuarkDrive, VolatileStatus::ProtoBooster,
     // Flash Fire's activation ends on switch-out (PS ability `onEnd` removes the volatile).
     VolatileStatus::FlashFire,
     // Unburden likewise: the ability's `onEnd` removes the volatile when its holder leaves the
@@ -5851,6 +5894,7 @@ fn apply_post_damage(
                         new: crate::ids::Terrain::Grassy,
                         new_turns: turns,
                     });
+                    refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
                 }
             }
             Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
@@ -8494,6 +8538,7 @@ fn execute_status_move(
                 new: crate::ids::Terrain::None,
                 new_turns: 0,
             });
+            refresh_proto_quark(&mut b); // PS Quark Drive `onTerrainChange`
         }
         return vec![b];
     }
@@ -9056,6 +9101,7 @@ fn set_weather(b: &mut Branch, weather: Weather, turns: i8) {
         new: weather,
         new_turns: turns,
     });
+    refresh_proto_quark(b); // PS Protosynthesis `onWeatherChange`
 }
 
 /// Set or increment a hazard on `target`'s side (capped at its max layers).
@@ -9900,6 +9946,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 new: crate::ids::Terrain::None,
                 new_turns: 0,
             });
+            refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
         }
     }
     if b.state.trick_room && b.state.trick_room_turns > 0 {
