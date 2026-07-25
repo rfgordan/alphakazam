@@ -144,3 +144,22 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
     }
     Ok(t)
 }
+
+/// Is PS's **Sleep Clause Mod** active for a trace recorded under `format`?
+///
+/// It never is. `harness/cosim.mjs` constructs every battle with
+/// `formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT` — random-battle TEAMS are
+/// pre-generated and the battle itself runs as a custom game so PS does not re-roll teams from the
+/// battle seed. `gen9customgame` carries no ruleset, and Sleep Clause Mod lives in the `standard`
+/// ruleset (data/rulesets.ts:1378, pulled in by gen9ou and friends, and listed explicitly on
+/// "[Gen 9] Random Battle" — a format the harness never instantiates). The default `FORMAT` is
+/// `gen9customgame`, so the other arm never fires either.
+///
+/// The old inference (`format.contains("randombattle")`) had it exactly backwards and made the
+/// engine refuse a second foe-inflicted sleep that the pinned PS happily applies — rb1312 t13 has
+/// Regice slept while the benched Iron Jugulis is still asleep from the same attacker, and PS rolls
+/// the `random(2,5)` duration for it.
+pub fn sleep_clause_for_format(format: &str) -> bool {
+    let effective = if format.contains("random") { "gen9customgame" } else { format };
+    effective != "gen9customgame"
+}

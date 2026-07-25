@@ -48,7 +48,7 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
 
     // Sleep Clause Mod exists in ranked formats (incl. random battles) but not customgame
     // (the recorded-team corpora).
-    let sleep_clause = trace.format.contains("randombattle");
+    let sleep_clause = crate::trace::sleep_clause_for_format(&trace.format);
     let mut results = Vec::new();
     let mut i = 0;
     // The state each unit replays from: the previous decision boundary.

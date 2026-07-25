@@ -321,7 +321,7 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
         Ok(c) => c,
         Err(u) => return mk_fail(Some(format!("canon:{}", u.0)), 0, 0, false),
     };
-    let sleep_clause = g.format.contains("randombattle");
+    let sleep_clause = crate::trace::sleep_clause_for_format(&g.format);
     let aligned = alignment_ok(g, limbs);
 
     let mut prng = PsPrng::from_limbs(limbs);

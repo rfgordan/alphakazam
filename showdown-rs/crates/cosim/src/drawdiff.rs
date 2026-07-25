@@ -143,7 +143,7 @@ fn compare_draws(rust: &[DrawEvent], rec: &[RecDraw]) -> Option<(&'static str, S
 pub fn draw_diff_trace(trace: &Trace) -> Result<Vec<DrawUnit>, Unsupported> {
     let first = trace.decisions.first().ok_or_else(|| Unsupported("trace:empty".into()))?;
     let canon = Canonical::from_first_state(&first.state_after)?;
-    let sleep_clause = trace.format.contains("randombattle");
+    let sleep_clause = crate::trace::sleep_clause_for_format(&trace.format);
 
     let mut results = Vec::new();
     if first.request_state != "teampreview" {

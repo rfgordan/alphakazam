@@ -133,7 +133,7 @@ fn emit_game(t: &Trace, hp_style: HpStyle) -> Result<Vec<String>, String> {
         return Err(format!("first-{}", first.request_state));
     }
     let canon = Canonical::from_first_state(&first.state_after).map_err(|u| format!("canon:{}", u.0))?;
-    let sleep_clause = t.format.contains("randombattle");
+    let sleep_clause = crate::trace::sleep_clause_for_format(&t.format);
 
     let mut prng = PsPrng::from_limbs(limbs);
     for _ in 0..init_gender_rolls(t) {

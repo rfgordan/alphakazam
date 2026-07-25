@@ -3118,6 +3118,26 @@ fn branch_sleep_counter(b: Branch, side: SideId) -> Vec<Branch> {
         .collect()
 }
 
+/// PS's `slp` condition rolls its `random(2, 5)` duration in `onStart` — the instant the status is
+/// SET, and therefore BEFORE the holder's Lum/Chesto Berry `onUpdate` gets to cure it. rb1297 t17:
+/// Sleep Powder lands on a Lum Berry Roaring Moon; PS rolls the duration, the berry then wipes the
+/// status, and the mon Outrages normally that same turn — but the draw was still made.
+///
+/// Call with `applied` = "the sleep was pushed", AFTER the cure attempt. Returns whether the sleep
+/// survived (the caller then forks the real duration via `branch_sleep_counter`); when it did not,
+/// emits the duration roll here as a draw-and-discard so the stream stays aligned without a
+/// pointless 3-way fork over a counter that was just cleared.
+fn sleep_survived_or_discard_duration(b: &mut Branch, side: SideId, applied: bool) -> bool {
+    if !applied {
+        return false;
+    }
+    if b.state.side(side).active().status == Status::Sleep {
+        return true;
+    }
+    draw(b, "random", &[2, 5], 2, "slp");
+    false
+}
+
 /// Freshly-applied Confusion: branch the duration (PS `time = random(2, 6)`; uniform 2-5,
 /// decremented on each move attempt, snaps out at 0).
 fn branch_confusion_counter(b: Branch, side: SideId) -> Vec<Branch> {
@@ -7755,7 +7775,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         }
         apply_synchronize(&mut proc, foe, md.secondary_status);
         consume_lum_if_statused(&mut proc, foe);
-        applied_sleep = applied_sleep && proc.state.side(foe).active().status == Status::Sleep;
+        applied_sleep = sleep_survived_or_discard_duration(&mut proc, foe, applied_sleep);
     }
     let mut procs = vec![proc];
     if applied_sleep {
@@ -7927,7 +7947,7 @@ fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData)
             }
             apply_synchronize(&mut pb, foe, status);
             consume_lum_if_statused(&mut pb, foe);
-            if slept && pb.state.side(foe).active().status == Status::Sleep {
+            if sleep_survived_or_discard_duration(&mut pb, foe, slept) {
                 // Freshly-applied sleep rolls its `random(2,5)` duration at the slp `onStart`.
                 out.extend(branch_sleep_counter(pb, foe));
                 continue;
@@ -8893,7 +8913,7 @@ fn execute_status_move(
         }
         apply_synchronize(&mut hit, foe, md.status);
         consume_lum_if_statused(&mut hit, foe);
-        applied_sleep = applied_sleep && hit.state.side(foe).active().status == Status::Sleep;
+        applied_sleep = sleep_survived_or_discard_duration(&mut hit, foe, applied_sleep);
     }
 
     // Sleep durations are stochastic (1-3 turns), and target volatiles (Taunt / Encore /
@@ -10114,7 +10134,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
                     mark_slept_by_foe(&mut x, side);
                     consume_lum_if_statused(&mut x, side);
-                    if x.state.side(side).active().status == Status::Sleep {
+                    if sleep_survived_or_discard_duration(&mut x, side, true) {
                         branch_sleep_counter(x, side)
                     } else {
                         vec![x]
