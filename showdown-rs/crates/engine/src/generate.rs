@@ -4219,14 +4219,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     {
         // High Jump Kick / Jump Kick / Supercell Slam still crash into the protector (1/2
         // max HP — PS `onMoveFail` fires on a protected target too).
-        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
-            let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
-            let crash = (maxhp / 2).min(hp);
-            if crash > 0 && b.state.side(side).active().ability != crate::ids::Ability::MagicGuard {
-                let slot = b.state.side(side).active_index;
-                push(&mut b, Instruction::Damage { side, slot, amount: crash });
-            }
-        }
+        apply_crash_damage(&mut b, side, &md);
         // A blocked rampage ends its lock without confusion; a blocked first use never locks.
         end_rampage_on_fail(&mut b, side, move_id);
         b.move_failed = true; // Protect-blocked → PS moveThisTurnResult false (doubles ST)
@@ -4366,14 +4359,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // High Jump Kick / Jump Kick / Supercell Slam: missing costs the user 1/2 of its
         // max HP (crash; PS `onMoveFail` → `damage(source.baseMaxhp / 2)`).
-        if matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
-            let (hp, maxhp) = { let p = mb.state.side(side).active(); (p.hp, p.max_hp) };
-            let crash = (maxhp / 2).min(hp);
-            if crash > 0 {
-                let slot = mb.state.side(side).active_index;
-                push(&mut mb, Instruction::Damage { side, slot, amount: crash });
-            }
-        }
+        apply_crash_damage(&mut mb, side, &md);
         end_rampage_on_fail(&mut mb, side, move_id);
         mb.move_failed = true; // missed → PS moveThisTurnResult false (doubles ST next turn)
         miss_out.push(mb);
@@ -4392,6 +4378,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // A target mid-Fly/Dig/etc. (semi-invulnerable) dodges the move entirely.
     if matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m)) {
         let mut hb = scaled(&b, hit_prob);
+        // `hitStepInvulnerability` empties `targets`, so `trySpreadMoveHit` returns false and
+        // `useMoveInner` fires MoveFail — the crash-damage moves crash.
+        apply_crash_damage(&mut hb, side, &md);
         end_rampage_on_fail(&mut hb, side, move_id);
         hb.move_failed = true; // dodged (semi-invulnerable) → moveThisTurnResult false
         out.push(hb);
@@ -4433,6 +4422,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if wind_immune {
             raise_boost(&mut ib, foe, BoostIndex::Attack, 1);
         }
+        // A blocked target is filtered out of `targets` by `hitStepTryImmunity` /
+        // `hitStepTryHitEvent`, so `trySpreadMoveHit` returns false and `useMoveInner` reaches
+        // `singleEvent('MoveFail')` (`battle-actions.ts:526`) — the crash-damage moves crash on
+        // an immunity or an absorbing ability exactly as they do on a miss. rb1100 t12: Supercell
+        // Slam into a Volt Absorb Thundurus-Therian costs Eelektross 145 HP in PS.
+        apply_crash_damage(&mut ib, side, &md);
         // Type-chart / Levitate immunity fails the move (PS `runImmunity` → hitResult false →
         // moveThisTurnResult false → Stomping Tantrum doubles next turn). A boosting absorb
         // (Well-Baked Body / Wind Rider) instead returns null → NOT a failure (no ST double).
@@ -5949,7 +5944,6 @@ fn apply_post_damage(
 
     // Defender on-hit reaction abilities (only when the hit connected with the mon itself).
     if any_damage && !hit_sub {
-        maybe_eat_sitrus(b, foe);
         let f = b.state.side(foe).active();
         if f.is_alive() {
             use crate::ids::Ability as Ab;
@@ -6050,6 +6044,18 @@ fn apply_post_damage(
             // Knocking the item off reveals what it was.
             reveal(b, foe, 0, crate::state::Reveal::ITEM);
         }
+    }
+
+    // The defender's pinch/HP berry is an `onUpdate`, and PS's `eachEvent('Update')` sits at
+    // `battle-actions.ts:970` — at the BOTTOM of `hitStepMoveHitLoop`, after `spreadMoveHit`
+    // has already run `runEvent('DamagingHit')` (:1142) and the move's own `onAfterHit`
+    // (:1144). Knock Off's item removal is that `onAfterHit`, so it beats the berry: a Sitrus
+    // holder knocked below half by Knock Off loses the berry instead of eating it (rb1383 t15:
+    // Muk Knock Off into a switching-in Veluza — PS 116, engine 189 with `last_berry` set).
+    // It still precedes Magician / Pickpocket, which are `AfterMoveSecondary(Self)` events
+    // fired by `useMoveInner` after the whole hit loop.
+    if any_damage && !hit_sub {
+        maybe_eat_sitrus(b, foe);
     }
 
     // Magician: after landing a damaging move, an itemless attacker steals the target's item
@@ -7197,6 +7203,28 @@ fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
         }
         push(b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
         on_item_lost(b, side);
+    }
+}
+
+/// High Jump Kick / Jump Kick / Supercell Slam's crash: `onMoveFail` →
+/// `this.damage(source.baseMaxhp / 2, source, source, condition('High Jump Kick'))`.
+/// `useMoveInner` fires `MoveFail` whenever `trySpreadMoveHit` returns false — i.e. whenever
+/// EVERY target was filtered out by one of the hit steps: accuracy miss, Protect, a
+/// semi-invulnerable dodge, a type/ability/flag immunity. The one non-crash failure is
+/// "no target at all", which returns before the MoveFail line (`battle-actions.ts:511`).
+/// Magic Guard blocks it: the damage source is a Condition, not a Move.
+fn apply_crash_damage(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if !matches!(md.id.to_id(), "highjumpkick" | "jumpkick" | "supercellslam") {
+        return;
+    }
+    let p = b.state.side(side).active();
+    if p.ability == crate::ids::Ability::MagicGuard || !p.is_alive() {
+        return;
+    }
+    let crash = (p.max_hp / 2).min(p.hp);
+    if crash > 0 {
+        let slot = b.state.side(side).active_index;
+        push(b, Instruction::Damage { side, slot, amount: crash });
     }
 }
 
