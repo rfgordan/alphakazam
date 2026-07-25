@@ -2805,6 +2805,12 @@ pub(crate) enum Order {
 
 /// The defender's types as the type chart should see them: a Scrappy attacker's Normal /
 /// Fighting moves treat the target's Ghost type as neutral (immunity removed).
+/// Freeze-Dry is the only gen9-legal move with an `onEffectiveness` handler that randbats can
+/// roll (Flying Press / Thousand Arrows are Past, Tar Shot is a volatile on the target).
+fn is_freeze_dry(md: &crate::data::MoveData) -> bool {
+    md.id.to_id() == "freezedry"
+}
+
 fn effective_def_types(scrappy: bool, move_type: Type, types: [Type; 2]) -> [Type; 2] {
     if scrappy && matches!(move_type, Type::Normal | Type::Fighting) {
         let unghost = |t: Type| if t == Type::Ghost { Type::None } else { t };
@@ -3929,6 +3935,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 let fslot = b.state.side(foe).active_index;
                 push(&mut b, Instruction::Heal { side: foe, slot: fslot, amount: heal });
             }
+            // `onTryHit` returning null empties `targets`, so `useMoveInner` reaches MoveFail
+            // and a crash-damage move crashes (rb1100 t12: Supercell Slam into Volt Absorb).
+            apply_crash_damage(&mut b, side, &md);
             return vec![b];
         }
         // Lightning Rod / Storm Drain / Motor Drive: like the absorbing abilities above these are
@@ -3947,6 +3956,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if affects_foe_mon && !mb && b.state.side(foe).active().is_alive() {
             if let Some(stat) = redirect_boost {
                 raise_boost(&mut b, foe, stat, 1);
+                apply_crash_damage(&mut b, side, &md);
                 return vec![b];
             }
         }
@@ -3959,6 +3969,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             && b.state.side(foe).active().is_alive()
         {
             raise_boost(&mut b, foe, BoostIndex::Attack, 1);
+            apply_crash_damage(&mut b, side, &md);
             return vec![b];
         }
         // Flash Fire: a Fire move targeting the holder is nullified (PS `onTryHit` `return null`)
@@ -3974,6 +3985,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             if !b.state.side(foe).volatiles.contains(VolatileStatus::FlashFire) {
                 push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::FlashFire });
             }
+            apply_crash_damage(&mut b, side, &md);
             return vec![b];
         }
     }
@@ -5106,7 +5118,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     }
     let scrappy = matches!(attacker.ability, Ab::Scrappy | Ab::MindsEye);
     let def_types_eff = effective_def_types(scrappy, md.typ, defender.types);
-    let type_mult = crate::damage::type_multiplier(md.typ, def_types_eff);
+    let type_mult = crate::damage::type_multiplier_fd(md.typ, def_types_eff, is_freeze_dry(md));
     if matches!(def_ab, Ab::Filter | Ab::SolidRock | Ab::PrismArmor) && type_mult > 1.0 {
         fmod = chain_final(fmod, 3072);
     }
@@ -5414,6 +5426,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         life_orb: false,
         adaptability,
         tera_shell,
+        freeze_dry: is_freeze_dry(md),
         final_num: fmod,
         final_den: 4096,
     };
@@ -6419,7 +6432,7 @@ fn apply_weakness_policy(b: &mut Branch, foe: SideId, md: &crate::data::MoveData
     if d.is_alive()
         && d.item == Item::WeaknessPolicy
         && md.category != MoveCategory::Status
-        && crate::damage::type_multiplier(md.typ, d.types) > 1.0
+        && crate::damage::type_multiplier_fd(md.typ, d.types, is_freeze_dry(md)) > 1.0
     {
         raise_boost(b, foe, BoostIndex::Attack, 2);
         raise_boost(b, foe, BoostIndex::SpecialAttack, 2);
@@ -7251,6 +7264,15 @@ fn maybe_eat_sitrus(b: &mut Branch, side: SideId) {
         b.state.side(side.other()).active().ability,
         crate::ids::Ability::Unnerve | crate::ids::Ability::AsOneGlastrier | crate::ids::Ability::AsOneSpectrier
     ) && b.state.side(side.other()).active().is_alive() {
+        return;
+    }
+    // The Sitrus Berry carries its own `onTryEatItem` (`data/items.ts:5752`):
+    // `if (!this.runEvent('TryHeal', pokemon, null, this.effect, pokemon.baseMaxhp / 4)) return false;`
+    // — so under Heal Block the berry is not merely a no-op heal, it is NOT EATEN AT ALL and
+    // stays in hand. rb1003 t14: Psychic Noise heal-blocks a Cheek Pouch Dedenne and drops it
+    // under half in the same hit; PS keeps the berry and stays at 70, the engine ate it and
+    // healed 65 + 87.
+    if heal_blocked(b, side) {
         return;
     }
     let p = b.state.side(side).active();
@@ -9470,6 +9492,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         life_orb: false,
         adaptability: false,
         tera_shell: false,
+        freeze_dry: false,
         final_num: 1,
         final_den: if screened { 2 } else { 1 },
     };

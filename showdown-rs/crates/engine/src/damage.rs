@@ -60,6 +60,21 @@ pub fn type_multiplier(att: Type, defender_types: [Type; 2]) -> f32 {
     type_effectiveness(att, defender_types[0]) * type_effectiveness(att, defender_types[1])
 }
 
+/// Per-defending-type effectiveness with Freeze-Dry's `onEffectiveness` applied.
+/// `data/moves.ts` `freezedry`: `onEffectiveness(typeMod, target, type) { if (type === 'Water')
+/// return 1; }`. PS's `runEffectiveness` sums a per-type EXPONENT, so returning 1 REPLACES the
+/// Ice-vs-Water -1 with +1 — x2 per Water type on the defender, i.e. x4 relative to the plain
+/// chart. It is a per-type override, so Water/Ground takes x2 (Water) x 2 (Ground) = x4.
+pub fn effectiveness_of(att: Type, def: Type, freeze_dry: bool) -> f32 {
+    if freeze_dry && def == Type::Water { 2.0 } else { type_effectiveness(att, def) }
+}
+
+/// `type_multiplier` with the Freeze-Dry override.
+pub fn type_multiplier_fd(att: Type, defender_types: [Type; 2], freeze_dry: bool) -> f32 {
+    effectiveness_of(att, defender_types[0], freeze_dry)
+        * effectiveness_of(att, defender_types[1], freeze_dry)
+}
+
 /// Nature multiplier (×1.1 / ×0.9 / ×1.0) for a given stat.
 pub fn nature_multiplier(nature: Nature, stat: StatIndex) -> f32 {
     let (boosted, lowered) = nature_stats(nature);
@@ -141,6 +156,9 @@ pub struct DamageInput {
     pub adaptability: bool,
     /// Tera Shell (Terapagos-Terastal at full HP): one extra resist step (PS onEffectiveness −1).
     pub tera_shell: bool,
+    /// Freeze-Dry: its own `onEffectiveness` makes every Water defending type ×2 (see
+    /// `effectiveness_of`).
+    pub freeze_dry: bool,
     /// A final defender-side damage modifier as a 4096-based ratio (num/den), applied
     /// after type/burn/Life Orb — e.g. Multiscale (×0.5), Filter (×0.75). `(1, 1)` = none.
     pub final_num: i64,
@@ -219,8 +237,8 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         return [0; 16];
     }
     // Type effectiveness as the two per-type multipliers, applied sequentially below.
-    let e0 = type_effectiveness(input.move_type, input.defender_types[0]);
-    let e1 = type_effectiveness(input.move_type, input.defender_types[1]);
+    let e0 = effectiveness_of(input.move_type, input.defender_types[0], input.freeze_dry);
+    let e1 = effectiveness_of(input.move_type, input.defender_types[1], input.freeze_dry);
     if e0 == 0.0 || e1 == 0.0 {
         return [0; 16];
     }
@@ -346,6 +364,7 @@ mod tests {
             life_orb: false,
             adaptability: false,
             tera_shell: false,
+            freeze_dry: false,
             final_num: 1,
             final_den: 1,
         };
