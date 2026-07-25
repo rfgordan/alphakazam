@@ -261,7 +261,7 @@ pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
-        foe_pending_move: None, custap: cu, external_move: None,
+        foe_pending_move: None, custap: cu, external_move: None, called: false,
     };
     let a = mk(SideId::One, i1, custap[0]);
     let c = mk(SideId::Two, i2, custap[1]);
@@ -463,6 +463,7 @@ fn apply_dancer_copies(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                 foe_pending_move: None,
                 custap: false,
                 external_move: Some(move_id),
+                called: false,
             })
         })
         .collect()
@@ -890,6 +891,7 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
         foe_pending_move: None,
         custap: cu,
         external_move: None,
+        called: false,
     };
     let both_move = matches!(s1, MoveChoice::Move(_)) && matches!(s2, MoveChoice::Move(_));
     let commit_tie = match (s1, s2) {
@@ -1601,6 +1603,7 @@ pub fn generate_move_action(
         foe_pending_move,
         custap: false,
         external_move: None,
+        called: false,
     })
     .into_iter()
     .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
@@ -1763,7 +1766,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0], custap[0]), (SideId::Two, s2, pivot[1], custap[1])]
         .into_iter()
         .filter_map(|(side, c, pv, cu)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu, external_move: None }),
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu, external_move: None, called: false }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -2484,6 +2487,11 @@ pub(crate) struct Action {
     /// bookkeeping, no rampage lock (the "Dancer Petal Dance hack"), and no re-trigger of
     /// Dancer. The full BeforeMove gauntlet (sleep/attract/confusion/paralysis) still runs.
     pub(crate) external_move: Option<crate::ids::MoveId>,
+    /// PS `actions.useMove` re-entry (Sleep Talk's called move): unlike `runMove` (Dancer), the
+    /// `useMove` path fires NO `BeforeMove` event — the sleep/freeze/recharge/Truant/confusion/
+    /// attract/paralysis gauntlet is skipped entirely and the called move resolves with its own
+    /// complete draw stream while the user stays asleep. Always paired with `external_move`.
+    pub(crate) called: bool,
 }
 
 /// Run one move action and append its trailing runAction Update (battle.ts:2882): after EVERY
@@ -3393,7 +3401,7 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
 
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
-    let Action { side, move_idx, pivot, foe_pending_move, external_move, .. } = action;
+    let Action { side, move_idx, pivot, foe_pending_move, external_move, called, .. } = action;
     let external = external_move.is_some();
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
@@ -3641,22 +3649,33 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
     let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
-    if status == Status::Sleep {
+    if status == Status::Sleep && !called {
         // Early Bird burns sleep turns twice as fast (PS slp onBeforeMove: an extra time--).
         let tick = if b.state.side(side).active().ability == crate::ids::Ability::EarlyBird { 2 } else { 1 };
         if counter > tick {
             push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - tick });
-            return vec![b];
-        }
-        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
-        // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
-        // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
-        if truant_gate(&mut b, side) {
-            return vec![b];
+            // PS slp `onBeforeMove` (priority 10) ticks the counter and then returns `false` —
+            // EXCEPT for a `sleepUsable` move (Sleep Talk, Snore), where it returns undefined and
+            // the mon acts while still asleep. `false` short-circuits `runEvent`, so the lower
+            // handlers (Truant 9, flinch 8, confusion 3, paralysis 1) never run in the cancel case;
+            // in the sleepUsable case Truant is next in line and still gets its toggle.
+            if !md.sleep_usable {
+                return vec![b];
+            }
+            if truant_gate(&mut b, side) {
+                return vec![b];
+            }
+        } else {
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+            // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
+            // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
+            if truant_gate(&mut b, side) {
+                return vec![b];
+            }
         }
     }
     // Freeze: a frozen mon can't move (the 20% thaw + act is left unmodeled for now).
-    if b.state.side(side).active().status == Status::Freeze {
+    if b.state.side(side).active().status == Status::Freeze && !called {
         return vec![b];
     }
 
@@ -3664,7 +3683,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     use crate::state::PendingMove;
     let pending = b.state.side(side).pending_move;
     // Recharge: the mon spent a recharge move last turn and forfeits this one.
-    if matches!(pending, PendingMove::Recharging) {
+    if matches!(pending, PendingMove::Recharging) && !called {
         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
         return vec![b];
     }
@@ -3932,7 +3951,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             )
             && !matches!(b.state.side(foe).pending_move, PendingMove::Charging(m) if is_semi_invuln_move(m))
         {
-            return execute_status_move(b, foe, &md, false);
+            return execute_status_move(b, foe, &md, None);
         }
         // A Substitute blocks foe-targeting status moves unless they bypass it (sound
         // moves, Taunt, Encore, ...) or the user has Infiltrator. PS blocks the move at
@@ -3970,7 +3989,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             return vec![b];
         }
         let ins_before = b.ins.len();
-        let mut branches = execute_status_move(b, side, &md, foe_pending_move.is_some());
+        let mut branches = execute_status_move(b, side, &md, foe_pending_move);
         // PS runs a status move through `hitStepMoveHitLoop` exactly like a damaging move: a
         // `moveHit` that applies its effect fires the per-hit `eachEvent('Update')`
         // (battle-actions.ts:970) and the post-hit-loop `eachEvent('Update')` (:1024). A move that
@@ -7950,8 +7969,68 @@ fn status_move_reaches_accuracy(b: &Branch, side: SideId, md: &crate::data::Move
     true
 }
 
-fn execute_status_move(mut b: Branch, side: SideId, md: &crate::data::MoveData, foe_moves_later: bool) -> Vec<Branch> {
+fn execute_status_move(
+    mut b: Branch,
+    side: SideId,
+    md: &crate::data::MoveData,
+    foe_pending: Option<crate::ids::MoveId>,
+) -> Vec<Branch> {
     let foe = side.other();
+    let foe_moves_later = foe_pending.is_some();
+
+    // Sleep Talk: `onTry` requires the user to be asleep (or Comatose) — used awake the move
+    // simply fails, with no draw. `onHit` samples uniformly over the user's OTHER usable move
+    // slots (PS `sleeptalk` excludes `nosleeptalk`/`charge`-flagged moves and empty slots; PP is
+    // NOT consulted) and then `actions.useMove`s the pick, which resolves as a full sub-move with
+    // its own complete draw stream (accuracy, crit, damage, secondaries) while the user stays
+    // asleep — `useMove` fires no `BeforeMove` event, pays no PP, and does no `moveUsed`
+    // bookkeeping, so `lastMove`/streak stay on Sleep Talk itself.
+    if md.id.to_id() == "sleeptalk" {
+        let user = b.state.side(side).active();
+        if user.status != Status::Sleep && user.ability != crate::ids::Ability::Comatose {
+            return vec![b];
+        }
+        let pool: Vec<crate::ids::MoveId> = user
+            .moves
+            .iter()
+            .map(|m| m.id)
+            .filter(|&id| {
+                if id == crate::ids::MoveId::None {
+                    return false;
+                }
+                let cd = move_data(id);
+                !cd.flag_nosleeptalk && !cd.flag_charge
+            })
+            .collect();
+        if pool.is_empty() {
+            return vec![b]; // PS: `if (!randomMove) return false` — no sample draw
+        }
+        let n = pool.len() as i32;
+        let p = 1.0 / pool.len() as f32;
+        return pool
+            .into_iter()
+            .enumerate()
+            .flat_map(|(idx, called_id)| {
+                let mut nb = scaled(&b, p);
+                draw(&mut nb, "sample", &[n], idx as i64, "sleeptalk");
+                // `dispatch_move_inner`, not `execute_move`: PS's `useMove` skips the whole
+                // BeforeMove gauntlet (and the Glaive Rush drop that sits above it).
+                dispatch_move_inner(
+                    nb,
+                    Action {
+                        side,
+                        move_idx: 0,
+                        pivot: Pivot::Stay,
+                        shell_phys: None,
+                        foe_pending_move: foe_pending,
+                        custap: false,
+                        external_move: Some(called_id),
+                        called: true,
+                    },
+                )
+            })
+            .collect();
+    }
 
     // Powder moves have no effect on Grass types, Overcoat, or Safety Goggles holders.
     if md.flag_powder && md.target != crate::data::MoveTarget::User {

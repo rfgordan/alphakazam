@@ -132,6 +132,14 @@ pub struct MoveData {
     pub flag_powder: bool,
     /// `bypasssub` flag: sound moves, Taunt, Encore, ... act through a Substitute.
     pub flag_bypass_sub: bool,
+    /// `charge` flag: two-turn moves (Solar Beam, Fly, Dig, Meteor Beam, ...). Sleep Talk's
+    /// callable pool excludes them (PS `sleeptalk` `onHit`).
+    pub flag_charge: bool,
+    /// `nosleeptalk` flag: the move cannot be called by Sleep Talk (PS `sleeptalk` `onHit`).
+    pub flag_nosleeptalk: bool,
+    /// PS `sleepUsable`: the move executes even while the user is asleep (Sleep Talk, Snore).
+    /// The slp `onBeforeMove` still ticks the sleep counter, it just does not cancel.
+    pub sleep_usable: bool,
 }
 
 impl MoveData {
@@ -180,6 +188,9 @@ impl MoveData {
             flag_heal: false,
             flag_powder: false,
             flag_bypass_sub: false,
+            flag_charge: false,
+            flag_nosleeptalk: false,
+            sleep_usable: false,
         }
     }
 }
