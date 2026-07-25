@@ -582,25 +582,58 @@ fn normalize_draw_cat(s: &str) -> String {
     no_args.split('(').next().unwrap_or(&no_args).trim().to_string()
 }
 
-pub fn run_seed_gate(args: &[String]) -> ExitCode {
-    let verbose = std::env::var("VERBOSE").is_ok();
-    let mut results = Vec::new();
+/// Games are independent (each seeds its own `PsPrng` and carries its own `State`), and every
+/// piece of ambient generation state the gate touches — `ANNOTATE_DRAWS`, `FORCED_TIE_ORDER`,
+/// `REALIZED_SOURCE`, `BEATUP_ORDER`, `DBG_UNIT` — is a `thread_local`, set and cleared inside
+/// `run_game`'s own unit loop. So a whole game may run on any one worker thread with no
+/// cross-talk. Output stays byte-deterministic: results are collected in argument order (rayon's
+/// indexed `map(...).collect()` preserves it) and printed afterwards.
+///
+/// Threads default to rayon's global pool; `GATE_THREADS=n` caps it (each in-flight game holds a
+/// fully parsed `serde_json::Value` trace, so the peak RSS is ~threads × trace size).
+fn run_games_parallel(args: &[String]) -> Result<(Vec<GameResult>, Option<String>), String> {
+    use rayon::prelude::*;
+    if let Some(n) = std::env::var("GATE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+    }
+    let loaded: Vec<Option<(String, GameResult)>> = args
+        .par_iter()
+        .map(|path| match load_any(path) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("{e}");
+                None
+            }
+        })
+        .collect();
     let mut ps_commit: Option<String> = None;
-    for path in args {
-        let t = match crate::trace::load_trace(path) {
-            Ok(t) => t,
-            Err(e) => { eprintln!("{e}"); continue; }
-        };
+    let mut results = Vec::with_capacity(loaded.len());
+    for (path, (commit, r)) in args.iter().zip(loaded.into_iter()).filter_map(|(p, o)| o.map(|g| (p, g))) {
         match &ps_commit {
-            None => ps_commit = Some(t.ps_commit.clone()),
-            Some(c) if *c != t.ps_commit => {
-                eprintln!("{path}: PS commit differs — refusing mixed corpus");
-                return ExitCode::FAILURE;
+            None => ps_commit = Some(commit),
+            Some(c) if *c != commit => {
+                return Err(format!("{path}: PS commit differs — refusing mixed corpus"));
             }
             _ => {}
         }
-        results.push(run_game(path, &t));
+        results.push(r);
     }
+    Ok((results, ps_commit))
+}
+
+/// Load one gate input (full v2 trace or slim seed fixture) and run it, returning its PS commit.
+fn load_any(path: &str) -> Result<(String, GameResult), String> {
+    let t = crate::trace::load_trace(path)?;
+    let commit = t.ps_commit.clone();
+    Ok((commit, run_game(path, &t)))
+}
+
+pub fn run_seed_gate(args: &[String]) -> ExitCode {
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let (results, ps_commit) = match run_games_parallel(args) {
+        Ok(x) => x,
+        Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+    };
 
     let games = results.len();
     let exact = results.iter().filter(|r| r.exact).count();
