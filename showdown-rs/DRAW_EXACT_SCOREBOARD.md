@@ -6,6 +6,189 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== PHASE-4 EXTENSION BURN-DOWN — certification (2026-07-25) ====
+
+**HEADLINE: 333 / 512 full games byte-exact from seed (65.0%); init-aligned 512 / 512.
+The audited 111-trace corpus is now 111 / 111 — R1 is CLOSED, the campaign has no named
+open item left on it.**
+
+Nine commits, every one PS-source-grounded, every one monotone: the newly-non-exact set was
+EMPTY at all nine steps (judged by exact-SET diff on both corpora, never by the count).
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 (audited + fixtures) | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **333 / 512 (65.0%)**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`**; the `rust-requested-draw-not-next-in-log` category is now EMPTY |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** (every convertible corpus state byte-exact) |
+| Engine tests | `cargo test --release -p engine -j 2` | all suites green |
+
+## The nine roots (taxonomy S1-S8 plus two found on the way)
+
+| # | class | games | PS reference |
+|---|-------|-------|--------------|
+| S1 | **Sleep Talk called-move re-entrancy** | 286 -> 295 | `data/moves.ts:16871` — `sleepUsable` + `onHit` `sample` + `actions.useMove` |
+| S4+R1 | **per-hit `DamagingHit` ability rolls** | 295 -> 300 | `battle-actions.ts:1142` — `runEvent('DamagingHit')` is INSIDE `spreadMoveHit` |
+| S2 | **Fickle Beam's `onBasePower` roll** | 300 -> 305 | `battle-actions.ts:1653` ("happens after crit calculation") + `data/moves.ts:5227` |
+| S3 | **sleep schedule** (Sleep Clause + Lum ordering) | 305 -> 312 | `data/rulesets.ts:1378`, `data/conditions.ts:59`, `harness/cosim.mjs` formatid |
+| S8 | **Protosynthesis / Quark Drive field-change re-derive** | 312 -> 316 | `data/abilities.ts:3473` `onWeatherChange` / `onTerrainChange` |
+| — | **`move.self.chance` + Defog vs Substitute** | 316 -> 320 | `battle-actions.ts` `selfDrops`, `data/moves.ts:3458` |
+| — | **Shields Down (Minior)** | 320 -> 324 | `data/abilities.ts:4194` + `clearVolatile`'s `setSpecies(baseSpecies)` |
+| — | **Lightning Rod / Storm Drain / Motor Drive** | 324 -> 333 | `onTryHit` sits in `hitStepTryHitEvent`, BEFORE `hitStepAccuracy` |
+
+### S1 — Sleep Talk (14 -> 0 in class; 9 games flipped)
+`sleepUsable` (sleeptalk, snore) passes the slp `onBeforeMove`: PS's handler ticks the counter and
+returns `false` for a normal move — which short-circuits `runEvent('BeforeMove')`, so Truant/flinch/
+confusion/paralysis never roll — but returns undefined for a `sleepUsable` move, which falls through
+to Truant (priority 9). The callable pool is the user's move slots minus empty slots and the
+`nosleeptalk` / `charge` flags (PP is NOT consulted); one `sample[n]@sleeptalk`, n branches; an empty
+pool returns false with no draw. The called move re-enters `dispatch_move_inner` with
+`external_move: Some(id)` and the new `Action.called`: `useMove` (Sleep Talk) differs from `runMove`
+(Dancer) in firing NO BeforeMove event at all, so `called` skips the sleep/freeze/recharge gates and
+enters below the Glaive Rush drop, and the sub-move then runs its own complete stream (accuracy,
+crit, damage, secondaries) while the user stays asleep. `lastMove`/streak stay on Sleep Talk (no
+`moveUsed` on the `useMove` path) and no PP is paid. New generated flags `flag_charge` /
+`flag_nosleeptalk` / `sleep_usable` (17 / 40 / 2 moves at the pin) — extraction rule, not a hardcoded
+list.
+
+### S4 + R1 — per-hit DamagingHit (VERDICT: LANDED, both halves)
+r3 d23 t19 (Koraidon Scale Shot into Froslass) records `[crit, dmg, randomChance[3,10]@cursedbody] x
+2`; rb1049 (Fezandipiti Beat Up) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`. Same root:
+`spreadMoveHit` runs the DamagingHit event once per CONNECTING HIT, and the engine applied the whole
+ability set once after the loop. Three pieces:
+- `apply_damage_hit` gained a `HitRolls` source. `Fixed` is the unchanged DP/enumerate path;
+  `Realized` peels each hit's crit + damage off the cursor INSIDE the loop. Peeking inside the loop
+  is what makes an interleaved ability roll possible at all — an up-front peek reads hit n's ability
+  slot as hit n+1's crit.
+- `realized_per_hit_damaging_hit` reuses `apply_contact_secondaries` + `apply_cursed_body` verbatim
+  (no second implementation to drift) and collapses the fork to the branch the cursor dictates. A
+  Substitute-absorbed hit fires nothing (`targets[i] = null`, battle-actions.ts:1085). **The cursor
+  advances by the chosen branch's draw SHAPES, not by matching results** — when an effect cannot land
+  the fork collapses to one draw-and-discard branch whose recorded result is the placeholder 0 while
+  PS's raw draw may be `true` (rb1152 t7: Beat Up into a target Toxic Chain cannot badly-poison; PS
+  rolls 0,1,0,0,0,1). Matching on the result there skipped the draw and desynced every later hit.
+- `Branch.per_hit_procs_done` suppresses the once-per-move application, and is CONSUMED
+  (`mem::replace`) at the post-hit-loop block because the branch is reused for the turn's second
+  mover — rb1341 t13: Triple Axel set the flag and silenced the Cursed Body roll PS makes against the
+  NEXT move.
+
+**Jury result: the 21 currently-exact multi-hit games all held** (exact-set diff, 0 lost), the
+distribution smoke stayed 18/18, and the differ's `args randomChance@cursedbody` mismatch is gone
+(3810 -> 3811 at that commit). The Scale Shot / Bullet Seed / Icicle Spear / Population Bomb /
+Triple Axel blast radius is clean.
+
+### S3 — the sleep schedule was two things
+1. **Sleep Clause Mod is never active in any recorded battle.** `harness/cosim.mjs` builds every
+   battle with `formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT`, and
+   `gen9customgame` carries no ruleset; Sleep Clause Mod lives in the `standard` ruleset and on the
+   "[Gen 9] Random Battle" format entry, neither of which the harness instantiates. cosim inferred
+   `sleep_clause = format.contains("randombattle")` — exactly backwards. Ground truth: rb1312 t13's
+   `stateAfter` has Regice asleep on the field while the benched Iron Jugulis is still asleep from
+   the same attacker. Replaced by `trace::sleep_clause_for_format`, which mirrors the harness mapping,
+   in all four cosim entry points.
+2. **The `random(2,5)` duration is rolled in `onStart`, before the Lum Berry's `onUpdate` cure.**
+   rb1297 t17: Sleep Powder lands on a Lum Berry Roaring Moon — PS rolls the duration, the berry
+   wipes the status, and Roaring Moon Outrages normally that same turn.
+   `sleep_survived_or_discard_duration` emits the roll as a draw-and-discard on the cured path at all
+   four sleep-application sites (status move, move secondary, Tri Attack / Dire Claw `sample`
+   secondary, residual/Yawn).
+
+### S8 — Protosynthesis / Quark Drive
+`refresh_proto_quark` runs after every `ChangeWeather` / `ChangeTerrain` push (five sites). PS's
+`fromBooster` is now explicit state — a `VolatileStatus::ProtoBooster` companion bit set where the
+Booster Energy is consumed, cleared on switch-out with its partner, read by convert and written by
+export. The exporter previously INFERRED it as "the field condition isn't up right now", which is
+ambiguous for exactly the case the removal arm must not fire on.
+
+### Shields Down (Minior) — three PS-source pieces
+The forme check is NOT continuous: `onStart` (`onSwitchInPriority: -1`) and `onResidual`
+(`onResidualOrder: 29`) only. A forme change is undone on switch-out (`clearVolatile` ends with
+`setSpecies(this.baseSpecies)`, and `base_species` is the right engine field because
+`Instruction::Transform` never writes it) — rb1328's Minior shells up at full HP and is plain
+`minior` on the bench forever after. And the Meteor shell is status-proof: `onSetStatus` returns
+`false` unconditionally, `onTryAddVolatile` separately refuses Yawn; Shields Down has no `breakable`
+flag so Mold Breaker does not pierce it.
+
+### Lightning Rod / Storm Drain / Motor Drive — the largest single win (+9)
+All three `onTryHit` + `return null`, and `hitStepTryHitEvent` precedes `hitStepAccuracy`. The engine
+knew the type immunity but not the +1 SpA / +1 Spe, and had no status-move absorb entry for them at
+all — so Thunder Wave into a Lightning Rod holder emitted a `rust-extra randomChance@accuracy`
+(rb1211 t18, rb1350 t30: PS's whole unit draws NOTHING). The missing boost was also behind a chunk of
+the `boost.spa` / `boost.spe` state-diff bucket.
+
+## The 179 still-open extension games, re-triaged
+
+| n | class | reading |
+|---|-------|---------|
+| 129 | `draws-match/state-diff` | the draw stream matches for the unit; the STATE differs |
+| 5 | `PS shuffle@generic` | a bracket/schedule shuffle the engine does not emit |
+| 5 | `move-order-tie` | unfilterable shuffle fork (both order-branches share a draw stream) |
+| 4 | `rust-extra randomChance@accuracy` | see below — three distinct roots, all now named |
+| 3+2 | `random@confusion` | rampage-end / Confuse Ray duration position |
+| 2 | `PS sample@roar` | the phaze `sample` vs the engine's residual shuffle |
+| 2 | `PS random@lockedmove` | rampage duration position |
+| 2 | `convert-target:volatile:magnetrise` | **S6, still open** — see below |
+| ~24 | singletons | `@struggle` (2), `@par` (2), `@shadowball`, `@icebeam`, `@freezedry`, `@throatchop`, `@icehammer`, `@heavyslam`, `@fireblast`, `@thunderbolt`, `@fakeout`, `@curse`, `@powerwhip`, `@hypervoice`, `@harvest`, `@bravebird`, `@disablemove`, `@crit`, `@trace` |
+
+Field split of the 129 `draws-match/state-diff` games: 57 `hp`, 14 `volatiles`, 12 `boosts`,
+7+3 `active_turns`, 6 `wish`, 3 `species`, 3 `sc.toxic_spikes`, tail. **Of the 57 hp deltas, 43
+exceed 10 HP** — wrong MECHANICS, not rounding; 9 are within 3 (rb1008 rb1052 rb1101 rb1105 rb1145
+rb1218 rb1221 rb1277 rb1282) and 5 sit in 4-10.
+
+## Named opens carried forward (each with evidence, none reclassified)
+
+- **S7 — modifier-chain rounding (9 games, |hp delta| <= 3). NOT ATTEMPTED this session.** PS
+  accumulates every `chainModify` within ONE event into `this.event.modifier` and applies
+  `modify(value, modifier)` once at the end of `runEvent`; the engine applies each modifier
+  sequentially, which differs by 1. rb1008 (Perrserker, Tough Claws + Choice Band + Knock Off x1.5)
+  is the clean instance: 250 vs 249. The fix is a real refactor of `compute_damage`'s base-power and
+  attack-stat chains into 4096 fixed-point accumulators; the state sweep (3831/3831) is the rail that
+  must stay green, and the bisect method is `battle.prng.getSeed()` (PS) vs `prng.limbs()` (gate) per
+  unit.
+- **S5 — tera formes (Ogerpon / Terapagos). NOT ATTEMPTED.** `Pokemon.terastallize()` forme-changes
+  Ogerpon to `<forme>tera` (gaining `EmbodyAspect{Teal,Wellspring,Hearthflame,Cornerstone}` and its
+  +1 stat) and Terapagos to `Terapagos-Stellar` (gaining `TeraformZero`). rb1184 is the recorded
+  instance: `engine=terapagosterastal ps=terapagosstellar`, `engine=TeraShell ps=TeraformZero`, and
+  max HP 273 vs 373 (base HP 90 -> 160), so it needs `respread_stats` AND a max-HP change.
+  `TeraformZero`'s `onStart` additionally clears weather and terrain, which touches the shuffle
+  schedule — do it with call-site ground-truthing, not by inspection.
+- **S6 — `magnetrise` (2 games). NOT ATTEMPTED.** `convert.rs` still has no mapping, so rb1173 and
+  rb1317 fail at `convert-target:volatile:magnetrise` before the gate can run. Cheap on the converter
+  side but it needs the MOVE implemented too (5-turn Ground immunity + residual tick), plus an
+  exporter entry for the round-trip gate, and `VolatileStatus::MagnetRise` / `magnet_rise_turns`
+  already exist unused.
+- **the 4 remaining `rust-extra randomChance@accuracy` are three distinct roots**, all evidenced:
+  rb1397 t27 — **Focus Punch's `beforeMoveCallback`**: a holder that lost focus returns `true` from
+  the callback, which `clearActiveMove`s with NO draw; the engine rolls accuracy for it. rb1183 t11
+  (mid-turn) and rb1034 t46 — the second mover makes no draw in PS at all. rb1348 t11 — PS's WHOLE
+  unit draws nothing (Draining Kiss + a terastallizing Outrage).
+- **O1-O7 from the terminal certification are unchanged** except that **R1 is now CLOSED**. The
+  stream-neutral `shuffle[3,0,2]` vs `[2,0,2]` stall-volatile item and the gate-consumed-outside-
+  `chosen_draws` accounting shapes still explain the differ's remaining 19 units.
+
+## Ops notes for the next session
+
+- `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`
+  **whenever `convert.rs` changes** — the S8 commit moved 22 of 401 digests.
+- The sidecar gate (`harness/seed-sidecars/*.json.gz`) upgrades every `state-digest` label to the
+  differing FIELD; `DBG_DIFF=1 DBG_GAME=rbNNNN` then prints every diff for that game. Note `dbg_on`
+  is `name.starts_with(DBG_GAME)`, and the DIFF lines go to stderr.
+- Judge every commit by the exact-SET diff on BOTH corpora. All nine commits this session were
+  strictly monotone.
+- **Kill criterion: still NEVER triggered.**
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 333 / 512**, and the non-exact SET must be a subset of the previous one. 8 s.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== PHASE-3 SEED EXTENSION — certification (2026-07-25) ====
 
 **HEADLINE: 286 / 512 full games byte-exact from seed (55.9%); init-aligned 512 / 512.**
