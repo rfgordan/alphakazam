@@ -1377,6 +1377,7 @@ fn is_grounded(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
     !(p.types.contains(&Type::Flying)
         || p.ability == crate::ids::Ability::Levitate
+        || state.side(side).volatiles.contains(VolatileStatus::MagnetRise)
         || p.item == Item::AirBalloon)
 }
 
@@ -3091,6 +3092,9 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // engine retaining it across switches.
     VolatileStatus::ChoiceLock,
     VolatileStatus::ThroatChop, VolatileStatus::HealBlock, VolatileStatus::TypeShifted,
+    // Magnet Rise is a plain volatile with no `onSwitchOut`, so `clearVolatile` drops it
+    // (rb1173 t3: PS's Klefki pivots out and its `magnetrise` is gone).
+    VolatileStatus::MagnetRise,
     // Trapping volatiles clear when their holder leaves the field (self-traps and the trapped
     // mon's own copy). Foe-sourced traps additionally end when the TRAPPER leaves — handled by
     // `clear_foe_sourced_traps` in `apply_switch_inner`.
@@ -3476,6 +3480,13 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
         return vec![b];
     }
     match v {
+        VolatileStatus::MagnetRise => {
+            // `duration: 5` (`data/moves.ts` magnetrise `condition`). Self-targeting, so `foe`
+            // resolves to the user's own side.
+            push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
+            let prev = b.state.side(foe).magnet_rise_turns;
+            push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::MagnetRise, previous: prev, new: 5 });
+        }
         VolatileStatus::Taunt => {
             // PS: base 3, +1 only when the target has already moved this turn
             // (activeTurns truthy and not in the queue) — a fresh switch-in stays at 3.
@@ -4444,9 +4455,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
     }
 
-    // Air Balloon: the holder is untargetable by Ground moves until the balloon pops.
+    // Air Balloon / Magnet Rise: the holder is off the ground, so Ground moves miss it. Both
+    // are `onImmunity('Ground') -> false` (`data/items.ts` airballoon, `data/moves.ts`
+    // magnetrise `condition`), which `runImmunity` consults in `hitStepTryImmunity` — before
+    // the accuracy roll, so no draw is made.
     if md.typ == Type::Ground
-        && b.state.side(foe).active().item == Item::AirBalloon
+        && (b.state.side(foe).active().item == Item::AirBalloon
+            || b.state.side(foe).volatiles.contains(VolatileStatus::MagnetRise))
         && b.state.side(foe).active().is_alive()
     {
         b.move_failed = true; // blocked → moveThisTurnResult false
@@ -10396,6 +10411,14 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::HealBlock, previous: hb, new: hb - 1 });
             if hb == 1 {
                 push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::HealBlock });
+            }
+        }
+        // Magnet Rise: `duration: 5`, `onResidualOrder: 18` (`data/moves.ts` magnetrise).
+        let mr = b.state.side(side).magnet_rise_turns;
+        if mr > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::MagnetRise, previous: mr, new: mr - 1 });
+            if mr == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::MagnetRise });
             }
         }
         let enc = b.state.side(side).encore;

@@ -39,7 +39,7 @@ const weatherRs = (s) => {
 
 // Boost effects PS implements via onHit callbacks (invisible to field extraction).
 const MANUAL_TARGET_BOOSTS = { partingshot: { atk: -1, spa: -1 } };
-const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock' };
+const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock', magnetrise:'MagnetRise' };
 const volatileRs = (s) => s && VOLATILE[s] ? `Some(VolatileStatus::${VOLATILE[s]})` : 'None';
 
 // boosts object -> [atk,def,spa,spd,spe,accuracy,evasion]

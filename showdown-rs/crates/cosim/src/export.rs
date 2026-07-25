@@ -125,6 +125,9 @@ fn volatiles_obj(side: &Side, weather_is_sun: bool, terrain_is_electric: bool) -
     if vs.contains(HealBlock) {
         v.insert("healblock".into(), json!({ "duration": side.heal_block_turns }));
     }
+    if vs.contains(MagnetRise) {
+        v.insert("magnetrise".into(), json!({ "duration": side.magnet_rise_turns }));
+    }
     if vs.contains(PerishSong) {
         // `convert` maps `perish{n}` -> perish_turns = n (the 3->1 countdown). A bare
         // `perishsong` with `duration` is the other accepted form; the numbered key is canonical.

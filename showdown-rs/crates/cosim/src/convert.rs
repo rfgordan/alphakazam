@@ -471,6 +471,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
                 side.volatiles.insert(VolatileStatus::HealBlock);
                 side.heal_block_turns = dur;
             }
+            "magnetrise" => {
+                side.volatiles.insert(VolatileStatus::MagnetRise);
+                side.magnet_rise_turns = dur;
+            }
             "perishsong" | "perish3" | "perish2" | "perish1" => {
                 side.volatiles.insert(VolatileStatus::PerishSong);
                 if let Some(n) = k.strip_prefix("perish").and_then(|n| n.parse::<u8>().ok()) {
@@ -710,6 +714,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
     "flinch", "charge", "focusenergy", "dragoncheer", "unburden", "throatchop", "healblock",
+    "magnetrise",
     "trapped", "trapper", "ingrain", "noretreat", "octolock", "chillyreception",
 ];
 
