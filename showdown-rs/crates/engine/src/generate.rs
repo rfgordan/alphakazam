@@ -3253,6 +3253,16 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
     // the USER; everything else on the foe.
     let foe = if md.target == crate::data::MoveTarget::User { side } else { side.other() };
     if !b.state.side(foe).active().is_alive() || b.state.side(foe).volatiles.contains(v) {
+        // Destiny Bond's own `onPrepareHit` is `return !pokemon.removeVolatile('destinybond')`
+        // — an already-active bond is REMOVED and the move FAILS, so it can never be stacked
+        // two turns running. r3 t19: the faster Froslass re-uses Destiny Bond, its bond is gone
+        // before Koraidon's Scale Shot KOs it, and Koraidon survives.
+        if v == VolatileStatus::DestinyBond
+            && b.state.side(foe).active().is_alive()
+            && b.state.side(foe).volatiles.contains(v)
+        {
+            push(&mut b, Instruction::RemoveVolatile { side: foe, volatile: v });
+        }
         return vec![b];
     }
     let mold_breaker = matches!(
@@ -3689,8 +3699,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     }
     let move_id = if struggling || external { move_id } else { b.state.side(side).active().moves[move_idx as usize].id };
 
-    // Destiny Bond lasts until the user's next move: moving again drops it.
-    if b.state.side(side).volatiles.contains(VolatileStatus::DestinyBond) {
+    // Destiny Bond lasts until the user's next move: moving again drops it. PS's
+    // `onBeforeMove` explicitly EXEMPTS Destiny Bond itself (`if (move.id === 'destinybond')
+    // return;`) — re-using it is handled by the move's own `onPrepareHit`, in
+    // `apply_status_target_volatile`.
+    if md.target_volatile != Some(VolatileStatus::DestinyBond)
+        && b.state.side(side).volatiles.contains(VolatileStatus::DestinyBond)
+    {
         push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::DestinyBond });
     }
 
@@ -5056,8 +5071,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         {
             def_stat = crate::damage::modify(def_stat, 3, 2);
         }
-        // Marvel Scale / Fur Coat (defender) raise physical Defense.
-        if md.category == MoveCategory::Physical && def_idx == crate::ids::StatIndex::Defense {
+        // Marvel Scale / Fur Coat (defender) raise physical Defense. Both are `onModifyDef`
+        // (data/abilities.ts `furcoat` / `marvelscale`), and `Pokemon#calculateStat` runs
+        // `Modify<Stat>` for whichever stat the move actually reads — so an
+        // `overrideDefensiveStat` special move (Secret Sword, Psyshock, Psystrike) gets them
+        // too. Key on the STAT, never on the move category (rb1123 t2: Secret Sword into a
+        // Fur Coat Persian-Alola — 47 in PS, 94 in the engine, exactly the missing ×2).
+        if def_idx == crate::ids::StatIndex::Defense {
             if def_ab == Ab::FurCoat {
                 def_stat = crate::damage::modify(def_stat, 2, 1);
             } else if def_ab == Ab::MarvelScale && defender.status != Status::None {
@@ -5837,6 +5857,22 @@ fn apply_post_damage(
         let atk = b.state.side(side).active();
         let dmg = (atk.max_hp / 4).max(1).min(atk.hp);
         push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+    }
+
+    // Destiny Bond: a foe that faints to this move takes the attacker with it. PS
+    // `data/moves.ts` `destinybond.condition.onFaint(target, source, effect)` — it fires for
+    // `effect.effectType === 'Move'` (non-futuremove) from a non-ally source and calls
+    // `source.faint()`. The volatile is only dropped when the HOLDER moves, so it is still up
+    // here. rb1369 t8: Weavile Knock Off KOs a Destiny Bonded Froslass and faints with it.
+    if any_damage
+        && !hit_sub
+        && !b.state.side(foe).active().is_alive()
+        && b.state.side(foe).volatiles.contains(VolatileStatus::DestinyBond)
+        && b.state.side(side).active().is_alive()
+    {
+        let aslot = b.state.side(side).active_index;
+        let hp = b.state.side(side).active().hp;
+        push(b, Instruction::Damage { side, slot: aslot, amount: hp });
     }
 
     // Toxic Debris: a physical hit on the holder scatters a Toxic Spikes layer onto the

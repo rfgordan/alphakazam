@@ -155,10 +155,21 @@ pub fn base_damage(level: u8, base_power: u16, attack: i16, defense: i16) -> i32
     (numerator / 50) + 2
 }
 
-/// The STAB modifier as a 4096-friendly ratio. Base STAB is ×1.5 (×2 with Adaptability).
-/// Terastallizing into one of the attacker's *original* types upgrades STAB to ×2 (×2.25
-/// with Adaptability); Tera into a new type keeps the move STAB-able for both the tera type
-/// and any matching original type at the normal rate.
+/// The STAB modifier as a 4096-friendly ratio, mirroring `battle-actions.ts:1762-1796`:
+///
+/// ```text
+/// isSTAB = move.forceSTAB || pokemon.hasType(type) || pokemon.getTypes(false, true).includes(type)
+/// stab   = isSTAB ? 1.5 : 1
+/// if (pokemon.terastallized === type && pokemon.getTypes(false, true).includes(type)) stab = 2
+/// stab   = runEvent('ModifySTAB', ...)          // Adaptability
+/// ```
+///
+/// The two type predicates are DIFFERENT for a terastallized Pokemon: `hasType` reads
+/// `getTypes()`, which for a Tera'd mon is EXACTLY `[teraType]`, while `getTypes(false, true)`
+/// is the pre-Tera list. Base STAB survives Tera through the second predicate — but
+/// Adaptability's `onModifySTAB` (`data/abilities.ts:44`) gates on `source.hasType(move.type)`,
+/// so after Terastallizing it only fires for moves of the TERA type. A Tera'd Adaptability mon
+/// attacking with one of its original (non-Tera) types therefore gets a plain ×1.5.
 fn stab_mod(input: &DamageInput) -> (i64, i64) {
     let mt = input.move_type;
     // Typeless moves (Struggle, confusion self-hit) never get STAB — but a mon's `types` array
@@ -166,16 +177,24 @@ fn stab_mod(input: &DamageInput) -> (i64, i64) {
     if mt == Type::None {
         return (1, 1);
     }
-    let (from_orig, from_tera) = if input.terastallized {
-        (input.attacker_base_types.contains(&mt), input.tera_type == mt)
+    // PS `pokemon.hasType(type)`.
+    let has_type = if input.terastallized {
+        input.tera_type == mt
     } else {
-        (input.attacker_types.contains(&mt), false)
+        input.attacker_types.contains(&mt)
     };
-    if !from_orig && !from_tera {
+    // PS `pokemon.getTypes(false, true)` — the pre-terastallized type list.
+    let base_has = if input.terastallized {
+        input.attacker_base_types.contains(&mt)
+    } else {
+        input.attacker_types.contains(&mt)
+    };
+    if !has_type && !base_has {
         return (1, 1);
     }
-    let double = from_orig && from_tera; // Tera into an original type
-    match (double, input.adaptability) {
+    let double = has_type && base_has && input.terastallized; // Tera into an original type
+    // Adaptability only applies where PS's `hasType` does.
+    match (double, input.adaptability && has_type) {
         (true, true) => (9216, 4096), // ×2.25
         (true, false) => (2, 1),      // ×2
         (false, true) => (2, 1),      // ×2
