@@ -220,6 +220,21 @@ fn stab_mod(input: &DamageInput) -> (i64, i64) {
     }
 }
 
+/// PS's `Battle#chainModify` (`sim/battle.ts:2334`): every handler inside ONE `runEvent`
+/// accumulates its factor into `this.event.modifier`, and `runEvent` applies the product ONCE
+/// at `battle.ts:932` (`relayVar = this.modify(relayVar, this.event.modifier)`). Applying each
+/// factor with its own `modify` instead rounds at every step and drifts by 1.
+/// `previous` and the result are 4096-scaled; identity is 4096.
+pub(crate) fn chain(previous: i64, num: i64, den: i64) -> i64 {
+    let next = num * 4096 / den; // trunc, PS `tr(numerator * 4096 / denominator)`
+    (previous * next + 2048) >> 12
+}
+
+/// PS's `modify` with an already-4096-scaled modifier (the accumulated `event.modifier`).
+pub(crate) fn modify_by(value: i64, modifier: i64) -> i64 {
+    (value * modifier + 2048 - 1) / 4096
+}
+
 /// PS's `modify`: `value * num/den` with 4096-based fixed point and round-half-up.
 /// Used for STAB / weather / burn / item modifiers so results match Showdown exactly.
 pub(crate) fn modify(value: i64, num: i64, den: i64) -> i64 {
