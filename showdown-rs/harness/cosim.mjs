@@ -1073,6 +1073,10 @@ async function main() {
 		format: FORMAT,
 		seed: [SEED_NUM, SEED_NUM + 7, SEED_NUM + 13, SEED_NUM + 29],
 		teamset: TEAMSET,
+		// The exact packed sets handed to `new Battle` — species/level/ability/item/moves/EVs/IVs
+		// AND each set's declared gender. Recorded so a trace (or the slim seed fixture built from
+		// it) can be re-recorded byte-identically without re-running PS's random-team generator.
+		packedTeams: [team1, team2],
 		decisions,
 		result: { winner: battle.winner ?? null, ended: battle.ended, turns: battle.turn },
 	};

@@ -10,7 +10,9 @@
 
 mod convert;
 mod diff;
+mod digest;
 mod drawdiff;
+mod fixture;
 mod export;
 mod protocol_emit;
 mod replay;
@@ -60,6 +62,12 @@ fn main() -> ExitCode {
     // independent of the engine. RAW_DRAW_GATE=1 cosim <traces...>.
     if std::env::var("RAW_DRAW_GATE").is_ok() {
         return run_raw_draw_gate(&args);
+    }
+
+    // Slim seed-fixture builder: convert full v2 traces into `*.fx.json.gz` gate fixtures
+    // (per-decision state DIGESTS instead of full serialized states). MAKE_FIXTURE=<outdir>.
+    if let Ok(outdir) = std::env::var("MAKE_FIXTURE") {
+        return crate::fixture::run_make_fixture(&args, &outdir);
     }
 
     // Seed-driven full-battle Replicate gate (Phase 3 deliverable #2).

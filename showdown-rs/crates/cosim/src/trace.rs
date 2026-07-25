@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Deserialize)]
@@ -21,11 +21,15 @@ pub struct Trace {
     #[serde(default)]
     pub seed: Option<[u16; 4]>,
     pub teamset: Option<String>,
+    /// The PS packed team strings the recorder handed `new Battle` (p1, p2). Present in traces
+    /// recorded after the seed-fixture work; empty for older ones.
+    #[serde(rename = "packedTeams", default)]
+    pub packed_teams: Vec<String>,
     pub decisions: Vec<Decision>,
     pub result: TraceResult,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct TraceResult {
     pub winner: Option<String>,
     pub ended: bool,
@@ -94,7 +98,7 @@ pub struct DistributionOutcome {
     pub state: Value,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ChoiceRec {
     /// The literal PS choice string ("move 2 terastallize", "switch 4", ...).
     pub choice: String,
@@ -102,7 +106,7 @@ pub struct ChoiceRec {
     pub resolved: Resolved,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Resolved {
     pub action: String, // "move" | "switch" | "teampreview" | "pass" | "default"
     #[serde(rename = "moveId")]
@@ -117,18 +121,23 @@ pub struct Resolved {
     pub roster_index: Option<u8>,
 }
 
-pub fn load_trace(path: &str) -> Result<Trace, String> {
+/// Read a possibly-gzipped UTF-8 file.
+pub fn read_maybe_gz(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-    let text = if path.ends_with(".gz") {
+    if path.ends_with(".gz") {
         use std::io::Read;
         let mut s = String::new();
         flate2::read::GzDecoder::new(&bytes[..])
             .read_to_string(&mut s)
             .map_err(|e| format!("gunzip {path}: {e}"))?;
-        s
+        Ok(s)
     } else {
-        String::from_utf8(bytes).map_err(|e| format!("utf8 {path}: {e}"))?
-    };
+        String::from_utf8(bytes).map_err(|e| format!("utf8 {path}: {e}"))
+    }
+}
+
+pub fn load_trace(path: &str) -> Result<Trace, String> {
+    let text = read_maybe_gz(path)?;
     let t: Trace = serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))?;
     if t.version != 2 {
         return Err(format!("{path}: unsupported trace version {}", t.version));

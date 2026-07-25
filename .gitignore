@@ -8,6 +8,13 @@ target/
 /showdown-rs/harness/traces/
 /showdown-rs/harness/traces-rand/
 
+# Seed-gate SIDECARS: the full v2 traces the slim `harness/seed-fixtures/*.fx.json.gz` were
+# built from. Kept out of git (~110 KB each vs ~7 KB for the fixture) and regenerated on demand
+# from the fixture's seed + format with `harness/record-seeds.sh` — the recorder is deterministic,
+# so a regenerated sidecar is byte-identical. Only needed to get a FIELD-LEVEL state diff on a
+# digest mismatch; the gate itself never reads them.
+/showdown-rs/harness/seed-sidecars/
+
 # OS / editor cruft
 .DS_Store
 *.swp
