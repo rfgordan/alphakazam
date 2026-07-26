@@ -2079,8 +2079,15 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 apply_end_of_turn(b, switched)
                     .into_iter()
                     .map(|mut nb| {
-                        // PS `endTurn` resets `statsRaisedThisTurn` on every active after the
-                        // residuals run (battle.ts) — drop the volatile at the same boundary.
+                        // PS `endTurn` resets `statsRaisedThisTurn` / `statsLoweredThisTurn` on
+                        // every active after the residuals run (battle.ts:1675-1676) — drop the
+                        // volatiles at the same boundary. But `turnLoop` returns on `this.ended`
+                        // (:2974) BEFORE calling `endTurn()`, so a residual faint that ends the
+                        // battle leaves both markers standing in the terminal state. Same rule the
+                        // `activeTurns` bump below already follows.
+                        if battle_over(&nb.state) {
+                            return nb;
+                        }
                         for s in [SideId::One, SideId::Two] {
                             if nb.state.side(s).volatiles.contains(VolatileStatus::StatsRaisedThisTurn) {
                                 push(&mut nb, Instruction::RemoveVolatile {
@@ -10469,6 +10476,44 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
     hs
 }
 
+/// Put back the Flying type Roost stripped from `side`'s active. The engine encodes PS's
+/// `roost` volatile (whose `onType` filters Flying out of `getTypes()`) as a real type change
+/// plus the `Roosted` marker; this is the undo half.
+fn restore_roost_typing_side(b: &mut Branch, side: SideId) {
+    let p = b.state.side(side).active();
+    if !p.is_alive() {
+        return;
+    }
+    let slot = b.state.side(side).active_index;
+    let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
+    if p.types != restored {
+        push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
+    }
+}
+
+/// Both sides' Roost typing, for the battle-ended abort path (the `Roosted` marker itself is
+/// left standing, matching PS, and is masked out of the state digest).
+fn restore_roost_typing(b: &mut Branch) {
+    for side in [SideId::One, SideId::Two] {
+        if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {
+            restore_roost_typing_side(b, side);
+        }
+    }
+}
+
+/// The two sides in PS's residual `speedSort` order — fastest active first, ties left in
+/// side order (a tie is exactly the case the emitted `shuffle` randomizes, and the digest
+/// cannot see which way it fell unless the two chips interact). Uses the same
+/// `effective_speed` `residual_handlers` sorts its per-active handlers by, so the applied
+/// order and the emitted shuffle order are derived from one number.
+fn residual_side_order(state: &State) -> [SideId; 2] {
+    if effective_speed(state, SideId::Two) > effective_speed(state, SideId::One) {
+        [SideId::Two, SideId::One]
+    } else {
+        [SideId::One, SideId::Two]
+    }
+}
+
 /// Emit the `speedSort` shuffle draws PS makes over the Residual handler list. Selection-sort
 /// mirror of `comparePriority`: sort best-first (order asc, speed desc, subOrder asc), then for
 /// every maximal run of ≥2 mutually-tying handlers emit one `shuffle[len, start, start+run]`, in
@@ -10496,6 +10541,17 @@ fn emit_residual_shuffles(b: &mut Branch) {
 }
 
 pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
+    // PS's residual pass ABORTS the moment the battle ends: `fieldEvent` runs
+    // `this.faintMessages(); if (this.ended) return;` after EVERY handler (sim/battle.ts:565-566,
+    // and again at :519 for a duration-expiry `end`). `turnLoop` then returns on `this.ended`
+    // (:2974) WITHOUT calling `endTurn()`, so none of endTurn's per-active bookkeeping runs
+    // either. The engine used to run the whole residual to completion and then do the end-of-turn
+    // resets unconditionally, which over-applied every handler ordered after the killing one.
+    use crate::instruction::ActiveCounter;
+    let mut ended_early = false;
+    let mut yawn_fired = [false; 2];
+    let mut fs_fired: [Option<u8>; 2] = [None, None];
+    'residual: {
     let b = &mut branch;
     // PS `fieldEvent('Residual')` speed-sorts the collected residual handlers via `speedSort`
     // (battle.ts:507); every tie-group of ≥2 handlers equal under `comparePriority` consumes one
@@ -10545,6 +10601,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Order: weather, then per active: Leftovers heal, status residual, Salt Cure.
     // (PS uses a finer speed-ordered residual queue; this covers the common cases.)
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let p = b.state.side(side).active();
         if !p.is_alive() {
             continue;
@@ -10607,6 +10664,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // FULL HP, so PS's `this.heal(212)` returns 0) then Leech Seed's order-8 drain of 30. PS
     // ends the turn at 213/243; the engine drained first and let the wish heal the 30 back.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let wish = b.state.side(side).wish;
         if wish.0 == 0 {
             continue;
@@ -10626,6 +10684,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
 
     // --- residual orders 5-7: Grassy Terrain (5/2), Leftovers / Black Sludge (5/4), Ingrain (7) ---
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let p = b.state.side(side).active();
         if !p.is_alive() {
             continue;
@@ -10701,6 +10760,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // PS also skips the residual entirely — drain AND heal — when the seeding slot's
     // occupant has fainted and not yet been replaced (`getAtSlot(sourceSlot)` -> fainted).
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let (alive, hp, maxhp, magic_guard) = {
             let p = b.state.side(side).active();
             (p.is_alive(), p.hp, p.max_hp, p.ability == crate::ids::Ability::MagicGuard)
@@ -10726,26 +10786,41 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             }
         }
     }
-    for side in [SideId::One, SideId::Two] {
-        let p = b.state.side(side).active();
-        if !p.is_alive() {
-            continue;
-        }
-        let slot = b.state.side(side).active_index;
-        let maxhp = p.max_hp;
-        use crate::ids::Ability as Ab;
-        let ability = p.ability;
-        let magic_guard = ability == Ab::MagicGuard;
-
-        // Status residual. Poison Heal *heals* 1/8 instead of taking poison/toxic damage;
-        // Magic Guard cancels the damage entirely.
-        let (palive, pstatus, php) = {
+    // --- residual order 9 (psn / tox) then order 10 (brn) ---
+    // `data/conditions.ts` gives `psn` and `tox` `onResidualOrder: 9` (:133, :154) and `brn`
+    // `onResidualOrder: 10` (:15). They are DIFFERENT orders, so PS's single globally ordered
+    // queue runs EVERY poison chip before ANY burn chip, whichever side holds them; within an
+    // order the two actives are `speedSort`ed, fastest first. The engine used to fold both into
+    // one per-side loop that always ran side One first, putting a side-One burn ahead of a
+    // side-Two poison. Invisible while both holders survive — the chips touch different HP bars —
+    // and decisive when one of them ENDS the battle, because PS's residual then returns and the
+    // later chip never happens (rb1279 d48: p2's Ho-Oh is `tox` at order 9 and p1's mon is `brn`
+    // at order 10; PS ticks the toxic first, then the burn KOs p1's last mon and the pass stops).
+    for order in [9u8, 10u8] {
+        for side in residual_side_order(&b.state) {
+            if battle_over(&b.state) { ended_early = true; break 'residual; }
             let p = b.state.side(side).active();
-            (p.is_alive(), p.status, p.hp)
-        };
-        if palive {
-            let poisoned = matches!(pstatus, Status::Poison | Status::Toxic);
-            if ability == Ab::PoisonHeal && poisoned {
+            if !p.is_alive() {
+                continue;
+            }
+            let slot = b.state.side(side).active_index;
+            let maxhp = p.max_hp;
+            let php = p.hp;
+            use crate::ids::Ability as Ab;
+            let ability = p.ability;
+            let magic_guard = ability == Ab::MagicGuard;
+            let pstatus = p.status;
+            let this_order = match pstatus {
+                Status::Poison | Status::Toxic => 9u8,
+                Status::Burn => 10u8,
+                _ => continue,
+            };
+            if this_order != order {
+                continue;
+            }
+            // Poison Heal *heals* 1/8 instead of taking poison/toxic damage; Magic Guard cancels
+            // the damage entirely.
+            if ability == Ab::PoisonHeal {
                 let heal = (maxhp / 8).max(1).min(maxhp - php);
                 if heal > 0 && !heal_blocked(b, side) {
                     push(b, Instruction::Heal { side, slot, amount: heal });
@@ -10775,6 +10850,19 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 }
             }
         }
+    }
+
+    for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let maxhp = p.max_hp;
+        use crate::ids::Ability as Ab;
+        let ability = p.ability;
+        let magic_guard = ability == Ab::MagicGuard;
 
         // Curse (Ghost, `onResidualOrder: 12`, data/moves.ts:3298): the cursed mon loses 1/4 max
         // HP each turn — AHEAD of Salt Cure / the partial trap (13) and Octolock (14), so a
@@ -10843,8 +10931,9 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Active-mon countdowns: Taunt / Encore / Disable tick and clear; Yawn ticks and puts the
     // holder to sleep at 0; Perish Song ticks and faints the holder at 0.
     use crate::instruction::ActiveCounter;
-    let mut yawn_fired = [false; 2];
+    yawn_fired = [false; 2];
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         if !b.state.side(side).active().is_alive() {
             continue;
         }
@@ -10924,15 +11013,9 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // are exact.) `data/moves.ts` roost's volatile is `onResidualOrder: 25`, so it lands after
     // the Perish Song faint (24) and before the screens (26).
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {
-            let p = b.state.side(side).active();
-            if p.is_alive() {
-                let slot = b.state.side(side).active_index;
-                let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
-                if p.types != restored {
-                    push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
-                }
-            }
+            restore_roost_typing_side(b, side);
             push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Roosted });
         }
     }
@@ -10940,6 +11023,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Safety net for the linked `trapped` release: a trap source that died to a RESIDUAL (burn,
     // its own partial trap, …) rather than a hit also frees the foe before the decision boundary.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         if b.state.side(side).volatiles.contains(VolatileStatus::Trapped)
             && !b.state.side(side.other()).active().is_alive()
         {
@@ -10954,6 +11038,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Then clear the single-turn volatiles themselves (PS removes duration-1 volatiles in the
     // same residual pass).
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let stall = b.state.side(side).stall_counter;
         if stall != 0 && !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
             push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
@@ -10976,6 +11061,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
 
     // Screens / Tailwind tick per side and clear at 0.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         use SideConditionId::*;
         let conds = b.state.side(side).side_conditions;
         for (sc, cur) in [
@@ -11022,6 +11108,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Dreams miss a foe that Yawn had only just put to sleep at order 23 and (b) gave Speed Boost
     // to a mon Perish Song had already fainted at order 24.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         use crate::ids::Ability as Ab;
         let p = b.state.side(side).active();
         if !p.is_alive() {
@@ -11070,6 +11157,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // i.e. after the 28/2 abilities above. (Harvest is also 28/2 but emits a draw, so it lives in
     // the branching tail below; it cannot interact with an orb's status.)
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let p = b.state.side(side).active();
         if !p.is_alive() {
             continue;
@@ -11091,6 +11179,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // Aura Wheel reads the forme at use time. The engine used to toggle it at the TOP of the
     // residual pass, ahead of every order-1..28 handler.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let p = b.state.side(side).active();
         if p.ability == crate::ids::Ability::HungerSwitch && p.is_alive() && !p.terastallized && !p.transformed {
             let plain = crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None);
@@ -11117,6 +11206,7 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     // to the terminal value {1,2, s-1}. The final locked turn (n==1) already ended and confused
     // at move time, so a live Rampaging here always has n>=2 -> stays >=1.
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         if let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move {
             if n >= 2 {
                 push(b, Instruction::SetPendingMove {
@@ -11129,8 +11219,9 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     }
 
     // Future Sight: tick; mark a strike when it lands (stochastic rolls -> branch below).
-    let mut fs_fired: [Option<u8>; 2] = [None, None];
+    fs_fired = [None, None];
     for side in [SideId::One, SideId::Two] {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
         let fs = b.state.side(side).future_sight;
         if fs.0 > 0 {
             let lands = fs.0 == 1;
@@ -11143,7 +11234,26 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     }
 
     // Harvest: 50% chance (always in sun) to regrow the holder's eaten berry.
+    } // 'residual
+
     let mut out_h = vec![branch];
+    if ended_early {
+        // PS returned out of `fieldEvent('Residual')` the instant the battle ended, so NO later
+        // residual handler runs (Harvest, Shed Skin, the Yawn expiry, the Future Sight strike),
+        // `runAction`'s trailing `eachEvent('Update')` never fires, and `turnLoop` returns before
+        // `endTurn()` — so its per-active bookkeeping (the `activeTurns` bump, the DisableMove /
+        // TrapPokemon speed sorts) never happens either. Hand the aborted state back as-is —
+        // except for Roost's typing, which is an ENCODING artifact, not PS state: PS never
+        // mutates `pokemon.types` for Roost (the `roost` volatile only filters Flying out of
+        // `getTypes()` via `onType`, data/moves.ts:15459-15463), while the engine strips the
+        // type and puts it back at order 25. An abort before order 25 would therefore leave the
+        // engine's stripped encoding facing PS's untouched `[Steel, Flying]` (rb1180 d42). The
+        // `Roosted` bit itself is already masked out of the state digest for the same reason.
+        for nb in &mut out_h {
+            restore_roost_typing(nb);
+        }
+        return out_h;
+    }
     for side in [SideId::One, SideId::Two] {
         out_h = out_h
             .into_iter()
