@@ -258,7 +258,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -317,6 +317,14 @@ pub(crate) struct Branch {
     /// realized (seed-gate / differ) path; the DP path leaves it false and keeps the once-per-move
     /// application, which is exact for a single-hit move and is what Enumerate/Sample verify.
     pub(crate) per_hit_procs_done: bool,
+    /// Transient (NOT part of State): the *deferred* `runEvent('DamagingHit')` payload for the last
+    /// connecting hit — `(any_damage, def_item, def_ability)`. `spreadMoveHit` runs step 5
+    /// (`secondaries()`) BEFORE step 7 (`runEvent('DamagingHit')`), so the hit loops stash the final
+    /// hit's event here instead of firing it inline and `apply_damaging_hit_step7` flushes it after
+    /// the secondary split. Hits that are followed by another executed hit flush at the top of the
+    /// next iteration (PS's damage calc for hit n+1 must see hit n's event), so at most one is ever
+    /// pending. See `apply_damaging_hit_step7`.
+    pub(crate) pending_damaging_hit: Option<(bool, Item, crate::ids::Ability)>,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1736,7 +1744,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -1960,7 +1968,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -2121,7 +2129,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -2429,7 +2437,7 @@ fn run_update_event(b: &mut Branch) {
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -2975,7 +2983,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -5214,9 +5222,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // was outside the guard — rb1147 d38: a Keldeo-Resolute behind a fresh Substitute takes a
         // Knock Off; PS leaves its Attack at 0, the engine gave it Justified's +1.
         if !hit_sub {
-            apply_justified(&mut hb, foe, &md);
-            apply_rattled(&mut hb, foe, &md);
-            apply_thermal_exchange(&mut hb, foe, &md);
             apply_bug_bite(&mut hb, side, &md);
             apply_thaw_on_hit(&mut hb, foe, &md);
             apply_spirit_shackle(&mut hb, side, &md);
@@ -5239,7 +5244,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             push(&mut hb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::GlaiveRush });
         }
         apply_relic_song_forme(&mut hb, side, &md);
-        apply_weak_armor(&mut hb, foe, &md);
         apply_throat_spray(&mut hb, side, &md);
         apply_spin_clear(&mut hb, side, &md);
         apply_white_herb(&mut hb, side);
@@ -5258,6 +5262,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // strip it here; only Sheer Force (which removed the secondaries upfront) suppresses the
             // roll. Emit those draw-and-discard rolls so the sub hit consumes the same stream PS does.
             emit_sub_secondary_rolls(&mut hb, side, &md);
+            // Step 7 still closes the hit — the deferred no-draw event, gated on the sub.
+            apply_damaging_hit_step7(&mut hb, side, &md, true);
             vec![hb]
         } else {
             apply_burning_jealousy(&mut hb, side, &md);
@@ -5278,6 +5284,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // into a Toxic Chain user — PS logs `random[100]@fakeout` then
                 // `randomChance[3,10]` with `event: DamagingHit`.
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                // ---- step 5 ends, step 7 begins ----
+                // The last connecting hit's deferred `runEvent('DamagingHit')`: the no-draw
+                // handlers (Rough Skin / Rocky Helmet chip, Stamina, Water Compaction, Seed Sower,
+                // Toxic Debris, Gooey, Justified, Rattled, Thermal Exchange, Weak Armor) land HERE,
+                // on the post-secondary board, and ahead of the drawing handlers below because PS
+                // orders Rough Skin / Iron Barbs (`onDamagingHitOrder: 1`) and Rocky Helmet (2)
+                // ahead of the unordered contact-status set — a chip that faints the attacker must
+                // suppress its paralysis/burn. See `apply_damaging_hit_step7`.
+                .map(|mut sb| { apply_damaging_hit_step7(&mut sb, side, &md, false); sb })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .collect::<Vec<_>>()
@@ -6277,6 +6292,18 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         HitRolls::Realized { count, .. } => *count,
     };
     for hit_i in 0..n_hits {
+        // The PREVIOUS hit's deferred step-7 `runEvent('DamagingHit')` (see
+        // `apply_damaging_hit_step7`): `spreadMoveHit` completes hit n — including step 7 — before
+        // `hitStepMoveHitLoop` begins hit n+1, so it must land before this hit's KO check and before
+        // its damage is re-derived. Only the LAST hit's event survives the loop and gets flushed
+        // after the secondaries.
+        if b.pending_damaging_hit.is_some() {
+            let pre_inputs = damage_inputs(b, side);
+            apply_damaging_hit_step7(b, side, md, false);
+            if damage_inputs(b, side) != pre_inputs {
+                calc = compute_damage(b, side, md);
+            }
+        }
         // PS's `hitStepMoveHitLoop` checks `targets.every(!hp)` at the TOP of each iteration,
         // BEFORE that hit's crit/damage rolls (which happen inside `spreadMoveHit` → `getDamage`).
         // So once the target has fainted, no further crit/damage draws are rolled. Emit the
@@ -6360,19 +6387,25 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         }
         // PS `spreadMoveHit` runs `runEvent('DamagingHit', damagedTargets, ...)` at the END of
         // EVERY hit (battle-actions.ts:1142) — inside the loop, not after it. On the realized path
-        // fire it here so Cursed Body / Toxic Chain / the contact-status abilities interleave into
-        // the stream between this hit and the next hit's crit roll.
+        // fire its DRAWING handlers here so Cursed Body / Toxic Chain / the contact-status abilities
+        // interleave into the stream between this hit and the next hit's crit roll.
         let pre_inputs = damage_inputs(b, side);
         if let HitRolls::Realized { cur, .. } = &mut rolls {
             realized_per_hit_damaging_hit(b, side, md, cur);
         }
-        // The no-draw `onDamagingHit` handlers are part of that SAME per-hit event: Stamina's
-        // +1 Def, Rough Skin / Iron Barbs / Rocky Helmet's chip, Gooey's -1 Spe. Anything the
-        // event moved that the damage formula reads is visible to the NEXT hit, so re-derive.
-        apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
+        // A status those handlers inflicted (Flame Body's burn halving the attacker's Atk) is an
+        // input to the NEXT hit's `getDamage` — PS re-derives it every loop iteration.
         if damage_inputs(b, side) != pre_inputs {
             calc = compute_damage(b, side, md);
         }
+        // The no-draw `onDamagingHit` handlers are part of that SAME per-hit event: Stamina's
+        // +1 Def, Water Compaction's +2, Rough Skin / Iron Barbs / Rocky Helmet's chip, Gooey's
+        // -1 Spe, Justified / Rattled / Thermal Exchange / Weak Armor. They are DEFERRED: step 7
+        // runs after step 5's `secondaries()`, and the secondaries are composed by the caller.
+        // The top of the next iteration flushes it (anything the event moved that the damage
+        // formula reads is visible to the NEXT hit); the last hit's flush happens after the
+        // secondary split.
+        b.pending_damaging_hit = Some((dmg > 0, def_item, def_ability));
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
     // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
@@ -6397,6 +6430,12 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
     let mut hits_executed: u8 = 0;
     let mut restat_dirty = false;
     for (i, &(roll, crit)) in hits.iter().enumerate() {
+        // Previous hit's deferred step-7 event (see `apply_damaging_hit_step7`).
+        if b.pending_damaging_hit.is_some() {
+            let pre_inputs = damage_inputs(b, side);
+            apply_damaging_hit_step7(b, side, md, false);
+            restat_dirty |= damage_inputs(b, side) != pre_inputs;
+        }
         let indexed_calc = &calcs[i.min(calcs.len() - 1)];
         let initial_rolls = if crit { &indexed_calc.rolls_crit } else { &indexed_calc.rolls_nocrit };
         let initial_raw = initial_rolls[roll as usize];
@@ -6453,10 +6492,10 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             hits_landed += 1;
             hits_executed += 1;
         }
-        // `runEvent('DamagingHit')` fires at the end of EVERY hit (battle-actions.ts:1142).
-        let pre_inputs = damage_inputs(b, side);
-        apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
-        restat_dirty |= damage_inputs(b, side) != pre_inputs;
+        // `runEvent('DamagingHit')` fires at the end of EVERY hit (battle-actions.ts:1142), but
+        // AFTER step 5's `secondaries()` — deferred, flushed at the top of the next iteration or
+        // (for the last hit) after the caller's secondary split.
+        b.pending_damaging_hit = Some((dmg > 0, def_item, def_ability));
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
     // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
@@ -6480,6 +6519,58 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
 ///
 /// Berserk and Anger Shell are NOT here: they are `onDamage` + `onAfterMoveSecondary`
 /// (`data/abilities.ts:404` / `:143`), keyed on the move's total, and stay once per move.
+/// `spreadMoveHit`'s numbered steps at the pin (`sim/battle-actions.ts:1044-1155`), and where each
+/// one lives in the engine. `hitStepMoveHitLoop` calls the WHOLE of this once per hit.
+///
+/// ```text
+///   0. tryPrimaryHitEvent          Substitute routing            in the hit loops
+///   1. getSpreadDamage (getDamage) crit + damage roll            in the hit loops
+///   2. spreadDamage                Instruction::Damage           in the hit loops
+///   3. runMoveEffects (onHit)      apply_bug_bite / apply_thaw_on_hit / apply_spirit_shackle /
+///                                  apply_sparkling_aria / apply_relic_song_forme
+///   4. selfDrops                   apply_self_drop, start_rampage_lock
+///   5. secondaries()               apply_damage_secondaries, apply_burning_jealousy,
+///                                  apply_target_secondary, apply_alluringvoice_confusion,
+///                                  apply_triattack_secondary, apply_direclaw_secondary,
+///                                  apply_partial_trap, apply_flinch_split
+///   6. forceSwitch                 apply_drag
+///   7. runEvent('DamagingHit')     THIS FUNCTION: apply_damaging_hit_reactions (Rough Skin /
+///                                  Iron Barbs / Rocky Helmet / Gulp Missile / Electromorphosis /
+///                                  Stamina / Water Compaction / Seed Sower / Toxic Debris /
+///                                  Gooey / Tangling Hair) + Justified / Rattled / Thermal
+///                                  Exchange / Weak Armor, then the DRAWING handlers
+///                                  apply_contact_secondaries / apply_cursed_body (realized paths
+///                                  fire those inside the loop) and apply_weakness_policy
+///   8. onAfterHit                  Stone Axe / Ceaseless Edge hazards, apply_spin_clear
+///   9. eachEvent('Update')         apply_pinch_berry, consume_lum_if_statused, emit_update_hit
+/// ```
+///
+/// The engine used to run step 7 INSIDE the hit loop and compose step 5 in the caller, i.e. 7
+/// before 5. rb1122 d5 is the witness: Palossand sits at Def +5, Azumarill's Liquidation lands and
+/// its 20% Def drop procs. PS takes 5 -> 4 (secondary) -> 6 (Water Compaction +2). The engine took
+/// 5 -> 6 (clamped) -> 5. So the hit loops now DEFER the event onto `Branch::pending_damaging_hit`
+/// and this flushes it — at the top of the next hit (PS finishes hit n before starting hit n+1) or,
+/// for the last hit, after the caller's secondary split.
+///
+/// The once-per-move fallback in `apply_post_damage` (`!per_hit_done`: fixed-damage moves and the
+/// enumeration DP paths) is deliberately NOT deferred — none of those moves has a `secondary`, so
+/// the reorder is a no-op for them, and leaving it in place keeps the event ahead of the
+/// Moxie / `onSourceAfterFaint` block that follows it.
+fn apply_damaging_hit_step7(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hit_sub: bool) {
+    let foe = side.other();
+    if let Some((any_damage, def_item, def_ability)) = b.pending_damaging_hit.take() {
+        apply_damaging_hit_reactions(b, side, md, any_damage, false, def_item, def_ability);
+    }
+    // `runEvent('DamagingHit')` is gated on `damagedDamage.length` — a Substitute hit records
+    // `damage[i] === true`, not a number, so no `onDamagingHit` handler runs behind a sub.
+    if !hit_sub {
+        apply_justified(b, foe, md);
+        apply_rattled(b, foe, md);
+        apply_thermal_exchange(b, foe, md);
+        apply_weak_armor(b, foe, md);
+    }
+}
+
 fn apply_damaging_hit_reactions(
     b: &mut Branch,
     side: SideId,
@@ -7786,6 +7877,13 @@ fn apply_multihit_realized_ma(
     // after which each remaining hit re-derives its `DamageCalc` from that hit's `MoveData`.
     let mut restat_dirty = false;
     for i in 0..count {
+        // Previous hit's deferred step-7 event (see `apply_damaging_hit_step7`) — it lands before
+        // this hit's KO check and before its damage is re-derived.
+        if hb.pending_damaging_hit.is_some() {
+            let pre_inputs = damage_inputs(&hb, side);
+            apply_damaging_hit_step7(&mut hb, side, md, false);
+            restat_dirty |= damage_inputs(&hb, side) != pre_inputs;
+        }
         // PS breaks the loop at the TOP once the target has fainted (before any hit draw).
         if hb.state.side(foe).active().hp <= 0 {
             break;
@@ -7854,11 +7952,13 @@ fn apply_multihit_realized_ma(
             hits_executed += 1;
         }
         // PS `spreadMoveHit` runs `runEvent('DamagingHit')` after EVERY hit — Fezandipiti's Beat Up
-        // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`.
+        // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`. The drawing handlers
+        // stay here; the no-draw ones are deferred behind step 5's `secondaries()`.
         let pre_inputs = damage_inputs(&hb, side);
         realized_per_hit_damaging_hit(&mut hb, side, md, &mut cur);
-        apply_damaging_hit_reactions(&mut hb, side, md, dmg > 0, false, def_item, def_ability);
+        // rb1198 d29: a Flame Body burn on hit 1 halves the attacker's Atk for hits 2-3.
         restat_dirty |= damage_inputs(&hb, side) != pre_inputs;
+        hb.pending_damaging_hit = Some((dmg > 0, def_item, def_ability));
     }
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
     apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability, true);
