@@ -4164,24 +4164,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         });
     }
 
-    // Disable: the disabled move fails outright; Taunt: status moves fail.
-    if !struggling {
-        let dis = b.state.side(side).disable;
-        if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
-            return vec![b];
-        }
-        // Throat Chop: sound moves fail. Heal Block: heal-flag moves (incl. drains) fail.
-        if b.state.side(side).volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound {
-            return vec![b];
-        }
-        if b.state.side(side).volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal {
-            return vec![b];
-        }
-        if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
-            return vec![b];
-        }
-    }
-
     // Damp shuts down self-destructing moves entirely (either active).
     if md.self_destruct {
         let damp = b.state.side(side).active().ability == crate::ids::Ability::Damp
@@ -4222,6 +4204,32 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Freeze: a frozen mon can't move (the 20% thaw + act is left unmodeled for now).
     if b.state.side(side).active().status == Status::Freeze && !called {
         return vec![b];
+    }
+
+    // Disable (`onBeforeMovePriority: 7`), Throat Chop / Heal Block / Gravity (6) and Taunt (5)
+    // — all `data/moves.ts` — sit BELOW mustrecharge (11), slp / frz (10), Truant (9) and flinch
+    // (8) in PS's `BeforeMove` ladder, and `runEvent` short-circuits on the first handler that
+    // returns `false`. So a sleeping, frozen, loafing or flinched mon never reaches these cancels,
+    // and the higher-priority handler's SIDE EFFECTS still land — above all slp's `time--`
+    // (`data/conditions.ts` slp `onBeforeMove`). The engine ran this block first, so a mon that
+    // was asleep AND taunted had its move cancelled by Taunt with the sleep counter untouched:
+    // rb1009 d4 (a Dondozo asleep on 3 selects Rest, Froslass Taunts it first — PS ticks 3 -> 2)
+    // and rb1356 d58 (the same shape with Coil).
+    if !struggling {
+        let dis = b.state.side(side).disable;
+        if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
+            return vec![b];
+        }
+        // Throat Chop: sound moves fail. Heal Block: heal-flag moves (incl. drains) fail.
+        if b.state.side(side).volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound {
+            return vec![b];
+        }
+        if b.state.side(side).volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal {
+            return vec![b];
+        }
+        if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
+            return vec![b];
+        }
     }
 
     // --- multi-turn move commitment (charge / semi-invulnerable / recharge) ---
