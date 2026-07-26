@@ -5167,6 +5167,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // used to sit ahead of the secondary split, which ate it.
             apply_pinch_berry(&mut sb, foe);
             apply_pinch_berry(&mut sb, side);
+            // Lum / Chesto are `onUpdate` handlers too (`data/items.ts` lumberry / chestoberry),
+            // so the SAME `eachEvent('Update')` cures a status this hit inflicted — on EITHER
+            // active. The engine cured only at the individual status-application sites, which
+            // between them miss the ones that status the ATTACKER: rb1204 d2, a Vileplume's
+            // Effect Spore paralyses the Outraging Flygon at step 7 and PS's Lum Berry wipes
+            // it here; the engine kept both the paralysis and the berry.
+            consume_lum_if_statused(&mut sb, foe);
+            consume_lum_if_statused(&mut sb, side);
             emit_update_hit(&mut sb);
             emit_update(&mut sb);
             // Pivot move (U-turn): switch the user out now that it connected. PS fires the move
