@@ -3796,6 +3796,24 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             return vec![b];
         }
     }
+    // Focus Punch: `beforeMoveCallback` (data/moves.ts:6015-6020) aborts the move when the
+    // `focuspunch` volatile's `lostFocus` is set — its `onHit` sets that for any non-Status move
+    // that hits the user this turn (data/moves.ts:6026-6030). PS runs `beforeMoveCallback` in
+    // `runMove` (sim/battle-actions.ts:270-276), i.e. AFTER the BeforeMove cancel handlers and
+    // BEFORE `deductPP` (:281) and `useMove` — so a de-focused Focus Punch pays no PP, deals no
+    // damage, and makes NO accuracy/crit/damage draws. The engine rolled a phantom
+    // `randomChance(100,100)@accuracy` for it (rb1397 t27: Mach Punch into a queued Focus Punch,
+    // PS records only Mach Punch's three draws). `physical_damage_taken`/`special_damage_taken`
+    // are the side's this-turn damage record (reset at the top of the residual phase) — exactly
+    // "was hit by a damaging move this turn".
+    if md.id.to_id() == "focuspunch" {
+        let s = b.state.side(side);
+        if s.physical_damage_taken > 0 || s.special_damage_taken > 0 {
+            let mut b = b;
+            b.move_failed = true; // PS sets `moveThisTurnResult = false`
+            return vec![b];
+        }
+    }
     // Judgment: takes the type of the user's held Plate (PS `onModifyType` via
     // `item.onPlate`; randbats Arceus formes always hold their matching Plate).
     if md.id.to_id() == "judgment" {
@@ -4448,6 +4466,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             branches = apply_dancer_copies(branches, side, move_id);
         }
         return branches;
+    }
+
+    // Poltergeist: `onTry(source, target) { return !!target.item; }` (data/moves.ts:13610-13612).
+    // PS runs `singleEvent('Try', …)` at the top of `hitStepTryHitEvent`/`tryMoveHit`
+    // (sim/battle-actions.ts:821) — after `deductPP`, but BEFORE `hitStepAccuracy` — so against an
+    // itemless target the move fails outright with NO accuracy roll and no damage (rb1327 t30: a
+    // Poltergeist aimed at a switching-in itemless mon; PS records zero draws for the unit).
+    if md.id.to_id() == "poltergeist" && b.state.side(foe).active().item == Item::None {
+        b.move_failed = true; // PS `moveThisTurnResult = false`
+        return vec![b];
     }
 
     // Protect: a protected target blocks the incoming damaging move (Protect moves +4
