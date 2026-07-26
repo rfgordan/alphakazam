@@ -1218,11 +1218,16 @@ fn apply_post_status_self_destruct(b: &mut Branch, side: SideId, _md: &crate::da
 /// A status move that affects the FOE (Thunder Wave, Taunt, Parting Shot, ...), as opposed
 /// to self/field moves — used for Prankster's Dark-type immunity.
 fn targets_foe_status(md: &crate::data::MoveData) -> bool {
-    md.status != Status::None
-        || md.target_boosts.iter().any(|&x| x != 0)
-        || md.target_volatile.is_some()
-        || md.force_switch
-        || matches!(md.id.to_id(), "partingshot" | "trick" | "switcheroo" | "encore" | "disable" | "taunt" | "whirlwind" | "roar" | "defog")
+    // PS's Prankster immunity is `!targets[i].isAlly(pokemon)` (battle-actions.ts:671-673): it
+    // keys on the move's resolved TARGET, so a self-targeting Prankster move is never blocked.
+    // `md.target_volatile` alone is not that test — the codegen folds PS `move.volatileStatus`
+    // in, and self-targeting moves (Substitute, Magnet Rise, Destiny Bond, …) carry one.
+    md.target.targets_foe()
+        && (md.status != Status::None
+            || md.target_boosts.iter().any(|&x| x != 0)
+            || md.target_volatile.is_some()
+            || md.force_switch
+            || matches!(md.id.to_id(), "partingshot" | "trick" | "switcheroo" | "encore" | "disable" | "taunt" | "whirlwind" | "roar" | "defog"))
 }
 
 /// Sleep Clause Mod: an induced (non-Rest) sleep fails while any other Pokémon on the
@@ -4166,13 +4171,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // paralysis. Mold Breaker bypasses. Side/field moves (hazards) don't target the mon.
     {
         use crate::ids::Ability as A;
-        let foe_status_target = md.status != Status::None
-            || md.target_boosts.iter().any(|&x| x != 0)
-            || md.target_volatile.is_some()
-            || md.force_switch
-            // Strength Sap's foe-facing effect is `onHit`-only (invisible to the codegen),
-            // but it targets the mon — Sap Sipper absorbs it (cosim caught the miss).
-            || md.id.to_id() == "strengthsap";
+        // `target_volatile` is the codegen's fold of PS `move.volatileStatus`, which is set on
+        // SELF-targeting moves too (Protect, Substitute, Magnet Rise, Aqua Ring, …). PS keys
+        // every one of these blocks on `move.target` / `target === source`, so a self-targeting
+        // move is never aimed at the foe's mon — gate on `MoveTarget::targets_foe()`.
+        let foe_status_target = md.target.targets_foe()
+            && (md.status != Status::None
+                || md.target_boosts.iter().any(|&x| x != 0)
+                || md.target_volatile.is_some()
+                || md.force_switch
+                // Strength Sap's foe-facing effect is `onHit`-only (invisible to the codegen),
+                // but it targets the mon — Sap Sipper absorbs it (cosim caught the miss).
+                || md.id.to_id() == "strengthsap");
         let affects_foe_mon = md.category != MoveCategory::Status || foe_status_target;
         let mb = matches!(b.state.side(side).active().ability, A::MoldBreaker | A::Teravolt | A::Turboblaze);
         let fa = b.state.side(foe).active().ability;
@@ -4346,11 +4356,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // Protect blocks a status move that targets the foe (Thunder Wave, Will-O-Wisp,
         // Toxic, Taunt, Parting Shot, Roar, ...) — but not self/field moves (Swords Dance,
-        // recovery, weather, hazards).
-        let targets_foe = md.status != Status::None
-            || md.target_boosts.iter().any(|&x| x != 0)
-            || md.target_volatile.is_some()
-            || md.force_switch;
+        // recovery, weather, hazards). `md.target_volatile` is the codegen's fold of PS
+        // `move.volatileStatus`, which SELF-targeting moves carry too (Protect itself,
+        // Substitute, Magnet Rise, Aqua Ring, Destiny Bond, Imprison, Laser Focus, …); PS's
+        // Protect `onTryHit` and Substitute `onTryPrimaryHit` (`if (target === source) return`,
+        // data/moves.ts:20857 / :16512) never see such a move, so gate on the move's TARGET.
+        let targets_foe = md.target.targets_foe()
+            && (md.status != Status::None
+                || md.target_boosts.iter().any(|&x| x != 0)
+                || md.target_volatile.is_some()
+                || md.force_switch);
         if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
             return vec![b];
         }
