@@ -8413,17 +8413,14 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
             }
         }
     }
-    let mut lowered = false;
     if target_eligible {
         for (i, &delta) in md.secondary_boosts.iter().enumerate() {
-            if delta != 0 {
-                lowered |= apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0;
+            // One `AfterEachBoost` per actually-changed stat (sim/battle.ts:2073).
+            if delta != 0 && apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0 {
+                react_to_stat_drop(&mut proc, foe);
+                apply_white_herb(&mut proc, foe);
             }
         }
-    }
-    if lowered {
-        react_to_stat_drop(&mut proc, foe);
-        apply_white_herb(&mut proc, foe);
     }
     let mut applied_sleep = false;
     let mut applied_status_now = false;
@@ -9573,15 +9570,15 @@ fn execute_status_move(
         hit.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold && !status_breaker;
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
     if hit.state.side(foe).active().is_alive() && !foe_immune {
-        let mut lowered = false;
         for (i, &delta) in md.target_boosts.iter().enumerate() {
-            if delta != 0 {
-                lowered |= apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta) < 0;
+            if delta != 0 && apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta) < 0 {
+                // PS fires `AfterEachBoost` INSIDE `boost()`'s per-stat loop (sim/battle.ts:2073),
+                // once for every stat whose `boostBy` was non-zero — so a TWO-stat drop wakes
+                // Defiant / Competitive TWICE. Parting Shot (atk -1, spa -1) into Competitive is
+                // 0 -> -1, then spa 0 -> -1 +2 +2 = +3 (rb1211 t44, rb1371 t7, rb1152 t12).
+                react_to_stat_drop(&mut hit, foe);
+                apply_white_herb(&mut hit, foe);
             }
-        }
-        if lowered {
-            react_to_stat_drop(&mut hit, foe);
-            apply_white_herb(&mut hit, foe);
         }
     }
     if let Some(sc) = md.side_condition {
@@ -10468,13 +10465,12 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             if !b.state.side(side.other()).active().is_alive() {
                 push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Octolock });
             } else if b.state.side(side).active().is_alive() {
-                let mut lowered = false;
                 for stat in [BoostIndex::Defense, BoostIndex::SpecialDefense] {
-                    lowered |= apply_boost_clamped(b, side, stat, -1) < 0;
-                }
-                if lowered {
-                    react_to_stat_drop(b, side);
-                    apply_white_herb(b, side);
+                    // One `AfterEachBoost` per actually-changed stat (sim/battle.ts:2073).
+                    if apply_boost_clamped(b, side, stat, -1) < 0 {
+                        react_to_stat_drop(b, side);
+                        apply_white_herb(b, side);
+                    }
                 }
             }
         }
