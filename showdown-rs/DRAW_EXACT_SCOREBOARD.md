@@ -6,6 +6,147 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== PHASE-6 EXTENSION BURN-DOWN — certification (2026-07-26) ====
+
+**HEADLINE: 400 / 512 full games byte-exact from seed (78.1%), up from 372; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Eight parity commits, every one PS-source-grounded, every one monotone: the newly-non-exact set
+was EMPTY at all eight steps (judged by exact-SET diff on both corpora, never by the count).
+**The mid-turn re-request counter class is CLOSED** — all 18 games (11 `active_turns` +
+7 `wish`) plus 7 more that shared the roots.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **400 / 512 (78.1%)**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | all suites green |
+
+## THE mid-turn re-request counter schedule — GROUND-TRUTHED TABLE
+
+The 18-game class was NOT one root. It was two, split cleanly by whether the divergent decision
+was the game's last (`stateAfter.ended == true`) or a `midTurn:true` move decision followed by a
+`switch` decision. PS's end-of-turn order, from `runAction` / `turnLoop` (sim/battle.ts):
+
+| # | PS site | what happens | consequence for the compared state |
+|---|---------|--------------|-----------------------------------|
+| 1 | `runAction(move)` → `faintMessages()` (battle.ts:2856-2857) | faints processed; **`if (this.ended) return true`** | a KO that ends the battle stops the turn HERE — no residual, no `endTurn`, no `nextTurn` |
+| 2 | `runAction(residual)` → `fieldEvent('Residual')` (battle.ts:2837) | residual handlers run. **A handler whose `effectHolder` fainted is skipped UNLESS `handler.state.isSlotCondition`** (battle.ts:512-514) — so Wish still ticks over a fainted slot | Wish is date-based (`getOverflowedTurnCount() <= startingTurn`) and cannot be deferred |
+| 3 | `faintMessages()`; `if (this.ended) return true` | a residual-induced KO can end the battle here too | same as #1 |
+| 4 | queue empty ⇒ `checkFainted()` (battle.ts:2864) ⇒ `switchFlag` ⇒ `makeRequest('switch')` (battle.ts:2933) `return true` | **turn does NOT advance; `activeTurns` is NOT incremented**; `battle.midTurn` stays true | the move decision's recorded post-state is captured HERE (`midTurn:true`, turn N) |
+| 5 | (player answers) `turnLoop` resumes with `midTurn` still true ⇒ no new `beforeTurn`/`residual`; `runAction(switch)` ⇒ `switchIn` sets `pokemon.activeTurns = 0` (battle-actions.ts:137) | the replacement enters at 0 | |
+| 6 | queue empty ⇒ `endTurn()` ⇒ `nextTurn()` (battle.ts:1756-1762) | `if (pokemon.fainted) continue; pokemon.activeTurns++` for every active; `this.turn++`; `makeRequest('move')` | the switch decision's post-state is captured HERE (`midTurn:false`, turn N+1) |
+
+Read off the table: **`activeTurns++` fires exactly once per turn, in `nextTurn()`, AFTER any
+mid-turn replacement switch-in and only if the battle has not ended.** The engine advanced it
+inside the residual per-side loop, whose `battle_over` guard is evaluated BEFORE the residual —
+so every game that ENDED on a residual-phase KO advanced the winner's counter one turn too many
+(15 instances, all `engine = ps + 1`). And **Wish's tick is a slot-condition residual that runs
+over a fainted holder**, which the engine skipped behind the same loop's fainted-active guard
+(7 instances, all `engine = ps + 1` ticks remaining). Opposite-looking directions, two roots.
+
+## The roots landed (in commit order)
+
+| # | commit | class | games | PS reference |
+|---|--------|-------|-------|--------------|
+| 1 | `df5cf4b` | **`activeTurns` advances in `nextTurn()`, not the residual phase** | 372 → 384 | `battle.ts:1756-1762` vs `:2857` / `:2864` / `:2933` |
+| 2 | `092b56a` | **Wish is a SLOT condition — its residual runs over a fainted holder, and a matured Wish there is CONSUMED without healing (it does not linger)** | 384 → 390 | `battle.ts:512-514` + `battle.ts:1138-1152` + `data/moves.ts:20945` |
+| 3 | `6afbce9` | **The HP-berry `Update` runs AFTER the move's secondaries** | 390 (rb1003 advances) | `battle-actions.ts:970` at the bottom of `hitStepMoveHitLoop`; `data/items.ts:5752` |
+| 4 | `caf597a` | **Knock Off's ×1.5 is an `onBasePower` `chainModify`, not its own rounding step** | 390 → 393 | `data/moves.ts:9970-9975` + `battle.ts` `chainModify`/`modify` |
+| 5 | `f6b165b` | **A cancelled attempt does not re-arm the rampage lock** | 393 → 395 | `data/conditions.ts:253-284` + `battle.ts:515-522` |
+| 6 | `8189f6a` | **Focus Punch's `beforeMoveCallback` and Poltergeist's `onTry` both precede the accuracy roll** | 395 → 397 | `data/moves.ts:6015-6020` + `battle-actions.ts:270-276`; `data/moves.ts:13610-13612` + `battle-actions.ts:821` |
+| 7 | `2354776` | **Sticky Hold does not block Knock Off's ×1.5** (item `singleEvent('TakeItem')` ≠ ability `runEvent('TakeItem')`) | 397 → 398 | `data/moves.ts:9970-9975` vs its `onAfterHit` |
+| 8 | `456f118` | **Leppa Berry** (`onUpdate` at any 0-PP slot; `onEat` +10 capped at `maxpp`) | 398 → 400 | `data/items.ts` leppaberry |
+
+Games flipped, by commit: 1 → rb1035 rb1180 rb1185 rb1189 rb1225 rb1264 rb1295 rb1296 rb1328
+rb1352 rb1376 rb1394; 2 → rb1039 rb1054 rb1203 rb1234 rb1393 rb1400; 4 → rb1008 rb1105 rb1221;
+5 → rb1113 rb1340; 6 → rb1327 rb1397; 7 → rb1104; 8 → rb1130 rb1389.
+
+### Method notes worth keeping
+
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057-1066`
+  records them after `battle.choose` returns). A `move` decision with `midTurn:true` is a turn
+  PS stopped mid-way to ask for a replacement; the trailing `switch` decision's post-state is
+  one turn later. That single fact split the 18-game class in two — the "opposite directions"
+  the Phase-5 handoff flagged were never one residual phase mis-attributed.
+- **A companion hack is a tell.** The Wish fix only paid off once its compensating
+  `apply_switch` hack (clear `wish.0 == 1` when a faint replacement enters) was ALSO removed:
+  with the correct tick the two cancelled each other and the game count did not move.
+- **Split "is it one modifier chain or two rounding steps?" per handler.** Knock Off's ×1.5 was
+  filed as a `basePowerCallback`; it is an `onBasePower` `chainModify(1.5)` at priority 0 and
+  belongs in the SAME `event.modifier` as Tough Claws (127 BP, not 126).
+
+## The 112 still-open games, re-triaged
+
+| n | class | reading |
+|---|-------|---------|
+| 71 | `draws-match/state-diff` | the draw stream matches for the unit; the STATE differs |
+| 6 | `PS shuffle@generic` | a residual-handler-list tie shuffle the engine does not emit |
+| 5 | `random@confusion` (3 PS-unconsumed, 2 PS) | rampage-end / Confuse Ray duration position |
+| 2 | `PS random@lockedmove` | the rampage `random(2,4)` position |
+| 2 | `rust-extra randomChance@accuracy` | over-emission (down from 4) |
+| 2 each | `PS random@curse` / `PS sample@roar` / `args @hypervoice` / `args @par` / `args @struggle` | bespoke |
+| ~14 | singletons | `@fakeout` `@thunderbolt` `@fireblast` `@heavyslam` `@discharge` `@icehammer` `@throatchop` `@freezedry` `@icebeam` `@shadowball` `@trace` `@knockoff` `@powerwhip` `@crit` `@disablemove` |
+
+First-divergence FIELD split (all classes): **50 `hp`**, 20 `volatiles`, 16 `boosts`,
+4 `status`, 3 `stall_counter`, 3 `species`, 3 `pp`, tail. Of the 50 `hp` games **37 exceed
+10 HP** (wrong mechanics), 6 sit in 4-10, and **7 are within 3** (rounding residue — down from
+11; three of those were Knock Off's chain).
+
+The 20 `volatiles` games decode to single missing/extra bits, no shared root visible:
+ThroatChop (rb1038 missing / rb1072 extra), MustRecharge (rb1092, rb1157 missing),
+Substitute (rb1109, rb1308 missing; rb1033 extra), Confusion (rb1287, rb1364, rb1384 missing;
+rb1121 extra), ChoiceLock (rb1099), Unburden (rb1126), DestinyBond (rb1229),
+MagnetRise (rb1237), ProtoBooster (rb1048, rb1278), Encore (rb1245 extra),
+HealBlock (rb1304 extra), Disable (rb1031 extra).
+
+## Named opens carried forward
+
+- **Rampage lock end at `n == 1` with a NON-confused user.** `unarm_rampage_on_cancel` handles
+  the drop whenever `onEnd`'s `addVolatile('confusion')` is a no-op (already confused — which a
+  confusion self-hit always is — or Own Tempo). An attract / full-paralysis / freeze cancel on
+  the FINAL locked turn needs a fresh `random(2, 6)` emitted at the RESIDUAL stream position,
+  which the move-time cancel site cannot produce. Likely the 2 `PS random@lockedmove` + part of
+  the 5 `random@confusion` games.
+- **The remaining `onBasePower` handlers still applied as their OWN `modify()` instead of
+  folding into `bp_chain`**: Collision Course / Electro Drift (`chainModify([5461,4096])`,
+  data/moves.ts:2633-2637), Psyblade (`:14038-14041`), Expanding Force (`:4952-4955`) — all move
+  handlers at priority 0, in-function and cheap to fold; and the `-ate` abilities
+  (`onBasePowerPriority: 23`, abilities.ts pixilate/refrigerate/aerilate/galvanize) and Analytic
+  (`onBasePowerPriority: 21`, abilities.ts:111-123), which are applied in `execute_move_inner`
+  before `md` reaches the damage function and need either a `MoveData` flag or the condition
+  recomputed at the chain site (Analytic additionally needs `foe_pending_move`). Each only
+  differs from the current code when a SECOND chain member co-occurs.
+- **The `stall` / Protect chain (3 games: rb1142, rb1214, rb1227).** rb1227 t15 is the clean
+  probe: p1 Protects into a p2 Nasty Plot and its ONLY divergence is
+  `s0.stall_counter engine=0 ps=1` — the engine took the `!foe_moves_later` outright-fail path
+  where PS's `queue.willAct()` is true. The missing `shuffle[4,2,4]` in the same unit follows
+  from the state (no `stall` volatile ⇒ a shorter residual handler list), so this is one root,
+  not two. Re-check how `Action::foe_pending_move` is populated for the first mover of a
+  move/move unit.
+- **Gulp Missile (rb1288, rb1367)** — `engine=cramorant ps=cramorantgorging`; the Surf/Dive
+  forme change (`gulpmissile.onSourceTryPrimaryHit`) and its retaliation are unmodelled.
+  **Ice Face's RESTORE (rb1253)** — `iceface.onStart` / `onWeatherChange` turn Eiscue-Noice back
+  into Eiscue under snow. Both are forme mechanics; 3 games.
+- **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**, **Magnet
+  Rise's `onTry` failure** — unchanged from Phase 5.
+- **Kill criterion: still NEVER triggered.** Eight commits, eight distinct structured roots,
+  27 games; density did not decay within the session.
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 400 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== PHASE-5 EXTENSION BURN-DOWN — certification (2026-07-25) ====
 
 **HEADLINE: 372 / 512 full games byte-exact from seed (72.7%), up from 333; init-aligned

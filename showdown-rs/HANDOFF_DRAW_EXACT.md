@@ -1,5 +1,62 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**PHASE 6 (2026-07-26): 400/512 full games byte-exact from seed (78.1%), up from 372;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS.
+Kill criteria NEVER triggered.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-6 EXTENSION BURN-DOWN" — before
+anything else.** It carries the eight roots this phase landed (PS file:line each), the
+GROUND-TRUTHED mid-turn re-request schedule table, the re-triaged 112 open games, and the named
+opens. **The mid-turn re-request counter class is CLOSED** (all 18 games), and so are the berry
+`Update` ordering and the `|hp| <= 3` Knock Off lead.
+
+The mid-turn class was TWO roots, not one — the "opposite directions" were an artifact of
+reading `active_turns` and `wish` as one phase:
+1. `activeTurns++` lives in `nextTurn()` (battle.ts:1762), reached only after the whole turn
+   survives to `endTurn()`. A KO that ENDS the battle returns from `runAction` first
+   (battle.ts:2857), so nobody is advanced — the engine advanced it in the residual loop.
+2. Wish is a SLOT condition, and `fieldEvent('Residual')` runs slot-condition handlers even over
+   a FAINTED holder (battle.ts:512-514) — the engine skipped the tick behind its fainted-active
+   guard, and its "matured Wish lingers" model (plus a compensating `apply_switch` hack) was the
+   opposite of PS, which CONSUMES it with no heal.
+
+The three biggest remaining levers, in order:
+
+1. **The 37 games whose first `hp` divergence exceeds 10 HP.** Wrong MECHANICS, one shared root
+   at a time — the loop that produced this phase. Knock Off recurred 7x in the divergent units
+   before its two fixes; re-run the "which move ids recur in the divergent unit" scan
+   (scratchpad recipe in the scoreboard) after every landing.
+2. **The `stall` / Protect chain (rb1227 t15 is a single-field probe).** `s0.stall_counter
+   engine=0 ps=1` with the ONLY other symptom a missing `shuffle[4,2,4]` that follows from it.
+   The engine took `!foe_moves_later` where PS's `queue.willAct()` is true.
+3. **The remaining `onBasePower` chainModify handlers** still applied as their own `modify()`
+   (Collision Course / Electro Drift / Psyblade / Expanding Force, the `-ate` abilities,
+   Analytic). Same root shape as the Knock Off fix; each only bites when a second chain member
+   co-occurs.
+
+Practical notes:
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests. Phase 6
+  touched only `generate.rs` / `instruction.rs`, so no digest moved.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved); join it to `VERBOSE=1 SEED_GATE=1 …` by
+  decision index. `DBG_GAME` is a `starts_with` prefix; DIFF lines go to stderr.
+- **`stateAfter.turn` / `midTurn` / `ended` in a trace are POST-state** (`harness/cosim.mjs:1057`
+  records them after `battle.choose` returns). `midTurn:true` on a `move` decision means PS
+  stopped mid-turn to ask for a replacement; its trailing `switch` decision is one turn later.
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.** Also watch
+  for COMPENSATING hacks: the Wish fix scored +0 until the `apply_switch` hack it had been
+  paired with was removed too.
+- The state divergence itself creates draw-class mislabels. Never treat the draw-class histogram
+  as a partition of roots.
+
+--- historical (pre-Phase-6) below ---
+
 **PHASE 5 (2026-07-25): 372/512 full games byte-exact from seed (72.7%), up from 333;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
