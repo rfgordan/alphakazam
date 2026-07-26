@@ -5447,10 +5447,16 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // its own `modify()` — a separate rounding step loses a base power point against an
     // ability that also sits in the chain (rb1008: Tough Claws + Knock Off, PS 127 BP, engine
     // 126).
+    // Sticky Hold is deliberately NOT consulted here: the boost's gate is
+    // `singleEvent('TakeItem', item, target.itemState, target, target, move, item)` — a
+    // single event on the ITEM effect, so only the item's OWN `onTakeItem` runs (the
+    // species-lock ones). Sticky Hold is an ABILITY `onTakeItem`, reached only by
+    // `pokemon.takeItem()` -> `runEvent('TakeItem')` in Knock Off's `onAfterHit`. A Sticky Hold
+    // holder therefore KEEPS its item and still eats the x1.5 (rb1104 t21: Knock Off into a
+    // Sticky Hold Eviolite holder — PS 41 damage, the engine 27).
     let knock_off_boost = md.id.to_id() == "knockoff"
         && defender.item != Item::None
-        && item_removable_from(defender.species, defender.item, Some(attacker.species))
-        && def_ab != Ab::StickyHold; // breakable → def_ab is already Mold-Breaker-suppressed
+        && item_removable_from(defender.species, defender.item, Some(attacker.species));
     let mut base_power = md.base_power;
     // Weight-based moves compute their base power dynamically.
     match md.id.to_id() {
