@@ -1,5 +1,76 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**PHASE 8 (2026-07-26): 433/512 full games byte-exact from seed (84.6%), up from 425;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS.
+Kill criteria NEVER triggered.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-8 EXTENSION BURN-DOWN" — before
+anything else.** It carries the four roots this phase landed (PS file:line each), the re-triaged
+79 open games, and the named opens.
+
+The single most useful thing this phase produced is a DIAGNOSTIC, not a fix:
+
+**`first_draw_mismatch` now compares the DAMAGE ROLL's RESULT, not just kind+args.** The gate
+drives the real PRNG, so a matching draw shape with a differing `random(16)` result proves the
+engine entered that unit with its prng at a different OFFSET — a draw MISCOUNT in an EARLIER unit
+that happened to leave the compared state alone. 11 games reclassified out of
+`draws-match/state-diff`, and **four of the five "`|hp| <= 3` rounding residue" games turned out
+to be prng-offset games, not rounding at all.** Only `random(16)` is compared: the engine's
+`random(100)` secondary/self-drop draws log a placeholder representative, so comparing those
+flags 509 of 512 games.
+
+Two traps that cost cycles this session, both worth remembering:
+1. **`DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]`" at a forced-replacement unit is a FALSE
+   POSITIVE.** The replacement bracket is consumed straight off `prng` in `step_unit` and never
+   enters `chosen_draws`, so the comparison always reports it missing even when it fired.
+2. **A `pending_move` / counter divergence can be a prng-offset symptom.** rb1310's
+   `Rampaging(_, 2)` vs `(_, 1)` looked exactly like the named "rampage residual tick" open; a
+   probe showed the EOT decrement firing correctly and the real cause was the engine selecting
+   the `random(2,4)=3` branch off a drifted prng.
+
+The three biggest remaining levers, in order:
+
+1. **The 35 games whose first `hp` divergence exceeds 10 HP.** Wrong MECHANICS, one shared root
+   at a time. Recurrences in the divergent unit: `knockoff` 4x, `struggle` 3x, `eff=par
+   ev=BeforeMove` 5x, `eff=harvest ev=Residual` 3x, `eff=cursedbody` 2x, `eff=flamebody` 2x.
+   Re-run the recurrence scan after every landing.
+2. **The 11 `result random[16]@…` games.** Each has a draw miscount in an earlier unit. Two have
+   a clean shape mismatch to start from: **rb1343 d34** (`rust-extra random[100]@secondary` — the
+   engine appends a 4th secondary roll to flamethrower) and **rb1029 d22 / rb1348 d12** (PS
+   records ZERO draws for the whole unit where the engine rolls accuracy+crit+damage — the same
+   shape as the Endeavor `onTryImmunity` root commit 4 closed).
+3. **Toxic Debris is the one `onDamagingHit` handler commit 1 left once-per-move** (and outside
+   the `any_damage` gate). `data/abilities.ts:5061`; a 2-hit physical move into Glimmora is the
+   probe. The four `apply_justified` / `apply_rattled` / `apply_thermal_exchange` /
+   `apply_weak_armor` handlers still run BEFORE the secondaries, unchanged from Phase 7.
+
+Practical notes (unchanged from Phase 7 unless noted):
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests. Phase 8 did
+  not touch it.
+- **`gen.rs` is generated** by `node harness/gen-data.mjs`. Phase 8 added `flag_mustpressure` and
+  `non_ghost_target`; regenerating from the pinned PS still reproduces the file byte-for-byte
+  apart from new fields (verify with `diff` after stripping them).
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved). **The DIFF lines only appear on SIDECARS** —
+  fixtures carry digests, not full state. `VERBOSE=1` on the gate lifts the row cap.
+  `DRAWCMP=1` prints the per-unit rust-vs-PS draw streams (see trap 1 above).
+- The sidecar's `decisions[i]` carries `choices`, `draws` with
+  `{kind,args,result,move,effect,event,pokemon}`, and `stateAfter`. `draws[].effect` / `event`
+  name the PS handler; joining `eff=` across the divergent units is what surfaced the
+  `par@BeforeMove` and `harvest@Residual` clusters above.
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.**
+- The state divergence itself creates draw-class mislabels. Never treat the draw-class histogram
+  as a partition of roots.
+
+--- historical (pre-Phase-8) below ---
+
 **PHASE 7 (2026-07-26): 425/512 full games byte-exact from seed (83.0%), up from 400;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).

@@ -6,6 +6,186 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== PHASE-8 EXTENSION BURN-DOWN — certification (2026-07-26) ====
+
+**HEADLINE: 433 / 512 full games byte-exact from seed (84.6%), up from 425; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Four parity commits, every one PS-source-grounded. Judged by the exact-SET diff on BOTH corpora
+at every step: **the newly-non-exact set was EMPTY at all four.**
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **433 / 512 (84.6%)**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+
+`convert.rs` was NOT touched, so the seed fixtures' baked digests did not move and no fixture
+regeneration was needed. `gen.rs` WAS regenerated (two new `MoveData` fields, commit 3);
+regenerating it from the pinned PS reproduces the previous file byte-for-byte apart from those
+fields — verified by `diff` with the new fields stripped.
+
+## The roots landed (in commit order)
+
+| # | commit | class | games | PS reference |
+|---|--------|-------|-------|--------------|
+| 1 | `791e33b` | **`runEvent('DamagingHit')` fires once per HIT, not once per move** — Stamina, Water Compaction, Rough Skin / Iron Barbs, Rocky Helmet, Electromorphosis, Seed Sower, Gooey / Tangling Hair. The stat one of them moves is visible to the NEXT hit's `getDamage` | 425 → 427 | `sim/battle-actions.ts:1142` inside the `hitStepMoveHitLoop` at `:874-970`; `data/abilities.ts:4471` `:5375` `:3893` `:2179` `:1164` `:4074` `:1597` `:4861`; `data/items.ts:5290` |
+| 2 | `95cb229` | **Lum / Chesto are `onUpdate`**, so the post-hit `eachEvent('Update')` cures EITHER active — including a status a step-7 `onDamagingHit` ability put on the ATTACKER | 427 → 428 | `data/items.ts` lumberry / chestoberry + `sim/battle-actions.ts:970` |
+| 3 | `f51de84` | **Pressure skips `foeSide` moves** (`pressureTargets = []`) unless `mustpressure` — so Spikes / Stealth Rock / Toxic Spikes ARE taxed and **Sticky Web is NOT** — and **Curse has already retargeted itself** to `self` for a non-Ghost user before the pressure resolution | 428 → 430 | `sim/pokemon.ts:853-860`; `sim/battle-actions.ts:429` (`ModifyMove`) vs `:467` (`getMoveTargets`); `data/moves.ts:3277` `:3304` |
+| 4 | `a00fd66` | **`hitStepTryImmunity` precedes `hitStepAccuracy`** — Endeavor / Dream Eater / Synchronoise fail with NO accuracy roll — **plus a RESULT-level draw check in the gate's triage** | 430 → 433 | `sim/battle-actions.ts:560` vs `:563`; `data/moves.ts:4796` `:4260` `:18663` |
+
+Games flipped, by commit: 1 → rb1155 rb1202; 2 → rb1204; 3 → rb1152 rb1377; 4 → rb1145 rb1223
+rb1282.
+
+## THE diagnostic that changed the taxonomy
+
+`first_draw_mismatch` (seedgate.rs) compared each draw's KIND and ARGS and **never its RESULT**.
+The gate drives the real PRNG through `replicate_select`, so a matching shape with a differing
+result is proof that the engine entered the unit with its prng at a different OFFSET — a draw
+MISCOUNT in an EARLIER unit that happened to leave the compared state alone. That is a
+completely different bug class from a state-computation divergence, and it was invisible inside
+`draws-match/state-diff`.
+
+The check is deliberately restricted to the DAMAGE ROLL (`random(16)`). The engine's
+`random(100)` secondary / self-drop draws log a canonical representative — a fork that cannot
+land its effect collapses to a single "draw-and-discard" branch whose logged result is the
+placeholder 0 — so comparing them flags 509 of 512 games, including every exact one. `random(16)`
+is always the realized value.
+
+**11 games reclassify** from `draws-match/state-diff` to `result random[16]@<move>`. Four of
+them (rb1271 |Δ|=4, rb1277 3, rb1345 2, rb1391 3) were the games previously filed as the
+"`|hp| <= 3` rounding residue" — **they are not rounding at all**, they are a damage roll taken
+at the wrong prng offset. That whole sub-bucket is closed as a mislabel.
+
+**Caveat, hard-won:** `DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]`" at any unit with a forced
+replacement is a FALSE POSITIVE. The replacement bracket is consumed directly off `prng` in
+`step_unit` and never enters `chosen_draws`, so the comparison always reports it missing. Do not
+chase those (this cost a probe cycle: `replacement_bracket_tied` was true and the bracket had
+already fired).
+
+## The 79 still-open games, re-triaged
+
+| n | class | reading |
+|---|-------|---------|
+| 48 | `draws-match/state-diff` | the draw stream matched for the unit AND the damage roll agreed; the STATE differs |
+| 11 | `result random[16]@…` | **NEW** — a draw miscount in an EARLIER unit; the state divergence is downstream |
+| 2 each | `PS shuffle@generic`, `args randomChance@hypervoice` / `@par` / `@struggle`, `rust-extra randomChance@accuracy` | draw-position offsets |
+| 1 each | `PS random@confusion`, `PS randomChance@heavyslam`, `PS randomChance@struggle`, `PS shuffle@thunderbolt`, `PS-unconsumed random@icehammer` / `randomChance@freezedry` / `randomChance@icebeam` / `sample@trace`, `args randomChance@powerwhip`, `args shuffle@generic`, `rust-extra randomChance@crit`, `rust-extra shuffle@disablemove` | bespoke |
+
+First-divergence FIELD split: **45 `hp`**, 10 `volatiles`, 9 `boosts`, 3 `species`,
+2 `status_counter`, 2 `types`, 2 `status`, 1 each `encore` / `ability` / `pending_move` / `item` /
+`substitute_hp` / `pp`. Of the 45 `hp` games **35 exceed 10 HP**, 7 sit in 4-10, and **3 are
+within 3** (down from 5 — and all three of those are now `result`-class, i.e. prng offset).
+
+The 11 `result random[16]` games and where their damage roll first goes wrong:
+rb1021 d59(thunderbolt), rb1271 d11(hydropump), rb1277 d12(gigadrain), rb1310 d18(outrage),
+rb1329 d24(heatcrash), rb1343 d36(voltswitch), rb1369 d46(knockoff), rb1378 d8(ceaselessedge),
+rb1395 d10(tripleaxel), plus rb1145/rb1282 which the commit-4 fix closed.
+Two of them have a CLEAN preceding shape mismatch to start from:
+- **rb1343 d34**: `rust-extra random[100]@secondary` — the engine rolls a secondary PS does not
+  (PS: `…@bugbuzz ×4, @flamethrower ×3`; the engine appended a 4th `random[100]` to flamethrower).
+- **rb1029 d22 / rb1348 d12**: PS records **zero draws for the whole unit** where the engine
+  rolls accuracy+crit+damage. Same shape as the Endeavor root that commit 4 closed — find which
+  pre-accuracy PS step failed (rb1348: `drainingkiss` vs a Tera'd `outrage` user).
+
+The 10 `volatiles` games are unchanged single bits: Substitute (rb1033 extra),
+StatsLoweredThisTurn (rb1048, rb1278 missing; rb1233 extra), ThroatChop (rb1072 extra),
+ChoiceLock (rb1099 missing), Confusion (rb1121 extra), Unburden (rb1126 missing),
+StatsRaisedThisTurn (rb1237 missing), Encore (rb1245 extra), HealBlock (rb1304 extra).
+
+The 44 open units whose divergent state carries an hp gap over 10 HP (35 of them with `hp` as the
+FIRST divergent field) — unit, move pair, the PS handler its draws name, |Δhp|. `eff=`/`ev=` are
+the union over the unit's recorded draws and are what surfaced the `par@BeforeMove`,
+`harvest@Residual`, `flamebody`/`cursedbody@DamagingHit` and `shedskin@Residual` clusters:
+
+```
+  rb1003 d34 t27 p1:hydropump p2:waterpulse [152]
+  rb1126 d7 t5 p1:sludgebomb p2:strengthsap [121]
+  rb1387 d36 t32 p1:encore p2:freezedry [119]
+  rb1198 d29 t20 p1:lavaplume p2:tripleaxel eff=flamebody ev=DamagingHit [114]
+  rb1369 d46 t42 p1:knockoff p2:bodyslam [92]
+  rb1103 d37 t32 p1:strengthsap p2:struggle [86]
+  rb1227 d39 t32 p1:substitute p2:scald eff=harvest ev=Residual [72]
+  rb1016 d23 t20 p1:ragefist p2:iciclespear [72]
+  rb1021 d59 t50 p1:thunderbolt p2:wish [69]
+  rb1252 d21 t15 p1:powerwhip p2:partingshot [66]
+  rb1231 d15 t12 p1:struggle p2:uturn [66]
+  rb1011 d43 t33 p1:closecombat p2:switch [63]
+  rb1243 d11 t10 p1:stompingtantrum p2:knockoff eff=par ev=BeforeMove [62]
+  rb1024 d81 t73 p1:struggle p2:switch [58]
+  rb1184 d5 t6 p1:terastarstorm p2:tachyoncutter [54]
+  rb1057 d11 t11 p1:protect p2:switch [53]
+  rb1348 d12 t11 p1:drainingkiss p2:outrage/T [52]
+  rb1372 d14 t13 p1:focusblast p2:surf [49]
+  rb1302 d7 t6 p1:tailslap p2:stealthrock eff=flamebody ev=DamagingHit [48]
+  rb1012 d60 t52 p1:gigadrain p2:scald eff=futuremove ev=End [47]
+  rb1280 d13 t13 p1:switch p2:photongeyser eff=harvest ev=Residual [35]
+  rb1236 d37 t29 p1:dracometeor p2:voltswitch [33]
+  rb1226 d29 t26 p1:yawn p2:toxic eff=par ev=BeforeMove [30]
+  rb1209 d28 t22 p1:leechseed p2:flipturn eff=par ev=BeforeMove [30]
+  rb1125 d2 t3 p1:icebeam p2:flowertrick/T [27]
+  rb1029 d22 t18 p1:gunkshot p2:swordsdance [24]
+  rb1300 d52 t48 p1:sleeptalk p2:focusblast eff=toxicchain ev=DamagingHit [22]
+  rb1274 d15 t10 p1:lavaplume p2:psychicnoise [22]
+  rb1048 d44 t33 p1:defog p2:thunderwave [22]
+  rb1362 d24 t20 p1:icebeam p2:thunderbolt eff=par ev=BeforeMove [18]
+  rb1326 d50 t40 p1:superfang p2:protect eff=stall ev=StallMove [18]
+  rb1116 d7 t6 p1:knockoff/T p2:closecombat [17]
+  rb1072 d27 t21 p1:earthquake p2:throatchop [17]
+  rb1030 d53 t46 p1:toxic p2:hypervoice eff=harvest ev=Residual [17]
+  rb1380 d15 t15 p1:scaleshot p2:toxic eff=shedskin ev=Residual [16]
+  rb1315 d28 t26 p1:earthquake p2:knockoff eff=toxicchain,shedskin ev=DamagingHit,Residual [16]
+  rb1304 d16 t12 p1:psychicnoise p2:switch [16]
+  rb1108 d4 t5 p1:shadowsneak p2:beakblast eff=cursedbody ev=DamagingHit [16]
+  rb1283 d17 t13 p1:knockoff p2:switch eff=trace ev=Update [15]
+  rb1278 d42 t31 p1:closecombat p2:willowisp eff=poisontouch ev=DamagingHit [15]
+  rb1033 d44 t33 p1:substitute p2:discharge eff=confusion ev=BeforeMove [15]
+  rb1378 d8 t8 p1:nastyplot p2:ceaselessedge/T [14]
+  rb1040 d2 t3 p1:stealthrock p2:earthpower/T [13]
+  rb1034 d57 t46 p1:knockoff p2:triplearrows eff=par ev=BeforeMove [11]
+```
+
+Recurrences worth a scan after every landing: `knockoff` 4x (rb1116 rb1283 rb1315 rb1369),
+`struggle` 3x (rb1024 rb1103 rb1231), `eff=par ev=BeforeMove` 5x (rb1209 rb1226 rb1243 rb1362
+rb1061), `eff=harvest ev=Residual` 3x (rb1030 rb1227 rb1280), `eff=cursedbody` 2x (rb1108
+rb1229), `eff=flamebody` 2x (rb1198 rb1302).
+
+## Named opens carried forward
+
+- **`hitStepTryImmunity`'s STATUS half was already complete** — `status_try_immunity_fails`
+  (generate.rs) covers leechseed / attract / captivate / trick / switcheroo / worryseed /
+  octolock. Commit 4 added the DAMAGING half. That set is now closed.
+- **Toxic Debris is still applied once per move** and outside the `any_damage` gate, while PS's
+  is an `onDamagingHit` (`data/abilities.ts:5061`) that caps at 2 layers. No witness, so it was
+  left in `apply_post_damage`; a 2-hit physical move into Glimmora/Grimmsnarl is the probe.
+- **Rampage BeforeMove-cancel at `n == 1` with a NON-confused user** — unchanged and still open.
+  rb1310, the one game with a `pending_move` first divergence, is NOT that case: it is a
+  `result random[16]@outrage` prng-offset game (its `Rampaging(_, 2)` vs `(_, 1)` is the engine
+  having selected the `random(2,4)=3` branch off a drifted prng, not a residual-tick bug — the
+  EOT decrement was verified firing with a probe).
+- **The `struggle` cluster (rb1024, rb1103, rb1231) is REQUEST LEGALITY**, unchanged.
+- **Gulp Missile (rb1288, rb1367)** and **Ice Face's RESTORE (rb1253)** — unchanged, 3 games.
+- **The remaining `onDamagingHit` handlers still applied BEFORE the secondaries**:
+  `apply_justified`, `apply_rattled`, `apply_thermal_exchange`, `apply_weak_armor` — unchanged.
+- **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**, **Magnet
+  Rise's `onTry` failure** — unchanged from Phase 5/6.
+- **Kill criterion: still NEVER triggered.** Four commits, four distinct structured roots plus
+  one diagnostic, 8 games; 2.0 games/commit, well above the 1/commit early-stop line.
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 433 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== PHASE-7 EXTENSION BURN-DOWN — certification (2026-07-26) ====
 
 **HEADLINE: 425 / 512 full games byte-exact from seed (83.0%), up from 400; init-aligned
