@@ -5712,8 +5712,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         && (md.secondary_chance > 0 || md.flinch_chance > 0
             || md.secondary_self_boosts.iter().any(|&x| x != 0)
             // Tri Attack's secondary is a sample-based onHit that the move table can't encode,
-            // so it isn't reflected in `secondary_chance`.
-            || md.id.to_id() == "triattack");
+            // so it isn't reflected in `secondary_chance`. Throat Chop's is the same shape —
+            // `secondary: {chance: 100, onHit(target) { target.addVolatile('throatchop') }}` —
+            // so it too earns Sheer Force's ×1.3 (rb1072 d27: PS's Sheer Force Tauros hits Iron
+            // Thorns for 73, the engine for 56, exactly the missing 5325/4096).
+            || matches!(md.id.to_id(), "triattack" | "throatchop"));
     // Life Orb's ×1.3 DAMAGE (onModifyDamage) always applies while held; Sheer Force only
     // suppresses the RECOIL (onAfterMoveSecondarySelf). Keep the two flags separate.
     let life_orb = attacker.item == Item::LifeOrb;
@@ -9066,8 +9069,16 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     use crate::instruction::ActiveCounter;
     if md.id == crate::ids::MoveId::from_id("throatchop").unwrap_or(crate::ids::MoveId::None) && !hit_sub {
         let foe = side.other();
+        // Throat Chop's lock is `secondary: {chance: 100, onHit(target) { target.addVolatile(
+        // 'throatchop') }}` (`data/moves.ts`), so every gate that strips a SECONDARY strips it:
+        // the target's Shield Dust / Covert Cloak, and the ATTACKER's Sheer Force, whose
+        // `onModifyMove` deletes `move.secondaries` outright in exchange for the ×1.3 base power
+        // `compute_damage` already applies. rb1072 d27 is the witness: a Sheer Force Tauros
+        // Throat Chops Iron Thorns and PS leaves it unlocked — the engine locked it, which then
+        // silently changed what Iron Thorns could pick for the rest of the game.
         let blocked = b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
-            || b.state.side(foe).active().item == Item::CovertCloak;
+            || b.state.side(foe).active().item == Item::CovertCloak
+            || b.state.side(side).active().ability == crate::ids::Ability::SheerForce;
         if b.state.side(foe).active().is_alive()
             && !blocked
             && !b.state.side(foe).volatiles.contains(VolatileStatus::ThroatChop)
@@ -9083,7 +9094,29 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     if !hit_sub {
         if let Some(v) = md.target_volatile {
             let foe = side.other();
-            if v != VolatileStatus::PartiallyTrapped && !b.state.side(foe).volatiles.contains(v) {
+            // Aroma Veil's `onAllyTryAddVolatile` (`data/abilities.ts:235-243`) returns null for
+            // attract / disable / encore / healblock / taunt / torment whenever the source is a
+            // MOVE — so it covers this path too, not just the status-move one and the
+            // chance-secondary one that already check it. Breakable, so a Mold Breaker attacker
+            // pierces it. rb1304 d16 is the witness: Hypno's Psychic Noise (`secondary:
+            // {chance: 100, volatileStatus: 'healblock'}`, so `target_volatile` here) hits an
+            // Alcremie that just switched in with Aroma Veil; PS blocks the Heal Block, the engine
+            // applied it and then withheld the Alcremie's Leftovers for two turns.
+            let aroma_veil_blocks = matches!(
+                v,
+                VolatileStatus::Attract | VolatileStatus::Disable | VolatileStatus::Encore
+                    | VolatileStatus::HealBlock | VolatileStatus::Taunt | VolatileStatus::Torment
+            ) && b.state.side(foe).active().ability == crate::ids::Ability::AromaVeil
+                && !matches!(
+                    b.state.side(side).active().ability,
+                    crate::ids::Ability::MoldBreaker
+                        | crate::ids::Ability::Teravolt
+                        | crate::ids::Ability::Turboblaze
+                );
+            if v != VolatileStatus::PartiallyTrapped
+                && !aroma_veil_blocks
+                && !b.state.side(foe).volatiles.contains(v)
+            {
                 push(b, Instruction::ApplyVolatile { side: foe, volatile: v });
                 // Heal Block carries a duration counter the end-of-turn residual decrements and
                 // expires on; a damaging move that applies it (Psychic Noise, target_volatile
