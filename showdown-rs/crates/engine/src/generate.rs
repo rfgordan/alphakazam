@@ -10714,6 +10714,7 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             match p.item {
                 It::Leftovers | It::BlackSludge => fpush(5, 4),
                 It::ToxicOrb | It::FlameOrb | It::StickyBarb => fpush(28, 3),
+                It::WhiteHerb => fpush(29, 8),
                 _ => {}
             }
             match p.status {
@@ -10724,7 +10725,7 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             match p.ability {
                 Ab::Hydration => fpush(5, 3),
                 Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => fpush(28, 2),
-                Ab::HungerSwitch => fpush(29, 7),
+                Ab::HungerSwitch | Ab::ShieldsDown => fpush(29, 7),
                 _ => {}
             }
             continue;
@@ -10768,6 +10769,14 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
         match p.item {
             It::Leftovers | It::BlackSludge => push(5, 4),
             It::ToxicOrb | It::FlameOrb | It::StickyBarb => push(28, 3),
+            // White Herb's `onResidual` is `onResidualOrder: 29` with the default Item subOrder 8
+            // (`data/items.ts:7697`, `sim/battle.ts:968`) — the LAST ordered handler in the queue,
+            // behind Hunger Switch / Shields Down (29/7). It is collected for every holder whether
+            // or not it has a negative stage to clear (the check is inside the callback), so two
+            // White Herb holders at equal Speed tie. rb1345 d11: both Blastoise hold one and the
+            // whole residual list is exactly those two → `shuffle[2,0,2]`, which the engine had as
+            // an EMPTY list. Also rb1034 d32 / rb1303 d32.
+            It::WhiteHerb => push(29, 8),
             _ => {}
         }
         // Abilities with an end-of-turn onResidual.
@@ -10780,8 +10789,33 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             // `[3,1,3]`/`[4,2,4]`). Verified as the ONLY residual handler missing corpus-wide.
             Ab::Hydration => push(5, 3),
             Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => push(28, 2),
-            Ab::HungerSwitch => push(29, 7),
+            // Minior's Shields Down is an `onResidual` at order 29 with the default Ability
+            // subOrder 7 — the same slot Hunger Switch occupies. rb1034 d32.
+            Ab::HungerSwitch | Ab::ShieldsDown => push(29, 7),
             _ => {}
+        }
+        // PS registers a Residual handler for EVERY effect carrying a live `duration`, whether or
+        // not it has an `onResidual` (`fieldEvent`'s `getKey = 'duration'`, `sim/battle.ts:486`,
+        // and `findPokemonEventHandlers`'s `getKey && volatileState[getKey]` at `:1111`). Two
+        // duration-only volatiles the engine never listed:
+        //   `flinch` (duration 1, `data/conditions.ts:198`) — still on the flinched mon at the
+        //     residual, removed by endTurn. rb1034 d56 `[3,1,3]` = leftovers/flinch/stall at one
+        //     Speed; rb1378 d4 `[4,2,4]`.
+        //   `twoturnmove` (duration 2, `:287`) — on a mon spending this turn charging. The
+        //     SEMI-INVULNERABLE moves (Fly / Dig / Dive / Bounce / Phantom Force / Shadow Force /
+        //     Sky Drop) add a SECOND handler, their own condition (also duration 2); Solar Beam /
+        //     Meteor Beam / Electro Shot / Sky Attack have no condition at all and add just the
+        //     one (rb1024 d106 records exactly one `twoturnmove/false/2`).
+        // Both are Conditions with no `onResidualOrder` → order `false`, default subOrder 2, so
+        // they tie with the protect/stall pair at the tail of the queue.
+        if v.contains(V::Flinch) {
+            push(FALSE, 2);
+        }
+        if let crate::state::PendingMove::Charging(m) = s.pending_move {
+            push(FALSE, 2); // twoturnmove
+            if is_semi_invuln_move(m) {
+                push(FALSE, 2); // the move's own semi-invulnerability condition
+            }
         }
         // Protect + Stall: PS registers a Residual handler (via `getKey:'duration'`,
         // battle.ts:487) for EACH duration-carrying volatile, independent of any onResidual
