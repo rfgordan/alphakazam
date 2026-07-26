@@ -10435,44 +10435,6 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     }
     // A Tera forme that fainted to a residual (poison, Leech Seed, ...) also regresses.
     regress_fainted_tera_formes(b);
-    // Hunger Switch (Morpeko): the forme toggles every end of turn (PS `onResidual` order
-    // 29) unless Terastallized. Both formes share stats and typing, so this is exactly a
-    // species-id swap; Aura Wheel reads the forme at use time.
-    for side in [SideId::One, SideId::Two] {
-        let p = b.state.side(side).active();
-        if p.ability == crate::ids::Ability::HungerSwitch && p.is_alive() && !p.terastallized && !p.transformed {
-            let plain = crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None);
-            let hangry = crate::ids::Species::from_id("morpekohangry").unwrap_or(crate::ids::Species::None);
-            let target_forme = if p.species == plain {
-                hangry
-            } else if p.species == hangry {
-                plain
-            } else {
-                continue;
-            };
-            let previous = transform_data_of(&b.state, side);
-            let mut new = previous;
-            new.species = target_forme;
-            let slot = b.state.side(side).active_index;
-            let previous_base_moves = b.state.side(side).active().base_moves;
-            push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
-        }
-    }
-    // Rampage (lockedmove) `onResidual`: decrement `trueDuration` each end of turn. The move
-    // action stored the mid-turn (kernel) value {2,3 on start, s on continuation}; this ticks it
-    // to the terminal value {1,2, s-1}. The final locked turn (n==1) already ended and confused
-    // at move time, so a live Rampaging here always has n>=2 → stays >=1.
-    for side in [SideId::One, SideId::Two] {
-        if let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move {
-            if n >= 2 {
-                push(b, Instruction::SetPendingMove {
-                    side,
-                    previous: crate::state::PendingMove::Rampaging(m, n),
-                    new: crate::state::PendingMove::Rampaging(m, n - 1),
-                });
-            }
-        }
-    }
     // PS decrements a residual effect's duration FIRST and, if it hits 0, ends the effect and
     // SKIPS its onResidual that turn (battle.ts residual loop). The SANDSTORM/snow CHIP and the
     // weather-tied ability heals (Rain Dish, Ice Body) are part of the weather's own residual, so
@@ -10589,7 +10551,35 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
         use crate::ids::Ability as Ab;
         let magic_guard = p.ability == Ab::MagicGuard;
 
-        // Leftovers.
+        // Grassy Terrain heals grounded actives 1/16 max HP at end of turn (5/2 — AHEAD of
+        // Leftovers at 5/4; both clamp at max HP, so with a Black Sludge chip in between the
+        // two orders give different HP).
+        let p = b.state.side(side).active();
+        let grounded = !p.types.contains(&Type::Flying) && p.ability != crate::ids::Ability::Levitate;
+        if b.state.terrain == crate::ids::Terrain::Grassy && grounded && p.hp < p.max_hp && p.is_alive() && !heal_blocked(b, side) {
+            let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
+            push(b, Instruction::Heal { side, slot, amount: heal });
+        }
+
+        // Hydration cures any non-volatile status while it's raining — `onResidualOrder: 5`,
+        // `onResidualSubOrder: 3` (`data/abilities.ts:1880-1889`). That is BEFORE the poison /
+        // burn chip at order 9/10, so a Hydration holder in rain takes NO status damage on the
+        // turn it is cured. The engine used to cure after the chip.
+        let p = b.state.side(side).active();
+        if p.ability == Ab::Hydration
+            && matches!(b.state.weather, Weather::Rain | Weather::HeavyRain)
+            && p.status != Status::None
+            && p.is_alive()
+        {
+            let prev = p.status;
+            let prev_ctr = p.status_counter;
+            push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
+            if prev_ctr != 0 {
+                push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
+            }
+        }
+
+        // Leftovers (5/4).
         let p = b.state.side(side).active();
         if p.item == Item::Leftovers && p.hp < p.max_hp && p.is_alive() && !heal_blocked(b, side) {
             let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
@@ -10607,14 +10597,6 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 let dmg = (maxhp / 8).max(1).min(p.hp);
                 push(b, Instruction::Damage { side, slot, amount: dmg });
             }
-        }
-
-        // Grassy Terrain heals grounded actives 1/16 max HP at end of turn.
-        let p = b.state.side(side).active();
-        let grounded = !p.types.contains(&Type::Flying) && p.ability != crate::ids::Ability::Levitate;
-        if b.state.terrain == crate::ids::Terrain::Grassy && grounded && p.hp < p.max_hp && p.is_alive() && !heal_blocked(b, side) {
-            let heal = (maxhp / 16).max(1).min(p.max_hp - p.hp);
-            push(b, Instruction::Heal { side, slot, amount: heal });
         }
 
         // Ingrain heals the rooted mon 1/16 max HP (PS residual order 7, before Leech Seed).
@@ -10710,16 +10692,13 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             }
         }
 
-        // Hydration cures any non-volatile status at end of turn while it's raining (after
-        // that turn's status damage has already been dealt).
+        // Curse (Ghost, `onResidualOrder: 12`, data/moves.ts:3298): the cursed mon loses 1/4 max
+        // HP each turn — AHEAD of Salt Cure / the partial trap (13) and Octolock (14), so a
+        // Curse KO cancels those.
         let p = b.state.side(side).active();
-        if ability == Ab::Hydration
-            && matches!(b.state.weather, Weather::Rain | Weather::HeavyRain)
-            && p.status != Status::None
-            && p.is_alive()
-        {
-            let prev = p.status;
-            push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
+        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::Curse) {
+            let dmg = (maxhp / 4).max(1).min(p.hp);
+            push(b, Instruction::Damage { side, slot, amount: dmg });
         }
 
         // Salt Cure.
@@ -10772,153 +10751,9 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             }
         }
 
-        // Curse (Ghost): the cursed mon loses 1/4 max HP each turn.
-        let p = b.state.side(side).active();
-        if p.is_alive() && !magic_guard && b.state.side(side).volatiles.contains(VolatileStatus::Curse) {
-            let dmg = (maxhp / 4).max(1).min(p.hp);
-            push(b, Instruction::Damage { side, slot, amount: dmg });
-        }
-
         // Sitrus Berry can also fire here if end-of-turn chip drops the holder to ≤ 1/2.
         apply_pinch_berry(b, side);
 
-        // Status orbs poison/burn the holder at end of turn (Toxic Orb → Toxic, Flame Orb →
-        // Burn) if it has no status yet. The status damage starts next turn.
-        let p = b.state.side(side).active();
-        if p.is_alive() {
-            let orb_status = match p.item {
-                Item::ToxicOrb => Status::Toxic,
-                Item::FlameOrb => Status::Burn,
-                _ => Status::None,
-            };
-            if orb_status != Status::None && status_applies(p, orb_status) {
-                push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
-            }
-        }
-
-        // Bad Dreams (Darkrai): each sleeping foe loses 1/8 max HP (PS onResidual 28.2).
-        // Comatose counts as asleep; Magic Guard on the sleeper prevents the damage.
-        if ability == Ab::BadDreams && b.state.side(side).active().is_alive() {
-            let foe = side.other();
-            let f = b.state.side(foe).active();
-            if f.is_alive()
-                && (f.status == Status::Sleep || f.ability == Ab::Comatose)
-                && f.ability != Ab::MagicGuard
-            {
-                let fslot = b.state.side(foe).active_index;
-                let dmg = (f.max_hp / 8).max(1).min(f.hp);
-                push(b, Instruction::Damage { side: foe, slot: fslot, amount: dmg });
-                // The chip can put the sleeper into its own pinch-berry range.
-                apply_pinch_berry(b, foe);
-            }
-        }
-
-        // Cud Chew: re-apply the eaten berry's effect at end of turn (PS onResidualOrder 28).
-        // The counter was set to 2 on eat and ticks down here; at 0 the berry effect fires again.
-        let cc = b.state.side(side).active().cudchew_turns;
-        if cc > 0 {
-            push(b, Instruction::SetCudChew { side, slot, previous: cc, new: cc - 1 });
-            if cc - 1 == 0 && b.state.side(side).active().is_alive() {
-                let berry = b.state.side(side).active().last_berry;
-                apply_berry_eat_effect(b, side, berry);
-            }
-        }
-
-        // Speed Boost: +1 Spe at end of turn, but not the turn the mon switched in.
-        let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
-        if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
-            raise_boost(b, side, BoostIndex::Speed, 1);
-        }
-
-        // Roost wears off: restore the user's pre-Roost typing. (In the modeled scope, types
-        // only change via Roost and Tera, so base types — or the tera type — are exact.)
-        if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {
-            let p = b.state.side(side).active();
-            if p.is_alive() {
-                let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
-                if p.types != restored {
-                    push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
-                }
-            }
-            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Roosted });
-        }
-    }
-
-    // Safety net for the linked `trapped` release: a trap source that died to a RESIDUAL (burn,
-    // its own partial trap, …) rather than a hit also frees the foe before the decision boundary.
-    for side in [SideId::One, SideId::Two] {
-        if b.state.side(side).volatiles.contains(VolatileStatus::Trapped)
-            && !b.state.side(side.other()).active().is_alive()
-        {
-            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Trapped });
-        }
-    }
-
-    // The Protect stall chain expires at end of turn unless it was refreshed by a successful
-    // Protect-family use THIS turn (PS `stall` volatile: duration 2, `onRestart` re-arms it; a
-    // turn where the holder did anything else — or never acted at all: full paralysis, sleep,
-    // flinch — lets the duration run out). The Protect volatile is exactly the this-turn marker.
-    // Then clear the single-turn volatiles themselves (PS removes duration-1 volatiles in the
-    // same residual pass).
-    for side in [SideId::One, SideId::Two] {
-        let stall = b.state.side(side).stall_counter;
-        if stall != 0 && !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
-            push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
-        }
-        // The `stall` volatile's duration ticks down every end of turn (a successful Protect this
-        // turn already re-armed it to 2 above). It stays in the Residual handler list until it
-        // reaches 0 — one turn PAST the Protect — matching PS's duration-2 lifetime. The residual
-        // shuffle was already emitted (top of this fn) off the pre-tick count, so this tick only
-        // affects NEXT turn's list length; state-neutral otherwise.
-        let st = b.state.side(side).stall_turns;
-        if st != 0 {
-            push(b, Instruction::SetStallTurns { side, previous: st, new: st - 1 });
-        }
-        for v in [VolatileStatus::Protect, VolatileStatus::Endure, VolatileStatus::Flinch] {
-            if b.state.side(side).volatiles.contains(v) {
-                push(b, Instruction::RemoveVolatile { side, volatile: v });
-            }
-        }
-    }
-
-    // --- duration ticking (cosim caught all of these as permanently-stuck effects) ---
-    // Terrain / Trick Room count down at end of turn and expire at 0. (Weather is ticked BEFORE
-    // the residual loop above so sandstorm doesn't chip on its final turn; terrain is ticked here,
-    // AFTER, so Grassy Terrain still heals on its final turn — its heal is a separate per-mon
-    // residual handler, not skipped by the field-duration decrement.)
-    if b.state.terrain != crate::ids::Terrain::None && b.state.terrain_turns > 0 {
-        push(b, Instruction::DecrementTerrainTurns);
-        if b.state.terrain_turns == 0 {
-            emit_field_change_shuffle(b); // clearTerrain -> eachEvent('TerrainChange')
-            push(b, Instruction::ChangeTerrain {
-                previous: b.state.terrain,
-                previous_turns: 0,
-                new: crate::ids::Terrain::None,
-                new_turns: 0,
-            });
-            refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
-        }
-    }
-    if b.state.trick_room && b.state.trick_room_turns > 0 {
-        push(b, Instruction::DecrementTrickRoomTurns);
-        if b.state.trick_room_turns == 0 {
-            push(b, Instruction::ToggleTrickRoom { previous_turns: 0, new_turns: 0 });
-        }
-    }
-    // Screens / Tailwind tick per side and clear at 0.
-    for side in [SideId::One, SideId::Two] {
-        use SideConditionId::*;
-        let conds = b.state.side(side).side_conditions;
-        for (sc, cur) in [
-            (Reflect, conds.reflect),
-            (LightScreen, conds.light_screen),
-            (AuroraVeil, conds.aurora_veil),
-            (Tailwind, conds.tailwind),
-        ] {
-            if cur > 0 {
-                push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: cur - 1 });
-            }
-        }
     }
 
     // Active-mon countdowns: Taunt / Encore / Disable tick and clear; Yawn ticks and puts the
@@ -10996,6 +10831,215 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 if hp > 0 {
                     push(b, Instruction::Damage { side, slot, amount: hp });
                 }
+            }
+        }
+    }
+
+    // --- residual order 25: Roost wears off, restoring the user's pre-Roost typing. (In the
+    // modeled scope, types only change via Roost and Tera, so base types — or the tera type —
+    // are exact.) `data/moves.ts` roost's volatile is `onResidualOrder: 25`, so it lands after
+    // the Perish Song faint (24) and before the screens (26).
+    for side in [SideId::One, SideId::Two] {
+        if b.state.side(side).volatiles.contains(VolatileStatus::Roosted) {
+            let p = b.state.side(side).active();
+            if p.is_alive() {
+                let slot = b.state.side(side).active_index;
+                let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
+                if p.types != restored {
+                    push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
+                }
+            }
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Roosted });
+        }
+    }
+
+    // Safety net for the linked `trapped` release: a trap source that died to a RESIDUAL (burn,
+    // its own partial trap, …) rather than a hit also frees the foe before the decision boundary.
+    for side in [SideId::One, SideId::Two] {
+        if b.state.side(side).volatiles.contains(VolatileStatus::Trapped)
+            && !b.state.side(side.other()).active().is_alive()
+        {
+            push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Trapped });
+        }
+    }
+
+    // The Protect stall chain expires at end of turn unless it was refreshed by a successful
+    // Protect-family use THIS turn (PS `stall` volatile: duration 2, `onRestart` re-arms it; a
+    // turn where the holder did anything else — or never acted at all: full paralysis, sleep,
+    // flinch — lets the duration run out). The Protect volatile is exactly the this-turn marker.
+    // Then clear the single-turn volatiles themselves (PS removes duration-1 volatiles in the
+    // same residual pass).
+    for side in [SideId::One, SideId::Two] {
+        let stall = b.state.side(side).stall_counter;
+        if stall != 0 && !b.state.side(side).volatiles.contains(VolatileStatus::Protect) {
+            push(b, Instruction::SetStallCounter { side, previous: stall, new: 0 });
+        }
+        // The `stall` volatile's duration ticks down every end of turn (a successful Protect this
+        // turn already re-armed it to 2 above). It stays in the Residual handler list until it
+        // reaches 0 — one turn PAST the Protect — matching PS's duration-2 lifetime. The residual
+        // shuffle was already emitted (top of this fn) off the pre-tick count, so this tick only
+        // affects NEXT turn's list length; state-neutral otherwise.
+        let st = b.state.side(side).stall_turns;
+        if st != 0 {
+            push(b, Instruction::SetStallTurns { side, previous: st, new: st - 1 });
+        }
+        for v in [VolatileStatus::Protect, VolatileStatus::Endure, VolatileStatus::Flinch] {
+            if b.state.side(side).volatiles.contains(v) {
+                push(b, Instruction::RemoveVolatile { side, volatile: v });
+            }
+        }
+    }
+
+    // Screens / Tailwind tick per side and clear at 0.
+    for side in [SideId::One, SideId::Two] {
+        use SideConditionId::*;
+        let conds = b.state.side(side).side_conditions;
+        for (sc, cur) in [
+            (Reflect, conds.reflect),
+            (LightScreen, conds.light_screen),
+            (AuroraVeil, conds.aurora_veil),
+            (Tailwind, conds.tailwind),
+        ] {
+            if cur > 0 {
+                push(b, Instruction::SetSideCondition { side, condition: sc, previous: cur, new: cur - 1 });
+            }
+        }
+    }
+
+    // --- duration ticking (cosim caught all of these as permanently-stuck effects) ---
+    // Terrain / Trick Room count down at end of turn and expire at 0. (Weather is ticked BEFORE
+    // the residual loop above so sandstorm doesn't chip on its final turn; terrain is ticked here,
+    // AFTER, so Grassy Terrain still heals on its final turn — its heal is a separate per-mon
+    // residual handler, not skipped by the field-duration decrement.)
+    if b.state.terrain != crate::ids::Terrain::None && b.state.terrain_turns > 0 {
+        push(b, Instruction::DecrementTerrainTurns);
+        if b.state.terrain_turns == 0 {
+            emit_field_change_shuffle(b); // clearTerrain -> eachEvent('TerrainChange')
+            push(b, Instruction::ChangeTerrain {
+                previous: b.state.terrain,
+                previous_turns: 0,
+                new: crate::ids::Terrain::None,
+                new_turns: 0,
+            });
+            refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
+        }
+    }
+    if b.state.trick_room && b.state.trick_room_turns > 0 {
+        push(b, Instruction::DecrementTrickRoomTurns);
+        if b.state.trick_room_turns == 0 {
+            push(b, Instruction::ToggleTrickRoom { previous_turns: 0, new_turns: 0 });
+        }
+    }
+    // --- residual order 28, subOrder 2: Bad Dreams / Cud Chew / Speed Boost ---
+    // All three are `onResidualOrder: 28, onResidualSubOrder: 2` (`data/abilities.ts:310`,
+    // `:2657`, `:4408`), so they run AFTER every counter (Taunt 15 … Perish Song 24), after the
+    // screens (26) and after the terrain / Trick Room duration (27) — and BEFORE the status orbs
+    // at 28/3. The engine used to run them inside the order-9 status loop, which (a) let Bad
+    // Dreams miss a foe that Yawn had only just put to sleep at order 23 and (b) gave Speed Boost
+    // to a mon Perish Song had already fainted at order 24.
+    for side in [SideId::One, SideId::Two] {
+        use crate::ids::Ability as Ab;
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let (ability, slot) = (p.ability, b.state.side(side).active_index);
+
+        // Bad Dreams (Darkrai): each sleeping foe loses 1/8 max HP. Comatose counts as asleep;
+        // Magic Guard on the sleeper prevents the damage.
+        if ability == Ab::BadDreams {
+            let foe = side.other();
+            let f = b.state.side(foe).active();
+            if f.is_alive()
+                && (f.status == Status::Sleep || f.ability == Ab::Comatose)
+                && f.ability != Ab::MagicGuard
+            {
+                let fslot = b.state.side(foe).active_index;
+                let dmg = (f.max_hp / 8).max(1).min(f.hp);
+                push(b, Instruction::Damage { side: foe, slot: fslot, amount: dmg });
+                // The chip can put the sleeper into its own pinch-berry range.
+                apply_pinch_berry(b, foe);
+            }
+        }
+
+        // Cud Chew: re-apply the eaten berry's effect. The counter was set to 2 on eat and ticks
+        // down here; at 0 the berry effect fires again.
+        let cc = b.state.side(side).active().cudchew_turns;
+        if cc > 0 {
+            push(b, Instruction::SetCudChew { side, slot, previous: cc, new: cc - 1 });
+            if cc - 1 == 0 && b.state.side(side).active().is_alive() {
+                let berry = b.state.side(side).active().last_berry;
+                apply_berry_eat_effect(b, side, berry);
+            }
+        }
+
+        // Speed Boost: +1 Spe at end of turn, but not the turn the mon switched in.
+        let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
+        if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
+            raise_boost(b, side, BoostIndex::Speed, 1);
+        }
+    }
+
+    // --- residual order 28, subOrder 3: the status orbs ---
+    // Toxic Orb / Flame Orb status the holder at end of turn if it has no status yet (the chip
+    // starts next turn). `data/items.ts` gives them `onResidualOrder: 28, onResidualSubOrder: 3`,
+    // i.e. after the 28/2 abilities above. (Harvest is also 28/2 but emits a draw, so it lives in
+    // the branching tail below; it cannot interact with an orb's status.)
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let orb_status = match p.item {
+            Item::ToxicOrb => Status::Toxic,
+            Item::FlameOrb => Status::Burn,
+            _ => Status::None,
+        };
+        if orb_status != Status::None && status_applies(p, orb_status) {
+            push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: orb_status });
+        }
+    }
+
+    // --- residual order 29: Hunger Switch (Morpeko) ---
+    // The forme toggles every end of turn (`data/abilities.ts` `onResidualOrder: 29`) unless
+    // Terastallized. Both formes share stats and typing, so this is exactly a species-id swap;
+    // Aura Wheel reads the forme at use time. The engine used to toggle it at the TOP of the
+    // residual pass, ahead of every order-1..28 handler.
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if p.ability == crate::ids::Ability::HungerSwitch && p.is_alive() && !p.terastallized && !p.transformed {
+            let plain = crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None);
+            let hangry = crate::ids::Species::from_id("morpekohangry").unwrap_or(crate::ids::Species::None);
+            let target_forme = if p.species == plain {
+                hangry
+            } else if p.species == hangry {
+                plain
+            } else {
+                continue;
+            };
+            let previous = transform_data_of(&b.state, side);
+            let mut new = previous;
+            new.species = target_forme;
+            let slot = b.state.side(side).active_index;
+            let previous_base_moves = b.state.side(side).active().base_moves;
+            push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+        }
+    }
+
+    // --- residual order `false` (duration-only handlers, sorted last) ---
+    // Rampage (lockedmove) `onResidual`: decrement `trueDuration` each end of turn. The move
+    // action stored the mid-turn (kernel) value {2,3 on start, s on continuation}; this ticks it
+    // to the terminal value {1,2, s-1}. The final locked turn (n==1) already ended and confused
+    // at move time, so a live Rampaging here always has n>=2 -> stays >=1.
+    for side in [SideId::One, SideId::Two] {
+        if let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move {
+            if n >= 2 {
+                push(b, Instruction::SetPendingMove {
+                    side,
+                    previous: crate::state::PendingMove::Rampaging(m, n),
+                    new: crate::state::PendingMove::Rampaging(m, n - 1),
+                });
             }
         }
     }
