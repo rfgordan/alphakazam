@@ -4340,7 +4340,24 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // Strength Sap's foe-facing effect is `onHit`-only (invisible to the codegen),
                 // but it targets the mon — Sap Sipper absorbs it (cosim caught the miss).
                 || md.id.to_id() == "strengthsap");
-        let affects_foe_mon = md.category != MoveCategory::Status || foe_status_target;
+        // Protect outranks every one of these abilities. Protect's condition carries
+        // `onTryHitPriority: 3` (`data/moves.ts:13989`) while Sap Sipper / Lightning Rod /
+        // Storm Drain / Motor Drive carry `onTryHitPriority: 1` and Volt Absorb / Water Absorb /
+        // Dry Skin / Earth Eater / Flash Fire the default 0 — and all of them are handlers of the
+        // SAME `runEvent('TryHit')` inside `hitStepTryHitEvent`, which short-circuits on the
+        // first `false`/`null`. So a protected target never reaches its own absorbing ability: no
+        // heal, no redirect boost, no Flash Fire activation. Same protect-bypass carve-outs as the
+        // damaging-move check further down (`checkMoveBypassesProtect` needs the `protect` flag;
+        // Mighty Cleave has none; Unseen Fist ignores protection on contact moves).
+        // rb1299 d35: Farigiraf Protects, Toucannon's Bullet Seed is Grass, and the engine still
+        // handed the protector Sap Sipper's +1 Attack.
+        let protect_blocks = md.flag_protect
+            && b.state.side(foe).volatiles.contains(VolatileStatus::Protect)
+            && md.id.to_id() != "mightycleave"
+            && !(md.flag_contact
+                && b.state.side(side).active().ability == crate::ids::Ability::UnseenFist);
+        let affects_foe_mon =
+            (md.category != MoveCategory::Status || foe_status_target) && !protect_blocks;
         let mb = matches!(b.state.side(side).active().ability, A::MoldBreaker | A::Teravolt | A::Turboblaze);
         let fa = b.state.side(foe).active().ability;
         let absorbs = matches!((md.typ, fa),
