@@ -4828,7 +4828,19 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         draw(&mut hb, "random", &[16], 0, "damage-roll");
         emit_modifydamage_shuffle(&mut hb);
         break_ice_face(&mut hb, foe);
-        out.push(hb);
+        // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
+        // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
+        // battle-actions.ts:1127-1129) and still runs step 5, `secondaries()`. rb1038 t5: Throat
+        // Chop into an intact Eiscue — PS rolls `random[100]` and the target ends the turn with
+        // the `throatchop` volatile even though the hit dealt nothing.
+        apply_damage_secondaries(&mut hb, side, &md, false);
+        out.extend(
+            apply_target_secondary(hb, side, &md)
+                .into_iter()
+                .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .flat_map(|sb| apply_cursed_body(sb, side, &md)),
+        );
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -4856,12 +4868,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         draw(&mut hb, "random", &[16], 0, "damage-roll");
         emit_modifydamage_shuffle(&mut hb);
         bust_disguise(&mut hb, foe);
-        match pivot {
-            Pivot::Target(t) => if hb.state.side(side).active().is_alive() { emit_pivot_trailing_update(&mut hb); apply_switch(&mut hb, side, t); },
-            Pivot::Pause => if hb.state.side(side).active().is_alive() { push(&mut hb, Instruction::PivotPending { side }); },
-            Pivot::Stay => {}
+        // `onDamage` returns 0, a NUMBER — the target stays live and `secondaries()` still runs
+        // (same shape as Ice Face above; data/abilities.ts:960-968).
+        apply_damage_secondaries(&mut hb, side, &md, false);
+        for mut sb in apply_target_secondary(hb, side, &md)
+            .into_iter()
+            .flat_map(|x| apply_flinch_split(x, side, &md))
+            .flat_map(|x| apply_contact_secondaries(x, side, &md))
+            .flat_map(|x| apply_cursed_body(x, side, &md))
+        {
+            match pivot {
+                Pivot::Target(t) => if sb.state.side(side).active().is_alive() { emit_pivot_trailing_update(&mut sb); apply_switch(&mut sb, side, t); },
+                Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                Pivot::Stay => {}
+            }
+            out.push(sb);
         }
-        out.push(hb);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
