@@ -4915,9 +4915,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_throat_spray(&mut hb, side, &md);
         apply_spin_clear(&mut hb, side, &md);
         apply_white_herb(&mut hb, side);
-        // Pinch berries fire on the HP drop from the move (defender) and any recoil (user).
-        apply_pinch_berry(&mut hb, foe);
-        apply_pinch_berry(&mut hb, side);
         // A Substitute blocks the target's own secondaries (boosts/status) and contact
         // abilities; otherwise split on the move's secondary, then the contact-status ability.
         // CONSUME the realized per-hit flag here: it is a per-MOVE transient (the branch is reused
@@ -4958,6 +4955,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             //   1024 post-hit-loop `eachEvent('Update')` — fires once for the move but AFTER
             //        faintMessages, so a KO'd (now-fainted) target breaks the tie and it doesn't.
             // Both emitted before the pivot/drag switch changes the on-field mon (and its Speed).
+            //
+            // The HP berries ARE that 970 Update's payload: `eachEvent('Update')` runs each
+            // active's item `onUpdate`, and it sits after the WHOLE `spreadMoveHit` — damage,
+            // `onHit`, self-drops, secondaries, `DamagingHit`, `onAfterHit` — so a berry decision
+            // reads the post-secondary state. Psychic Noise that heal-blocks the target in the
+            // same hit that drops it under half therefore keeps the berry (`sitrusberry
+            // .onTryEatItem` is gated by Heal Block, data/items.ts:5752). The pinch-berry check
+            // used to sit ahead of the secondary split, which ate it.
+            apply_pinch_berry(&mut sb, foe);
+            apply_pinch_berry(&mut sb, side);
             emit_update_hit(&mut sb);
             emit_update(&mut sb);
             // Pivot move (U-turn): switch the user out now that it connected. PS fires the move
@@ -6325,9 +6332,11 @@ fn apply_post_damage(
     // Muk Knock Off into a switching-in Veluza — PS 116, engine 189 with `last_berry` set).
     // It still precedes Magician / Pickpocket, which are `AfterMoveSecondary(Self)` events
     // fired by `useMoveInner` after the whole hit loop.
-    if any_damage && !hit_sub {
-        maybe_eat_sitrus(b, foe);
-    }
+    //
+    // The EAT itself is NOT here: `battle-actions.ts:970` also sits after the move's
+    // SECONDARIES (`spreadMoveHit` order: damage -> onHit -> selfDrops -> secondaries ->
+    // DamagingHit -> onAfterHit -> :970), so the berry decision must read the post-secondary
+    // state. It is applied at the 970/1024 emission site in the hit path.
 
     // Magician: after landing a damaging move, an itemless attacker steals the target's item
     // (PS onAfterMoveSecondarySelf; excluded for pivot moves — source.switchFlag — and Fling).
