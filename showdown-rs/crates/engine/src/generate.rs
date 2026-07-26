@@ -2381,6 +2381,32 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
     if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
+        run_switch_in_update(b);
+    }
+}
+
+/// PS ends a `switch` action's `runAction` with `this.eachEvent('Update')` (`sim/battle.ts:2882`),
+/// exactly as it does after a move — so every `onUpdate` handler on the board runs once the
+/// entering mon is in and its switch-in ability has fired. The payload that matters here is the
+/// item set: the Sitrus Berry's `onUpdate(pokemon) { if (pokemon.hp <= pokemon.maxhp / 2)
+/// pokemon.eatItem(); }` and Lum / Chesto's cure (`data/items.ts`). A mon that enters onto
+/// hazards and lands at or below half therefore eats its berry IMMEDIATELY, and one that Toxic
+/// Spikes just statused cures it — neither waits for the next damage event or the residual.
+///
+/// rb1003 d34 is the witness: Dedenne (Cheek Pouch, Sitrus, 70/261) replaces a faint on 2 layers
+/// of Spikes, takes 43 and lands at 27. PS eats the berry on the spot — 65 from the berry plus
+/// Cheek Pouch's extra 1/3 max — and ends the unit at 179/261; the engine left it at 27 holding
+/// an uneaten berry.
+///
+/// `eachEvent` speed-sorts the actives, so run the faster one's handlers first.
+fn run_switch_in_update(b: &mut Branch) {
+    let mut order = [SideId::One, SideId::Two];
+    if effective_speed(&b.state, order[1]) > effective_speed(&b.state, order[0]) {
+        order.swap(0, 1);
+    }
+    for side in order {
+        apply_pinch_berry(b, side);
+        consume_lum_if_statused(b, side);
     }
 }
 
@@ -2406,6 +2432,7 @@ pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Inst
             apply_switch_in_ability(&mut b, side);
         }
     }
+    run_switch_in_update(&mut b);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
     b.ins
