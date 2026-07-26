@@ -6353,6 +6353,22 @@ fn apply_damaging_hit_reactions(
                 refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
             }
         }
+        // Toxic Debris is an `onDamagingHit` too (`data/abilities.ts:5061`), so a physical
+        // MULTI-HIT move scatters one layer PER HIT until the cap: `side.addSideCondition
+        // ('toxicspikes')` guarded by `move.category === 'Physical' && (!toxicSpikes ||
+        // toxicSpikes.layers < 2)`, with `side = source.side` (the attacker's). It is inside
+        // this event, so it needs damage to have landed and it does NOT need the holder alive.
+        Ab::ToxicDebris if md.category == MoveCategory::Physical => {
+            let cur = b.state.side(side).side_conditions.toxic_spikes;
+            if cur < 2 {
+                push(b, Instruction::SetSideCondition {
+                    side,
+                    condition: SideConditionId::ToxicSpikes,
+                    previous: cur,
+                    new: cur + 1,
+                });
+            }
+        }
         Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
             // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
             // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
@@ -6540,22 +6556,6 @@ fn apply_post_damage(
         let aslot = b.state.side(side).active_index;
         let hp = b.state.side(side).active().hp;
         push(b, Instruction::Damage { side, slot: aslot, amount: hp });
-    }
-
-    // Toxic Debris: a physical hit on the holder scatters a Toxic Spikes layer onto the
-    // attacker's side (up to 2).
-    if md.category == MoveCategory::Physical
-        && b.state.side(foe).active().ability == crate::ids::Ability::ToxicDebris
-    {
-        let cur = b.state.side(side).side_conditions.toxic_spikes;
-        if cur < 2 {
-            push(b, Instruction::SetSideCondition {
-                side,
-                condition: SideConditionId::ToxicSpikes,
-                previous: cur,
-                new: cur + 1,
-            });
-        }
     }
 
     // Air Balloon pops on the first hit that lands (the holder becomes grounded).
