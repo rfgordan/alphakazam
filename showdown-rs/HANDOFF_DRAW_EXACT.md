@@ -1,5 +1,75 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN VI (2026-07-26): 444/512 full games byte-exact from seed (86.7%), up from 433;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS.
+Kill criteria NEVER triggered.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN VI" — before anything else.**
+It carries the seven roots that tranche landed (PS file:line each), the re-triaged 68 open games,
+and the named opens. It was written RETROACTIVELY (the tranche ended without it) from a full
+re-run of every gate, so its numbers are measured at `51fed0b`, not carried forward.
+
+The three biggest remaining levers, in order:
+
+1. **The 26 games whose first `hp` divergence exceeds 10 HP.** Wrong MECHANICS, one shared root
+   at a time. `knockoff` now recurs 7x (rb1034 rb1116 rb1147 rb1243 rb1283 rb1315 rb1369) — the
+   largest move cluster in the corpus. Re-run the recurrence scan after every landing.
+2. **The `stats*ThisTurn` trio (rb1048, rb1237, rb1278).** All three are a MISSING
+   `StatsRaisedThisTurn` / `StatsLoweredThisTurn` bit, from three different boost paths
+   (foe evasion drop, own status-move boost, a move's self-drop). PS sets both inside `boost()`,
+   which all three go through. Largest untried shared structure in the non-`hp` half.
+3. **The 9 `result random[16]@…` games.** Each has a draw miscount in an EARLIER unit; the
+   compared damage roll differs while the shape matches, which localizes the OFFSET, not the
+   root. rb1029 d22 and rb1348 d12 have a clean preceding shape mismatch to start from
+   (`rust-extra` accuracy/crit where PS records none for the whole unit — the same shape as the
+   Endeavor `onTryImmunity` root).
+
+Two traps that keep costing cycles:
+1. **`DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]`" at a forced-replacement unit is a FALSE
+   POSITIVE.** The replacement bracket is consumed straight off `prng` in `step_unit` and never
+   enters `chosen_draws`.
+2. **A `pending_move` / counter divergence can be a prng-offset symptom** (rb1310).
+
+Frames that paid off and are worth keeping:
+- **`spreadMoveHit`'s numbered steps are the draw order:** 1. `getDamage`/`spreadDamage`
+  3. `onHit` 4. `selfDrops` 5. `secondaries()` (flinch is one) 6. `forceSwitch`
+  7. `runEvent('DamagingHit')` 8. `onAfterHit` 9. `eachEvent('Update')`.
+- **PS re-derives `getDamage` every hit-loop iteration**, so anything step 7 changed is an input
+  to hit N+1 (commit `03682fe`).
+- **`fieldEvent('Residual')` is ONE globally ordered queue** — `onResidualOrder` off the pin is
+  the authority (`67c93ee`). Known remaining out-of-order handler: **Shed Skin is 5/3** and still
+  runs in the branching tail after Harvest (28/2); fixing it moves a DRAW, so the residual's
+  deterministic tail must become branch-based first. Witnesses rb1315, rb1380.
+- **`first_draw_mismatch` compares the DAMAGE ROLL's RESULT**, not just kind+args — a matching
+  shape with a differing `random(16)` proves a prng OFFSET, i.e. a miscount in an earlier unit.
+  Only `random(16)` is compared; the `random(100)` draws log placeholders.
+- **`DBG_INSTR=1`** (with `DBG_GAME`/`DBG_I`) prints the chosen branch's instruction stream —
+  the only thing that localizes a `draws-match/state-diff` unit.
+
+Practical notes:
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests.
+- **`gen.rs` is generated** by `node harness/gen-data.mjs`; regenerating from the pinned PS
+  reproduces it byte-for-byte apart from justified new fields.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved). **The DIFF lines only appear on SIDECARS.**
+  `VERBOSE=1` on the gate lifts the row cap. Volatile bitmasks in those DIFF lines decode against
+  the enum order in `crates/engine/src/volatile.rs` (discriminant = bit index).
+- The sidecar's `decisions[i]` is indexed by the gate's `dN` DIRECTLY (`decisions[81]` is `d81`,
+  `turn` field matches `tN`), and carries `choices`, `draws` with
+  `{kind,args,result,move,effect,event,pokemon}`, and `stateAfter`.
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.**
+- The state divergence itself creates draw-class mislabels. Never treat the draw-class histogram
+  as a partition of roots. Burn-down VI dissolved the whole `eff=flamebody` cluster this way.
+
+--- historical (pre-burn-down-VI) below ---
+
 **PHASE 8 (2026-07-26): 433/512 full games byte-exact from seed (84.6%), up from 425;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
