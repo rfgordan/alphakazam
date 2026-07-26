@@ -2381,25 +2381,32 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
     if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
-        run_switch_in_update(b);
+        run_update_event(b);
     }
 }
 
-/// PS ends a `switch` action's `runAction` with `this.eachEvent('Update')` (`sim/battle.ts:2882`),
-/// exactly as it does after a move — so every `onUpdate` handler on the board runs once the
-/// entering mon is in and its switch-in ability has fired. The payload that matters here is the
-/// item set: the Sitrus Berry's `onUpdate(pokemon) { if (pokemon.hp <= pokemon.maxhp / 2)
-/// pokemon.eatItem(); }` and Lum / Chesto's cure (`data/items.ts`). A mon that enters onto
-/// hazards and lands at or below half therefore eats its berry IMMEDIATELY, and one that Toxic
-/// Spikes just statused cures it — neither waits for the next damage event or the residual.
+/// The PAYLOAD of PS's `this.eachEvent('Update')` — the event `runAction` fires at the end of
+/// EVERY action, move or switch alike (`sim/battle.ts:2882`). `emit_update` and friends only
+/// account for the SHUFFLE that event's speedSort consumes; this runs what the event actually
+/// does. The handlers that matter are the `onUpdate` items: the Sitrus Berry's
+/// `onUpdate(pokemon) { if (pokemon.hp <= pokemon.maxhp / 2) pokemon.eatItem(); }` and Lum /
+/// Chesto's cure (`data/items.ts`).
 ///
-/// rb1003 d34 is the witness: Dedenne (Cheek Pouch, Sitrus, 70/261) replaces a faint on 2 layers
-/// of Spikes, takes 43 and lands at 27. PS eats the berry on the spot — 65 from the berry plus
-/// Cheek Pouch's extra 1/3 max — and ends the unit at 179/261; the engine left it at 27 holding
-/// an uneaten berry.
+/// Two witnesses, one on each kind of action:
+/// - **switch** — rb1003 d34: Dedenne (Cheek Pouch, Sitrus, 70/261) replaces a faint on 2 layers
+///   of Spikes, takes 43 and lands at 27. PS eats the berry on the spot — 65 from the berry plus
+///   Cheek Pouch's extra 1/3 max — and ends the unit at 179/261; the engine left it at 27 holding
+///   an uneaten berry.
+/// - **move** — rb1227 d39: Arboliva (Harvest, Sitrus) takes a 100 Scald and then Substitutes for
+///   another 288/4 = 72, landing at 116/288, under half. PS eats the Sitrus at the move action's
+///   2882 Update (+72), Leech Seed heals it 36 to 224, and the order-28 Harvest residual regrows
+///   the berry. The engine only ran the berry check at the per-HIT Update inside `spreadMoveHit`
+///   (`battle-actions.ts:970`), which no status move ever reaches and which sits AHEAD of Life
+///   Orb / recoil self-damage even on a damaging one — so it stayed at 152 with the berry unlit.
 ///
-/// `eachEvent` speed-sorts the actives, so run the faster one's handlers first.
-fn run_switch_in_update(b: &mut Branch) {
+/// `eachEvent` speed-sorts the actives, so run the faster one's handlers first. Idempotent: a
+/// berry already eaten is no longer in hand, so firing this after the 970 Update changes nothing.
+fn run_update_event(b: &mut Branch) {
     let mut order = [SideId::One, SideId::Two];
     if effective_speed(&b.state, order[1]) > effective_speed(&b.state, order[0]) {
         order.swap(0, 1);
@@ -2432,7 +2439,7 @@ pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Inst
             apply_switch_in_ability(&mut b, side);
         }
     }
-    run_switch_in_update(&mut b);
+    run_update_event(&mut b);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
     b.ins
@@ -2873,6 +2880,14 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
         effective_speed(&b.state, SideId::Two),
     ])));
     let mut out = execute_move(b, action);
+    // PS's `runAction` ends a MOVE action with `this.eachEvent('Update')` (sim/battle.ts:2882)
+    // just as it ends a switch action with one. Run that event's payload here — the per-hit 970
+    // Update inside `spreadMoveHit` is a different, earlier event that no status move reaches and
+    // that sits ahead of the self-damage in `apply_post_damage` (Substitute's HP cost, Life Orb,
+    // recoil) even on a damaging move. See `run_update_event` for the two witnesses.
+    for nb in &mut out {
+        run_update_event(nb);
+    }
     if annotating() {
         for nb in &mut out {
             // Commit PS's `moveLastTurnResult` for the acting side: a move that failed to connect
