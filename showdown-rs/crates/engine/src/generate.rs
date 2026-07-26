@@ -6105,6 +6105,113 @@ fn bust_disguise(b: &mut Branch, foe: SideId) {
     });
 }
 
+/// Gulp Missile's SWALLOW half: `onSourceTryPrimaryHit` (`data/abilities.ts` gulpmissile) fires
+/// on the Cramorant that just landed a Surf and swaps it into `cramorantgulping`, or into
+/// `cramorantgorging` when it is at or below half HP:
+///
+/// ```text
+/// if (effect?.id === 'surf' && source.hasAbility('gulpmissile') && source.species.name === 'Cramorant') {
+///   const forme = source.hp <= source.maxhp / 2 ? 'cramorantgorging' : 'cramorantgulping';
+///   source.formeChange(forme, effect);
+/// }
+/// ```
+///
+/// (Dive's half lives in Dive's own `onTryMove` and is not modelled — no witness in the corpus.)
+/// All three formes share one base-stat line, so unlike Ice Face / Shields Down this is a pure
+/// species swap with no stat respread. `formeChange` is not permanent, so `clearVolatile` on
+/// switch-out puts the base forme back — the engine's `Transform` is reverted by its switch reset
+/// for the same reason.
+fn gulp_missile_swallow(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if md.id.to_id() != "surf" {
+        return;
+    }
+    let p = b.state.side(side).active();
+    if p.ability != crate::ids::Ability::GulpMissile || !p.is_alive() || p.transformed {
+        return;
+    }
+    let Some(base) = crate::ids::Species::from_id("cramorant") else { return };
+    if p.species != base {
+        return;
+    }
+    let want_id = if (p.hp as i32) * 2 <= p.max_hp as i32 { "cramorantgorging" } else { "cramorantgulping" };
+    let Some(want) = crate::ids::Species::from_id(want_id) else { return };
+    let previous = transform_data_of(&b.state, side);
+    let mut new = previous;
+    new.species = want;
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = b.state.side(side).active().base_moves;
+    push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
+}
+
+/// Gulp Missile's SPIT half — an `onDamagingHit` on the loaded Cramorant. `side` is the ATTACKER
+/// that just landed the hit; `foe` holds the ability.
+///
+/// ```text
+/// onDamagingHit(damage, target, source, move) {
+///   if (!source.hp || !source.isActive || target.isSemiInvulnerable()) return;
+///   if (['cramorantgulping','cramorantgorging'].includes(target.species.id)) {
+///     this.damage(source.baseMaxhp / 4, source, target);
+///     if (target.species.id === 'cramorantgulping') this.boost({def: -1}, source, target, null, true);
+///     else source.trySetStatus('par', target, move);
+///     target.formeChange('cramorant', move);
+///   }
+/// }
+/// ```
+///
+/// Note the early return on a fainted attacker: it suppresses the REVERT too, so a Cramorant that
+/// KO's its attacker with the recoil-free hit keeps its loaded forme. The 1/4 is off the
+/// attacker's `baseMaxhp` and is ability-sourced, so Magic Guard blocks it.
+fn apply_gulp_missile(b: &mut Branch, side: SideId, foe: SideId) {
+    let Some(gulping) = crate::ids::Species::from_id("cramorantgulping") else { return };
+    let Some(gorging) = crate::ids::Species::from_id("cramorantgorging") else { return };
+    let Some(base) = crate::ids::Species::from_id("cramorant") else { return };
+    let holder = b.state.side(foe).active();
+    if holder.ability != crate::ids::Ability::GulpMissile {
+        return;
+    }
+    let loaded = holder.species;
+    if loaded != gulping && loaded != gorging {
+        return;
+    }
+    if !b.state.side(side).active().is_alive() {
+        return;
+    }
+    let aslot = b.state.side(side).active_index;
+    if b.state.side(side).active().ability != crate::ids::Ability::MagicGuard {
+        let atk = b.state.side(side).active();
+        let dmg = (atk.max_hp / 4).max(1).min(atk.hp);
+        push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+    }
+    if b.state.side(side).active().is_alive() {
+        if loaded == gulping {
+            apply_boost_clamped(b, side, BoostIndex::Defense, -1);
+        } else {
+            let breaker = matches!(
+                b.state.side(foe).active().ability,
+                crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze
+            );
+            let can = status_applies_src(b.state.side(side).active(), Status::Paralysis, false, breaker)
+                && !status_blocked_by_field(&b.state, side, Status::Paralysis);
+            if can {
+                push(b, Instruction::ChangeStatus {
+                    side,
+                    slot: aslot,
+                    previous: Status::None,
+                    new: Status::Paralysis,
+                });
+                apply_synchronize(b, side, Status::Paralysis);
+                consume_lum_if_statused(b, side);
+            }
+        }
+    }
+    let previous = transform_data_of(&b.state, foe);
+    let mut new = previous;
+    new.species = base;
+    let slot = b.state.side(foe).active_index;
+    let previous_base_moves = b.state.side(foe).active().base_moves;
+    push(b, Instruction::Transform { side: foe, slot, previous, new, previous_base_moves });
+}
+
 fn break_ice_face(b: &mut Branch, foe: SideId) {
     let Some(noice) = crate::ids::Species::from_id("eiscuenoice") else { return };
     let p = b.state.side(foe).active();
@@ -6410,6 +6517,10 @@ fn apply_damaging_hit_reactions(
             }
         }
     }
+    // Gulp Missile's spit — a loaded Cramorant punishes the hit and reverts.
+    if !hit_sub {
+        apply_gulp_missile(b, side, foe);
+    }
     // Electromorphosis charges the holder after any damaging hit. The Charge volatile
     // doubles its next Electric move and is consumed by that move.
     if !hit_sub
@@ -6557,6 +6668,8 @@ fn apply_post_damage(
             }
         }
         // Move recoil (Brave Bird, Flare Blitz): self-damage a fraction of damage dealt.
+        // Gulp Missile loads the user the moment its Surf connects (`onSourceTryPrimaryHit`).
+        gulp_missile_swallow(b, side, md);
         // Rock Head and Magic Guard prevent recoil.
         let recoil_immune = matches!(b.state.side(side).active().ability, Ab::RockHead | Ab::MagicGuard);
         if md.recoil.0 > 0 && !recoil_immune {
