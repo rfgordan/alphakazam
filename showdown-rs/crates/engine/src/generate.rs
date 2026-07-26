@@ -5375,16 +5375,17 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 
     // Knock Off: ×1.5 base power when the target is holding a REMOVABLE item — no boost when
     // the item is species-locked (Rusted Sword/Shield, Ogerpon masks, Origin orbs) or the
-    // holder has Sticky Hold (PS's basePowerCallback runs the TakeItem event first).
-    let mut base_power = if md.id.to_id() == "knockoff"
+    // holder has Sticky Hold (PS's handler runs the `TakeItem` event first). This is a MOVE
+    // `onBasePower` doing `this.chainModify(1.5)` (data/moves.ts:9970-9975), so it belongs in
+    // the shared BasePower chain below (no `onBasePowerPriority` ⇒ 0 ⇒ it chains LAST), NOT as
+    // its own `modify()` — a separate rounding step loses a base power point against an
+    // ability that also sits in the chain (rb1008: Tough Claws + Knock Off, PS 127 BP, engine
+    // 126).
+    let knock_off_boost = md.id.to_id() == "knockoff"
         && defender.item != Item::None
         && item_removable_from(defender.species, defender.item, Some(attacker.species))
-        && def_ab != Ab::StickyHold // breakable → def_ab is already Mold-Breaker-suppressed
-    {
-        crate::damage::modify(md.base_power as i64, 3, 2) as u16
-    } else {
-        md.base_power
-    };
+        && def_ab != Ab::StickyHold; // breakable → def_ab is already Mold-Breaker-suppressed
+    let mut base_power = md.base_power;
     // Weight-based moves compute their base power dynamically.
     match md.id.to_id() {
         "grassknot" | "lowkick" => {
@@ -5610,6 +5611,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     }
     if terrain_halve {
         bp_chain = bp_step(bp_chain, 2048);
+    }
+    // 0 (no `onBasePowerPriority` ⇒ chains last): the MOVE's own `onBasePower` — Knock Off's
+    // `chainModify(1.5)` against a removable-item holder.
+    if knock_off_boost {
+        bp_chain = bp_step(bp_chain, 6144);
     }
     if bp_chain != 4096 {
         base_power = crate::damage::modify(base_power as i64, bp_chain, 4096) as u16;
