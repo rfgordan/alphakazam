@@ -5071,7 +5071,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // Weakness Policy on the target (super-effective hit), then White Herb if the user's
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
-        apply_weakness_policy(&mut hb, foe, &md);
         apply_justified(&mut hb, foe, &md);
         // Rattled / Thermal Exchange (onDamagingHit), Bug Bite's berry steal and the frozen-
         // target thaw (move onHit / frz onHit) don't fire when a Substitute took the hit.
@@ -5128,6 +5127,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // application, which is exact for the single-hit moves Enumerate/Sample verify.
             apply_target_secondary(hb, side, &md)
                 .into_iter()
+                .flat_map(|sb| apply_alluringvoice_confusion(sb, side, &md))
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
                 .flat_map(|sb| apply_direclaw_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
@@ -5143,6 +5143,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
+            // Weakness Policy is `onDamagingHit` (data/items.ts:7591-7605) — step 7 of
+            // `spreadMoveHit`, AFTER `secondaries()` at step 5. Applying it earlier made its
+            // +2 Atk/+2 SpA visible to a secondary that reads `target.statsRaisedThisTurn`
+            // (Alluring Voice, Burning Jealousy): rb1178 t11 — PS does NOT confuse the
+            // Weakness-Policy Tyranitar that Alluring Voice just boosted.
+            apply_weakness_policy(&mut sb, foe, &md);
             // In-kernel Update shuffles for this connecting hit, in PS order (after `spreadMoveHit`
             // = self-drops + target secondaries + DamagingHit contact abilities have all rolled):
             //   970  per-hit `eachEvent('Update')` — fires on the PRE-faint board (a target
@@ -8409,6 +8415,39 @@ fn extra_secondary_roll_move(id: crate::ids::MoveId) -> bool {
         // a STATE caveat, not a draw one. The sole corpus instance procs, so the sweep stays exact.)
         | "diamondstorm"
     )
+}
+
+/// Alluring Voice's `secondary: { chance: 100, onHit }` confuses the target only when it RAISED
+/// a stat this turn (`target.statsRaisedThisTurn`, data/moves.ts alluringvoice). PS always rolls
+/// the secondary's `random(100)` (emitted by `apply_target_secondary` via
+/// `extra_secondary_roll_move`); when the condition holds, `addVolatile('confusion')` then rolls
+/// its own `random(2, 6)` duration at that same position. rb1364 t23: Leafeon's Swords Dance
+/// resolves first, so PS logs `random[2,6]=5` with `effect: confusion, event: Start`.
+fn apply_alluringvoice_confusion(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    if md.id.to_id() != "alluringvoice" {
+        return vec![b];
+    }
+    if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
+        return vec![b];
+    }
+    let foe = side.other();
+    let d = b.state.side(foe).active();
+    let blocked = d.ability == crate::ids::Ability::ShieldDust || d.item == Item::CovertCloak;
+    if !d.is_alive()
+        || blocked
+        || d.ability == crate::ids::Ability::OwnTempo
+        || !b.state.side(foe).volatiles.contains(VolatileStatus::StatsRaisedThisTurn)
+        || b.state.side(foe).volatiles.contains(VolatileStatus::Confusion)
+    {
+        return vec![b];
+    }
+    let mut b = b;
+    push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Confusion });
+    let mut branches = branch_confusion_counter(b, foe);
+    for nb in &mut branches {
+        consume_lum_if_statused(nb, foe);
+    }
+    branches
 }
 
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
