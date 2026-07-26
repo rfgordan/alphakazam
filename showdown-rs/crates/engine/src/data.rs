@@ -144,6 +144,16 @@ pub struct MoveData {
     /// PS `sleepUsable`: the move executes even while the user is asleep (Sleep Talk, Snore).
     /// The slp `onBeforeMove` still ticks the sleep counter, it just does not cancel.
     pub sleep_usable: bool,
+
+    // ---- RUNTIME flags (never set in the generated table; stamped by `execute_move_inner`
+    // so that `compute_damage` can fold the handler into the single `onBasePower` chain) ----
+    /// PS `move.typeChangerBoosted === this.effect`: an `-ate` ability (Pixilate / Refrigerate /
+    /// Aerilate / Galvanize) retyped this move, so its `onBasePower` (priority 23) contributes
+    /// `chainModify([4915, 4096])` (data/abilities.ts:3263-3266 and siblings).
+    pub type_changer_boosted: bool,
+    /// Analytic's `onBasePower` (priority 21) condition already evaluated at move time —
+    /// no other active still `willMove()` (data/abilities.ts:110-125).
+    pub analytic_boosted: bool,
 }
 
 impl MoveData {
@@ -196,6 +206,8 @@ impl MoveData {
             flag_charge: false,
             flag_nosleeptalk: false,
             sleep_usable: false,
+            type_changer_boosted: false,
+            analytic_boosted: false,
         }
     }
 }

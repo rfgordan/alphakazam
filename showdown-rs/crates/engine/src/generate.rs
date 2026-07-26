@@ -3855,7 +3855,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         };
         if let Some(t) = ate_type {
             md.typ = t;
-            md.base_power = crate::damage::modify(md.base_power as i64, 4915, 4096) as u16;
+            // PS sets `move.typeChangerBoosted = this.effect` in `onModifyType`; the ×1.2 is a
+            // SEPARATE `onBasePower` handler (priority 23) that chains with every other
+            // onBasePower modifier instead of rounding on its own. Stamp the flag and let
+            // `compute_damage` fold it into `bp_chain`.
+            md.type_changer_boosted = true;
         }
     }
     // Liquid Voice: sound moves become Water-type (PS onModifyType, no power change).
@@ -3907,14 +3911,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Analytic: ×1.3 base power when no other active will still move this turn (PS
     // onBasePower chainModify([5325, 4096]); queue.willMove is falsy for a foe that already
     // moved, chose a switch, or is fainted — exactly foe_pending_move == None here).
-    // NOTE: dynamic-BP moves (weight/HP-scaled) recompute base power inside compute_damage
-    // and drop this multiply; no in-format Analytic holder carries one.
+    // The condition is evaluated HERE (it needs the action queue) but the ×1.3 is applied inside
+    // `compute_damage`'s single onBasePower chain — which also makes it apply to the
+    // dynamic-BP moves whose base power is recomputed there.
     if attacker.ability == crate::ids::Ability::Analytic
         && foe_pending_move.is_none()
         && md.category != MoveCategory::Status
-        && md.base_power > 0
     {
-        md.base_power = crate::damage::modify(md.base_power as i64, 5325, 4096) as u16;
+        md.analytic_boosted = true;
     }
     let foe = side.other();
 
@@ -5528,24 +5532,23 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         {
             base_power = base_power.saturating_mul(2);
         }
-        // Collision Course / Electro Drift: ~x1.33 when super effective.
-        "collisioncourse" | "electrodrift"
-            if crate::damage::type_multiplier(md.typ, b.state.side(side.other()).active().types) > 1.0 =>
-        {
-            base_power = crate::damage::modify(base_power as i64, 5461, 4096) as u16;
-        }
-        // Psyblade: x1.5 in Electric Terrain (any user; terrain applies to the field).
-        "psyblade" if b.state.terrain == crate::ids::Terrain::Electric => {
-            base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-        }
-        // Expanding Force: x1.5 when its GROUNDED user attacks in Psychic Terrain.
-        "expandingforce"
-            if b.state.terrain == crate::ids::Terrain::Psychic && is_grounded(&b.state, side) =>
-        {
-            base_power = crate::damage::modify(base_power as i64, 6144, 4096) as u16;
-        }
         _ => {}
     }
+    // Collision Course / Electro Drift (`chainModify([5461, 4096])` when super effective,
+    // data/moves.ts:2633-2637 / :4619-4623), Psyblade (×1.5 in Electric Terrain, :14038-14042)
+    // and Expanding Force (×1.5 for a grounded user in Psychic Terrain, :4952-4956) are the
+    // MOVE's own `onBasePower` handlers — no `onBasePowerPriority`, so they chain LAST, in the
+    // same accumulated `event.modifier` as every ability/item handler (see `bp_chain` below).
+    let move_own_bp: Option<i64> = match md.id.to_id() {
+        "collisioncourse" | "electrodrift"
+            if crate::damage::type_multiplier(md.typ, b.state.side(side.other()).active().types) > 1.0 =>
+            Some(5461),
+        "psyblade" if b.state.terrain == crate::ids::Terrain::Electric => Some(6144),
+        "expandingforce"
+            if b.state.terrain == crate::ids::Terrain::Psychic && is_grounded(&b.state, side) =>
+            Some(6144),
+        _ => None,
+    };
     // Type-boosting held items: ×1.2 base power for the matching move type (PS onBasePower
     // chainModify([4915, 4096])). Plates boost their type too (all 17, for Arceus formes).
     let type_item_boost = plate_type(attacker.item) == Some(md.typ) && plate_type(attacker.item).is_some()
@@ -5617,7 +5620,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if attacker.ability == Ab::Technician && base_power <= 60 {
         bp_chain = bp_step(bp_chain, 6144);
     }
-    // 23: Iron Fist (punch ×1.2) / Reckless (recoil or crash-damage move ×1.2).
+    // 23: Iron Fist (punch ×1.2) / Reckless (recoil or crash-damage move ×1.2) / the `-ate`
+    // abilities' ×1.2 for the move they retyped (abilities.ts pixilate:3263-3266,
+    // refrigerate/aerilate/galvanize identical). One ability per holder, so no tie.
+    if md.type_changer_boosted {
+        bp_chain = bp_step(bp_chain, 4915);
+    }
     if attacker.ability == Ab::IronFist && md.flag_punch {
         bp_chain = bp_step(bp_chain, 4915);
     }
@@ -5627,7 +5635,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         bp_chain = bp_step(bp_chain, 4915);
     }
     // 21: Sheer Force (×1.3) / Supreme Overlord (×table, +10% per fallen ally) / Tough Claws
-    // (contact ×1.3) — one ability.
+    // (contact ×1.3) / Analytic (×1.3 when no other active still `willMove`,
+    // abilities.ts:110-125) — one ability.
+    if md.analytic_boosted {
+        bp_chain = bp_step(bp_chain, 5325);
+    }
     if sheer_force_active {
         bp_chain = bp_step(bp_chain, 5325);
     }
@@ -5678,7 +5690,8 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     if attacker.ability == Ab::PunkRock && md.flag_sound {
         bp_chain = bp_step(bp_chain, 5325);
     }
-    // 0: terrain boost (×1.3) then terrain halve (×0.5) — grounded user/target gated above.
+    // 6: terrain boost (×1.3) then terrain halve (×0.5) — grounded user/target gated above
+    // (`onBasePowerPriority: 6` on each terrain condition, data/moves.ts).
     if terrain_boost {
         bp_chain = bp_step(bp_chain, 5325);
     }
@@ -5686,9 +5699,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         bp_chain = bp_step(bp_chain, 2048);
     }
     // 0 (no `onBasePowerPriority` ⇒ chains last): the MOVE's own `onBasePower` — Knock Off's
-    // `chainModify(1.5)` against a removable-item holder.
+    // `chainModify(1.5)` against a removable-item holder, and Collision Course / Electro Drift /
+    // Psyblade / Expanding Force (resolved into `move_own_bp` above).
     if knock_off_boost {
         bp_chain = bp_step(bp_chain, 6144);
+    }
+    if let Some(num) = move_own_bp {
+        bp_chain = bp_step(bp_chain, num);
     }
     if bp_chain != 4096 {
         base_power = crate::damage::modify(base_power as i64, bp_chain, 4096) as u16;

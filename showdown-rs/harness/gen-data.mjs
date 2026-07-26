@@ -162,6 +162,10 @@ moves.forEach((m, i) => {
 		`crit_ratio: ${m.critRatio || 1}`,
 		`always_crit: ${m.willCrit === true}`,
 		`self_destruct: ${!!m.selfdestruct}`,
+		// Runtime-only flags (PS stamps these on the *active* move, not the dex entry):
+		// `move.typeChangerBoosted` (the -ate abilities) and Analytic's willMove() condition.
+		`type_changer_boosted: false`,
+		`analytic_boosted: false`,
 	];
 	moveRows.push(`    MoveData { ${fields.join(', ')} },`);
 });
