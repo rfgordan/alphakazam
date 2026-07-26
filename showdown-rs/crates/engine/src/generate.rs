@@ -5190,10 +5190,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
         // Weakness Policy on the target (super-effective hit), then White Herb if the user's
         // own self-drops (Leaf Storm, Close Combat, ...) left a negative stage.
-        apply_justified(&mut hb, foe, &md);
-        // Rattled / Thermal Exchange (onDamagingHit), Bug Bite's berry steal and the frozen-
-        // target thaw (move onHit / frz onHit) don't fire when a Substitute took the hit.
+        // Justified / Rattled / Thermal Exchange (onDamagingHit), Bug Bite's berry steal and the
+        // frozen-target thaw (move onHit / frz onHit) don't fire when a Substitute took the hit:
+        // the sub's `onTryPrimaryHit` eats the damage, `spreadMoveHit`'s `damage[i]` is 0, and
+        // `runEvent('DamagingHit')` (`sim/battle-actions.ts:1142`) is gated on it. `apply_justified`
+        // was outside the guard — rb1147 d38: a Keldeo-Resolute behind a fresh Substitute takes a
+        // Knock Off; PS leaves its Attack at 0, the engine gave it Justified's +1.
         if !hit_sub {
+            apply_justified(&mut hb, foe, &md);
             apply_rattled(&mut hb, foe, &md);
             apply_thermal_exchange(&mut hb, foe, &md);
             apply_bug_bite(&mut hb, side, &md);
@@ -10548,7 +10552,7 @@ fn emit_residual_shuffles(b: &mut Branch) {
     }
 }
 
-pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
+pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec<Branch> {
     // PS's residual pass ABORTS the moment the battle ends: `fieldEvent` runs
     // `this.faintMessages(); if (this.ended) return;` after EVERY handler (sim/battle.ts:565-566,
     // and again at :519 for a duration-expiry `end`). `turnLoop` then returns on `this.ended`
@@ -11152,9 +11156,18 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             }
         }
 
-        // Speed Boost: +1 Spe at end of turn, but not the turn the mon switched in.
-        let side_idx = match side { SideId::One => 0, SideId::Two => 1 };
-        if ability == Ab::SpeedBoost && !switched[side_idx] && b.state.side(side).active().is_alive() {
+        // Speed Boost: +1 Spe at end of turn, but not the turn the mon entered. PS's gate is
+        // `if (pokemon.activeTurns)` (`data/abilities.ts:4412`) — a counter reset to 0 by
+        // `switchIn` (`sim/battle-actions.ts:137`) and bumped in `nextTurn`, so it is 0 for EVERY
+        // way of entering: a chosen switch, a pivot, a faint replacement AND a DRAG. The engine
+        // read a `switched` flag built from the two sides' chosen actions, which misses the drag
+        // (rb1239 d34: p1's Roar drags a Speed Boost mon in and the engine handed it +1 Spe on
+        // the spot). The `switched` parameter is now vestigial — its plumbing through `request.rs`
+        // can be removed the next time that file is touched.
+        if ability == Ab::SpeedBoost
+            && b.state.side(side).active_turns != 0
+            && b.state.side(side).active().is_alive()
+        {
             raise_boost(b, side, BoostIndex::Speed, 1);
         }
     }
