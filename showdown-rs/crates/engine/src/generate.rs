@@ -3199,6 +3199,38 @@ struct DamageCalc {
     life_orb: bool,
 }
 
+/// PS's `lockedmove` volatile carries `duration: 2` and is re-armed ONLY by its `onRestart`,
+/// which fires when the user ACTUALLY re-uses the locked move (`addVolatile` from the move's
+/// `self` effect). A turn whose attempt is cancelled by a BeforeMove handler — confusion
+/// self-hit, attract, full paralysis, freeze, Truant — never re-arms it, so the residual loop
+/// takes `duration` 1 -> 0 and ENDS the volatile (`if (eventid === 'Residual' && handler.end &&
+/// handler.state?.duration)`, sim/battle.ts:515-522). `lockedmove.onEnd` then confuses only
+/// `if (this.effectState.trueDuration <= 1)` (data/conditions.ts:277-279) — so with rampage
+/// turns still to run the lock simply DROPS, with no confusion and no duration draw.
+/// (`trueDuration` is the engine's `Rampaging(_, n)`, still holding its start-of-turn value at
+/// move time because the residual's `onResidual` decrement is skipped on the ending turn.)
+fn unarm_rampage_on_cancel(b: &mut Branch, side: SideId) {
+    use crate::state::PendingMove;
+    let pending = b.state.side(side).pending_move;
+    let PendingMove::Rampaging(_, n) = pending else { return };
+    // At n == 1 `onEnd` DOES reach `target.addVolatile('confusion')`. That is a no-op — and
+    // rolls NO `random(2, 6)` duration draw — when the user is already confused (`addVolatile`
+    // on a present volatile only calls `onRestart`, and `confusion` has none) or has Own Tempo;
+    // a confusion self-hit cancel is by construction already confused. The one case still open
+    // is n == 1 with a NON-confused user (attract / full paralysis / freeze cancel): that needs
+    // the fresh `random(2, 6)` at the RESIDUAL stream position, so it is left untouched here.
+    if n < 2
+        && !b.state.side(side).volatiles.contains(VolatileStatus::Confusion)
+        && b.state.side(side).active().ability != crate::ids::Ability::OwnTempo
+    {
+        return;
+    }
+    push(b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+    if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+    }
+}
+
 /// Execute one move, first splitting on confusion: a confused, awake mon has a 1/3 chance to
 /// hit itself instead of acting. The 2/3 "acts normally" branch is identical to no-confusion
 /// behavior, so this only *adds* the self-hit outcomes (no regression on the common path).
@@ -3314,6 +3346,12 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     if out.is_empty() {
         dispatch_move_inner(b, action)
     } else {
+        // Every branch in `out` is a CANCELLED attempt (confusion self-hit / attract / full
+        // paralysis): the locked move was not re-used, so its `lockedmove` volatile is not
+        // re-armed and expires at this turn's residual.
+        for nb in &mut out {
+            unarm_rampage_on_cancel(nb, side);
+        }
         out.extend(dispatch_move_inner(scaled(&b, act), action));
         out
     }
