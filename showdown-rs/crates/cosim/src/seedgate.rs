@@ -509,6 +509,14 @@ fn step_unit(
         let c = &outcomes[choice];
         let cs: Vec<String> = c.draws.iter().map(|d| format!("{}{:?}={}@{}", d.kind, d.args, d.result, d.site)).collect();
         eprintln!("  CHOSEN [{choice}] draws=[{}]", cs.join(" "));
+        // The draw stream says WHICH branch; the instruction stream says WHAT the branch did.
+        // A `draws-match/state-diff` unit is a wrong-mechanics unit by definition, so the only
+        // way to localize it is to read the instructions the chosen branch emitted.
+        if std::env::var("DBG_INSTR").is_ok() {
+            for ins in &c.instructions {
+                eprintln!("    INSTR {ins:?}");
+            }
+        }
     }
     let chosen_draws = outcomes[choice].draws.clone();
     state.apply_instructions(&outcomes[choice].instructions);

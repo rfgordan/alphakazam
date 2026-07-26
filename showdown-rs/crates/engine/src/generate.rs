@@ -10540,6 +10540,54 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
                 }
             }
         }
+    }
+
+    // --- residual order 4: Wish (slot condition) ---
+    // Wish (PS `onResidualOrder: 4`, data/moves.ts:20945) is a SLOT condition, and
+    // `fieldEvent('Residual')` runs slot-condition handlers even when the slot's occupant has
+    // fainted: `if ((handler.effectHolder as Pokemon).fainted) { if (!(handler.state
+    // ?.isSlotCondition)) continue; }` (sim/battle.ts:512-514). So the tick is unconditional —
+    // it does NOT take the fainted-active guard — and PS's own bookkeeping is date-based
+    // (`getOverflowedTurnCount() <= startingTurn` → not yet), so nothing can defer it.
+    // On maturity the handler calls `removeSlotCondition` unconditionally; only the HEAL is
+    // gated on a live occupant (`onEnd(target) { if (target && !target.fainted) heal }`). A
+    // Wish that matures over a fainted slot is therefore CONSUMED with no heal — it does not
+    // linger to a later end of turn.
+    //
+    // Order 4 puts it AFTER the weather chip/heals (field order 1) and BEFORE Grassy Terrain
+    // (5/2), Leftovers (5/4), Ingrain (7), Leech Seed (8) and the status chip (9/10). The engine
+    // used to run it at the very end of the residual pass, which let a later heal top up HP the
+    // wish had already restored — rb1209 d28 is the witness: a matured Wish over Mismagius (at
+    // FULL HP, so PS's `this.heal(212)` returns 0) then Leech Seed's order-8 drain of 30. PS
+    // ends the turn at 213/243; the engine drained first and let the wish heal the 30 back.
+    for side in [SideId::One, SideId::Two] {
+        let wish = b.state.side(side).wish;
+        if wish.0 == 0 {
+            continue;
+        }
+        let landed = wish.0 == 1;
+        let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
+        push(b, Instruction::SetWish { side, previous: wish, new });
+        if landed {
+            let p = b.state.side(side).active();
+            if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
+                let amt = wish.1.min(p.max_hp - p.hp);
+                let slot = b.state.side(side).active_index;
+                push(b, Instruction::Heal { side, slot, amount: amt });
+            }
+        }
+    }
+
+    // --- residual orders 5-7: Grassy Terrain (5/2), Leftovers / Black Sludge (5/4), Ingrain (7) ---
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let maxhp = p.max_hp;
+        use crate::ids::Ability as Ab;
+        let magic_guard = p.ability == Ab::MagicGuard;
 
         // Leftovers.
         let p = b.state.side(side).active();
@@ -10878,30 +10926,6 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
     use crate::instruction::ActiveCounter;
     let mut yawn_fired = [false; 2];
     for side in [SideId::One, SideId::Two] {
-        // Wish (PS `onResidualOrder: 4`, data/moves.ts:20945) is a SLOT condition, and
-        // `fieldEvent('Residual')` runs slot-condition handlers even when the slot's occupant has
-        // fainted: `if ((handler.effectHolder as Pokemon).fainted) { if (!(handler.state
-        // ?.isSlotCondition)) continue; }` (sim/battle.ts:512-514). So the tick is unconditional —
-        // it sits ahead of the fainted-active guard below — and PS's own bookkeeping is date-based
-        // (`getOverflowedTurnCount() <= startingTurn` → not yet), so nothing can defer it.
-        // On maturity the handler calls `removeSlotCondition` unconditionally; only the HEAL is
-        // gated on a live occupant (`onEnd(target) { if (target && !target.fainted) heal }`). A
-        // Wish that matures over a fainted slot is therefore CONSUMED with no heal — it does not
-        // linger to a later end of turn.
-        let wish = b.state.side(side).wish;
-        if wish.0 > 0 {
-            let landed = wish.0 == 1;
-            let new = if landed { (0, 0) } else { (wish.0 - 1, wish.1) };
-            push(b, Instruction::SetWish { side, previous: wish, new });
-            if landed {
-                let p = b.state.side(side).active();
-                if p.is_alive() && p.hp < p.max_hp && !heal_blocked(b, side) {
-                    let amt = wish.1.min(p.max_hp - p.hp);
-                    let slot = b.state.side(side).active_index;
-                    push(b, Instruction::Heal { side, slot, amount: amt });
-                }
-            }
-        }
         if !b.state.side(side).active().is_alive() {
             continue;
         }
