@@ -6155,15 +6155,15 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         // EVERY hit (battle-actions.ts:1142) — inside the loop, not after it. On the realized path
         // fire it here so Cursed Body / Toxic Chain / the contact-status abilities interleave into
         // the stream between this hit and the next hit's crit roll.
+        let pre_inputs = damage_inputs(b, side);
         if let HitRolls::Realized { cur, .. } = &mut rolls {
             realized_per_hit_damaging_hit(b, side, md, cur);
         }
         // The no-draw `onDamagingHit` handlers are part of that SAME per-hit event: Stamina's
-        // +1 Def, Rough Skin / Iron Barbs / Rocky Helmet's chip, Gooey's -1 Spe. A stat one of
-        // them moved is visible to the NEXT hit's damage formula, so re-derive the calc.
-        let restat = damaging_hit_reactions_change_stats(b, side);
+        // +1 Def, Rough Skin / Iron Barbs / Rocky Helmet's chip, Gooey's -1 Spe. Anything the
+        // event moved that the damage formula reads is visible to the NEXT hit, so re-derive.
         apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
-        if restat {
+        if damage_inputs(b, side) != pre_inputs {
             calc = compute_damage(b, side, md);
         }
     }
@@ -6247,8 +6247,9 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             hits_executed += 1;
         }
         // `runEvent('DamagingHit')` fires at the end of EVERY hit (battle-actions.ts:1142).
-        restat_dirty |= damaging_hit_reactions_change_stats(b, side);
+        let pre_inputs = damage_inputs(b, side);
         apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
+        restat_dirty |= damage_inputs(b, side) != pre_inputs;
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
     // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
@@ -6384,15 +6385,36 @@ fn apply_damaging_hit_reactions(
     }
 }
 
-/// True when one of the per-hit `onDamagingHit` reactions can change a stat the damage formula
-/// reads, so the realized hit loops must re-derive the `DamageCalc` for the next hit.
-fn damaging_hit_reactions_change_stats(b: &Branch, side: SideId) -> bool {
-    use crate::ids::Ability as Ab;
+/// Everything `compute_damage` reads that a per-hit `runEvent('DamagingHit')` reaction can move.
+///
+/// PS re-derives `getDamage` from LIVE state on every hit of the hit loop, so the engine's cached
+/// `DamageCalc` is only valid while none of these inputs has changed. Comparing a snapshot taken
+/// before the event with one taken after is strictly more faithful than enumerating which
+/// abilities move a stat: it catches the boost handlers (Stamina, Water Compaction, Gooey /
+/// Tangling Hair), the field handler (Seed Sower's terrain) AND the STATUS handlers — Flame Body
+/// burning the attacker halves its Attack for every remaining hit.
+///
+/// rb1198 d29 is the status witness: p2's 3-hit Triple Axel into a Flame Body holder burns the
+/// user on hit 1 (`randomChance[3,10]@contact-status` = 1). PS's hits 2 and 3 are then computed
+/// at half Attack (43 / 43 / 64); the engine kept the unburned calc and scaled it by base power
+/// (43 / 90 / 134), 114 HP too much.
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct DamageInputs {
+    atk: (crate::ids::Status, [i8; BoostIndex::COUNT], crate::ids::Ability, Item, [Type; 2]),
+    def: (crate::ids::Status, [i8; BoostIndex::COUNT], crate::ids::Ability, Item, [Type; 2]),
+    field: (Weather, crate::ids::Terrain),
+    screens: (u8, u8, u8),
+}
+fn damage_inputs(b: &Branch, side: SideId) -> DamageInputs {
     let foe = side.other();
-    matches!(b.state.side(foe).active().ability, Ab::Stamina | Ab::WaterCompaction)
-        || matches!(b.state.side(foe).active().ability, Ab::Gooey | Ab::TanglingHair)
-        || b.state.side(foe).active().ability == Ab::SeedSower
-        || b.state.side(side).active().ability == Ab::Stamina
+    let (asd, dsd) = (b.state.side(side), b.state.side(foe));
+    let (a, d) = (asd.active(), dsd.active());
+    DamageInputs {
+        atk: (a.status, asd.boosts, a.ability, a.item, a.types),
+        def: (d.status, dsd.boosts, d.ability, d.item, d.types),
+        field: (b.state.weather, b.state.terrain),
+        screens: (dsd.side_conditions.reflect, dsd.side_conditions.light_screen, dsd.side_conditions.aurora_veil),
+    }
 }
 
 /// Effects keyed on the *total* damage a move dealt: drain, move recoil, Life Orb recoil,
@@ -7620,9 +7642,10 @@ fn apply_multihit_realized_ma(
         }
         // PS `spreadMoveHit` runs `runEvent('DamagingHit')` after EVERY hit — Fezandipiti's Beat Up
         // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`.
+        let pre_inputs = damage_inputs(&hb, side);
         realized_per_hit_damaging_hit(&mut hb, side, md, &mut cur);
-        restat_dirty |= damaging_hit_reactions_change_stats(&hb, side);
         apply_damaging_hit_reactions(&mut hb, side, md, dmg > 0, false, def_item, def_ability);
+        restat_dirty |= damage_inputs(&hb, side) != pre_inputs;
     }
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
     apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability, true);
