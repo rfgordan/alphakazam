@@ -1,5 +1,66 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**PHASE 7 (2026-07-26): 425/512 full games byte-exact from seed (83.0%), up from 400;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS.
+Kill criteria NEVER triggered.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "PHASE-7 EXTENSION BURN-DOWN" — before
+anything else.** It carries the ten roots this phase landed (PS file:line each), the re-triaged
+87 open games with the `hp > 10` move pairs listed, and the named opens.
+
+The single most useful frame this phase produced: **`spreadMoveHit`'s numbered steps are the
+draw order.** Three separate roots were "the engine ran X at the wrong step" —
+
+1. `getDamage` / `spreadDamage`  2. — 3. `onHit` (`runMoveEffects`) 4. `selfDrops`
+   (`self: {volatileStatus}` — the rampage lock, mustrecharge) 5. `secondaries()` (INCLUDING
+   flinch — it is `secondaries: [{volatileStatus:'flinch'}]`) 6. `forceSwitch`
+   7. `runEvent('DamagingHit')` (Static / Flame Body / Poison Point / Poison Touch / Toxic
+   Chain / Cursed Body / **Weakness Policy** / Rattled / Weak Armor / Justified / Thermal
+   Exchange) 8. `onAfterHit` 9. `eachEvent('Update')`.
+
+When a `@move` draw and an `@ability` draw swap places in a unit, check the step numbers before
+hunting for a missing mechanic.
+
+The three biggest remaining levers, in order:
+
+1. **The 35 games whose first `hp` divergence exceeds 10 HP.** Wrong MECHANICS, one shared root
+   at a time. `knockoff` recurs 5x (rb1116 rb1243 rb1283 rb1315 rb1369) and `struggle` 3x.
+   Re-run the recurrence scan after every landing.
+2. **The `struggle` cluster is REQUEST LEGALITY, not mechanics.** rb1231 d15: PS resolved p1's
+   "move 1" to `struggle` while the engine's move1 still had PP. PS's request JSON is in the
+   sidecar and `check_legality` (`crates/cosim/src/replay.rs`) already diffs it — start there.
+3. **The remaining `onDamagingHit` handlers still run BEFORE the secondaries**: `apply_justified`,
+   `apply_rattled`, `apply_thermal_exchange`, `apply_weak_armor`. Weakness Policy was moved
+   because rb1178 witnessed it; the other four are the same rule with no witness yet.
+
+Practical notes (unchanged from Phase 6 unless noted):
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests. Phase 7 did
+  not touch it.
+- **`gen.rs` is generated** by `node harness/gen-data.mjs` and regenerating it from the pinned PS
+  reproduces the committed file byte-for-byte. Adding a `MoveData` field is therefore cheap and
+  safe: add it to `data.rs`, emit it from `gen-data.mjs`, re-run the generator, diff.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved). `VERBOSE=1` on the gate lifts the 45-row cap
+  on the per-game divergence listing — you need it to compute the exact-SET diff.
+- The sidecar's `decisions[i]` carries `choices` (not `choice`), `draws` with
+  `{kind,args,result,move,effect,event,pokemon}`, and `stateAfter`. **`draws[].event` /
+  `effect` name the PS handler** — `event: "DamagingHit", effect: "toxicchain"` is what told us
+  the flinch roll had to come first.
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.** A regression
+  is a lead: rb1178 fell out of the Alluring Voice commit and named the Weakness Policy bug.
+- The state divergence itself creates draw-class mislabels. Never treat the draw-class histogram
+  as a partition of roots.
+
+--- historical (pre-Phase-7) below ---
+
+
 **PHASE 6 (2026-07-26): 400/512 full games byte-exact from seed (78.1%), up from 372;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).

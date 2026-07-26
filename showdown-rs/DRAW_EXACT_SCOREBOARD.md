@@ -6,6 +6,141 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== PHASE-7 EXTENSION BURN-DOWN — certification (2026-07-26) ====
+
+**HEADLINE: 425 / 512 full games byte-exact from seed (83.0%), up from 400; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Eight parity commits, every one PS-source-grounded. Judged by the exact-SET diff on BOTH
+corpora at every step: the newly-non-exact set was EMPTY at all eight. (It was NOT empty at one
+intermediate step — see "Alluring Voice" below — and that regression named the next root.)
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **425 / 512 (83.0%)**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | all suites green |
+
+`convert.rs` was NOT touched, so the seed fixtures' baked digests did not move and no fixture
+regeneration was needed. `gen.rs` WAS regenerated (two new `MoveData` fields); regenerating it
+from the pinned PS reproduces the previous file byte-for-byte apart from the new fields —
+verified by diff before the fields were added.
+
+## The roots landed (in commit order)
+
+| # | commit | class | games | PS reference |
+|---|--------|-------|-------|--------------|
+| 1 | `7bf572f` | **The last six `onBasePower` `chainModify` handlers folded into the one `event.modifier`** — Collision Course / Electro Drift, Psyblade, Expanding Force, the `-ate` abilities, Analytic | 400 (latent) | `data/moves.ts:2633-2637` `:4619-4623` `:14038-14042` `:4952-4956`; `data/abilities.ts:3263-3266` `:110-125` |
+| 2 | `f9b3192` | **A move's `volatileStatus` does not mean it targets the foe** — Protect / Substitute / absorbing abilities / Prankster gated on `MoveTarget` | 400 → 403 | `data/moves.ts` substitute `onTryPrimaryHit` (`target === source`); `sim/battle-actions.ts:671-673` |
+| 3 | `b1f063a` | **PS never drops `lockedmove` on a move FAILURE** — `onAfterMove` removes it at `duration === 1`, so a failed rampage on the final locked turn still confuses | 403 → 405 | `sim/battle-actions.ts:311-312` + `data/conditions.ts:253-284` + `data/moves.ts:1015-1020` |
+| 3b | `b1f063a` | **The rampage START draw sits at the SELF-DROP position** (`self: {volatileStatus:'lockedmove'}` is applied by `selfDrops`, before secondaries and DamagingHit) | 405 → 407 | `sim/battle-actions.ts:1117` + `data/conditions.ts:264-267` |
+| 4 | `af31239` | **`AfterEachBoost` fires once per CHANGED stat, not once per boost event** — a two-stat drop wakes Defiant / Competitive TWICE | 407 → 409 | `sim/battle.ts:2073` + `data/abilities.ts:891-905` / `:635-649` |
+| 5 | `66594aa` | **Flinch is a SECONDARY** — rolled at step 5, before the `DamagingHit` ability rolls at step 7 | 409 → 410 | `sim/battle-actions.ts:1120` vs the `damagedTargets` `runEvent('DamagingHit')` below it |
+| 5b | `66594aa` | **Protect / Substitute key on `move.target` + the `protect` FLAG**, not on the codegen-visible payload | 410 → 416 | `sim/battle.ts:1300-1308` (`checkMoveBypassesProtect`) |
+| 6 | `e3d3829` | **The recharge turn**: `mustrecharge` volatile lockstep with `pending_move`, PS's explicit `removeVolatile('truant')`, and the gate's missing `"recharge"` pseudo-move | 416 → 418 | `data/conditions.ts:364-373`; `crates/cosim/src/convert.rs:536-539` |
+| 7 | `63610ab` | **An Ice Face / Disguise nullification still runs the move's secondaries** — `onDamage` returns 0, a NUMBER, so the target stays live | 418 → 423 | `data/abilities.ts:960-968`; `sim/battle-actions.ts:1127-1129` |
+| 8 | `669a727` | **Alluring Voice's conditional confusion** + **Weakness Policy is `onDamagingHit`** (step 7, after `secondaries()`) | 423 → 425 | `data/moves.ts` alluringvoice; `data/items.ts:7591-7605` |
+
+Games flipped, by commit: 2 → rb1109 rb1142 rb1308; 3 → rb1098 rb1384; 3b → rb1031 rb1321;
+4 → rb1102 rb1211; 5 → rb1392; 5b → rb1059 rb1066 rb1190 rb1214 rb1287 rb1307; 6 → rb1092
+rb1157; 7 → rb1038 rb1135 rb1143 rb1279 rb1371; 8 → rb1052 rb1364.
+
+### Method notes worth keeping
+
+- **`spreadMoveHit`'s numbered steps are the spine of the draw order.** Three of this phase's
+  roots were "the engine ran X at the wrong step": flinch (a step-5 secondary) after the step-7
+  DamagingHit abilities; the rampage lock (a step-4 `self` effect) at the end of the move;
+  Weakness Policy (step 7) before the step-5 secondaries. When a `@move` draw and an `@ability`
+  draw swap places, look up the step numbers before looking for a missing mechanic.
+- **The codegen's `MoveData` payload is not PS's targeting.** `target_volatile` is `gen-data.mjs`
+  folding `move.volatileStatus`, which SELF-targeting moves carry too (Protect, Substitute,
+  Magnet Rise, Destiny Bond, …), and it is ABSENT for every move whose foe-facing effect is an
+  `onHit` callback (Strength Sap, Trick, Pain Split, Topsy-Turvy). Any predicate that means
+  "does this reach the foe's mon?" must read `md.target`.
+- **A regression is a lead.** Landing Alluring Voice's confusion cost rb1178, and that one game
+  named the Weakness Policy ordering bug. Never revert on a count; read the lost game.
+- **The `stall` / `queue.willAct()` lead was WRONG.** rb1227's Protect never reached
+  `execute_status_move` at all — a Substitute from three turns earlier was up and the engine
+  read Protect as a foe-targeting volatile move. Single-field probes tell you the SYMPTOM, not
+  the site; instrument the return path before theorising about the predicate.
+
+## The 87 still-open games, re-triaged
+
+| n | class | reading |
+|---|-------|---------|
+| 64 | `draws-match/state-diff` | the draw stream matches for the unit; the STATE differs |
+| 2 | `PS shuffle@generic` | a residual-handler-list tie shuffle the engine does not emit |
+| 2 each | `args randomChance@hypervoice` / `@par` / `@struggle`, `rust-extra randomChance@accuracy` | draw-position offsets |
+| 1 each | `PS random@confusion`, `PS randomChance@heavyslam`, `PS randomChance@struggle`, `PS shuffle@thunderbolt`, `PS-unconsumed random@icehammer`, `PS-unconsumed randomChance@freezedry`, `PS-unconsumed randomChance@icebeam`, `PS-unconsumed sample@trace`, `args randomChance@knockoff`, `args randomChance@powerwhip`, `args shuffle@generic`, `rust-extra randomChance@crit`, `rust-extra shuffle@disablemove` | bespoke |
+
+First-divergence FIELD split: **48 `hp`**, 10 `volatiles`, 9 `boosts`, 3 `status`, 3 `species`,
+2 `status_counter`, 2 `types`, 4 `pp`, tail. Of the 48 `hp` games **35 exceed 10 HP** (wrong
+mechanics), 8 sit in 4-10, and **5 are within 3** (rounding residue — down from 7).
+
+The 10 `volatiles` games are now single-bit, no shared root visible: Substitute (rb1033 extra),
+StatsLoweredThisTurn (rb1048, rb1278 missing), ThroatChop (rb1072 extra), ChoiceLock (rb1099
+missing), Confusion (rb1121 extra), Unburden (rb1126 missing), StatsRaisedThisTurn (rb1237
+missing), Encore (rb1245 extra), HealBlock (rb1304 extra). **Note the four
+`statsRaisedThisTurn` / `statsLoweredThisTurn` bits** — PS clears them in `nextTurn`
+(`sim/battle.ts:1675`) and on switch-out (`sim/battle-actions.ts:123`); they are cheap to
+re-check and they gate Burning Jealousy, Lash Out and Alluring Voice.
+
+The 35 `hp > 10` games, with the divergent unit's move pair:
+rb1003 d34(hydropump+waterpulse), rb1011 d43(closecombat+SW), rb1012 d60(gigadrain+scald),
+rb1016 d23(ragefist+iciclespear), rb1021 d59(thunderbolt+wish), rb1024 d81(struggle+SW),
+rb1029 d22(gunkshot+swordsdance), rb1030 d53(toxic+hypervoice), rb1040 d2(stealthrock+earthpower),
+rb1057 d11(protect+SW), rb1103 d37(strengthsap+struggle), rb1108 d4(shadowsneak+beakblast),
+rb1116 d7(knockoff+closecombat), rb1125 d2(icebeam+flowertrick),
+rb1184 d5(terastarstorm+tachyoncutter), rb1198 d29(lavaplume+tripleaxel),
+rb1209 d28(leechseed+flipturn), rb1226 d29(yawn+toxic), rb1227 d39(substitute+scald),
+rb1231 d15(struggle+uturn), rb1236 d37(dracometeor+voltswitch),
+rb1243 d11(stompingtantrum+knockoff), rb1274 d15(lavaplume+psychicnoise),
+rb1280 d13(SW+photongeyser), rb1283 d17(knockoff+SW), rb1300 d52(sleeptalk+focusblast),
+rb1302 d7(tailslap+stealthrock), rb1315 d28(earthquake+knockoff), rb1348 d12(drainingkiss+outrage),
+rb1362 d24(icebeam+thunderbolt), rb1369 d46(knockoff+bodyslam), rb1372 d14(focusblast+surf),
+rb1378 d8(nastyplot+ceaselessedge), rb1380 d15(scaleshot+toxic), rb1387 d36(encore+freezedry).
+`knockoff` still recurs 5x (rb1116, rb1243, rb1283, rb1315, rb1369) and `struggle` 3x.
+
+## Named opens carried forward
+
+- **The `struggle` cluster (rb1024, rb1103, rb1231) is a REQUEST-LEGALITY divergence, not a
+  mechanics one.** rb1231 d15: PS resolves p1's "move 1" to `struggle` while the engine's
+  `move1` still had PP (`s0#3.move1.pp engine=5 ps=6`), so the engine used the real move and
+  the whole unit's draw stream shifted. Start from `check_legality` in `crates/cosim/src/replay.rs`
+  — PS's request JSON is the ground truth and is recorded in the sidecar.
+- **Rampage lock end at `n == 1` with a NON-confused user, CANCELLED by a BeforeMove handler**
+  (attract / full paralysis / freeze). `runMove` returns before `useMove`, so there is no
+  `onAfterMove`; the volatile survives to the residual loop, whose `duration` 1 → 0 ends it
+  there (`sim/battle.ts:515-522`), putting the `random(2, 6)` at the RESIDUAL stream position.
+  `unarm_rampage_on_cancel` still leaves that case alone. This is the one PHASE-6 named open
+  that is genuinely still open — the other rampage leads all landed as commit 3/3b.
+- **Gulp Missile (rb1288, rb1367)** — `engine=cramorant ps=cramorantgorging`; the Surf/Dive
+  forme change (`gulpmissile.onSourceTryPrimaryHit`) and its retaliation are unmodelled.
+  **Ice Face's RESTORE (rb1253)** — `iceface.onStart` / `onWeatherChange` turn Eiscue-Noice back
+  into Eiscue under snow. Both are forme mechanics; 3 games.
+- **The remaining `onDamagingHit` handlers are still applied BEFORE the secondaries**:
+  `apply_justified`, `apply_rattled`, `apply_thermal_exchange`, `apply_weak_armor`. Only
+  Weakness Policy was moved (it was the one with a witness). Each is a `runEvent('DamagingHit')`
+  handler and belongs beside `apply_contact_secondaries` / `apply_cursed_body`.
+- **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**, **Magnet
+  Rise's `onTry` failure** — unchanged from Phase 5/6.
+- **Kill criterion: still NEVER triggered.** Eight commits, ten distinct structured roots,
+  25 games; density did not decay within the session.
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 425 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== PHASE-6 EXTENSION BURN-DOWN — certification (2026-07-26) ====
 
 **HEADLINE: 400 / 512 full games byte-exact from seed (78.1%), up from 372; init-aligned
