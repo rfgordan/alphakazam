@@ -491,6 +491,15 @@ fn step_unit(
         }
         let b3 = peek.random_range(0, 2); // gen8 dynamic re-sort
         engine::generate::set_forced_tie_order(Some(b0 == b3));
+    } else if engine::generate::switch_order_tie(state, mc[0], mc[1]) {
+        // Two `switch` actions at equal OUTGOING Speed: the `commitChoices` `queue.sort()`
+        // shuffle[2,0,2] is the unit's FIRST draw and there is no dynamic re-sort to compose with
+        // (it is gated on the next queued action being a move), so side One switches first iff that
+        // single bit is 0. The outcome is state-visible — it decides which side's switch-in ability
+        // fires against which mon (rb1250 d32). See `engine::generate::switch_order_tie`.
+        let mut peek = *prng;
+        let b0 = peek.random_range(0, 2);
+        engine::generate::set_forced_tie_order(Some(b0 == 0));
     }
     // Install the realized multi-hit source: `*prng` is the PRNG state at this decision's start
     // (replicate_select consumes it only after generation). A variable multi-hit move realizes its

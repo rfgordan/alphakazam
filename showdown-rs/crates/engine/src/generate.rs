@@ -946,6 +946,25 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
     }
 }
 
+/// Would this pair of choices resolve as a Speed TIE between two `switch` ACTIONS?
+///
+/// Both sides switching queues two `switch` actions at order 103, speed-sorted on the OUTGOING
+/// (current) active's Speed. On a tie `commitChoices`' `queue.sort()` breaks it with one
+/// `shuffle[2,0,2]` (`sim/battle.ts:3038`), and unlike the `eachEvent` Update shuffles that tie
+/// is NOT state-neutral: the faster side's `switch` queues its `runSwitch` at order 101, which
+/// preempts the slower side's pending `switch` (103), so the winner's switch-in ability fires
+/// while the loser's OLD mon is still on the field. rb1250 d32: Heatran and Malamar are both at
+/// 167 Speed and PS's shuffle put p2 first, so Salamence's Intimidate landed on the outgoing
+/// Heatran and Rabsca came in clean.
+///
+/// Unlike a both-move tie there is NO second queue sort to compose with: `runAction`'s gen8
+/// dynamic re-sort (`sim/battle.ts:2940`) is gated on `queue.peek()?.choice === 'move'`, and the
+/// next queued action here is a `switch`. So side One goes first iff the shuffle's single
+/// `random(2)` bit is 0.
+pub fn switch_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
+    matches!((s1, s2), (MoveChoice::Switch(_), MoveChoice::Switch(_))) && actives_speed_tied(state)
+}
+
 /// Recompute a mon's stats for a NEW base-stat spread, preserving its own EV/IV/nature.
 ///
 /// PS's forme changes go through `Pokemon.setSpecies` -> `spreadModify(species.baseStats, this.set)`,
@@ -2001,8 +2020,17 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
         let pairs = [switch_actions[0], switch_actions[1]];
         for b in &mut branches {
             let mut order = pairs;
-            if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
+            let (sp0, sp1) = (effective_speed(&b.state, order[0].0), effective_speed(&b.state, order[1].0));
+            if sp1 > sp0 {
                 order.swap(0, 1);
+            } else if sp1 == sp0 {
+                // A double-switch Speed TIE is decided by `commitChoices`' `queue.sort()` shuffle
+                // and is NOT state-neutral — it picks whose switch-in ability sees whose mon (see
+                // `switch_order_tie`). Replicate forces the realized side; Enumerate/Sample keep
+                // the deterministic side-One-first reading.
+                if forced_tie_order() == Some(false) {
+                    order.swap(0, 1);
+                }
             }
             // A turn-action double switch is NOT batched: the `switch` action (order 103)
             // queues its `runSwitch` (order 101), which preempts the other side's pending
