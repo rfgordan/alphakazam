@@ -4303,6 +4303,70 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         record_move_use(&mut b, side, move_id);
     }
 
+    // ── `runEvent('TryMove')` (`sim/battle-actions.ts:485-492`) ──────────────────────────────
+    // The FIRST thing `useMoveInner` runs after the Pressure PP deduction, and it is one event
+    // for status and damaging moves alike. Queenly Majesty / Dazzling / Armor Tail register
+    // `onFoeTryMove` here; the whole hit-step chain (invulnerability, TryHit — which carries
+    // Protect at priority 3, Psychic Terrain at 4 and the absorbing abilities at 1/0 — type
+    // immunity, the Prankster-vs-Dark check, accuracy) comes after.
+    //
+    // These two blocks used to sit BELOW the `md.category == Status` dispatch, so they only ever
+    // guarded damaging moves and a Prankster-boosted status move sailed straight through. rb1061
+    // d34 is the witness: Klefki's Prankster Thunder Wave (+1 priority) into a Queenly Majesty
+    // Tsareena — PS's whole unit is Tsareena's own move (the block makes no draw at all), while
+    // the engine rolled Thunder Wave's `randomChance(90,100)` and paralysed her.
+    //
+    // Queenly Majesty (breakable): the foe's increased-priority moves fail against the holder's
+    // side (`data/abilities.ts:3671`, `move.priority > 0.1` — the EFFECTIVE priority, so
+    // Prankster / Gale Wings / Grassy Glide boosts count; foeSide-targeting moves exempt).
+    {
+        let holder = b.state.side(foe).active();
+        if holder.is_alive() && holder.ability == crate::ids::Ability::QueenlyMajesty {
+            let atk = b.state.side(side).active();
+            let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
+            let mut pri = md.priority;
+            if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
+                pri += 1;
+            }
+            if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
+                pri += 1;
+            }
+            if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
+                pri += 1;
+            }
+            let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
+            if pri > 0 && !mb && !side_targeting {
+                b.move_failed = true; // blocked → moveThisTurnResult false
+                return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+            }
+        }
+    }
+    // Psychic Terrain blocks priority moves aimed at grounded targets (`data/moves.ts:14120`,
+    // `onTryHitPriority: 4` — above Protect's 3 and the absorbing abilities' 1/0, and it exempts
+    // `move.target === 'self'`). Prankster's boost counts here too: PS compares `effect.priority`,
+    // which `getActionSpeed` has already raised.
+    if b.state.terrain == crate::ids::Terrain::Psychic
+        && md.target != crate::data::MoveTarget::User
+        && b.state.side(foe).active().is_alive()
+        && is_grounded(&b.state, foe)
+    {
+        let atk = b.state.side(side).active();
+        let mut pri = md.priority;
+        if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
+            pri += 1;
+        }
+        if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
+            pri += 1;
+        }
+        if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
+            pri += 1;
+        }
+        if pri > 0 {
+            b.move_failed = true; // blocked → moveThisTurnResult false
+            return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
+        }
+    }
+
     // Prankster-boosted status moves fail against Dark-type targets (after PP is paid).
     if md.category == MoveCategory::Status
         && b.state.side(side).active().ability == crate::ids::Ability::Prankster
@@ -4764,41 +4828,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return end_rampage_on_fail(b, side, move_id);
     }
 
-    // Psychic Terrain blocks priority moves aimed at grounded targets.
-    if b.state.terrain == crate::ids::Terrain::Psychic
-        && md.priority > 0
-        && is_grounded(&b.state, foe)
-        && b.state.side(foe).active().is_alive()
-    {
-        b.move_failed = true; // blocked → moveThisTurnResult false
-        return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
-    }
-
-    // Queenly Majesty (breakable): the foe's increased-priority moves fail against the
-    // holder's side (PS onFoeTryMove, move.priority > 0.1 — the EFFECTIVE priority, so
-    // Prankster / Gale Wings / Grassy Glide boosts count; foeSide-targeting moves exempt).
-    {
-        let holder = b.state.side(foe).active();
-        if holder.is_alive() && holder.ability == crate::ids::Ability::QueenlyMajesty {
-            let atk = b.state.side(side).active();
-            let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
-            let mut pri = md.priority;
-            if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
-                pri += 1;
-            }
-            if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
-                pri += 1;
-            }
-            if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
-                pri += 1;
-            }
-            let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
-            if pri > 0 && !mb && !side_targeting {
-                b.move_failed = true; // blocked → moveThisTurnResult false
-                return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
-            }
-        }
-    }
+    // (Queenly Majesty's `onFoeTryMove` and Psychic Terrain's `onTryHitPriority: 4` are checked
+    // ABOVE, before the status/damaging split — both outrank everything on this path.)
 
     // Air Balloon / Magnet Rise: the holder is off the ground, so Ground moves miss it. Both
     // are `onImmunity('Ground') -> false` (`data/items.ts` airballoon, `data/moves.ts`
