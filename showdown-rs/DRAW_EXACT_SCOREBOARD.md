@@ -6,6 +6,223 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== BURN-DOWN VII — certification (2026-07-26) ====
+
+**HEADLINE: 457 / 512 full games byte-exact from seed (89.3%), up from 444; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Seven parity commits, every one PS-source-grounded, plus the missing burn-down VI certification
+(written retroactively — see the section below it). Judged by the exact-SET diff on BOTH corpora
+at every step: **the newly-non-exact set was EMPTY at all seven.** 13 games / 7 commits =
+**1.86 games/commit**, so the early-stop line (<1 game/commit across 3 consecutive commits) was
+never approached and no asymptote assessment is due.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **457 / 512 = 89.3%**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+
+`convert.rs` was NOT touched, so the seed fixtures' baked digests did not move and no fixture
+regeneration was needed. `gen.rs` was NOT regenerated (no new `MoveData` fields). Every parity
+commit is `crates/engine/src/generate.rs`-only.
+
+## The roots landed (in commit order)
+
+| # | commit | class | games | PS reference |
+|---|--------|-------|-------|--------------|
+| 1 | `6d1c053` | **The residual pass ABORTS the instant the battle ends** — `fieldEvent` runs `this.faintMessages(); if (this.ended) return;` after EVERY handler, and `turnLoop` then returns on `this.ended` WITHOUT calling `endTurn()`, so no later residual handler runs, the trailing `eachEvent('Update')` never fires, and endTurn's per-active bookkeeping (the `stats*ThisTurn` reset, the DisableMove / TrapPokemon sorts) never happens. **AND psn / tox are `onResidualOrder: 9` while brn is 10** — different orders, so PS's one queue runs EVERY poison chip before ANY burn chip, speed-sorted within an order; the engine folded both into one per-side loop that always ran side One first | 444 → 448 | `sim/battle.ts:565-566` `:519` `:2974` `:1675-1676`; `data/conditions.ts:15` (brn 10) `:133` (psn 9) `:154` (tox 9) |
+| 2 | `9ca8c04` | **Disable (7), Throat Chop / Heal Block / Gravity (6) and Taunt (5) are BELOW slp / frz (10), mustrecharge (11), Truant (9) and flinch (8)** in the `BeforeMove` ladder, and `runEvent` short-circuits on the first `false` — so a sleeping mon never reaches the Taunt cancel and slp's `time--` still fires. The engine ran the cancel block first, freezing the sleep counter | 448 → 450 | `data/moves.ts` disable / throatchop / healblock / gravity / taunt `onBeforeMovePriority`; `data/conditions.ts` slp `onBeforeMove` |
+| 3 | `fd03ce2` | **Justified is an `onDamagingHit`, so a Substitute cancels it** (it sat one line above the engine's existing `!hit_sub` guard) — **and Speed Boost's gate is `pokemon.activeTurns`, which a DRAG zeroes too**, not the "chose to switch" flag the engine read | 450 → 451 | `sim/battle-actions.ts:1142` `:137`; `data/abilities.ts:4412` |
+| 4 | `07fca24` | **Protect outranks every absorbing ability** — Protect's condition is `onTryHitPriority: 3`, Sap Sipper / Lightning Rod / Storm Drain / Motor Drive are 1 and Volt Absorb / Water Absorb / Dry Skin / Earth Eater / Flash Fire are 0, and all of them are handlers of the SAME `runEvent('TryHit')` in `hitStepTryHitEvent`. A protected target gets no heal, no redirect boost, no Flash Fire | 451 → 452 | `data/moves.ts:13989` (protect) vs `data/abilities.ts` `onTryHitPriority: 1` |
+| 5 | `d9b1b4f` | **Throat Chop's lock IS a `secondary`** (`{chance: 100, onHit: addVolatile}`), so Sheer Force deletes it — and the same codegen invisibility had kept Throat Chop OUT of `sheer_force_active`, costing it the ×1.3. **AND Aroma Veil blocks a 100%-secondary Heal Block** (the `target_volatile` path never checked it) | 452 → 454 | `data/moves.ts` throatchop `secondary`; `data/abilities.ts:235-243` (aromaveil) |
+| 6 | `8414464` | **Gulp Missile** — `onSourceTryPrimaryHit` loads Cramorant into `cramorantgulping` / `cramorantgorging` (at or below half HP) when its Surf connects; `onDamagingHit` on the loaded forme deals 1/4 of the ATTACKER's `baseMaxhp`, then Def −1 or paralysis, then reverts. A fainted attacker suppresses the revert too | 454 → 457 | `data/abilities.ts` gulpmissile |
+
+Games flipped, by commit: 1 → rb1048 rb1148 rb1237 rb1278; 2 → rb1009 rb1356; 3 → rb1147;
+4 → rb1299; 5 → rb1304 rb1072; 6 → rb1288 rb1367 rb1372.
+
+Three named opens CLOSED outright: **the `stats*ThisTurn` trio** (rb1048 / rb1237 / rb1278 — the
+shared structure the burn-down VI re-triage had just identified as the largest untried one in the
+non-`hp` half), **the `status_counter` class** (rb1009 / rb1356, both of them), and **Gulp Missile**
+(rb1288 / rb1367, open since Phase 5).
+
+## What the re-triage method produced this tranche
+
+Three of the seven roots came from the SAME cheap step, worth repeating verbatim next time:
+
+1. Take every open game whose first divergence has **|Δhp| == 0** — a boost, a volatile bit, a
+   counter. Those are single-mechanic bugs with no downstream noise.
+2. Decode the volatile bitmasks against the enum order in `crates/engine/src/volatile.rs`
+   (discriminant = bit index) and read the *direction* (engine EXTRA vs engine MISSING).
+3. Join on direction + PS handler. Three MISSING `stats*ThisTurn` bits from three different boost
+   paths named one root; two EXTRA `ThroatChop`/`HealBlock` bits named two more.
+
+The other lever that paid: **checking `stateAfter.ended` on the divergent unit.** All three
+witnesses for root 1 were the LAST decision of their game with `ended: true` and `midTurn: true` —
+which is precisely the signature of "PS returned before `endTurn`".
+
+## The 55 still-open games, re-triaged at the certifying commit
+
+First-divergence CLASS split (from the 512 gate):
+
+| n | class |
+|---|-------|
+| 25 | `draws-match/state-diff` |
+| 9 | `result random[16]@…` — a draw miscount in an EARLIER unit |
+| 2 each | `args randomChance@struggle`, `args randomChance@par`, `rust-extra randomChance@accuracy`, `PS shuffle@generic` |
+| 1 each | `PS random@confusion`, `PS randomChance@heavyslam`, `PS randomChance@struggle`, `PS shuffle@thunderbolt`, `PS-unconsumed random@icehammer` / `randomChance@freezedry` / `randomChance@icebeam` / `sample@trace`, `args randomChance@hypervoice` / `randomChance@powerwhip` / `shuffle@generic`, `rust-extra randomChance@crit` |
+
+First-divergence FIELD split: **33 `hp`**, 5 `volatiles`, 6 `boosts` (3 def / 2 atk / 1 spe),
+2 `types`, 1 each `status` / `stall_counter` / `ability` / `species` / `pending_move` / `item` /
+`substitute_hp` / `last_berry` / `pp`. Of the 33 `hp` games **25 exceed 10 HP**, 5 sit in 4-10, and
+3 are within 3.
+
+The 9 `result random[16]` games and the roll that first disagrees (unchanged set):
+rb1021 d59(thunderbolt, rust=13), rb1057 d26(sludgewave, 9), rb1271 d11(hydropump, 9),
+rb1277 d12(gigadrain, 14), rb1310 d18(outrage, 1), rb1329 d24(heatcrash, 1),
+rb1343 d36(voltswitch, 8), rb1369 d46(knockoff, 14), rb1378 d8(ceaselessedge, 6).
+
+The 5 remaining `volatiles` games, decoded (bit index = `volatile.rs` discriminant):
+rb1033 bit 1 `Substitute` engine EXTRA; rb1099 bit 24 `ChoiceLock` on the WRONG SIDE (a Trick
+divergence, with the items also swapped); rb1121 bit 0 `Confusion` engine EXTRA; rb1126 bit 28
+`Unburden` engine MISSING (PS ate the Sitrus, the engine still holds it); rb1245 bit 4 `Encore`
+engine EXTRA. Down from 10 — the whole `stats*ThisTurn` pair and both `ThroatChop`/`HealBlock`
+bits are gone.
+
+Every open game, its first divergent unit, the move pair, the PS handlers its draws name, and
+`[first-divergent-field, max |Δhp| in the block]`, sorted by hp gap:
+
+```
+  rb1024 d81 t73 p1:struggle p2:switch [hp 121]
+  rb1126 d7 t5 p1:sludgebomb p2:strengthsap [volatiles 121]
+  rb1387 d36 t32 p1:encore p2:freezedry [hp 119]
+  rb1029 d22 t18 p1:gunkshot p2:swordsdance [hp 97]
+  rb1369 d46 t42 p1:knockoff p2:bodyslam [hp 92]
+  rb1103 d37 t32 p1:strengthsap p2:struggle [hp 86]
+  rb1125 d2 t3 p1:icebeam p2:flowertrick/T [hp 79]
+  rb1021 d59 t50 p1:thunderbolt p2:wish [hp 69]
+  rb1348 d12 t11 p1:drainingkiss p2:outrage/T [hp 69]
+  rb1231 d15 t12 p1:struggle p2:uturn [hp 66]
+  rb1252 d21 t15 p1:powerwhip p2:partingshot [boost.atk 66]
+  rb1011 d43 t33 p1:closecombat p2:switch [hp 63]
+  rb1243 d11 t10 p1:stompingtantrum p2:knockoff eff=par ev=BeforeMove [hp 62]
+  rb1362 d24 t20 p1:icebeam p2:thunderbolt eff=par ev=BeforeMove [hp 56]
+  rb1184 d5 t6 p1:terastarstorm p2:tachyoncutter [hp 54]
+  rb1012 d60 t52 p1:gigadrain p2:scald eff=futuremove ev=End [hp 47]
+  rb1034 d57 t46 p1:knockoff p2:triplearrows eff=par ev=BeforeMove [boost.def 35]
+  rb1236 d37 t29 p1:dracometeor p2:voltswitch [hp 33]
+  rb1300 d52 t48 p1:sleeptalk p2:focusblast eff=toxicchain ev=DamagingHit [hp 22]
+  rb1326 d50 t40 p1:superfang p2:protect eff=stall ev=StallMove [substitute_hp 18]
+  rb1030 d53 t46 p1:toxic p2:hypervoice eff=harvest ev=Residual [hp 17]
+  rb1116 d7 t6 p1:knockoff/T p2:closecombat [hp 17]
+  rb1108 d4 t5 p1:shadowsneak p2:beakblast eff=cursedbody ev=DamagingHit [hp 16]
+  rb1315 d28 t26 p1:earthquake p2:knockoff eff=shedskin,toxicchain ev=DamagingHit,Residual [hp 16]
+  rb1380 d15 t15 p1:scaleshot p2:toxic eff=shedskin ev=Residual [hp 16]
+  rb1033 d44 t33 p1:substitute p2:discharge eff=confusion ev=BeforeMove [volatiles 15]
+  rb1283 d17 t13 p1:knockoff p2:switch eff=trace ev=Update [hp 15]
+  rb1057 d26 t25 p1:sludgewave p2:psychicnoise [hp 14]
+  rb1378 d8 t8 p1:nastyplot p2:ceaselessedge/T [hp 14]
+  rb1040 d2 t3 p1:stealthrock p2:earthpower/T [hp 13]
+  rb1191 d17 t14 p1:thunderbolt p2:playrough [hp 8]
+  rb1329 d24 t17 p1:heatcrash p2:earthquake [hp 8]
+  rb1343 d36 t27 p1:voltswitch p2:kowtowcleave [hp 8]
+  rb1061 d34 t27 p1:thunderwave p2:rapidspin eff=par ev=BeforeMove [hp 7]
+  rb1121 d18 t15 p1:hurricane p2:uturn eff=toxicchain ev=DamagingHit [volatiles 6]
+  rb1370 d3 t4 p1:hypervoice p2:thunderwave [status 5]
+  rb1271 d11 t9 p1:switch p2:hydropump/T [hp 4]
+  rb1277 d12 t9 p1:sludgebomb p2:gigadrain [hp 3]
+  rb1391 d20 t15 p1:switch p2:heavyslam [hp 3]
+  rb1345 d11 t9 p1:icebeam p2:icebeam [hp 2]
+  rb1093 d22 t17 p1:icehammer p2:switch [boost.spe 0]
+  rb1099 d57 t47 p1:trick p2:calmmind [volatiles 0]
+  rb1119 d8 t7 p1:moonblast p2:sludgewave [types 0]
+  rb1122 d5 t6 p1:shadowball p2:liquidation [boost.def 0]
+  rb1233 d39 t32 p1:clangingscales p2:wish [boost.def 0]
+  rb1239 d64 t51 p1:hurricane p2:dazzlinggleam [stall_counter 0]
+  rb1244 d10 t7 p1:voltswitch/T p2:switch [ability 0]
+  rb1245 d18 t15 p1:hypervoice p2:encore [volatiles 0]
+  rb1250 d32 t29 p1:switch p2:switch [boost.atk 0]
+  rb1253 d12 t10 p1:snowscape p2:bellydrum [species 0]
+  rb1310 d18 t14 p1:dragondance p2:outrage eff=lockedmove ev=Start [pending_move 0]
+  rb1314 d45 t38 p1:stickyweb p2:revivalblessing [item 0]
+  rb1347 d61 t56 p1:trick p2:rest [last_berry 0]
+  rb1359 d7 t7 p1:switch p2:calmmind [types 0]
+  rb1360 d6 t6 p1:dragontail p2:dragontail/T [move3.pp 0]
+```
+
+Recurrences to re-scan after every landing: **`knockoff` 6x** (rb1034 rb1116 rb1243 rb1283 rb1315
+rb1369 — still the largest move cluster), `icebeam` 4x (rb1125 rb1345 rb1362 + rb1345's mirror),
+`struggle` 3x (rb1024 rb1103 rb1231), `thunderbolt` 3x (rb1021 rb1191 rb1362), `hypervoice` 3x
+(rb1030 rb1245 rb1370), `voltswitch` 3x (rb1236 rb1244 rb1343). Handler recurrences: `eff=par
+ev=BeforeMove` 4x (rb1034 rb1061 rb1243 rb1362), `eff=toxicchain ev=DamagingHit` 3x (rb1121
+rb1300 rb1315), `eff=shedskin ev=Residual` 2x (rb1315 rb1380).
+
+## Named opens carried forward — with the newly-located ones first
+
+- **THE BIGGEST STRUCTURAL ONE, now localized: the move's SECONDARIES run AFTER the per-hit
+  `runEvent('DamagingHit')` in the engine, and BEFORE it in PS.** `spreadMoveHit`'s numbered steps
+  are 5. `secondaries()` then 7. `runEvent('DamagingHit')`; the engine's hit loop fires the
+  DamagingHit group at the end of each hit (`apply_damage_hit_rolls`) and the caller applies the
+  secondaries afterwards. **rb1122 d5 is the exact witness**: Palossand sits at Def +5, Azumarill's
+  Liquidation lands and its 20% Def drop procs. PS takes 5 → 4 (secondary) → 6 (Water Compaction
+  +2). The engine takes 5 → 6 (clamped, Water Compaction) → 5 (secondary). This subsumes the
+  Phase-7 "`apply_rattled` / `apply_thermal_exchange` / `apply_weak_armor` still run before the
+  secondaries" open (Justified left that list in commit 3). It is invisible in the DRAW stream —
+  the no-draw handlers make no roll — so only `stateAfter` can catch it, and fixing it means moving
+  the secondaries INTO the hit loop, which will move `random[100]@secondary` draws for multi-hit
+  moves. Wants its own tranche.
+- **A double SWITCH on a Speed TIE must branch on the shuffle's outcome.** rb1250 d32 is the
+  witness and it is fully diagnosed: Heatran and Malamar are both at 167 Speed, the sidecar's first
+  draw is the `shuffle[2,0,2]` over the two `switch` actions (order 103), and PS's realized order
+  put p2 first — so Salamence's Intimidate landed on the OUTGOING Heatran and Rabsca came in clean.
+  The engine treats that shuffle as annotation-only and always resolves side One first. The
+  interleaving itself is already right (`switch` 103 vs `runSwitch` 101 — the faster side completes
+  its whole entry before the slower side switches; a double REPLACEMENT is `instaswitch` at order 3
+  and correctly batches instead), so only the tie-break is missing.
+- **Clanging Scales' self Def −1 lands in the engine and not in PS** (rb1233 d39, 2 diffs). Not yet
+  diagnosed; the target is a Sap Sipper Farigiraf and the user a Soundproof Kommo-o.
+- **The `struggle` cluster (rb1024, rb1103, rb1231) is REQUEST LEGALITY**, unchanged. rb1024 is
+  still the largest single gap in the corpus (121 HP).
+- **Shed Skin is residual order 5/3** and still runs in the branching tail after Harvest (28/2);
+  fixing it moves a DRAW, so the residual's deterministic tail must become branch-based first.
+  Witnesses rb1315, rb1380.
+- **Ice Face's RESTORE (rb1253)** — unchanged; now the ONLY `species` first-divergence left.
+- **Rampage BeforeMove-cancel at `n == 1` with a NON-confused user** — unchanged; rb1310 is still a
+  `result random[16]@outrage` prng-offset game, not this.
+- **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**, **Magnet Rise's
+  `onTry` failure** — unchanged from Phase 5/6.
+- **NEW, opened by commit 2: confusion (3), Attract (2) and paralysis (1) are still resolved in the
+  OUTER pre-move chain**, i.e. ahead of the order-5..7 cancels rather than behind them. PS would
+  cancel on Taunt without ticking the confusion counter or rolling its 1/3 — a DRAW-order
+  consequence, so it wants its own commit and its own witness.
+- **NEW, opened by commit 3: `apply_end_of_turn`'s `switched` parameter is vestigial.** Its plumbing
+  through `request.rs`'s `Pending::Pivot` / `Pending::Revive` can be deleted the next time that
+  file is touched.
+- **NEW, opened by commit 1: Roost's typing is an ENCODING artifact, not PS state.** PS never
+  mutates `pokemon.types` for Roost — the `roost` volatile only filters Flying out of `getTypes()`
+  via `onType` — while the engine strips the type and restores it at residual order 25. The
+  battle-ended abort path now un-strips it explicitly, but ANY decision boundary that falls inside
+  a live Roost window (a pivot or faint request after the Roost, on the same turn) has the same
+  mismatch. The principled fix is in `convert.rs`/`digest.rs` (compare the restored typing when
+  `Roosted` is set, the way the `Roosted` BIT is already masked), and it costs a fixture
+  regeneration.
+- **Kill criterion: NOT triggered.** 1.86 games/commit across seven commits; the worst single
+  commit still flipped one game.
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 457 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== BURN-DOWN VI — certification (2026-07-26, written retroactively) ====
 
 **HEADLINE: 444 / 512 full games byte-exact from seed (86.7%), up from 433; init-aligned

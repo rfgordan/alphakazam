@@ -1,5 +1,98 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN VII (2026-07-26): 457/512 full games byte-exact from seed (89.3%), up from 444;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
+engine tests 12 suites green. Kill criteria NEVER triggered (1.86 games/commit over 7 commits).
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN VII" — before anything else.**
+It carries the six roots (PS file:line each), the re-triaged 55 open games, and the named opens.
+The section below it, "BURN-DOWN VI", was written RETROACTIVELY for the tranche that landed
+`3d99bcf..51fed0b` without one.
+
+The three biggest remaining levers, in order:
+
+1. **The move's SECONDARIES run AFTER the per-hit `runEvent('DamagingHit')` in the engine and
+   BEFORE it in PS.** `spreadMoveHit` step 5 is `secondaries()`, step 7 is `DamagingHit`; the
+   engine's hit loop fires the DamagingHit group at the end of each hit and the caller applies the
+   secondaries afterwards. **rb1122 d5 is the exact witness** (Palossand at Def +5, Liquidation's
+   20% drop procs: PS 5 -> 4 -> 6 with Water Compaction, engine 5 -> 6 clamped -> 5). Subsumes the
+   Phase-7 "onDamagingHit handlers still run before the secondaries" open. Invisible in the draw
+   stream; fixing it moves `random[100]@secondary` for multi-hit moves. Wants its own tranche.
+2. **The 25 games whose first `hp` divergence exceeds 10 HP.** Wrong MECHANICS, one shared root at
+   a time. `knockoff` recurs 6x (rb1034 rb1116 rb1243 rb1283 rb1315 rb1369). Re-run the recurrence
+   scan after every landing.
+3. **The 9 `result random[16]@…` games.** Each has a draw miscount in an EARLIER unit; the compared
+   damage roll differs while the shape matches, which localizes the OFFSET, not the root. rb1029
+   d22 and rb1348 d12 have a clean preceding shape mismatch to start from (`rust-extra`
+   accuracy/crit where PS records none for the whole unit).
+
+**The triage move that produced three of burn-down VII's six roots**, worth repeating first thing:
+take every open game whose first divergence has **|Δhp| == 0** (a boost, a volatile bit, a
+counter), decode the volatile bitmask against the enum order in `crates/engine/src/volatile.rs`
+(discriminant = bit index), and read the DIRECTION (engine EXTRA vs engine MISSING). Three MISSING
+`stats*ThisTurn` bits from three different boost paths named one root; two EXTRA
+`ThroatChop`/`HealBlock` bits named two more. The companion check: **look at `stateAfter.ended` on
+the divergent unit** — `ended: true` + `midTurn: true` on the LAST decision is the signature of
+"PS returned before `endTurn`".
+
+Traps that keep costing cycles:
+1. **`DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]`" at a forced-replacement unit is a FALSE
+   POSITIVE.** The replacement bracket is consumed straight off `prng` in `step_unit` and never
+   enters `chosen_draws`.
+2. **A `pending_move` / counter divergence can be a prng-offset symptom** (rb1310).
+3. **An indented block in a `///` doc comment is compiled as a Rust DOCTEST.** Pasted PS source
+   must be ```` ```text ````-fenced or `cargo test -p engine` fails on it.
+4. **A speed-tie `shuffle` is NOT always state-neutral.** rb1250: the tie between two `switch`
+   actions decides which side's Intimidate sees which mon.
+
+Frames that paid off and are worth keeping:
+- **`spreadMoveHit`'s numbered steps are the draw order:** 1. `getDamage`/`spreadDamage`
+  3. `onHit` 4. `selfDrops` 5. `secondaries()` (flinch is one) 6. `forceSwitch`
+  7. `runEvent('DamagingHit')` 8. `onAfterHit` 9. `eachEvent('Update')`. (See lever 1 — the engine
+  still has 5 and 7 swapped.)
+- **PS's `BeforeMove` ladder, and `runEvent` short-circuits on the first `false`:** 100 glaiverush /
+  grudge / rage / chillyreception (bookkeeping), 11 mustrecharge, 10 slp + frz, 9 Truant, 8 flinch,
+  7 disable, 6 gravity / healblock / throatchop, 5 taunt, 3 confusion, 2 attract, 1 par,
+  -1 destinybond. A handler that never runs also never applies its SIDE EFFECT (slp's `time--`).
+- **PS's `TryHit` is one event:** protect-family conditions are `onTryHitPriority: 3`, the
+  redirect/absorb abilities 1 or 0. Protect always wins.
+- **`fieldEvent('Residual')` is ONE globally ordered queue** and it **RETURNS the moment the battle
+  ends** (`faintMessages(); if (this.ended) return;` after every handler), after which `turnLoop`
+  skips `endTurn()` entirely. `onResidualOrder` off the pin is the authority — note psn/tox 9 vs
+  brn 10 are DIFFERENT orders.
+- **`first_draw_mismatch` compares the DAMAGE ROLL's RESULT**, not just kind+args — a matching shape
+  with a differing `random(16)` proves a prng OFFSET, i.e. a miscount in an earlier unit. Only
+  `random(16)` is compared; the `random(100)` draws log placeholders.
+- **`DBG_INSTR=1`** (with `DBG_GAME`/`DBG_I`) prints the chosen branch's instruction stream — the
+  only thing that localizes a `draws-match/state-diff` unit.
+
+Practical notes:
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests.
+- **`gen.rs` is generated** by `node harness/gen-data.mjs`; regenerating from the pinned PS
+  reproduces it byte-for-byte apart from justified new fields.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE
+  pass (serial, so the blocks are not interleaved). **The DIFF lines only appear on SIDECARS.**
+  `VERBOSE=1` on the gate lifts the row cap.
+- The sidecar's `decisions[i]` is indexed by the gate's `dN` DIRECTLY (`decisions[81]` is `d81`,
+  its `turn` field matches `tN`), and carries `choices`, `draws` with
+  `{kind,args,result,move,effect,event,pokemon}`, and `stateAfter`. A `shuffle` draw also carries
+  `group`/`full` — the actual speed-sorted handler or action list PS shuffled, which is how the
+  rb1250 double-switch tie was identified.
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.**
+- The state divergence itself creates draw-class mislabels. Never treat the draw-class histogram
+  as a partition of roots.
+- The full 512 gate takes ~4 min; `cargo build --release -p cosim -j 2` plus both gates plus the
+  differ exceeds a 600 s tool timeout — run them as separate commands.
+
+--- historical (pre-burn-down-VII) below ---
+
 **BURN-DOWN VI (2026-07-26): 444/512 full games byte-exact from seed (86.7%), up from 433;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
