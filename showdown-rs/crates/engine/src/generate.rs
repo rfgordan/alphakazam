@@ -1258,21 +1258,80 @@ fn is_rampage_move(id: crate::ids::MoveId) -> bool {
     matches!(id.to_id(), "outrage" | "petaldance" | "thrash" | "ragingfury")
 }
 
-/// A rampage use that FAILED to connect — missed (Hustle Outrage), was Protect-blocked, or
-/// had no living target: PS drops the `lockedmove` volatile with no confusion (battle-
-/// actions removes it on any unsuccessful use), and a FIRST use simply never locks (the
-/// `lockedmove` self-volatile only applies on a hit).
-fn end_rampage_on_fail(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
+/// A rampage use that FAILED to connect — missed (Hustle Outrage), was Protect-blocked, had no
+/// living target, or hit an immune target. PS never removes `lockedmove` on a move failure:
+/// the volatile's `duration` is 1 at the start of every locked turn and is re-armed to 2 only
+/// by `onRestart`, which fires from the move's ON-HIT `self: {volatileStatus: 'lockedmove'}`.
+/// A use that does not connect therefore leaves `duration === 1`, and `lockedmove.onAfterMove`
+/// — which `runMove` fires unconditionally after `useMove` (sim/battle-actions.ts:311-312) —
+/// calls `removeVolatile`, i.e. `onEnd`. `onEnd` confuses when `trueDuration <= 1`
+/// (data/conditions.ts:277-279). So a failed rampage on the FINAL locked turn still confuses,
+/// with the `random(2, 6)` duration draw at the move's stream position; only a failure with
+/// rampage turns still to run drops the lock silently. A FIRST use never locks at all.
+///
+/// Returns branches because the confusion duration splits.
+fn end_rampage_on_fail(mut b: Branch, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
+    use crate::state::PendingMove;
     if !is_rampage_move(move_id) {
-        return;
+        return vec![b];
     }
     let pending = b.state.side(side).pending_move;
-    if matches!(pending, crate::state::PendingMove::Rampaging(m, _) if m == move_id) {
-        push(b, Instruction::SetPendingMove { side, previous: pending, new: crate::state::PendingMove::None });
+    let final_turn = matches!(pending, PendingMove::Rampaging(m, n) if m == move_id && n <= 1);
+    if matches!(pending, PendingMove::Rampaging(m, _) if m == move_id) {
+        push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
     }
     if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
-        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+        push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
     }
+    if final_turn
+        && b.state.side(side).active().is_alive()
+        && !b.state.side(side).volatiles.contains(VolatileStatus::Confusion)
+        && b.state.side(side).active().ability != crate::ids::Ability::OwnTempo
+    {
+        push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
+        let mut branches = branch_confusion_counter(b, side);
+        for nb in &mut branches {
+            consume_lum_if_statused(nb, side);
+        }
+        return branches;
+    }
+    vec![b]
+}
+
+/// PS applies a rampage move's `self: { volatileStatus: 'lockedmove' }` in `selfDrops`
+/// (sim/battle-actions.ts:1117 — step 4 of `spreadMoveHit`, after `onHit` and BEFORE the
+/// target's secondaries at step 5 and the `DamagingHit` contact abilities that follow). The
+/// `lockedmove` `onStart` rolls `this.random(2, 4)` (data/conditions.ts:264-267), so that draw
+/// sits at the SELF-DROP position in the stream, not at the end of the move.
+///
+/// Only a CONNECTING hit gets here — an immune/missed/blocked use never runs `selfDrops`, so it
+/// never starts a lock. A continuation instead hits `onRestart`, which rolls nothing.
+fn start_rampage_lock(b: Branch, side: SideId, move_id: crate::ids::MoveId) -> Vec<Branch> {
+    use crate::state::PendingMove;
+    if !is_rampage_move(move_id)
+        || b.state.side(side).pending_move != PendingMove::None
+        || !b.state.side(side).active().is_alive()
+    {
+        return vec![b];
+    }
+    // `trueDuration` is the mid-turn (kernel) value {2,3}; the end-of-turn `onResidual`
+    // decrements it, so the terminal snapshot is {1,2}.
+    [2u8, 3]
+        .into_iter()
+        .map(|rem| {
+            let mut nb = scaled(&b, 0.5);
+            draw(&mut nb, "random", &[2, 4], rem as i64, "lockedmove");
+            push(&mut nb, Instruction::SetPendingMove {
+                side,
+                previous: PendingMove::None,
+                new: PendingMove::Rampaging(move_id, rem),
+            });
+            if !nb.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                push(&mut nb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::LockedMove });
+            }
+            nb
+        })
+        .collect()
 }
 
 /// Apply rampage lock state transitions to every outcome branch after the move resolves.
@@ -1293,17 +1352,16 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
         })
     };
     if failed {
+        // Same rule as every other non-connecting use: the lock ends here, and on the FINAL
+        // locked turn `lockedmove.onEnd` still confuses (see `end_rampage_on_fail`).
         return out
             .into_iter()
-            .map(|mut b| {
-                let pending = b.state.side(side).pending_move;
-                if matches!(pending, PendingMove::Rampaging(m, _) if m == move_id) {
-                    push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
-                    if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
-                        push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
-                    }
+            .flat_map(|b| {
+                if matches!(b.state.side(side).pending_move, PendingMove::Rampaging(m, _) if m == move_id) {
+                    end_rampage_on_fail(b, side, move_id)
+                } else {
+                    vec![b]
                 }
-                b
             })
             .collect();
     }
@@ -1348,25 +1406,10 @@ fn apply_rampage_state(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                         vec![b]
                     }
                 }
-                PendingMove::None => {
-                    // Starting a rampage: PS's lockedmove `onStart` sets `trueDuration =
-                    // this.random(2,4)` (2 or 3), which is the mid-turn (kernel) value; the
-                    // end-of-turn `onResidual` then decrements it, so the terminal snapshot is
-                    // {1,2}. The engine stores the kernel value here and decrements at end of turn.
-                    [2u8, 3]
-                        .into_iter()
-                        .map(|rem| {
-                            let mut nb = scaled(&b, 0.5);
-                            // PS `lockedmove` `onStart`: `trueDuration = this.random(2, 4)` (2/3).
-                            draw(&mut nb, "random", &[2, 4], rem as i64, "lockedmove");
-                            push(&mut nb, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::Rampaging(move_id, rem) });
-                            if !nb.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
-                                push(&mut nb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::LockedMove });
-                            }
-                            nb
-                        })
-                        .collect()
-                }
+                // Starting a rampage is NOT here: PS applies `self: {volatileStatus:'lockedmove'}`
+                // in `selfDrops` (battle-actions.ts:1117, step 4 of `spreadMoveHit`), i.e. BEFORE
+                // the target's secondaries and before the `DamagingHit` contact abilities — see
+                // `start_rampage_lock`, called at the self-drop fork.
                 _ => vec![b],
             }
         })
@@ -4509,10 +4552,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // High Jump Kick / Jump Kick / Supercell Slam still crash into the protector (1/2
         // max HP — PS `onMoveFail` fires on a protected target too).
         apply_crash_damage(&mut b, side, &md);
-        // A blocked rampage ends its lock without confusion; a blocked first use never locks.
-        end_rampage_on_fail(&mut b, side, move_id);
         b.move_failed = true; // Protect-blocked → PS moveThisTurnResult false (doubles ST)
-        return vec![b];
+        // A blocked rampage ends its lock (Protect's own `onTryHit` only deletes it outright
+        // when `duration === 2`, which a non-connecting turn never reaches).
+        return end_rampage_on_fail(b, side, move_id);
     }
 
     // Psychic Terrain blocks priority moves aimed at grounded targets.
@@ -4653,18 +4696,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // High Jump Kick / Jump Kick / Supercell Slam: missing costs the user 1/2 of its
         // max HP (crash; PS `onMoveFail` → `damage(source.baseMaxhp / 2)`).
         apply_crash_damage(&mut mb, side, &md);
-        end_rampage_on_fail(&mut mb, side, move_id);
         mb.move_failed = true; // missed → PS moveThisTurnResult false (doubles ST next turn)
-        miss_out.push(mb);
+        miss_out.extend(end_rampage_on_fail(mb, side, move_id));
     }
 
     let foe_alive = b.state.side(foe).active().is_alive();
     if !foe_alive {
         // No living target: the move fails outright — no rampage lock, no recharge.
         let mut hb = scaled(&b, hit_prob);
-        end_rampage_on_fail(&mut hb, side, move_id);
         hb.move_failed = true; // no target → moveThisTurnResult false
-        out.push(hb);
+        out.extend(end_rampage_on_fail(hb, side, move_id));
         out.extend(miss_out);
         return out;
     }
@@ -4674,9 +4715,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // `hitStepInvulnerability` empties `targets`, so `trySpreadMoveHit` returns false and
         // `useMoveInner` fires MoveFail — the crash-damage moves crash.
         apply_crash_damage(&mut hb, side, &md);
-        end_rampage_on_fail(&mut hb, side, move_id);
         hb.move_failed = true; // dodged (semi-invulnerable) → moveThisTurnResult false
-        out.push(hb);
+        out.extend(end_rampage_on_fail(hb, side, move_id));
         out.extend(miss_out);
         return out;
     }
@@ -4945,7 +4985,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let damaged: Vec<(Branch, bool)> = damaged
         .into_iter()
         .flat_map(|(hb, hit_sub)| {
-            apply_self_drop(hb, side, &md).into_iter().map(move |x| (x, hit_sub)).collect::<Vec<_>>()
+            apply_self_drop(hb, side, &md)
+                .into_iter()
+                // Same `selfDrops` step: a rampage move's `self: {volatileStatus:'lockedmove'}`
+                // (a Dancer copy — `external` — engages no lock).
+                .flat_map(|x| if external { vec![x] } else { start_rampage_lock(x, side, move_id) })
+                .map(move |x| (x, hit_sub))
+                .collect::<Vec<_>>()
         })
         .collect();
     for (mut hb, hit_sub) in damaged {
