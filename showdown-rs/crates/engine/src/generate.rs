@@ -4915,8 +4915,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // path (seed gate / differ) draws each member's crit + damage off the source; Enumerate/
         // Sample stay on the sumset-DP convolution (no per-hit stream needed).
         if let Some(cur) = realized_cursor(&b) {
-            let calcs = beatup_calcs(&b, side, &md);
-            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
+            let mds = beatup_mds(&b, side, &md);
+            let calcs: Vec<DamageCalc> = mds.iter().map(|m| compute_damage(&b, side, m)).collect();
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur)
         } else {
             apply_beatup(&b, side, &md, hit_prob)
         }
@@ -4940,7 +4941,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             let slot = hb.state.side(foe).active_index;
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: dealt });
         }
-        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability);
+        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability, false);
         vec![(hb, false)]
     } else if matches!(md.id.to_id(), "populationbomb")
         && realized_cursor(&b).is_some()
@@ -4949,7 +4950,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // single branch off the source (per-hit accuracy + crit + damage, Loaded Dice count).
         let cur = realized_cursor(&b).unwrap();
         let calcs = vec![compute_damage(&b, side, &md)];
-        apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
+        apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, std::slice::from_ref(&md), cur)
     } else if matches!(md.id.to_id(), "tripleaxel" | "triplekick") {
         // Ascending power (20/40/60 or 10/20/30) with a fresh 90% accuracy check per hit;
         // a miss ends the move. hit_prob here is the single-hit accuracy.
@@ -4961,7 +4962,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if let Some(cur) = realized_cursor(&b) {
             // Realized single path (seed gate / differ): per-hit accuracy + crit + damage off the
             // source, KO-truncated. The enumerated branch below serves Enumerate/Sample (no draws).
-            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, cur)
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur)
         } else {
             let crit_p = crit_chance(&b, side, &md);
             let acc = hit_prob;
@@ -6107,13 +6108,21 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         if let HitRolls::Realized { cur, .. } = &mut rolls {
             realized_per_hit_damaging_hit(b, side, md, cur);
         }
+        // The no-draw `onDamagingHit` handlers are part of that SAME per-hit event: Stamina's
+        // +1 Def, Rough Skin / Iron Barbs / Rocky Helmet's chip, Gooey's -1 Spe. A stat one of
+        // them moved is visible to the NEXT hit's damage formula, so re-derive the calc.
+        let restat = damaging_hit_reactions_change_stats(b, side);
+        apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
+        if restat {
+            calc = compute_damage(b, side, md);
+        }
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
     // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
     // one hit connected with the Pokémon itself (a fully sub-absorbed move records nothing:
     // its per-target damage entry stays `false`). Verified against the pin empirically.
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
-    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability, true);
     hit_sub
 }
 
@@ -6129,6 +6138,7 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
     let mut total_dealt: i32 = 0;
     let mut hits_landed: u8 = 0;
     let mut hits_executed: u8 = 0;
+    let mut restat_dirty = false;
     for (i, &(roll, crit)) in hits.iter().enumerate() {
         let indexed_calc = &calcs[i.min(calcs.len() - 1)];
         let initial_rolls = if crit { &indexed_calc.rolls_crit } else { &indexed_calc.rolls_nocrit };
@@ -6152,8 +6162,11 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             break_ice_face(b, foe);
             continue;
         }
-        // Indexed moves change power each hit, and Ice Face can change Defense between hits.
-        let noice_calc = if b.state.side(foe).active().species == crate::ids::Species::from_id("eiscuenoice").unwrap_or(crate::ids::Species::None) {
+        // Indexed moves change power each hit, and Ice Face — or a per-hit `onDamagingHit`
+        // reaction (Stamina's +1 Def) — can change Defense between hits.
+        let noice_calc = if b.state.side(foe).active().species == crate::ids::Species::from_id("eiscuenoice").unwrap_or(crate::ids::Species::None)
+            || restat_dirty
+        {
             Some(compute_damage(b, side, &{ let mut m = *md; m.base_power *= (i + 1) as u16; m }))
         } else {
             None
@@ -6183,19 +6196,144 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
             hits_landed += 1;
             hits_executed += 1;
         }
+        // `runEvent('DamagingHit')` fires at the end of EVERY hit (battle-actions.ts:1142).
+        restat_dirty |= damaging_hit_reactions_change_stats(b, side);
+        apply_damaging_hit_reactions(b, side, md, dmg > 0, false, def_item, def_ability);
     }
     // PS's `timesAttacked += hit - 1` counts every EXECUTED hit — including ones a Substitute
     // absorbed and the KO-ing hit (nothing after a faint executes) — but only when at least
     // one hit connected with the Pokémon itself (a fully sub-absorbed move records nothing:
     // its per-target damage entry stays `false`). Verified against the pin empirically.
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
-    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
+    apply_post_damage(b, side, md, total_dealt, any_damage, hit_sub, times_count, life_orb, def_item, def_ability, true);
     hit_sub
 }
 
+/// PS's `runEvent('DamagingHit')` (`sim/battle-actions.ts:1142`) sits at the END of
+/// `spreadMoveHit`, which `hitStepMoveHitLoop` calls ONCE PER HIT — so every `onDamagingHit`
+/// handler fires once per hit of a multi-hit move, not once per move. A 3-hit Triple Axel
+/// raises a Stamina holder's Defense three times (`data/abilities.ts:4471-4474`, an
+/// unconditional `this.boost({def: 1})`) and each later hit is computed against the raised
+/// stat; Rough Skin / Iron Barbs (`:3893` / `:2179`, `onDamagingHitOrder: 1`) and Rocky Helmet
+/// (`data/items.ts:5296`, `onDamagingHitOrder: 2`) likewise bite once per hit.
+///
+/// rb1202 d2 is the witness: p1 U-turns into a Stamina Archaludon and p2's Triple Axel lands
+/// all three hits — PS ends at `def: +3` / 218 HP, the engine at `def: +1` / 189.
+///
+/// Berserk and Anger Shell are NOT here: they are `onDamage` + `onAfterMoveSecondary`
+/// (`data/abilities.ts:404` / `:143`), keyed on the move's total, and stay once per move.
+fn apply_damaging_hit_reactions(
+    b: &mut Branch,
+    side: SideId,
+    md: &crate::data::MoveData,
+    any_damage: bool,
+    hit_sub: bool,
+    def_item: Item,
+    def_ability: crate::ids::Ability,
+) {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    if !any_damage {
+        return;
+    }
+    let aslot = b.state.side(side).active_index;
+    // Magic Guard blocks EVERY non-Move damage source: Rough Skin / Iron Barbs pass the
+    // ABILITY and Rocky Helmet the ITEM as the effect, so all three are blocked.
+    let magic_guard = b.state.side(side).active().ability == Ab::MagicGuard;
+    // Contact punishers: Rough Skin / Iron Barbs (1/8, ability onDamagingHit) AND Rocky
+    // Helmet (1/6, item) — PS runs BOTH when the holder has ability + item (the c5
+    // directed traces caught the engine applying only one).
+    if md.flag_contact && !hit_sub && !magic_guard {
+        if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
+            let atk = b.state.side(side).active();
+            if atk.is_alive() {
+                let dmg = (atk.max_hp / 8).max(1).min(atk.hp);
+                push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+            }
+        }
+        if def_item == Item::RockyHelmet {
+            let atk = b.state.side(side).active();
+            if atk.is_alive() {
+                let dmg = (atk.max_hp / 6).max(1).min(atk.hp);
+                push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
+            }
+        }
+    }
+    // Electromorphosis charges the holder after any damaging hit. The Charge volatile
+    // doubles its next Electric move and is consumed by that move.
+    if !hit_sub
+        && def_ability == Ab::Electromorphosis
+        && b.state.side(foe).active().is_alive()
+        && !b.state.side(foe).volatiles.contains(VolatileStatus::Charge)
+    {
+        push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Charge });
+    }
+    if hit_sub {
+        return;
+    }
+    let f = b.state.side(foe).active();
+    if f.is_alive() {
+        match f.ability {
+            Ab::Stamina => {
+                raise_boost(b, foe, BoostIndex::Defense, 1);
+            }
+            Ab::WaterCompaction if md.typ == Type::Water => {
+                raise_boost(b, foe, BoostIndex::Defense, 2);
+            }
+            _ => {}
+        }
+    }
+    // onDamagingHit reactions that fire even while the holder is FAINTING (PS runs the
+    // event before faint processing; the c5 directed traces caught the is_alive gate):
+    // Seed Sower's terrain is field-level, and Gooey/Tangling Hair boost the ATTACKER.
+    let f = b.state.side(foe).active();
+    match f.ability {
+        Ab::SeedSower => {
+            // Being hit by a damaging move plants Grassy Terrain (PS onDamagingHit
+            // this.field.setTerrain — fails silently if already Grassy).
+            if b.state.terrain != crate::ids::Terrain::Grassy {
+                let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
+                emit_field_change_shuffle(b); // setTerrain -> eachEvent('TerrainChange')
+                push(b, Instruction::ChangeTerrain {
+                    previous: b.state.terrain,
+                    previous_turns: b.state.terrain_turns,
+                    new: crate::ids::Terrain::Grassy,
+                    new_turns: turns,
+                });
+                refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
+            }
+        }
+        Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
+            // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
+            // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
+            // Defiant/Competitive apply on the attacker's side).
+            if b.state.side(side).active().is_alive() {
+                if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
+                    react_to_stat_drop(b, side);
+                    apply_white_herb(b, side);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when one of the per-hit `onDamagingHit` reactions can change a stat the damage formula
+/// reads, so the realized hit loops must re-derive the `DamageCalc` for the next hit.
+fn damaging_hit_reactions_change_stats(b: &Branch, side: SideId) -> bool {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    matches!(b.state.side(foe).active().ability, Ab::Stamina | Ab::WaterCompaction)
+        || matches!(b.state.side(foe).active().ability, Ab::Gooey | Ab::TanglingHair)
+        || b.state.side(foe).active().ability == Ab::SeedSower
+        || b.state.side(side).active().ability == Ab::Stamina
+}
+
 /// Effects keyed on the *total* damage a move dealt: drain, move recoil, Life Orb recoil,
-/// contact punishers (Rocky Helmet / Rough Skin / Iron Barbs), and Toxic Debris. Shared by
-/// the exact per-hit path and the multi-hit sumset-DP path so both stay in lockstep.
+/// and Toxic Debris. Shared by the exact per-hit path and the multi-hit sumset-DP path so both
+/// stay in lockstep. `per_hit_done` suppresses the `runEvent('DamagingHit')` reactions when the
+/// caller already fired them inside its hit loop (the realized executors).
+#[allow(clippy::too_many_arguments)]
 fn apply_post_damage(
     b: &mut Branch,
     side: SideId,
@@ -6207,6 +6345,7 @@ fn apply_post_damage(
     life_orb: bool,
     def_item: Item,
     def_ability: crate::ids::Ability,
+    per_hit_done: bool,
 ) {
     use crate::ids::Ability as Ab;
     let foe = side.other();
@@ -6254,34 +6393,13 @@ fn apply_post_damage(
                 push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
             }
         }
-        // Contact punishers: Rough Skin / Iron Barbs (1/8, ability onDamagingHit) AND Rocky
-        // Helmet (1/6, item) — PS runs BOTH when the holder has ability + item (the c5
-        // directed traces caught the engine applying only one).
-        if md.flag_contact && !hit_sub && !magic_guard {
-            if matches!(def_ability, Ab::RoughSkin | Ab::IronBarbs) {
-                let atk = b.state.side(side).active();
-                if atk.is_alive() {
-                    let dmg = (atk.max_hp / 8).max(1).min(atk.hp);
-                    push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
-                }
-            }
-            if def_item == Item::RockyHelmet {
-                let atk = b.state.side(side).active();
-                if atk.is_alive() {
-                    let dmg = (atk.max_hp / 6).max(1).min(atk.hp);
-                    push(b, Instruction::Damage { side, slot: aslot, amount: dmg });
-                }
-            }
-        }
-        // Electromorphosis charges the holder after any damaging hit. The Charge volatile
-        // doubles its next Electric move and is consumed by that move.
-        if !hit_sub
-            && def_ability == Ab::Electromorphosis
-            && b.state.side(foe).active().is_alive()
-            && !b.state.side(foe).volatiles.contains(VolatileStatus::Charge)
-        {
-            push(b, Instruction::ApplyVolatile { side: foe, volatile: VolatileStatus::Charge });
-        }
+    }
+    // The `runEvent('DamagingHit')` reactions (contact punishers, Stamina, Gooey, …). PS fires
+    // that event at the END of EVERY hit; the realized executors therefore call
+    // `apply_damaging_hit_reactions` inside their hit loop and pass `per_hit_done`, so this
+    // once-per-move fallback only serves the enumeration paths that have no per-hit stream.
+    if !per_hit_done {
+        apply_damaging_hit_reactions(b, side, md, any_damage, hit_sub, def_item, def_ability);
     }
 
     // Moxie / Chilling Neigh (+ As One Glastrier): +1 Atk on a KO; Grim Neigh (+ As One
@@ -6446,18 +6564,13 @@ fn apply_post_damage(
         }
     }
 
-    // Defender on-hit reaction abilities (only when the hit connected with the mon itself).
+    // Defender reactions keyed on the move's TOTAL damage — `onAfterMoveSecondary`, not
+    // `onDamagingHit`, so they stay once per move even for a multi-hit move.
     if any_damage && !hit_sub {
         let f = b.state.side(foe).active();
         if f.is_alive() {
             use crate::ids::Ability as Ab;
             match f.ability {
-                Ab::Stamina => {
-                    raise_boost(b, foe, BoostIndex::Defense, 1);
-                }
-                Ab::WaterCompaction if md.typ == Type::Water => {
-                    raise_boost(b, foe, BoostIndex::Defense, 2);
-                }
                 Ab::Berserk => {
                     // Fires when the hit drops the holder below half.
                     let hp = f.hp as i32;
@@ -6489,39 +6602,6 @@ fn apply_post_damage(
                 }
                 _ => {}
             }
-        }
-        // onDamagingHit reactions that fire even while the holder is FAINTING (PS runs the
-        // event before faint processing; the c5 directed traces caught the is_alive gate):
-        // Seed Sower's terrain is field-level, and Gooey/Tangling Hair boost the ATTACKER.
-        let f = b.state.side(foe).active();
-        match f.ability {
-            Ab::SeedSower => {
-                // Being hit by a damaging move plants Grassy Terrain (PS onDamagingHit
-                // this.field.setTerrain — fails silently if already Grassy).
-                if b.state.terrain != crate::ids::Terrain::Grassy {
-                    let turns = if f.item == Item::TerrainExtender { 8 } else { 5 };
-                    emit_field_change_shuffle(b); // setTerrain -> eachEvent('TerrainChange')
-                    push(b, Instruction::ChangeTerrain {
-                        previous: b.state.terrain,
-                        previous_turns: b.state.terrain_turns,
-                        new: crate::ids::Terrain::Grassy,
-                        new_turns: turns,
-                    });
-                    refresh_proto_quark(b); // PS Quark Drive `onTerrainChange`
-                }
-            }
-            Ab::Gooey | Ab::TanglingHair if md.flag_contact => {
-                // Contact drops the attacker's Speed by 1 (PS onDamagingHit boost(spe:-1)
-                // with source=holder — a foe-inflicted drop, so blockers/Mirror Armor and
-                // Defiant/Competitive apply on the attacker's side).
-                if b.state.side(side).active().is_alive() {
-                    if apply_boost_clamped(b, side, BoostIndex::Speed, -1) < 0 {
-                        react_to_stat_drop(b, side);
-                        apply_white_herb(b, side);
-                    }
-                }
-            }
-            _ => {}
         }
         // Soul-Heart: +1 SpA whenever a Pokémon faints from this hit.
         if !b.state.side(foe).active().is_alive()
@@ -7056,7 +7136,7 @@ fn apply_multihit_dp_ice_face(
         }
         apply_post_damage(
             &mut hb, side, md, total, total > 0, false, hits.saturating_sub(1) as u8,
-            calc.life_orb, calc.def_item, calc.def_ability,
+            calc.life_orb, calc.def_item, calc.def_ability, false,
         );
         out.push((hb, false));
     }
@@ -7151,7 +7231,7 @@ fn apply_multihit_dp_ice_face_sub(
         let only_hit_substitute = mon_hits == 0;
         apply_post_damage(
             &mut hb, side, md, sub_damage + mon, sub_damage + mon > 0, only_hit_substitute,
-            damaging_hits, noice_calc.life_orb, noice_calc.def_item, noice_calc.def_ability,
+            damaging_hits, noice_calc.life_orb, noice_calc.def_item, noice_calc.def_ability, false,
         );
         out.push((hb, only_hit_substitute));
     }
@@ -7246,7 +7326,7 @@ fn apply_multihit_dp(b: &Branch, side: SideId, md: &crate::data::MoveData, min: 
         if total > 0 {
             push(&mut hb, Instruction::Damage { side: foe, slot, amount: total as i16 });
         }
-        apply_post_damage(&mut hb, side, md, total, total > 0, false, hits, calc.life_orb, calc.def_item, calc.def_ability);
+        apply_post_damage(&mut hb, side, md, total, total > 0, false, hits, calc.life_orb, calc.def_item, calc.def_ability, false);
         out.push((hb, false));
     }
     out
@@ -7325,7 +7405,7 @@ fn apply_multihit_dp_sub(
         let only_hit_substitute = mon_hits == 0;
         let times_count = if mon_hits > 0 { executed } else { 0 };
         apply_post_damage(&mut hb, side, md, sub_dmg + mon, sub_dmg + mon > 0,
-            only_hit_substitute, times_count, calc.life_orb, calc.def_item, calc.def_ability);
+            only_hit_substitute, times_count, calc.life_orb, calc.def_item, calc.def_ability, false);
         out.push((hb, only_hit_substitute));
     }
     out
@@ -7391,7 +7471,7 @@ fn apply_multihit_realized(
 /// faint never executes, so the draw stream truncates exactly where PS's `hitStepMoveHitLoop` breaks.
 fn apply_multihit_realized_ma(
     b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32,
-    calcs: &[DamageCalc], mut cur: RealizedCursor,
+    calcs: &[DamageCalc], mds: &[crate::data::MoveData], mut cur: RealizedCursor,
 ) -> Vec<(Branch, bool)> {
     use crate::ids::Ability as Ab;
     let foe = side.other();
@@ -7417,6 +7497,9 @@ fn apply_multihit_realized_ma(
     let mut total: i32 = 0;
     let mut hits_landed: u8 = 0;
     let mut hits_executed: u8 = 0;
+    // Set once a per-hit `onDamagingHit` reaction has moved a stat the damage formula reads,
+    // after which each remaining hit re-derives its `DamageCalc` from that hit's `MoveData`.
+    let mut restat_dirty = false;
     for i in 0..count {
         // PS breaks the loop at the TOP once the target has fainted (before any hit draw).
         if hb.state.side(foe).active().hp <= 0 {
@@ -7441,7 +7524,12 @@ fn apply_multihit_realized_ma(
         // `draw` above advances the real prng / draw log but not this cursor clone), so the next
         // hit's crit/accuracy/damage peek stays aligned on a screened target.
         cur.consume_shuffle(modifydamage_screen_count(&hb));
-        let calc = &calcs[i.min(calcs.len() - 1)];
+        let fresh_calc = if restat_dirty {
+            Some(compute_damage(&hb, side, &mds[i.min(mds.len() - 1)]))
+        } else {
+            None
+        };
+        let calc = fresh_calc.as_ref().unwrap_or(&calcs[i.min(calcs.len() - 1)]);
         let raw = if crit { calc.rolls_crit[roll] } else { calc.rolls_nocrit[roll] };
         let bypass_sub = md.flag_sound
             || hb.state.side(side).active().ability == Ab::Infiltrator;
@@ -7483,9 +7571,11 @@ fn apply_multihit_realized_ma(
         // PS `spreadMoveHit` runs `runEvent('DamagingHit')` after EVERY hit — Fezandipiti's Beat Up
         // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`.
         realized_per_hit_damaging_hit(&mut hb, side, md, &mut cur);
+        restat_dirty |= damaging_hit_reactions_change_stats(&hb, side);
+        apply_damaging_hit_reactions(&mut hb, side, md, dmg > 0, false, def_item, def_ability);
     }
     let times_count = if hits_landed > 0 { hits_executed } else { 0 };
-    apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability);
+    apply_post_damage(&mut hb, side, md, total, any_damage, hit_sub, times_count, life_orb, def_item, def_ability, true);
     hb.per_hit_procs_done = true;
     vec![(hb, hit_sub)]
 }
@@ -7500,7 +7590,14 @@ fn apply_multihit_realized_ma(
 /// user always, plus each ally that is alive and status-free), each with base power
 /// `5 + floor(species base Atk / 10)` but the USER's Attack vs the target's Defense.
 fn beatup_calcs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<DamageCalc> {
-    let mut calcs: Vec<DamageCalc> = Vec::new();
+    beatup_mds(b, side, md).iter().map(|m| compute_damage(b, side, m)).collect()
+}
+
+/// Beat Up's per-participant `MoveData` (party order, each with that member's base power), the
+/// input `beatup_calcs` folds into `DamageCalc`s. Kept separate so the realized executor can
+/// re-derive a hit's calc after a per-hit `onDamagingHit` reaction moved the target's Defense.
+fn beatup_mds(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<crate::data::MoveData> {
+    let mut mds: Vec<crate::data::MoveData> = Vec::new();
     let s = b.state.side(side);
     // PS iterates `pokemon.side.pokemon` in its CURRENT array order (active-first, swap-tracked),
     // NOT the fixed canonical/teampreview slot order the engine stores. Since each participant's
@@ -7523,9 +7620,9 @@ fn beatup_calcs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Dam
         let bp = (5 + (base_atk / 10)).max(1) as u16;
         let mut m = *md;
         m.base_power = bp;
-        calcs.push(compute_damage(b, side, &m));
+        mds.push(m);
     }
-    calcs
+    mds
 }
 
 fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32) -> Vec<(Branch, bool)> {
@@ -7612,7 +7709,7 @@ fn apply_beatup(b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: 
         let only_hit_substitute = mon_hits == 0 && sub_dmg > 0;
         let times_count = if mon_hits > 0 { executed } else { 0 };
         apply_post_damage(&mut hb, side, md, sub_dmg + mon, mon > 0,
-            only_hit_substitute, times_count, calcs[0].life_orb, calcs[0].def_item, calcs[0].def_ability);
+            only_hit_substitute, times_count, calcs[0].life_orb, calcs[0].def_item, calcs[0].def_ability, false);
         out.push((hb, only_hit_substitute));
     }
     out
