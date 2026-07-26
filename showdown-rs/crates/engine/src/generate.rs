@@ -1253,6 +1253,19 @@ fn mark_slept_by_foe(b: &mut Branch, side: SideId) {
     }
 }
 
+/// PS `mustrecharge.onBeforeMove` (data/conditions.ts:364-373): the recharge turn removes BOTH
+/// the `mustrecharge` volatile and — explicitly — the holder's `truant` volatile, then returns
+/// null. Truant's own `onBeforeMove` (priority 9) never runs, because `runEvent` breaks on
+/// mustrecharge's falsy return at priority 11; PS clears it by hand so a Slaking that spent its
+/// recharge turn is NOT also loafing on the turn after.
+fn clear_recharge_volatiles(b: &mut Branch, side: SideId) {
+    for v in [VolatileStatus::MustRecharge, VolatileStatus::Truant] {
+        if b.state.side(side).volatiles.contains(v) {
+            push(b, Instruction::RemoveVolatile { side, volatile: v });
+        }
+    }
+}
+
 /// Rampage moves lock the user in for 2-3 turns total, then confuse it.
 fn is_rampage_move(id: crate::ids::MoveId) -> bool {
     matches!(id.to_id(), "outrage" | "petaldance" | "thrash" | "ragingfury")
@@ -2939,6 +2952,7 @@ fn flinch_cancel_chain(mut b: Branch, side: SideId) -> Vec<Branch> {
     if matches!(pending, crate::state::PendingMove::Recharging) {
         // mustrecharge (11) removes itself and cancels before slp/frz/Truant/flinch run.
         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: crate::state::PendingMove::None });
+        clear_recharge_volatiles(&mut b, side);
         return vec![b];
     }
     match status {
@@ -3792,6 +3806,15 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
             {
                 let prev = b.state.side(side).pending_move;
                 push(b, Instruction::SetPendingMove { side, previous: prev, new: crate::state::PendingMove::Recharging });
+                // Keep the `mustrecharge` VOLATILE bit in lockstep with `pending_move`:
+                // `convert.rs` sets both when it reads PS's `mustrecharge` volatile
+                // (crates/cosim/src/convert.rs:536-539), and the digest hashes the raw bitset,
+                // so an engine state that only moved `pending_move` mismatches every PS state
+                // captured while the recharge is pending (rb1092 t14, rb1157 t15 — Giga Impact:
+                // PS's volatiles carry bit 21, the engine's do not).
+                if !b.state.side(side).volatiles.contains(VolatileStatus::MustRecharge) {
+                    push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::MustRecharge });
+                }
             }
         }
     }
@@ -4126,6 +4149,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Recharge: the mon spent a recharge move last turn and forfeits this one.
     if matches!(pending, PendingMove::Recharging) && !called {
         push(&mut b, Instruction::SetPendingMove { side, previous: pending, new: PendingMove::None });
+        clear_recharge_volatiles(&mut b, side);
         return vec![b];
     }
     // Are we cashing in a two-turn move that finished charging last turn?

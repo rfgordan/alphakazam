@@ -566,6 +566,13 @@ pub(crate) fn resolve_choice(
             let side = &state.sides[si];
             let active = &side.pokemon[side.active_index as usize];
             let mid = r.move_id.as_deref().unwrap_or("");
+            if mid == "recharge" {
+                // PS's request for a `mustrecharge` mon offers the single pseudo-move
+                // "recharge" (sim/pokemon.ts `getMoveRequestData`), which is not on the set.
+                // The engine signals it through `pending_move == Recharging`: whatever slot is
+                // chosen, `before_move` cancels the attempt and clears the flag.
+                return Ok((MoveChoice::Move(0), r.tera));
+            }
             if mid == "struggle" {
                 // engine signals Struggle via a 0-pp chosen slot
                 let slot = active.moves.iter().position(|m| m.pp == 0).unwrap_or(0);
@@ -635,6 +642,10 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             if m != engine::ids::MoveId::None {
                 eng_moves = vec![m.to_id().to_string()];
             }
+        }
+        // A recharging mon's request is PS's single pseudo-move "recharge".
+        if side.pending_move == engine::state::PendingMove::Recharging {
+            eng_moves = vec!["recharge".to_string()];
         }
         eng_moves.sort();
         if ps_moves != eng_moves && ps_moves != vec!["struggle".to_string()] {
