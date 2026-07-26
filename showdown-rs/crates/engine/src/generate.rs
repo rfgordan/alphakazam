@@ -4090,6 +4090,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 && pressure_affected(&md);
             let amount = if pressured { 2u8.min(pp) } else { 1 };
             push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount });
+            maybe_eat_leppa(&mut b, side);
         }
     }
 
@@ -6504,6 +6505,34 @@ fn apply_post_damage(
 /// Sitrus Berry: when the holder's HP is at or below 1/2, it eats the berry and heals 1/4
 /// of max HP. The berry's *consumption* isn't compared (item is excluded from `relaxed_eq`,
 /// and the harness re-projects PS's pre-turn item each turn), so we only emit the heal.
+/// Leppa Berry — `onUpdate(pokemon) { const moveSlot = pokemon.moveSlots.find(m => m.pp === 0);
+/// if (moveSlot) pokemon.eatItem(); }`, with `onEat` restoring `moveSlot.pp += 10` capped at
+/// `maxpp` (data/items.ts leppaberry). Like every item `onUpdate` it fires at the next
+/// `eachEvent('Update')`, which for the move's own PP is the acting side's runAction Update — so
+/// it is applied at the PP-deduction site, the same decision-boundary state. rb1130 t10 / rb1389
+/// t6: a Revival Blessing / 1-PP slot hits 0 and PS eats the berry back to full.
+fn maybe_eat_leppa(b: &mut Branch, side: SideId) {
+    if matches!(
+        b.state.side(side.other()).active().ability,
+        crate::ids::Ability::Unnerve | crate::ids::Ability::AsOneGlastrier | crate::ids::Ability::AsOneSpectrier
+    ) && b.state.side(side.other()).active().is_alive() {
+        return;
+    }
+    let p = b.state.side(side).active();
+    if p.item != Item::LeppaBerry || !p.is_alive() {
+        return;
+    }
+    // PS's `onUpdate` finds the FIRST 0-PP slot; `onEat` then prefers that same slot.
+    let Some(mi) = p.moves.iter().position(|m| m.max_pp > 0 && m.pp == 0) else { return };
+    let amount = 10u8.min(p.moves[mi].max_pp - p.moves[mi].pp);
+    let slot = b.state.side(side).active_index;
+    if amount > 0 {
+        push(b, Instruction::RestorePp { side, slot, move_index: mi as u8, amount });
+    }
+    push(b, Instruction::ChangeItem { side, slot, previous: Item::LeppaBerry, new: Item::None });
+    on_berry_eaten_id(b, side, Item::LeppaBerry);
+}
+
 fn apply_pinch_berry(b: &mut Branch, side: SideId) {
     // (Historical name.) Routed through the consuming implementation — the old version
     // healed without eating the berry, double-healing alongside maybe_eat_sitrus.

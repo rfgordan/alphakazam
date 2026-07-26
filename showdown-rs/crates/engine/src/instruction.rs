@@ -147,6 +147,9 @@ pub enum Instruction {
 
     // --- moves ---
     DecrementPp { side: SideId, slot: u8, move_index: u8, amount: u8 },
+    /// Leppa Berry's `onEat` restores PP to a slot (PS `moveSlot.pp += 10`, capped at `maxpp`).
+    /// `amount` is the already-capped delta, so the inverse is a plain subtraction.
+    RestorePp { side: SideId, slot: u8, move_index: u8, amount: u8 },
     SetMoveDisabled { side: SideId, slot: u8, move_index: u8, disabled: bool },
 
     // --- consecutive-use tracking (active Pokémon; resets on switch) ---
@@ -323,6 +326,9 @@ impl State {
             }
             DecrementPp { side, slot, move_index, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp -= amount;
+            }
+            RestorePp { side, slot, move_index, amount } => {
+                self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp += amount;
             }
             SetMoveDisabled { side, slot, move_index, disabled } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].disabled = disabled;
@@ -502,6 +508,9 @@ impl State {
             }
             DecrementPp { side, slot, move_index, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp += amount;
+            }
+            RestorePp { side, slot, move_index, amount } => {
+                self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp -= amount;
             }
             SetMoveDisabled { side, slot, move_index, .. } => {
                 // The only forward transition toggles disabled true/false; reversing a
