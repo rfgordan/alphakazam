@@ -2497,11 +2497,24 @@ fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
     }
 }
 
-/// Does Pressure tax this move's PP? Exact via the move's codegen'd target field.
-fn pressure_affected(md: &crate::data::MoveData) -> bool {
-    // PS: Pressure deducts an extra PP when the move's resolved target includes the Pressure
-    // holder or its side. With the codegen'd target field this is now exact.
-    md.target.targets_foe()
+/// Does Pressure tax this move's PP?
+///
+/// PS resolves the answer in `Pokemon#getMoveTargets` (sim/pokemon.ts:853-860): the pressure
+/// targets are the move's targets, EXCEPT that a `foeSide` move gets NONE
+/// (`if (move.target === 'foeSide') pressureTargets = []`) and a `mustpressure` move always gets
+/// the foes. So the hazards SPLIT: Spikes / Stealth Rock / Toxic Spikes carry `mustpressure` and
+/// are taxed, while Sticky Web — the one `foeSide` hazard without the flag — is NOT.
+/// rb1377 d4 / rb1326 d2: PS leaves a Sticky Web at 31 PP, the engine took it to 30.
+///
+/// `singleEvent('ModifyMove')` runs at battle-actions.ts:429, BEFORE the `getMoveTargets` at
+/// :467, so Curse has already swapped in its `nonGhostTarget` (`self`) for a non-Ghost user and
+/// is likewise untaxed. rb1152 d48.
+fn pressure_affected(md: &crate::data::MoveData, user_is_ghost: bool) -> bool {
+    if md.flag_mustpressure {
+        return true;
+    }
+    let target = if user_is_ghost { md.target } else { md.non_ghost_target };
+    target != crate::data::MoveTarget::FoeSide && target.targets_foe()
 }
 
 /// On-switch-in ability effects (weather setters and Intimidate).
@@ -4161,9 +4174,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let pp = b.state.side(side).active().moves[move_idx as usize].pp;
         if pp > 0 {
             let foe_active = b.state.side(side.other()).active();
+            let user_is_ghost = b.state.side(side).active().types.contains(&Type::Ghost);
             let pressured = foe_active.is_alive()
                 && foe_active.ability == crate::ids::Ability::Pressure
-                && pressure_affected(&md);
+                && pressure_affected(&md, user_is_ghost);
             let amount = if pressured { 2u8.min(pp) } else { 1 };
             push(&mut b, Instruction::DecrementPp { side, slot, move_index: move_idx, amount });
             maybe_eat_leppa(&mut b, side);

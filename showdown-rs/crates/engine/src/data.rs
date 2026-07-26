@@ -60,6 +60,13 @@ pub struct MoveData {
     /// Base PP (before PP Ups; PS default sets carry max PP Ups = ×8/5).
     pub pp: u8,
     pub target: MoveTarget,
+    /// PS `move.nonGhostTarget` — the target Curse's `onModifyMove` (data/moves.ts:3277)
+    /// substitutes for a non-Ghost user. Equal to `target` for every other move.
+    pub non_ghost_target: MoveTarget,
+    /// PS `flags.mustpressure` — Pressure taxes this move even when `getMoveTargets` would
+    /// otherwise hand it no pressure targets (Spikes / Stealth Rock / Toxic Spikes / Imprison /
+    /// Snatch / Tera Blast).
+    pub flag_mustpressure: bool,
     /// Crit-stage bonus from the move itself (1 = normal, 2 = high-crit like Slash, ...).
     pub crit_ratio: u8,
     /// Always crits (Wicked Blow, Surging Strikes, Flower Trick, ...).
@@ -171,6 +178,8 @@ impl MoveData {
             priority,
             pp: 0,
             target: MoveTarget::Normal,
+            non_ghost_target: MoveTarget::Normal,
+            flag_mustpressure: false,
             crit_ratio: 1,
             always_crit: false,
             self_destruct: false,

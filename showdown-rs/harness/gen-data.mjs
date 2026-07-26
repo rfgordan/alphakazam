@@ -160,6 +160,8 @@ moves.forEach((m, i) => {
 		`sleep_usable: ${m.sleepUsable === true}`,
 		`pp: ${m.pp || 0}`,
 		`target: ${targetRs(m.target)}`,
+		`non_ghost_target: ${targetRs(m.nonGhostTarget || m.target)}`,
+		`flag_mustpressure: ${!!(m.flags && m.flags.mustpressure)}`,
 		`crit_ratio: ${m.critRatio || 1}`,
 		`always_crit: ${m.willCrit === true}`,
 		`self_destruct: ${!!m.selfdestruct}`,
