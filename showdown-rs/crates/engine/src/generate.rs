@@ -4107,6 +4107,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         md.category = if atk > spa { MoveCategory::Physical } else { MoveCategory::Special };
     }
 
+    // Photon Geyser (and Ultra Necrozma's Light That Burns the Sky) is declared Special but its
+    // `onModifyMove` flips it to Physical when the user's Attack beats its Special Attack:
+    // `if (pokemon.getStat('atk', false, true) > pokemon.getStat('spa', false, true))
+    // move.category = 'Physical'` (`data/moves.ts:13351-13353`). `getStat(stat, false, true)` is
+    // BOOSTED but UNMODIFIED — boosts count, ability/item modifiers do not — the same comparison
+    // Tera Blast makes above. Strictly `>`, so a tie stays Special.
+    //
+    // rb1280 d13 is the witness: a Necrozma-Dusk-Mane (base Atk 157 vs SpA 113) Photon Geysers a
+    // switching-in Arboliva, whose Defense is far below its Special Defense. PS deals 102, the
+    // engine ran the special side and dealt 67.
+    if matches!(md.id.to_id(), "photongeyser" | "lightthatburnsthesky") {
+        let p = b.state.side(side).active();
+        let atk = boosted_stat(p.stat(crate::ids::StatIndex::Attack) as i64, b.state.side(side).boost(BoostIndex::Attack));
+        let spa = boosted_stat(p.stat(crate::ids::StatIndex::SpecialAttack) as i64, b.state.side(side).boost(BoostIndex::SpecialAttack));
+        if atk > spa {
+            md.category = MoveCategory::Physical;
+        }
+    }
+
     // Charge (including the volatile granted by Electromorphosis) doubles the next Electric
     // attack and is consumed by any non-Charge Electric move. PS also consumes it when that
     // move subsequently misses or is aborted, so remove it before the move's early exits.
