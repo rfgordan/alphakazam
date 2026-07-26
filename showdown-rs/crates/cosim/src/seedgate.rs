@@ -586,7 +586,7 @@ fn step_unit(
 }
 
 /// Recorded PS draws of a unit, reduced to (kind, args, semantic label) for draw-class triage.
-struct RecLabel { kind: String, args: Vec<i64>, label: String }
+struct RecLabel { kind: String, args: Vec<i64>, label: String, result: Option<i64> }
 
 fn rec_draw_labels(unit: &[&GateDecision<'_>]) -> Vec<RecLabel> {
     let mut out = Vec::new();
@@ -602,7 +602,12 @@ fn rec_draw_labels(unit: &[&GateDecision<'_>]) -> Vec<RecLabel> {
             let ctx = if !effect.is_empty() { effect } else if !event.is_empty() { event }
                 else if !mv.is_empty() { mv } else { "generic" };
             let label = format!("{kind}{args:?}@{ctx}");
-            out.push(RecLabel { kind, args, label });
+            let result = match v.get("result") {
+                Some(Value::Bool(b)) => Some(*b as i64),
+                Some(Value::Number(n)) => n.as_i64(),
+                _ => None,
+            };
+            out.push(RecLabel { kind, args, label, result });
         }
     }
     out
@@ -626,6 +631,26 @@ fn first_draw_mismatch(rust: &[DrawEvent], rec: &[RecLabel]) -> Option<String> {
             (Some(r), None) => return Some(format!("rust-extra {}{:?}@{}", r.kind, r.args, r.site)),
             (None, Some(p)) => return Some(format!("PS-unconsumed {}", p.label)),
             (None, None) => unreachable!(),
+        }
+    }
+    // Kind and args agreeing only proves the unit's draw SHAPE matched. The gate drives the REAL
+    // prng, so a differing RESULT at a matching position means the engine entered this unit with
+    // its prng at a different offset — a draw MISCOUNT in an earlier unit that happened to leave
+    // the compared state alone. That is a completely different bug class from a state-computation
+    // divergence, and it was hiding inside `draws-match/state-diff`.
+    // Only the DAMAGE ROLL is compared. The engine's `random(100)` secondary / self-drop draws
+    // record a canonical representative (a branch that cannot land its effect collapses to a
+    // "draw-and-discard" whose logged result is the placeholder 0), so their results are not PS's
+    // raw values and would drown this check in false positives. `random(16)` is always the
+    // realized value `replicate_select` matched off the real prng.
+    for i in 0..rust.len().min(rec.len()) {
+        if rust[i].kind != "random" || rust[i].args != [16] {
+            continue;
+        }
+        if let Some(want) = rec[i].result {
+            if want != rust[i].result {
+                return Some(format!("result {} (rust ={})", rec[i].label, rust[i].result));
+            }
         }
     }
     None

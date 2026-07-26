@@ -4590,6 +4590,34 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return vec![b];
     }
 
+    // `hitStepTryImmunity` (sim/battle-actions.ts:560) runs its `singleEvent('TryImmunity')`
+    // BEFORE `hitStepAccuracy` (:563), so a move whose `onTryImmunity` returns false fails with
+    // NO accuracy roll at all. The damaging members of that set (data/moves.ts):
+    //   endeavor      :4796  `return pokemon.hp < target.hp`
+    //   dreameater    :4260  `return target.status === 'slp' || target.hasAbility('comatose')`
+    //   synchronoise  :18663 `return target.hasType(source.getTypes())`
+    // rb1282 d13: p1's Luvdisc Endeavors a target that is NOT above it in HP and PS records ZERO
+    // draws for the unit; the engine rolled the 100% accuracy check, offsetting the prng for the
+    // rest of the game (its next damage roll came out 11 where PS drew a different value).
+    {
+        let (atk, def) = (b.state.side(side).active(), b.state.side(foe).active());
+        let immune = match md.id.to_id() {
+            "endeavor" => !(atk.hp < def.hp),
+            "dreameater" => {
+                def.status != Status::Sleep && def.ability != crate::ids::Ability::Comatose
+            }
+            "synchronoise" => !def
+                .types
+                .iter()
+                .any(|t| *t != Type::None && atk.types.contains(t)),
+            _ => false,
+        };
+        if immune {
+            b.move_failed = true; // PS `moveThisTurnResult = false`
+            return vec![b];
+        }
+    }
+
     // Protect: a protected target blocks the incoming damaging move (Protect moves +4
     // priority, so the protector has already set the volatile this turn).
     if b.state.side(foe).volatiles.contains(VolatileStatus::Protect)
