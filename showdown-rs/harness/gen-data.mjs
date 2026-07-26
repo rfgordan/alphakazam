@@ -154,6 +154,7 @@ moves.forEach((m, i) => {
 		`flag_heal: ${!!(m.flags && m.flags.heal)}`,
 		`flag_powder: ${!!(m.flags && m.flags.powder)}`,
 		`flag_bypass_sub: ${!!(m.flags && m.flags.bypasssub)}`,
+		`flag_protect: ${!!(m.flags && m.flags.protect)}`,
 		`flag_charge: ${!!(m.flags && m.flags.charge)}`,
 		`flag_nosleeptalk: ${!!(m.flags && m.flags.nosleeptalk)}`,
 		`sleep_usable: ${m.sleepUsable === true}`,

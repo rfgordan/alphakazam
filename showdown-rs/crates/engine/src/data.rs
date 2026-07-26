@@ -136,6 +136,9 @@ pub struct MoveData {
     pub flag_powder: bool,
     /// `bypasssub` flag: sound moves, Taunt, Encore, ... act through a Substitute.
     pub flag_bypass_sub: bool,
+    /// `protect` flag: the move is blocked by Protect/Detect/… (PS `checkMoveBypassesProtect`,
+    /// sim/battle.ts:1300-1308). Roar/Whirlwind/Perish Song and the field moves lack it.
+    pub flag_protect: bool,
     /// `charge` flag: two-turn moves (Solar Beam, Fly, Dig, Meteor Beam, ...). Sleep Talk's
     /// callable pool excludes them (PS `sleeptalk` `onHit`).
     pub flag_charge: bool,
@@ -203,6 +206,7 @@ impl MoveData {
             flag_heal: false,
             flag_powder: false,
             flag_bypass_sub: false,
+            flag_protect: false,
             flag_charge: false,
             flag_nosleeptalk: false,
             sleep_usable: false,

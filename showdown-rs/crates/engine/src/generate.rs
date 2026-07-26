@@ -4404,14 +4404,25 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // Substitute, Magnet Rise, Aqua Ring, Destiny Bond, Imprison, Laser Focus, …); PS's
         // Protect `onTryHit` and Substitute `onTryPrimaryHit` (`if (target === source) return`,
         // data/moves.ts:20857 / :16512) never see such a move, so gate on the move's TARGET.
-        let targets_foe = md.target.targets_foe()
-            && (md.status != Status::None
-                || md.target_boosts.iter().any(|&x| x != 0)
-                || md.target_volatile.is_some()
-                || md.force_switch);
-        if targets_foe && b.state.side(foe).volatiles.contains(VolatileStatus::Protect) {
+        // Whether the move is AIMED AT the foe's mon (not its side, not the field, not the
+        // user) — PS registers Protect's `onTryHit` and Substitute's `onTryPrimaryHit` on the
+        // target Pokemon, so both fire on exactly this set. Guessing from the payload
+        // (`status`/`target_boosts`/`target_volatile`/`force_switch`) missed the moves whose
+        // foe-facing effect lives in an `onHit` callback the codegen cannot see — Strength Sap,
+        // Trick/Switcheroo, Topsy-Turvy, Pain Split, …
+        let targets_foe_mon = matches!(md.target,
+            crate::data::MoveTarget::Normal | crate::data::MoveTarget::AdjacentFoe
+                | crate::data::MoveTarget::Any | crate::data::MoveTarget::AllAdjacent
+                | crate::data::MoveTarget::AllAdjacentFoes | crate::data::MoveTarget::RandomNormal
+                | crate::data::MoveTarget::Scripted);
+        // PS `checkMoveBypassesProtect` (sim/battle.ts:1300-1308): Protect stops the move iff it
+        // carries the `protect` FLAG. Roar / Whirlwind / Perish Song and the field moves do not.
+        if targets_foe_mon && md.flag_protect
+            && b.state.side(foe).volatiles.contains(VolatileStatus::Protect)
+        {
             return vec![b];
         }
+        let targets_foe = targets_foe_mon;
         // Magic Bounce (breakable): a reflectable status move aimed at the holder (or its
         // side — hazards) is used BY the holder against the original user instead. Runs
         // after Protect (onTryHitPriority 3 vs 1) and before the Substitute check (the
@@ -5074,8 +5085,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
                 .flat_map(|sb| apply_direclaw_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
-                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
+                // FLINCH IS A SECONDARY (`secondaries: [{volatileStatus:'flinch'}]`), so PS rolls
+                // it in `secondaries()` — step 5 of `spreadMoveHit` — BEFORE the `DamagingHit` /
+                // `SourceDamagingHit` ability rolls (Static / Flame Body / Poison Point / Poison
+                // Touch / Toxic Chain / Cursed Body) that follow at step 7. rb1392 t2: Fake Out
+                // into a Toxic Chain user — PS logs `random[100]@fakeout` then
+                // `randomChance[3,10]` with `event: DamagingHit`.
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .collect::<Vec<_>>()
         };
