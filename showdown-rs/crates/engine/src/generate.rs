@@ -659,9 +659,19 @@ fn switch_entry_speed(pre: &State, side: SideId, slot: u8) -> i32 {
 /// engine recorded none and ran three draws behind from turn 15 on.
 fn emit_switch_bracket(b: &mut Branch, pre: &State, side: SideId, target: u8) {
     with_switch_bracket_speeds(b, pre, side, target, |b| {
-        emit_update(b); // switch action runAction Update (2882)
-        emit_update(b); // runSwitch getAllActive speedSort (battle-actions.ts:182)
-        emit_update(b); // runSwitch runAction Update (2882)
+        emit_update(b); // switch action runAction Update (2882) — plain getAllActive()
+        // `runSwitch` sorts `this.battle.getAllActive(TRUE)` (`sim/battle-actions.ts:181-182`) —
+        // the ONLY speed sort in the bracket that passes `includeFainted`. A slot still holding a
+        // mon that fainted earlier this turn therefore COUNTS, so the sort can tie (and consume a
+        // shuffle) on a board where both Updates around it see a single active and consume none.
+        // `emit_update_hit` is exactly that predicate ("the slot is occupied" rather than "alive").
+        //
+        // rb1710 d5 t4 / rb1706 d8 t6: a pivot lands while the FOE's slot holds a mon the pivot
+        // move just KO'd and whose replacement is a separate, later decision. PS records exactly
+        // ONE `shuffle[2,0,2]` for the landing — this one — and the engine recorded none, running
+        // a draw behind PS for the rest of the game.
+        emit_update_hit(b); // runSwitch getAllActive(true) speedSort (battle-actions.ts:182)
+        emit_update(b); // runSwitch runAction Update (2882) — plain getAllActive()
     });
 }
 
@@ -669,7 +679,18 @@ fn with_switch_bracket_speeds(
     b: &mut Branch, pre: &State, entered: SideId, slot: u8, f: impl FnOnce(&mut Branch),
 ) {
     let prev = MOVE_TIE_SPEEDS.with(|c| c.get());
-    let mut sp = [effective_speed(&b.state, SideId::One), effective_speed(&b.state, SideId::Two)];
+    // A slot holding a mon that FAINTED earlier this turn is in `getAllActive(true)`, and it sorts
+    // on the cached `pokemon.speed` that `faintMessages`' `clearVolatile` left behind:
+    // `clearVolatile` ends in `setSpecies(baseSpecies)`, which ends in
+    // `this.speed = this.storedStats.spe` (`sim/pokemon.ts:1419`). That is the RAW stat — no
+    // boosts, no paralysis, no Choice Scarf, no Tailwind. Reading `effective_speed` there sees
+    // boosts PS has already thrown away (rb1706 d7: Excadrill's Rapid Spin +1 Spe, on top of the
+    // +3 it was already carrying, all of it gone the moment it faints — 185, not 277).
+    let sort_speed = |s: SideId| {
+        let p = b.state.side(s).active();
+        if p.is_alive() { effective_speed(&b.state, s) } else { p.stat(crate::ids::StatIndex::Speed) as i32 }
+    };
+    let mut sp = [sort_speed(SideId::One), sort_speed(SideId::Two)];
     sp[entered as usize] = switch_entry_speed(pre, entered, slot);
     MOVE_TIE_SPEEDS.with(|c| c.set(Some(sp)));
     f(b);
