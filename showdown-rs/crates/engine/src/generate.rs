@@ -11168,6 +11168,13 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec
     let mut ended_early = false;
     let mut yawn_fired = [false; 2];
     let mut fs_fired: [Option<u8>; 2] = [None, None];
+    // `runAction`'s `case 'residual'` calls `this.updateSpeed()` at its START (sim/battle.ts:2835),
+    // and that is the LAST `updateSpeed` before the action's trailing `eachEvent('Update')` at
+    // :2882. So the trailing Update speed-sorts on the Speed cached BEFORE any residual ran — a
+    // Speed change the residual phase itself makes must not break (or make) its tie. Same cache
+    // rule as the switch bracket, one event later. See `switch_entry_speed` / trap #2.
+    let pre_residual_speeds =
+        [effective_speed(&branch.state, SideId::One), effective_speed(&branch.state, SideId::Two)];
     'residual: {
     let b = &mut branch;
     // PS `fieldEvent('Residual')` speed-sorts the collected residual handlers via `speedSort`
@@ -12122,9 +12129,21 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec
     }
     // runAction Update after the `residual` action completes (battle.ts:2882): one `shuffle[2,0,2]`
     // on a surviving equal-Speed pair. Emitted last, after every residual draw (incl. Future Sight).
+    //
+    // It sorts on `pre_residual_speeds` — the cache `case 'residual'`'s own `updateSpeed()` wrote
+    // at :2835, before the first handler ran. LIVENESS is still read off the post-residual board
+    // (`getAllActive` after `faintMessages`), which is exactly what `MOVE_TIE_SPEEDS` overrides.
+    // Mirror-pair witnesses, both Regigigas games where Slow Start's counter expires this turn:
+    // rb1369 d49 t45 (engine emitted a trailing `@update` shuffle PS does not — the engine had
+    // already un-halved the Speed via the `activeTurns` bump above, tying the foe) and rb1310
+    // d35 t28 (the exact mirror: PS records one extra shuffle after the residual sort, because its
+    // cache still holds the HALVED Speed, which is the one that ties).
     if annotating() {
         for nb in &mut out {
+            let prev_tie = MOVE_TIE_SPEEDS.with(|c| c.replace(Some(pre_residual_speeds)));
             emit_update(nb);
+            MOVE_TIE_SPEEDS.with(|c| c.set(prev_tie));
+            // getRequests' trap shuffle is a fresh sort outside the residual action — live Speed.
             // Then PS builds the next move request (`getRequests` → per-active TrapPokemon), whose
             // multi-trap tie shuffle is the turn's trailing draw.
             emit_trap_pokemon_shuffles(nb);
