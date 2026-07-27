@@ -7232,6 +7232,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             bp_chain = bp_step(bp_chain, POW[fallen]);
         }
     }
+    // 17: Dry Skin on the DEFENDER — `onFoeBasePower` ×1.25 for an incoming Fire move
+    // (`data/abilities.ts` dryskin, `onFoeBasePowerPriority: 17`). The engine modelled Dry Skin's
+    // Water absorb and its weather residual and not this half. rb1636 d5: a Delphox's Fire Blast
+    // into a Toxicroak — 43 HP of the 244 PS took off it.
+    if def_ab == Ab::DrySkin && md.typ == Type::Fire {
+        bp_chain = bp_step(bp_chain, 5120); // 1.25 = 5120/4096
+    }
     // 19: Strong Jaw (bite ×1.5) / Sharpness (slicing ×1.5).
     if attacker.ability == Ab::StrongJaw && md.flag_bite {
         bp_chain = bp_step(bp_chain, 6144);
