@@ -41,7 +41,12 @@ pub struct Fixture {
     pub kind: String,
     #[serde(rename = "psCommit")]
     pub ps_commit: String,
+    /// The `--format` the recorder was invoked with. NOT the rules the battle was played under.
     pub format: String,
+    /// The formatid actually handed to `new Battle`. Absent on every legacy fixture (all of
+    /// which were played as `gen9customgame` whatever `format` says) — see `trace::ruleset_for`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ruleset: Option<String>,
     pub teamset: Option<String>,
     pub seed: Option<[u16; 4]>,
     /// PS packed team strings, p1 then p2 — every set's species/level/ability/item/moves/EVs/IVs
@@ -186,6 +191,7 @@ pub fn build_fixture(t: &Trace) -> Result<Fixture, String> {
         kind: "seed-fixture".into(),
         ps_commit: t.ps_commit.clone(),
         format: t.format.clone(),
+        ruleset: t.ruleset.clone(),
         teamset: t.teamset.clone(),
         seed: t.seed,
         packed_teams: t.packed_teams.clone(),

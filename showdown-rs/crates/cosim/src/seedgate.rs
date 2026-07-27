@@ -63,6 +63,9 @@ pub(crate) struct GateDecision<'a> {
 
 pub(crate) struct GateInput<'a> {
     pub format: &'a str,
+    /// The rules the recording was PLAYED under — resolved from the explicit `ruleset` stamp,
+    /// NOT from `format`. See `trace::ruleset_for`.
+    pub ruleset: engine::ruleset::Ruleset,
     pub seed: Option<[u16; 4]>,
     /// PS's full serialized state after the FIRST (teampreview) decision.
     pub init_state: &'a Value,
@@ -115,6 +118,7 @@ impl<'a> GateInput<'a> {
         }).collect();
         Ok(GateInput {
             format: &t.format,
+            ruleset: crate::trace::ruleset_for(t.ruleset.as_deref(), &t.format)?,
             seed: t.seed,
             init_state: &first.state_after,
             packed_teams: &t.packed_teams,
@@ -141,6 +145,7 @@ impl<'a> GateInput<'a> {
         }).collect();
         Ok(GateInput {
             format: &f.format,
+            ruleset: crate::trace::ruleset_for(f.ruleset.as_deref(), &f.format)?,
             seed: f.seed,
             init_state: &f.init_state,
             packed_teams: &f.packed_teams,
@@ -405,14 +410,14 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
     let Some(first) = g.decisions.first() else {
         return mk_fail(Some("empty-trace".into()), 0, 0, false);
     };
-    if first.request_state != "teampreview" {
+    if first.request_state != crate::trace::first_decision_state(&g.ruleset) {
         return mk_fail(Some(format!("first-{}", first.request_state)), 0, 0, false);
     }
     let canon = match Canonical::from_first_state(g.init_state) {
         Ok(c) => c,
         Err(u) => return mk_fail(Some(format!("canon:{}", u.0)), 0, 0, false),
     };
-    let sleep_clause = crate::trace::sleep_clause_for_format(&g.format);
+    let ruleset = g.ruleset;
     let aligned = alignment_ok(g, limbs);
 
     let mut prng = PsPrng::from_limbs(limbs);
@@ -422,7 +427,7 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
     consume_recorded(&mut prng, first);
 
     let mut state = match convert_state(g.init_state, &canon) {
-        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
+        Ok(mut s) => { s.ruleset = ruleset; s }
         Err(u) => return mk_fail(Some(format!("convert0:{}", u.0)), 0, 0, aligned),
     };
     restore_transformed_base_moves(&mut state, g.packed_teams);
@@ -463,7 +468,7 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
         // engine stores a fixed canonical slot order, so feed it PS's array order (the recorded
         // pre-state's `rosterIndex` sequence) for this unit.
         engine::generate::set_beatup_order(g.decisions[i - 1].roster_order.clone());
-        let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, sleep_clause, &mut prng) {
+        let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, ruleset, &mut prng) {
             Ok(x) => x,
             Err(label) => {
                 return mk_fail(Some(format!("d{i}[t{}]:{label}", dp.turn)), decisions_ok, total, aligned);
@@ -491,7 +496,7 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
             let field = last.state_after
                 .and_then(|target| convert_state(target, &canon).ok())
                 .map(|mut tgt| {
-                    tgt.sleep_clause = sleep_clause;
+                    tgt.ruleset = ruleset;
                     let diffs = crate::diff::diff_states(&state, &tgt);
                     if std::env::var("DBG_DIFF").is_ok() && dbg_on {
                         for dd in &diffs { eprintln!("  DIFF {}: {}", dd.category, dd.detail); }
@@ -525,7 +530,7 @@ fn step_unit(
     state: &mut State,
     unit: &[&GateDecision<'_>],
     canon: &Canonical,
-    _sleep_clause: bool,
+    _ruleset: engine::ruleset::Ruleset,
     prng: &mut PsPrng,
 ) -> Result<(Vec<DrawEvent>, bool), String> {
     let dp = unit[0];

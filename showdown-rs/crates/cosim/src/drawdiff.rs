@@ -143,10 +143,11 @@ fn compare_draws(rust: &[DrawEvent], rec: &[RecDraw]) -> Option<(&'static str, S
 pub fn draw_diff_trace(trace: &Trace) -> Result<Vec<DrawUnit>, Unsupported> {
     let first = trace.decisions.first().ok_or_else(|| Unsupported("trace:empty".into()))?;
     let canon = Canonical::from_first_state(&first.state_after)?;
-    let sleep_clause = crate::trace::sleep_clause_for_format(&trace.format);
+    let ruleset = crate::trace::ruleset_for(trace.ruleset.as_deref(), &trace.format)
+        .map_err(Unsupported)?;
 
     let mut results = Vec::new();
-    if first.request_state != "teampreview" {
+    if first.request_state != crate::trace::first_decision_state(&ruleset) {
         return Err(Unsupported(format!("trace:first-decision-{}", first.request_state)));
     }
     let mut boundary: &Value = &first.state_after;
@@ -163,24 +164,24 @@ pub fn draw_diff_trace(trace: &Trace) -> Result<Vec<DrawUnit>, Unsupported> {
             j += 1;
         }
         let target = &unit.last().unwrap().state_after;
-        results.push(diff_unit(boundary, &unit, target, &canon, sleep_clause));
+        results.push(diff_unit(boundary, &unit, target, &canon, ruleset));
         boundary = target;
         i = j;
     }
     Ok(results)
 }
 
-fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical, sleep_clause: bool) -> DrawUnit {
+fn diff_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical, ruleset: engine::ruleset::Ruleset) -> DrawUnit {
     let dp = unit[0];
     let turn = dp.turn;
     let mk_unsupported = |s: String| DrawUnit { turn, class: DrawClass::Unsupported(s) };
 
     let state_before = match convert_state(before, canon) {
-        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
+        Ok(mut s) => { s.ruleset = ruleset; s }
         Err(u) => return mk_unsupported(u.0),
     };
     let state_target = match convert_state(target, canon) {
-        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
+        Ok(mut s) => { s.ruleset = ruleset; s }
         Err(u) => return mk_unsupported(u.0),
     };
 

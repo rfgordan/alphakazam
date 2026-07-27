@@ -1415,7 +1415,7 @@ fn targets_foe_status(md: &crate::data::MoveData) -> bool {
 /// Sleep Clause Mod: an induced (non-Rest) sleep fails while any other Pokémon on the
 /// target's side is already asleep.
 fn sleep_clause_blocks(state: &State, side: SideId) -> bool {
-    if !state.sleep_clause {
+    if !state.ruleset.sleep_clause {
         return false;
     }
     let s = state.side(side);

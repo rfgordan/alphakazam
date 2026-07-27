@@ -129,11 +129,11 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> usize {
 fn emit_game(t: &Trace, hp_style: HpStyle) -> Result<Vec<String>, String> {
     let Some(limbs) = t.seed else { return Err("no-seed".into()) };
     let Some(first) = t.decisions.first() else { return Err("empty".into()) };
-    if first.request_state != "teampreview" {
+    let ruleset = crate::trace::ruleset_for(t.ruleset.as_deref(), &t.format)?;
+    if first.request_state != crate::trace::first_decision_state(&ruleset) {
         return Err(format!("first-{}", first.request_state));
     }
     let canon = Canonical::from_first_state(&first.state_after).map_err(|u| format!("canon:{}", u.0))?;
-    let sleep_clause = crate::trace::sleep_clause_for_format(&t.format);
 
     let mut prng = PsPrng::from_limbs(limbs);
     for _ in 0..init_gender_rolls(t) {
@@ -142,7 +142,7 @@ fn emit_game(t: &Trace, hp_style: HpStyle) -> Result<Vec<String>, String> {
     consume_recorded(&mut prng, first);
 
     let mut state = convert_state(&first.state_after, &canon).map_err(|u| format!("convert0:{}", u.0))?;
-    state.sleep_clause = sleep_clause;
+    state.ruleset = ruleset;
 
     let mut out = Vec::new();
     out.push("|start".to_string());
