@@ -6,6 +6,195 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== BURN-DOWN X — certification (2026-07-27) ====
+
+**HEADLINE: 483 / 512 full games byte-exact from seed (94.3%), up from 476; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+**THE RESULT THAT MATTERS MORE THAN THE COUNT: the PRNG-OFFSET class is EMPTY.** All six of
+burn-down IX's localized offset games are closed, and re-running `PRNG_TRACE` over ALL 29 remaining
+open games shows **every one of them aligns step-for-step with PS's cumulative advance count,
+through and including the unit where its state first diverges** (753 boundary lines, zero delta
+mismatches). Nothing left in the corpus misaligns the stream. Every open game is now a pure
+MECHANICS bug — wrong state on a perfectly aligned stream — including the ten the gate still labels
+with a draw-CLASS name (`args randomChance@struggle`, `PS-unconsumed random@icehammer`, …), which
+are same-step-count disagreements, not miscounts. **Trap #8 ("a draw-CLASS label is not a root
+label") is now the ONLY way to read the remaining labels.**
+
+Six parity commits, every one PS-source-grounded, judged by the exact-SET diff on BOTH corpora at
+every step: **the newly-non-exact set was EMPTY at all six.** 7 games / 6 commits = **1.17
+games/commit**. Kill criterion NOT triggered — the longest run below 1 game/commit is ZERO
+(per-commit yield 1, 2, 1, 1, 2, 0-docs). `convert.rs` untouched, so **no fixture regeneration**.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim … seed-fixtures/*.fx.json.gz` | **483 / 512 = 94.3%**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, 0 unsupported |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+
+## The roots landed (in commit order)
+
+| # | commit | root | games |
+|---|--------|------|-------|
+| 1 | `7923336` | **The post-residual `eachEvent('Update')` sorts on the PRE-residual cached Speed.** `runAction`'s `case 'residual'` calls `updateSpeed()` at its START (`sim/battle.ts:2835`) and that is the LAST refresh before the same action's trailing Update at `:2882`, so a Speed change the residual phase itself makes cannot break or create its tie. The switch bracket's cache rule, one event later. The rb1310 / rb1369 MIRROR PAIR, both Regigigas games where Slow Start's counter expires that turn | 476 → 477 (rb1369; rb1310 advances d36 → d46) |
+| 2 | `dacc956` | **Shed Skin runs at residual order 5/3**, not in the branching tail after Harvest (28) — ten orders late, so a cured holder still took the order-9/10 status chip. See "The structural change" below | 477 → 479 (rb1315, rb1380) |
+| 3 | `4147434` | **Good as Gold blocks a status move BEFORE the accuracy roll.** `onTryHit` fires in `hitStepTryHitEvent` (step 1) and `hitStepAccuracy` is step 4 (`sim/battle-actions.ts:551-563`), so the holder's target makes NO accuracy draw; the engine rolled one and blocked only the move's PAYLOAD. It returns `null`, not `false`, so `moveThisTurnResult` is null and `move_failed` must stay clear | 479 → 480 (rb1277) |
+| 4 | `aba469e` | **A mon that faints mid-turn sorts its residual handlers on its UNBOOSTED Speed.** `faintMessages` runs `clearVolatile(false)` (`sim/battle.ts:2576`), zeroing boosts and volatiles, and the residual action's own `updateSpeed()` then recomputes the cache from that cleared board. rb1021: a Sticky-Webbed Magnezone is KO'd and its Leftovers handler ties the foe's at 151/151, not 100/151 | 480 → 481 (rb1021) |
+| 5 | `60a1be2` | **A simultaneous both-sides replacement makes TWO draws the gate never consumed**, on two DIFFERENT Speed pairs. See "The new PRNG call site" below | 481 → 483 (rb1271, rb1329) |
+| 6 | this commit | docs | — |
+
+## The structural change: Shed Skin's 33% split inside a single-`&mut Branch` residual core
+
+Standing blocker for three tranches. `apply_end_of_turn`'s deterministic core is one `&mut Branch`
+walk over orders 1..29 and Shed Skin is a SPLIT, so the core cannot branch mid-walk.
+
+Resolved by **hoisting the split into a thin wrapper**: `apply_end_of_turn` enumerates the outcome
+combinations up front (at most one holder per side → at most four), scales the branch probability
+per combination, and runs the core once per combination with each holder's outcome FORCED. The core
+takes `shed: [Option<bool>; 2]` and, at the order-5/3 slot, emits `randomChance(33,100)` with the
+forced result and applies the cure; `None` means "no roll on that side". The site re-checks PS's own
+short-circuit (`pokemon.hp && pokemon.status`) on the LIVE board, so a holder that faints to the
+order-1 weather chip makes no draw and the two forced branches collapse to a harmless duplicate
+whose probabilities still sum to the parent's.
+
+The site iterates `residual_side_order` (speed order), because with two holders the residual handler
+list is `speedSort`ed and the faster one rolls first. It sits between Wish (4) and the orders 5-7
+loop; the ≤1-slot inversion against Grassy Terrain (5/2) is unobservable — no order-5 handler reads
+or writes `status`, and none of them draws.
+
+**This is the template for any future mid-residual split** (a second one would nest the same way).
+
+## The new PRNG call site: `insertChoice`'s `random(firstIndex, lastIndex + 1)`
+
+`sim/battle-queue.ts:395`. When an inserted action TIES (by `comparePriority`) with a run of queue
+positions, `insertChoice` picks its slot with a bare `this.battle.random(from, to)` — **not** a
+shuffle. This is the first time the engine models that call site anywhere.
+
+A simultaneous both-sides forced replacement fires up to TWO draws before the replacement bracket,
+on two different Speed pairs, and each witness fires exactly ONE of them — which is what proves they
+are two draws and not one:
+
+| draw | PS site | ties on | witness |
+|---|---|---|---|
+| `shuffle[2,0,2]` | `commitChoices`' `queue.sort()` over the two `instaswitch` actions (order 3) | the OUTGOING, just-fainted mons' `getActionSpeed()` — post-`clearVolatile`, so unboosted | **rb1271 d10 t8** — the unit's ONLY PS draw; incoming Torkoal 85 / Iron Bundle 257 untied |
+| `random[0,2]` | `switchIn`'s `queue.insertChoice({runSwitch})` | the INCOMING mons' `switch_entry_speed` (= `replacement_bracket_tied`) | **rb1329 d23 t16** — outgoing Squawkabilly 205 / Qwilfish 189 untied |
+
+Why the second one fires at all: `instaswitch` is order 3 and `runSwitch` is 101, so the FIRST
+replacement's `runSwitch` sorts BEHIND the second side's still-pending `instaswitch` and is still in
+the queue when the second replacement inserts its own. The two `runSwitch` actions share order and
+priority → `comparePriority` returns 0 on equal Speed → `firstIndex !== lastIndex` → one draw.
+
+**Corpus census.** `random` draws with args `[0,2]` appear exactly TWICE in all 401 sidecars:
+rb1329 d23 and rb1368 d0. rb1368 d0 is the battle-start `case 'start'` action, where BOTH leads'
+`switchIn` run back-to-back inside ONE action and hit the same `insertChoice` tie — the same rule,
+already accounted for on that path.
+
+## The recurring shape this tranche made explicit
+
+Three of the six roots are the SAME sentence in different clothes, and it is worth stating once:
+
+> **`pokemon.speed` is a cache, and every speed-tie predicate reads whatever board the last
+> `updateSpeed()` saw — never the live board.**
+
+Burn-down IX found it at `insertChoice` (the switch bracket). This tranche found it at the residual
+action's start (commit 1) and at `faintMessages`' `clearVolatile` (commit 4). The remaining
+`updateSpeed()` sites — `commitChoices` and "before each move action" — are already modelled.
+**Whenever a tie disagrees, ask which `updateSpeed()` was last, not what the Speed is now.**
+
+A second recurring shape, now three tranches deep:
+
+> **An immunity the engine models as an EFFECT gate is often a HIT STEP in PS.**
+> Queenly Majesty / Psychic Terrain (burn-down VIII), Shield Dust / Covert Cloak (IX), Good as Gold
+> (this one). The tell is always the same: the engine rolls a draw PS never makes.
+
+## The 29 still-open games — the evidenced table, all stream-clean
+
+Every one of these has an ALIGNED PRNG stream at its first divergence (verified by `PRNG_TRACE`
+this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
+
+```
+  rb1011 d43 t33  s0#3.hp 140/77
+  rb1012 d60 t52  s0#2.hp 138/185
+  rb1024 d81 t73  s0#3.hp 308/250 + move0.pp 3/4 + s1#1.hp 0/121    STRUGGLE / request legality
+  rb1030 d53 t46  s1#5.hp 61/78 + status_counter 2/1                TOXIC STAGE (pairs with rb1300)
+  rb1040 d2  t3   s0#0.hp 230/217
+  rb1093 d22 t17  s0.boost.spe -2/-3
+  rb1103 d37 t32  s0#0.hp 222/136 + times_hit 5/6                   STRUGGLE / request legality
+  rb1108 d4  t5   s0#2.hp 89/73 + status None/Burn
+  rb1119 d8  t7   s1#4.types [Fire,None]/[Fairy,None]               Roost ENCODING artifact
+  rb1125 d2  t3   s0#0.hp 0/27 + s1#0.times_hit 1/2
+  rb1126 d7  t5   s1.volatiles bit28 UNBURDEN missing + s1#5.hp 396/275
+  rb1184 d5  t6   s1#4.hp 196/142
+  rb1191 d17 t14  s0#1.hp 25/33
+  rb1231 d15 t12  s0#3.hp 274/208 + move1.pp 5/6                    STRUGGLE / request legality
+  rb1233 d39 t32  s0.boost.def -2/-1 + bit39 extra                  Clanging Scales self Def -1
+  rb1236 d37 t29  s0#4.hp 51/18
+  rb1239 d64 t51  s1.stall_counter 0/1
+  rb1244 d10 t7   s1#4.ability Trace/WaterAbsorb
+  rb1253 d12 t10  s1#2.species 222/221                              Ice Face RESTORE
+  rb1300 d52 t48  s0#1.hp 152/174 + status_counter 2/1              pairs with rb1030
+  rb1310 d46 t37  s1.boost.def -1/0, spe 1/0 + bits38,39 extra      engine's mon did not leave
+  rb1314 d45 t38  s1#0.item LightClay/None
+  rb1326 d50 t40  s1.substitute_hp 66/48 + s1#2.times_hit 2/1
+  rb1345 d42 t32  s1.pending_move None/Charging(meteorbeam)
+  rb1347 d61 t56  s1#1.last_berry None/ChestoBerry
+  rb1348 d12 t11  s0#1.hp 159/107 + s1.boost.def 1/0
+  rb1359 d7  t7   s0#0.types [Normal,Fire]/[Ghost,None] + move0 None/transform
+  rb1360 d6  t6   s1#2.move3.pp 7/8
+  rb1387 d36 t32  s0#3.hp 337/218 + times_hit 2/3 + bit4 ENCORE extra
+```
+
+**Volatile bit key** (discriminant = bit index, `volatile.rs`): 4 Encore, 28 Unburden,
+38 StatsRaisedThisTurn, 39 StatsLoweredThisTurn.
+
+### Clusters worth naming (by DIVERGENT FIELD, per trap #1 — never by move name)
+
+- **`status_counter` 2 vs 1 — rb1030, rb1300.** In both, the engine's chip is exactly one extra
+  toxic stage (rb1030 −17 with maxhp/16 = 17; rb1300 −22 with maxhp/16 = 22). PS's `tox` condition
+  starts `effectState.stage = 0` in `onStart` and increments in `onResidual`, so the FIRST residual
+  after application is stage 1. **The two-game shared root is that the engine reaches that first
+  residual with the counter already at 1.** rb1030's toxic is applied by the move Toxic, rb1300's by
+  Toxic Chain's `DamagingHit` secondary — two different application paths, same result, which points
+  at a stale counter that a previous cure left behind rather than at either application site.
+  Principled fix to try: zero `status_counter` on EVERY None→X `ChangeStatus` (PS's `onStart` always
+  re-initialises `effectState`), rather than hunting the cure path that leaks it.
+- **STRUGGLE / request legality — rb1024, rb1103, rb1231** (unchanged, and now with direct
+  evidence): in all three the engine's PP is exactly one LOWER than PS's while PS's draw is a
+  Struggle crit roll. The engine let the mon use a real move where PS forced Struggle. rb1024 is
+  still the largest single gap in the corpus (58 HP at t73).
+- **`times_hit` one lower in the engine + a `PS-unconsumed` accuracy roll — rb1125, rb1387.** PS
+  makes an accuracy roll for a move the engine never runs. rb1387 comes with a spurious **Encore**
+  the engine still holds (bit 4) and PS does not — i.e. the engine's mover is locked out of the move
+  PS used. Check the Encore duration tick before anything else.
+- **Roost typing (rb1119, rb1359) is still an ENCODING artifact** and still deliberately not fixed
+  — the `convert.rs` change would cost a full fixture regeneration for zero measured gain.
+
+## Named opens carried forward (unchanged unless noted)
+
+- **`apply_end_of_turn`'s `switched` parameter is still vestigial** — and it now also threads
+  through the new `apply_end_of_turn_inner`. Delete both when `request.rs` is next touched.
+- The engine's **Imposter** copies the target's BOOSTED Speed into `storedStats`; the **BeforeMove
+  ladder's confusion / Attract / paralysis half** still has no witness; **Ice Face's RESTORE**,
+  **Rampage BeforeMove-cancel at `n == 1`**, **Terapagos-Stellar's FAINT regression**, **Battle
+  Bond's once-per-stint guard**, **Magnet Rise's `onTry` failure** — all unchanged.
+- Deliberately NOT modelled in the `AfterMove` list, for want of a witness: the mover's own
+  `onAfterMove` handlers and the MOVE's own `onAfterMove`.
+
+## Recommendation for the next tranche
+
+The corpus is NOT mined out, but its character has changed. There are no stream bugs left, so
+`PRNG_TRACE` has done its job and the next tranche's primary tool is **`DBG_INSTR`** (with
+`DBG_GAME`/`DBG_I`) — the only thing that localizes a `draws-match/state-diff` unit — plus the
+`DBG_DIFF` field table above. Start with the two-game `status_counter` cluster and the
+`times_hit`/Encore pair; those are the only remaining multi-game roots the evidence supports.
+
+---
+
 # ==== BURN-DOWN IX — certification (2026-07-27) ====
 
 **HEADLINE: 476 / 512 full games byte-exact from seed (93.0%), up from 466; init-aligned
@@ -293,7 +482,8 @@ stream offsets, i.e. the existing corpus has not been mined out.
 ## Extended CI gate
 
 8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
-   — **must stay >= 476 / 512**, and the non-exact SET must be a subset of the previous one.
+   — **must stay >= 483 / 512** (raised from 476 at burn-down X), and the non-exact SET must be a
+   subset of the previous one.
 9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
 
 ---

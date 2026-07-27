@@ -1,56 +1,96 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**BURN-DOWN IX (2026-07-27): 476/512 full games byte-exact from seed (93.0%), up from 466;
+**BURN-DOWN X (2026-07-27): 483/512 full games byte-exact from seed (94.3%), up from 476;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
-Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
-engine tests 12 suites green. Kill criteria NOT triggered (1.0 games/commit over 10 commits;
-longest sub-line run is 2). `convert.rs` untouched — no fixture regeneration.
+Differ 99.53% (3813/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
+engine tests 12 suites green. Kill criteria NOT triggered (1.17 games/commit over 6 commits;
+longest sub-line run is ZERO). `convert.rs` untouched — no fixture regeneration.
 
-**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN IX" — before anything else.**
+**THE HEADLINE IS NOT THE COUNT — IT IS THAT THE PRNG-OFFSET CLASS IS EMPTY.** All six of
+burn-down IX's localized offset games are closed, and `PRNG_TRACE` re-run over ALL 29 remaining
+open games shows every one aligning step-for-step with PS's cumulative advance count through and
+including the unit where its state first diverges (753 boundary lines, zero delta mismatches).
+**Every open game is now a pure MECHANICS bug on an aligned stream** — including the ten the gate
+still labels with a draw-CLASS name; those are same-step-count disagreements, not miscounts.
 
-**Use the new tool FIRST. It is the most valuable thing this tranche produced.**
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN X" — before anything else.**
+It carries the 29-game evidenced table (first divergent FIELD per game, volatile bits decoded) and
+the only two multi-game clusters the evidence supports.
+
+**Which tool to reach for has therefore CHANGED.** `PRNG_TRACE` has done its job; use it now only
+to CONFIRM a game is stream-clean (one command, seconds). The primary tool is **`DBG_INSTR=1`**
+(with `DBG_GAME`/`DBG_I`) — the only thing that localizes a `draws-match/state-diff` unit — backed
+by `DBG_DIFF=1` for the divergent field.
 
 > **`PRNG_TRACE=<game-prefix>`** prints, at every unit boundary, the engine's absolute PRNG
 > position (steps replayed from the seed) against PS's cumulative recorded advance count. The first
-> unit whose per-unit DELTAS differ is the unit that MISALIGNED the stream. A
-> `result random[16]@…` label names the unit that *reads* a bad stream, never the one that broke it
-> — this closes that gap.
+> unit whose per-unit DELTAS differ is the unit that MISALIGNED the stream.
 >
 > ```
 > GATE_THREADS=1 PRNG_TRACE=rb SEED_GATE=1 target/release/cosim harness/seed-sidecars/*.json.gz \
 >   2> pt.txt >/dev/null
 > ```
 >
-> It turned eight offset labels into eight units, which collapsed into three shared roots — and it
-> proved rb1362's long-standing "`replicate_select` `random(100)` decode bug" never existed.
 > **`DBG_SELECT=1`** is its companion (replicate_select's per-position candidates/shapes/value).
 
-**The other new source of ground truth: the sidecars record PS's `pokemon.speed` VERBATIM.** That
-is the cache every speed-tie predicate reads. Four of this tranche's ten commits came from diffing
-it against `effective_speed`. Use it before reasoning about any tie.
+**The one sentence behind three of burn-down X's five roots — and behind four of IX's ten:**
+
+> **`pokemon.speed` is a CACHE, and every speed-tie predicate reads whatever board the last
+> `updateSpeed()` saw, never the live board.** The sites, all now modelled: `commitChoices`;
+> before each move action; `insertChoice` (the switch bracket, IX); the START of the `residual`
+> action (`sim/battle.ts:2835` — X commit 1, so the post-residual Update sorts on the PRE-residual
+> Speed); and `faintMessages`' `clearVolatile(false)` (X commit 4 — a mon that faints mid-turn
+> sorts its surviving residual handlers UNBOOSTED). **When a tie disagrees, ask which
+> `updateSpeed()` was last — not what the Speed is now.**
+
+**The other recurring shape, now three tranches deep:** an immunity the engine models as an EFFECT
+gate is often a HIT STEP in PS. Queenly Majesty / Psychic Terrain (VIII), Shield Dust / Covert
+Cloak (IX), **Good as Gold (X)**. The tell is always the same — the engine rolls a draw PS never
+makes. `hitStepTryHitEvent` is step 1 and `hitStepAccuracy` is step 4
+(`sim/battle-actions.ts:551-563`).
+
+**A PRNG call site that is NOT a shuffle** (first modelled in X): `insertChoice` picks a tying
+action's queue slot with `this.battle.random(firstIndex, lastIndex + 1)`
+(`sim/battle-queue.ts:395`). A bare `random[0,2]` in a sidecar is this, not a shuffle.
+
+**How to put a stochastic effect in the middle of the residual core** (X commit 2, Shed Skin at
+order 5/3): do NOT try to branch the core. `apply_end_of_turn` is a thin WRAPPER that enumerates
+the outcome combinations up front, scales each branch's probability, and runs the single-`&mut
+Branch` core once per combination with the outcome FORCED; the core takes `shed: [Option<bool>; 2]`
+and emits the draw at the right order slot. Nest the same way for a second split.
+
+**The sidecars record PS's `pokemon.speed` VERBATIM**, and the residual/AfterMove `shuffle` groups
+record the `speed` each HANDLER sorted on. That is the cache above, in the log. Four of burn-down
+IX's ten commits and two of X's five came from diffing it against `effective_speed`. Use it before
+reasoning about any tie.
 
 The three biggest remaining levers, in order:
 
-1. **The six OFFSET games, already localized to a unit and a signed delta** (scoreboard section
-   "The six remaining OFFSET games"). rb1310 (−1) and rb1369 (+1) are a MIRROR PAIR on the
-   post-residual `eachEvent('Update')`, and `runAction`'s `case 'residual'` calls `updateSpeed()`
-   at its START (`sim/battle.ts:2835`) — so that trailing Update sorts on the PRE-residual cached
-   Speed, and Slow Start's counter hitting 0 at order 28 must not break its tie. Same cache rule as
-   the switch bracket, one event later. Start there.
-2. **The 20 `draws-match/state-diff` games.** Wrong MECHANICS with an aligned stream — the class no
-   census can see. Start from the `|Δhp| == 0` half (rb1093 boost.spe, rb1233 boost.def, rb1239
+1. **The two multi-game clusters in the 29-game evidenced table** (scoreboard, "Clusters worth
+   naming"). (a) `status_counter` 2 vs 1 — rb1030 and rb1300, both exactly one extra toxic stage on
+   the FIRST residual after application, reached through two DIFFERENT application paths (the move
+   Toxic; Toxic Chain's `DamagingHit` secondary), which points at a stale counter a previous cure
+   left behind. Principled fix to try: zero `status_counter` on EVERY None->X `ChangeStatus`, since
+   PS's `onStart` always re-initialises `effectState`. (b) `times_hit` one lower in the engine plus a
+   `PS-unconsumed` accuracy roll — rb1125 and rb1387; rb1387 also holds a spurious **Encore**
+   (volatile bit 4) PS does not, i.e. the engine's mover is locked out of the move PS used, so check
+   the Encore duration tick first.
+2. **The rest of the 29, one at a time, off the evidenced table.** They are all stream-clean, so the
+   only tool that localizes them is `DBG_INSTR`. The `|delta hp| == 0` ones are still the cheapest —
+   rb1093 boost.spe, rb1233 boost.def (Clanging Scales' self Def -1: engine -2, PS -1), rb1239
    stall_counter, rb1253 species, rb1314 item, rb1345 pending_move, rb1347 last_berry, rb1360 pp,
-   rb1119/rb1359 types, rb1126 volatiles, rb1326 substitute_hp) — single-mechanic bugs with no
-   downstream noise.
-3. **Shed Skin's residual ORDER (5/3).** Two witnesses (rb1315, rb1380), fully diagnosed, and the
-   handler-list half already landed. The blocker is precise: `apply_end_of_turn`'s deterministic
-   core is a single `&mut Branch` loop over orders 1..29 and Shed Skin is a 33% SPLIT, so the core
-   must branch mid-loop. The Hydration block (same 5/3 slot, no draw) is the template for where the
-   cure goes.
+   rb1126 volatiles (Unburden missing) — single-mechanic bugs with no downstream noise.
+3. **STRUGGLE / request legality — rb1024, rb1103, rb1231.** Now with direct evidence: in all three
+   the engine's PP is exactly one LOWER than PS's while PS's draw is a Struggle crit roll, i.e. the
+   engine let the mon use a real move where PS forced Struggle. rb1024 is still the largest single
+   gap in the corpus (58 HP at t73). One root, three games — the best remaining games/commit if the
+   legality rule can be pinned down.
 
 **Triage moves that keep paying, in order to run them:**
-1. `PRNG_TRACE` over every open game (above).
+1. `DBG_INSTR=1` on the open game's divergent unit (`DBG_GAME`/`DBG_I`), read against the
+   `DBG_DIFF=1` field. This is now step 1: every open game is stream-clean, so `PRNG_TRACE` will
+   only ever confirm that — run it once to re-verify after a landing, not to localize.
 2. The handler-list census off the sidecars — every `shuffle` draw carries `group` AND `full` (PS's
    ENTIRE sorted handler list with `effect`/`effectType`/`order`/`subOrder`/`speed`). Group the
    corpus by `(eventid, effect, effectType, order, subOrder)` and diff against the engine's model.
