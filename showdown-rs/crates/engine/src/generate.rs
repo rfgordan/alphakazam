@@ -258,7 +258,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -326,6 +326,13 @@ pub(crate) struct Branch {
     /// next iteration (PS's damage calc for hit n+1 must see hit n's event), so at most one is ever
     /// pending. See `apply_damaging_hit_step7`.
     pub(crate) pending_damaging_hit: Option<(bool, Item, crate::ids::Ability)>,
+    /// Transient (NOT part of State): a DRAG (Dragon Tail / Circle Throw / Roar / Whirlwind)
+    /// happened during this move action, so every remaining `getAllActive()` speed-sort in the
+    /// action must use THESE cached Speeds instead of the move-start snapshot in
+    /// `MOVE_TIE_SPEEDS`. Set per-branch by `apply_drag` (the drawn target differs per branch, so
+    /// a thread-local cannot carry it); read by `run_move_action`'s trailing 2882 emit; reset at
+    /// the top of every `run_move_action`. See `apply_drag` for the PS derivation.
+    pub(crate) drag_tie_speeds: Option<[i32; 2]>,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1890,7 +1897,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -2120,7 +2127,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -2331,7 +2338,7 @@ pub fn replacement_field_change_draws(state: &State, replacements: &[(SideId, u8
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -2668,7 +2675,7 @@ fn run_update_event(b: &mut Branch) {
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -3131,6 +3138,7 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     b.move_failed = false;
     b.pivot_update_done = false;
     b.per_hit_procs_done = false;
+    b.drag_tie_speeds = None;
     // Freeze both actives' Speed at this move's start (PS's `updateSpeed()` before the move action)
     // so the move's own internal Updates sort on the pre-move Speed — a paralysis/secondary Speed
     // change the move applies does not retroactively break its own tie. Save/restore for called-move
@@ -3166,7 +3174,17 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
             // A pivot move already emitted its trailing 2882 on the PRE-switch board at the pivot
             // site (PS fires it before processing `switchFlag`); don't re-emit on the post-switch board.
             if !nb.pivot_update_done {
-                emit_update(nb); // move action's trailing 2882 (uses the frozen pre-move Speed)
+                // Move action's trailing 2882. Normally it sorts on the frozen pre-move Speed; if
+                // this action DRAGGED a mon in, PS's `getAllActive()` now contains the REPLACEMENT
+                // and its (stale, never-refreshed) cache — see `apply_drag`.
+                match nb.drag_tie_speeds {
+                    Some(sp) => {
+                        let prev = MOVE_TIE_SPEEDS.with(|c| c.replace(Some(sp)));
+                        emit_update(nb);
+                        MOVE_TIE_SPEEDS.with(|c| c.set(prev));
+                    }
+                    None => emit_update(nb),
+                }
             }
         }
     }
@@ -3232,7 +3250,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -11113,10 +11131,72 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
         .map(|(idx, t)| {
             let mut nb = scaled(&b, p);
             draw(&mut nb, "sample", &[n], idx as i64, "drag");
+            emit_drag_switchin_sort(&mut nb, dragged, t);
             apply_switch(&mut nb, dragged, t);
             nb
         })
         .collect()
+}
+
+/// PS's `pokemon.speed` for a BENCHED mon is ALWAYS its unboosted `storedStats.spe`: every path
+/// off the field ends in `clearVolatile()` (`sim/pokemon.ts:1509`), whose last statement is
+/// `setSpecies(this.baseSpecies)`, whose last statement is `this.speed = this.storedStats.spe`
+/// (`:1419`). Measured against the recorded corpus: **197714 benched snapshots across the 401
+/// sidecars, ZERO with `speed !== storedStats.spe`.** No item, ability, boost, paralysis, Tailwind
+/// or weather modifier is in it — those live in `getActionSpeed()`, which only `updateSpeed()`
+/// calls.
+fn benched_speed_cache(state: &State, side: SideId, slot: u8) -> i32 {
+    state.side(side).pokemon[slot as usize].stat(crate::ids::StatIndex::Speed) as i32
+}
+
+/// A DRAG does NOT refresh the incoming mon's Speed cache, and every later speed-sort in the
+/// action sees the POST-drag board.
+///
+/// `switchIn(..., isDrag=true)` on gen >= 5 calls `this.runSwitch(pokemon)` DIRECTLY
+/// (`sim/battle-actions.ts:145-150`) instead of `queue.insertChoice({choice:'runSwitch'})` — and
+/// `insertChoice` is the ONLY caller of `choice.pokemon.updateSpeed()`
+/// (`sim/battle-queue.ts:374`). So unlike an ordinary switch (see `switch_entry_speed`), the
+/// dragged-in mon's `pokemon.speed` is never recomputed: it keeps the benched value above until
+/// the end-of-`runAction` `updateSpeed()` at `sim/battle.ts:2942`.
+///
+/// Two sorts then run on that board, both potentially one `shuffle[2,0,2]`:
+///   1. `runSwitch`'s `speedSort(getAllActive(true))` (`sim/battle-actions.ts:181-182`) — THIS
+///      function. It precedes `fieldEvent('SwitchIn')`, so it is emitted BEFORE `apply_switch`
+///      runs hazards and switch-in abilities, on the post-drag Speed pair.
+///   2. the move action's trailing `eachEvent('Update')` (`sim/battle.ts:2879`) — carried on the
+///      branch as `drag_tie_speeds` and consumed in `run_move_action`.
+///
+/// Witnesses, all rb1360 (Hydrapple 121 phazes with Dragon Tail):
+///   * d31 t27 and d77 t67 drag **Dipplin** (stored Spe 121) back in: PS records exactly the two
+///     shuffles above, `sample[2]@dragontail` then `shuffle[2,0,2]` (eventid `null` = the
+///     `speedSort`) then `shuffle[2,0,2]` (eventid `Update` = the 2882), both groups reading
+///     `["p1: Hydrapple:121", "p2: Dipplin:121"]`.
+///   * d6 t6 drags **Empoleon** (stored Spe 149) in: PS's unit stream ENDS at `sample[4]@drag`.
+///     The engine used to emit a twelfth draw here because the frozen PRE-move pair was the
+///     OUTGOING Dipplin's 121 against Hydrapple's 121 — a tie that the replacement breaks.
+///     That extra `shuffle` was the corpus's last PRNG offset (`engine=53 ps=52` at the d7
+///     boundary).
+fn emit_drag_switchin_sort(b: &mut Branch, dragged: SideId, target: u8) {
+    let other = dragged.other();
+    let mut sp = MOVE_TIE_SPEEDS.with(|c| c.get()).unwrap_or([
+        effective_speed(&b.state, SideId::One),
+        effective_speed(&b.state, SideId::Two),
+    ]);
+    sp[dragged as usize] = benched_speed_cache(&b.state, dragged, target);
+    // Carry the pair to the action's trailing 2882 (which sorts `getAllActive()` — fainted
+    // excluded, so `emit_update`'s own liveness test still applies).
+    b.drag_tie_speeds = Some(sp);
+    // `runSwitch` sorts `getAllActive(TRUE)`, i.e. fainted actives are still in the list — the
+    // attacker may have died to recoil / Rocky Helmet before the phaze resolved. A fainted mon has
+    // already been through `clearVolatile(false)`, so it sorts on the same benched cache.
+    let other_slot = b.state.side(other).active_index;
+    let other_occupied = b.state.side(other).active().species != crate::ids::Species::None;
+    if !b.state.side(other).active().is_alive() {
+        sp[other as usize] = benched_speed_cache(&b.state, other, other_slot);
+    }
+    if annotating() && other_occupied && sp[0] == sp[1] {
+        draw(b, "shuffle", &[2, 0, 2], -1, "update");
+    }
 }
 
 /// The 16 damage rolls of a landing Future Sight / Doom Desire: computed at hit time from the
