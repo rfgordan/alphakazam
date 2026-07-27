@@ -30,14 +30,21 @@ class RolloutBuffer:
         self.values = torch.zeros(shape, device=device)
         self.rewards = torch.zeros(shape, device=device)
         self.dones = torch.zeros(shape, device=device)
+        # "The learner actually chose here." Under the decision-point env (`flow_env`) a faint
+        # replacement or pivot landing is single-sided, so the other side's stored action is a
+        # no-op the engine discarded — real transition, no real decision. `ppo_update` masks the
+        # policy/entropy terms with this; value regression and GAE run over every step. Defaults
+        # to all-ones so the whole-turn envs are unaffected.
+        self.active = torch.ones(shape, device=device)
 
         # Filled by compute_gae().
         self.advantages = torch.zeros(shape, device=device)
         self.returns = torch.zeros(shape, device=device)
 
     def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None,
-            opp_action=None, dyn_target=None):
+            opp_action=None, dyn_target=None, active=None):
         self.obs[t] = obs
+        self.active[t] = 1.0 if active is None else active
         if self.obs_ids is not None and obs_ids is not None:
             self.obs_ids[t] = obs_ids
         if self.aux and opp_action is not None:
@@ -76,6 +83,7 @@ class RolloutBuffer:
             values=self.values.reshape(-1),
             advantages=self.advantages.reshape(-1),
             returns=self.returns.reshape(-1),
+            active=self.active.reshape(-1),
         )
         if self.obs_ids is not None:
             d["obs_ids"] = self.obs_ids.reshape(-1, self.id_dim)
