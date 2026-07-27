@@ -659,9 +659,19 @@ fn switch_entry_speed(pre: &State, side: SideId, slot: u8) -> i32 {
 /// engine recorded none and ran three draws behind from turn 15 on.
 fn emit_switch_bracket(b: &mut Branch, pre: &State, side: SideId, target: u8) {
     with_switch_bracket_speeds(b, pre, side, target, |b| {
-        emit_update(b); // switch action runAction Update (2882)
-        emit_update(b); // runSwitch getAllActive speedSort (battle-actions.ts:182)
-        emit_update(b); // runSwitch runAction Update (2882)
+        emit_update(b); // switch action runAction Update (2882) — plain getAllActive()
+        // `runSwitch` sorts `this.battle.getAllActive(TRUE)` (`sim/battle-actions.ts:181-182`) —
+        // the ONLY speed sort in the bracket that passes `includeFainted`. A slot still holding a
+        // mon that fainted earlier this turn therefore COUNTS, so the sort can tie (and consume a
+        // shuffle) on a board where both Updates around it see a single active and consume none.
+        // `emit_update_hit` is exactly that predicate ("the slot is occupied" rather than "alive").
+        //
+        // rb1710 d5 t4 / rb1706 d8 t6: a pivot lands while the FOE's slot holds a mon the pivot
+        // move just KO'd and whose replacement is a separate, later decision. PS records exactly
+        // ONE `shuffle[2,0,2]` for the landing — this one — and the engine recorded none, running
+        // a draw behind PS for the rest of the game.
+        emit_update_hit(b); // runSwitch getAllActive(true) speedSort (battle-actions.ts:182)
+        emit_update(b); // runSwitch runAction Update (2882) — plain getAllActive()
     });
 }
 
@@ -669,7 +679,18 @@ fn with_switch_bracket_speeds(
     b: &mut Branch, pre: &State, entered: SideId, slot: u8, f: impl FnOnce(&mut Branch),
 ) {
     let prev = MOVE_TIE_SPEEDS.with(|c| c.get());
-    let mut sp = [effective_speed(&b.state, SideId::One), effective_speed(&b.state, SideId::Two)];
+    // A slot holding a mon that FAINTED earlier this turn is in `getAllActive(true)`, and it sorts
+    // on the cached `pokemon.speed` that `faintMessages`' `clearVolatile` left behind:
+    // `clearVolatile` ends in `setSpecies(baseSpecies)`, which ends in
+    // `this.speed = this.storedStats.spe` (`sim/pokemon.ts:1419`). That is the RAW stat — no
+    // boosts, no paralysis, no Choice Scarf, no Tailwind. Reading `effective_speed` there sees
+    // boosts PS has already thrown away (rb1706 d7: Excadrill's Rapid Spin +1 Spe, on top of the
+    // +3 it was already carrying, all of it gone the moment it faints — 185, not 277).
+    let sort_speed = |s: SideId| {
+        let p = b.state.side(s).active();
+        if p.is_alive() { effective_speed(&b.state, s) } else { p.stat(crate::ids::StatIndex::Speed) as i32 }
+    };
+    let mut sp = [sort_speed(SideId::One), sort_speed(SideId::Two)];
     sp[entered as usize] = switch_entry_speed(pre, entered, slot);
     MOVE_TIE_SPEEDS.with(|c| c.set(Some(sp)));
     f(b);
@@ -2264,13 +2285,16 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 apply_end_of_turn(b, switched)
                     .into_iter()
                     .map(|mut nb| {
-                        // PS `endTurn` resets `statsRaisedThisTurn` / `statsLoweredThisTurn` on
+                        // PS `nextTurn` resets `statsRaisedThisTurn` / `statsLoweredThisTurn` on
                         // every active after the residuals run (battle.ts:1675-1676) — drop the
-                        // volatiles at the same boundary. But `turnLoop` returns on `this.ended`
-                        // (:2974) BEFORE calling `endTurn()`, so a residual faint that ends the
-                        // battle leaves both markers standing in the terminal state. Same rule the
-                        // `activeTurns` bump below already follows.
-                        if battle_over(&nb.state) {
+                        // volatiles at the same boundary, but ONLY when PS actually reaches
+                        // `nextTurn`. See `next_turn_reached`: an empty active slot means a
+                        // replacement bracket follows and `clear_stats_raised_markers` makes the
+                        // call there instead. Clearing here would fire BEFORE those replacements,
+                        // which is the wrong side of PS's order (rb1529: Reuniclus's Intimidate
+                        // marker was dropped at a residual PS never ran, three replacement
+                        // switch-ins before the battle ended).
+                        if !next_turn_reached(&nb.state) {
                             return nb;
                         }
                         for s in [SideId::One, SideId::Two] {
@@ -2345,11 +2369,43 @@ pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instructi
     b.ins
 }
 
-/// Faint replacements resolve inside a pseudo-turn of their own in PS: after the switch-in
-/// (and its abilities — Download, Intimidate reactions, ...) another `endTurn` runs, whose
-/// per-mon bookkeeping resets `statsRaisedThisTurn` on every active. The replacement entry
-/// APIs (`switch_into` / `switch_into_pair`) therefore never leave the marker set.
+/// Does PS reach `nextTurn()` from this board — i.e. is the turn actually going to END here?
+///
+/// `go()` (`sim/battle.ts`) drains its action queue and only then calls `nextTurn()`, and it
+/// returns early on `this.ended` OR `this.requestState`. Both early exits show up in state as the
+/// same thing: an active slot with a fainted mon in it. If a side is wiped the battle ended; if it
+/// still has a bench, `checkFainted` raised a `switch` request and the turn is suspended until the
+/// replacement lands. Either way the per-turn bookkeeping `nextTurn` does — the
+/// `statsRaisedThisTurn` / `statsLoweredThisTurn` reset — has NOT happened yet.
+fn next_turn_reached(state: &State) -> bool {
+    [SideId::One, SideId::Two].iter().all(|&s| state.side(s).active().is_alive())
+}
+
+/// `statsRaisedThisTurn` / `statsLoweredThisTurn` are cleared in exactly two PS places: on the
+/// OUTGOING mon inside `switchIn` (`sim/battle-actions.ts:123-124`, already covered by the
+/// switch-out volatile reset) and on every ACTIVE mon inside `nextTurn`
+/// (`sim/battle.ts:1675-1676`). A faint replacement is followed by the rest of the turn and then
+/// that `nextTurn`, so the replacement entry APIs stand in for it here.
+///
+/// **Unless the turn never gets there.** `go()` runs its action queue and only then calls
+/// `nextTurn()`, and it returns early on BOTH `this.ended` and `this.requestState` — so the
+/// markers freeze into the recorded state whenever the replacement leaves an active slot
+/// EMPTY. Two shapes, one predicate:
+///
+/// - the replacement kills itself on entry and its side still has a live bench, so PS issues
+///   ANOTHER switch request and returns from `go()` before `nextTurn` (rb1529: Suicune and
+///   then Scovillain each enter into Spikes + Stealth Rock and die on the way in, while
+///   Reuniclus keeps the `statsLoweredThisTurn` that the foe's Intimidate gave it);
+/// - the replacement kills itself on entry and the side is now EMPTY, so the battle ends
+///   (rb1433: Sticky Web sits on both sides, both replacements take −1 Spe, and Stealth Rock
+///   finishes the 20-HP Houndstone).
+///
+/// A fainted active covers both — `battle_over` implies one. `apply_end_of_turn`'s own clear
+/// carried only the `this.ended` half; both now go through `next_turn_reached`.
 fn clear_stats_raised_markers(state: &mut State) {
+    if !next_turn_reached(state) {
+        return;
+    }
     for side in [SideId::One, SideId::Two] {
         state.side_mut(side).volatiles.remove(VolatileStatus::StatsRaisedThisTurn);
         state.side_mut(side).volatiles.remove(VolatileStatus::StatsLoweredThisTurn);
@@ -3716,6 +3772,28 @@ fn unarm_rampage_on_cancel(b: &mut Branch, side: SideId) {
     }
 }
 
+/// The `BeforeMove` handlers at priorities 7 / 6 / 5 — Disable (`onBeforeMovePriority: 7`),
+/// Throat Chop / Heal Block / Gravity (6) and Taunt (5). Each returns `false`, and PS's
+/// `runEvent` short-circuits there, so NOTHING below them runs: not confusion's countdown and
+/// 1/3 roll (3), not Attract's 1/2 (2), not paralysis' 1/4 (1), and not `deductPP`.
+///
+/// Enumerated from the pin rather than recalled — the full descending ladder is
+/// `100` Glaive Rush / Grudge / Rage / Chilly Reception (marker removal, never a cancel),
+/// `11` mustrecharge, `10` slp + frz, `9` Truant, `8` flinch, `7` Disable, `6` Gravity +
+/// Heal Block + Throat Chop, `5` Taunt, `3` confusion, `2` Attract, `1` par, `0` choicelock +
+/// Gorilla Tactics, `-1` Destiny Bond. Everything at 8 and above is handled by `execute_move`'s
+/// earlier gates; this is the 7/6/5 rung, and it belongs ABOVE the 3/2/1 draw ladder.
+fn before_move_blocked_7_6_5(state: &State, side: SideId, md: &crate::data::MoveData) -> bool {
+    let s = state.side(side);
+    // Disable: only the named move.
+    (s.disable.0 != crate::ids::MoveId::None && s.disable.0 == md.id)
+        // Throat Chop: sound moves. Heal Block: heal-flag moves (incl. drains).
+        || (s.volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound)
+        || (s.volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal)
+        // Taunt: every status move.
+        || (s.taunt_turns > 0 && md.category == MoveCategory::Status)
+}
+
 /// Execute one move, first splitting on confusion: a confused, awake mon has a 1/3 chance to
 /// hit itself instead of acting. The 2/3 "acts normally" branch is identical to no-confusion
 /// behavior, so this only *adds* the self-hit outcomes (no regression on the common path).
@@ -3784,6 +3862,27 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         && truant_gate(&mut b, side)
     {
         return vec![b];
+    }
+    // Disable (7), Throat Chop / Heal Block / Gravity (6) and Taunt (5) come NEXT in PS's
+    // `BeforeMove` ladder — above confusion (3), Attract (2) and paralysis (1). `runEvent`
+    // short-circuits on the first handler that returns false, so a mon whose move one of these
+    // cancels never reaches the lower handlers: **no paralysis roll, no Attract roll, no
+    // confusion countdown, and no PP.** The engine ran them the other way round, inside
+    // `execute_move_inner`, below this whole ladder.
+    //
+    // rb1493 d46 t39 is the witness: a paralyzed Chansey picks Heal Bell, Ursaring's Throat Chop
+    // lands first, and PS's unit records the four Throat Chop draws and NOTHING else — no
+    // `randomChance[1, 4]@par`. The engine rolled it, went one draw ahead of PS for the rest of
+    // the game, and the offset first showed up a unit later as a missing Seismic Toss accuracy.
+    // (rb1649 is the same shape.)
+    {
+        let attacker = b.state.side(side).active();
+        let mid = action.external_move.unwrap_or(attacker.moves[action.move_idx as usize].id);
+        let struggling = action.external_move.is_none()
+            && (attacker.moves[action.move_idx as usize].pp == 0 || action.struggling);
+        if !struggling && before_move_blocked_7_6_5(&b.state, side, &move_data(mid)) {
+            return vec![b];
+        }
     }
     // Confusion counts down on each move attempt and ends ("snapped out") at 0, in which
     // case the mon acts normally this turn (PS decrements before the 1/3 roll).
@@ -4057,8 +4156,30 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
             }
         }
         VolatileStatus::Yawn => {
+            // The drowse is a VOLATILE, so it is refused by `onTryAddVolatile`, not by
+            // `onSetStatus` — a different (and shorter) list than "can this mon be put to sleep".
+            // Enumerated from the pin (`…filter(x => x.onTryAddVolatile)`), the handlers that
+            // return null for `yawn` are: insomnia, vitalspirit, purifyingsalt, shieldsdown
+            // (Meteor Minior), leafguard in sun, safeguard, and **electricterrain for a GROUNDED
+            // target**. `status_applies` already carries the ability half; the terrain half was
+            // missing, and it is NOT interchangeable with `status_blocked_by_field` — Misty
+            // Terrain blocks `confusion`, never `yawn`, so a Yawn under Misty still lands its
+            // volatile and only fails later at `onSetStatus`. (Safeguard is a side condition the
+            // engine does not model at all; noted, not fixed here.)
+            //
+            // rb1778 d36 t32: Pincurchin's Electric Surge terrain is still up when it pivots out
+            // to Copperajah and Meowstic's Prankster Yawn resolves. PS refuses the volatile; the
+            // engine drowsed a mon that cannot sleep.
+            let leaf_guard_sun = b.state.side(foe).active().ability == crate::ids::Ability::LeafGuard
+                && matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun);
+            let electric_ground = b.state.terrain == crate::ids::Terrain::Electric
+                && is_grounded(&b.state, foe);
             let t = b.state.side(foe).active();
-            if t.status == Status::None && status_applies(t, Status::Sleep) {
+            if t.status == Status::None
+                && status_applies(t, Status::Sleep)
+                && !leaf_guard_sun
+                && !electric_ground
+            {
                 push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
                 let prev = b.state.side(foe).yawn_turns;
                 push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::Yawn, previous: prev, new: 2 });
@@ -4627,21 +4748,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // was asleep AND taunted had its move cancelled by Taunt with the sleep counter untouched:
     // rb1009 d4 (a Dondozo asleep on 3 selects Rest, Froslass Taunts it first — PS ticks 3 -> 2)
     // and rb1356 d58 (the same shape with Coil).
-    if !struggling {
-        let dis = b.state.side(side).disable;
-        if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
-            return vec![b];
-        }
-        // Throat Chop: sound moves fail. Heal Block: heal-flag moves (incl. drains) fail.
-        if b.state.side(side).volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound {
-            return vec![b];
-        }
-        if b.state.side(side).volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal {
-            return vec![b];
-        }
-        if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
-            return vec![b];
-        }
+    // `execute_move` already ran this ladder for a real move action, ahead of confusion /
+    // attract / paralysis. It stays here for the CALLED entries that reach
+    // `dispatch_move_inner` directly (Sleep Talk, Dancer, a bounced move), which never pass
+    // through `execute_move`. One predicate, `before_move_blocked_7_6_5`, for both.
+    if !struggling && before_move_blocked_7_6_5(&b.state, side, &md) {
+        return vec![b];
     }
 
     // --- multi-turn move commitment (charge / semi-invulnerable / recharge) ---
@@ -4792,6 +4904,28 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
     }
 
+    // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
+    // user BEFORE the hit is attempted: `useMoveInner` calls `battle.faint(pokemon, pokemon, move)`
+    // at `sim/battle-actions.ts:501`, and `trySpreadMoveHit` — which owns EVERY hit step, including
+    // `hitStepTryHitEvent` and the absorbing abilities below — is not reached until :519. So the
+    // user faints against a type-immune target, against an ABSORBING ability, through Protect, and
+    // on a miss alike. (Damp already cancelled the move above, so no faint there.) The hit-branch
+    // self-destruct in `apply_post_damage` is a no-op once the user is already down.
+    //
+    // This block used to sit BELOW the absorb section, whose early `return vec![b]` skipped it.
+    // rb1774 d10 t7: Golem-Alola (Galvanize) Explodes into a Volt Absorb Minun. PS's whole unit is
+    // one `randomChance[100,100]@encore` — no accuracy roll, no damage — and Golem is at 0 HP with
+    // a replacement queued. The engine's Golem walked away untouched.
+    if matches!(move_id.to_id(), "explosion" | "selfdestruct" | "mistyexplosion") {
+        let (alive, hp, aslot) = {
+            let p = b.state.side(side).active();
+            (p.is_alive(), p.hp, b.state.side(side).active_index)
+        };
+        if alive {
+            push(&mut b, Instruction::Damage { side, slot: aslot, amount: hp });
+        }
+    }
+
     // Absorbing abilities (Volt Absorb / Water Absorb / Dry Skin / Earth Eater) nullify a move
     // of their type that targets the holder AND heal it 1/4 max HP (PS onTryHit). This fires for
     // damaging AND status moves alike — e.g. Thunder Wave vs Volt Absorb heals and prevents the
@@ -4894,20 +5028,41 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_crash_damage(&mut b, side, &md);
             return vec![b];
         }
-    }
-
-    // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
-    // user BEFORE the hit is attempted — PS gen9 queues `battle.faint(pokemon)` in `useMove`
-    // ahead of `tryMoveHit`. So the user faints even against a type-immune target, through
-    // Protect, or on a miss. (Damp already cancelled the move above, so no faint there.) The
-    // hit-branch self-destruct in `apply_post_damage` is a no-op once the user is already down.
-    if matches!(move_id.to_id(), "explosion" | "selfdestruct" | "mistyexplosion") {
-        let (alive, hp, aslot) = {
-            let p = b.state.side(side).active();
-            (p.is_alive(), p.hp, b.state.side(side).active_index)
-        };
-        if alive {
-            push(&mut b, Instruction::Damage { side, slot: aslot, amount: hp });
+        // Well-Baked Body (+2 Def vs a Fire move) and Wind Rider (+1 Atk vs a `wind`-flagged
+        // move) are the same `onTryHit` -> `return null` shape as every ability above, and the
+        // damaging path already models both — but only there, inside the `connects` test. A
+        // STATUS move of the matching type fell through this whole block to the accuracy draw.
+        //
+        // Enumerated from the pin rather than recalled: the gen9 abilities whose `onTryHit`
+        // blocks on a move TYPE or FLAG are exactly dryskin / earthEater / flashfire /
+        // lightningrod / motordrive / sapsipper / soundproof / stormdrain / voltabsorb /
+        // waterabsorb / wellbakedbody / windrider / bulletproof (plus goodasgold, magicbounce,
+        // oblivious, overcoat, sturdy, telepathy, wonderguard, which are handled elsewhere or
+        // are singles-irrelevant). Well-Baked Body and Wind Rider were the two missing here.
+        //
+        // rb1432 t49 / rb1650 t11: Will-O-Wisp (Fire, 85% accurate) into a Dachsbun. PS runs
+        // `hitStepTryHitEvent` at step 2 and `hitStepAccuracy` at step 5
+        // (`sim/battle-actions.ts:551-563`), so the whole unit draws NOTHING and Dachsbun ends
+        // at +2 Def, unburned. The engine rolled `randomChance(85,100)`, burned it, and ran a
+        // draw ahead from there.
+        //
+        // Soundproof / Bulletproof block with no side effect at all; the `flag_immune` test on
+        // the damaging path had them, this path did not (Roar into a Soundproof holder).
+        let flag_blocked = (md.flag_sound && fa == A::Soundproof)
+            || (md.flag_bullet && fa == A::Bulletproof)
+            || (is_wind_move(md.id) && fa == A::WindRider);
+        if affects_foe_mon
+            && (flag_blocked || (md.typ == Type::Fire && fa == A::WellBakedBody))
+            && !mb
+            && b.state.side(foe).active().is_alive()
+        {
+            if fa == A::WellBakedBody {
+                raise_boost(&mut b, foe, BoostIndex::Defense, 2);
+            } else if fa == A::WindRider {
+                raise_boost(&mut b, foe, BoostIndex::Attack, 1);
+            }
+            apply_crash_damage(&mut b, side, &md);
+            return vec![b];
         }
     }
 
@@ -5454,8 +5609,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 apply_target_secondary(hb, side, &md)
                     .into_iter()
                     .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
-                    .flat_map(|sb| apply_cursed_body(sb, side, &md)),
+                    .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md)),
             );
         }
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
@@ -5500,8 +5655,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             for mut sb in apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|x| apply_flinch_split(x, side, &md))
-                .flat_map(|x| apply_contact_secondaries(x, side, &md))
                 .flat_map(|x| apply_cursed_body(x, side, &md))
+                .flat_map(|x| apply_contact_secondaries(x, side, &md))
             {
                 match pivot {
                     Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
@@ -5819,8 +5974,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // ahead of the unordered contact-status set — a chip that faints the attacker must
                 // suppress its paralysis/burn. See `apply_damaging_hit_step7`.
                 .map(|mut sb| { apply_damaging_hit_step7(&mut sb, side, &md, false); sb })
-                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -7564,6 +7719,21 @@ fn apply_post_damage(
     // etc.) — unless the item is species-locked to the holder (PS onTakeItem false) or the
     // holder has Sticky Hold (suppressed by Mold Breaker, but def_ability reflects that).
     if md.id.to_id() == "knockoff" && !hit_sub {
+        // Knock Off's removal is `onAfterHit` — step 8 — and `runEvent('DamagingHit')` is step 7,
+        // so an `onDamagingHit` ITEM consumes itself before Knock Off can take it. The engine runs
+        // `apply_post_damage` ahead of the deferred `apply_damaging_hit_step7` (see the Gulp
+        // Missile note below for the same hazard), so the removal would erase the item first.
+        // Fire the policy here, ahead of the take; the caller's later call re-reads the item and
+        // finds nothing, exactly like the Gulp Missile precedent.
+        //
+        // Safe to hoist it above step 5 for THIS move only: Knock Off has no `secondaries`, so the
+        // reason the caller defers the policy — keeping the +2/+2 invisible to a secondary that
+        // reads `statsRaisedThisTurn` (rb1178: Alluring Voice) — has nothing to act on here.
+        //
+        // rb1544 t14 (Knock Off into a Weakness Policy Solgaleo) and rb1447 t25 (into a Necrozma-
+        // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
+        // policy consumed, the engine at +0 / +0 with it merely knocked away.
+        apply_weakness_policy(b, foe, &md);
         let f = b.state.side(foe).active();
         if f.is_alive()
             && f.item != Item::None
@@ -9347,6 +9517,22 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
 ///
 /// PS fires `runEvent('DamagingHit')` inside `spreadMoveHit` (battle-actions.ts:1142), i.e. ONCE
 /// PER CONNECTING HIT of `hitStepMoveHitLoop` — not once per move. The handlers that roll are
+/// **Order within the event: every TARGET handler, then every SOURCE handler.**
+/// `runEvent('DamagingHit')` is one of the four event ids that are NOT speed-sorted —
+/// `['Invulnerability', 'TryHit', 'DamagingHit', 'EntryHazard']` sort with
+/// `Battle.compareLeftToRightOrder` (`sim/battle.ts:789-790`), which is `order` ascending
+/// (undefined -> 4294967296, so the unordered handlers come LAST, after Rough Skin / Iron Barbs
+/// / Aftermath / Innards Out / Electromorphosis / Wind Power at order 1), then `priority`
+/// descending, then `index` — and for a single target every `index` is 0, so the sort is stable
+/// and the COLLECTION order survives. `findEventHandlers` collects the target's `on<Event>`
+/// first and pushes the source's `onSource<Event>` last, so a target's Cursed Body rolls before
+/// the attacker's Toxic Chain / Poison Touch regardless of either mon's Speed.
+///
+/// rb1520 d35 t27: Fezandipiti (Toxic Chain, Spe 210) Moonblasts a Banette (Cursed Body,
+/// Spe 174) to 0 HP. PS's stream is `cursedbody=false` then `toxicchain=true`; the engine ran
+/// the faster mon's handler first, read `false` as Toxic Chain and `true` as Cursed Body, and
+/// Disabled Moonblast where PS badly-poisoned nothing.
+///
 /// Cursed Body (`randomChance(3,10)` on the target), Toxic Chain (`onSourceDamagingHit`,
 /// `randomChance(3,10)` on the attacker) and the contact-status set (Static / Flame Body / Poison
 /// Point / Poison Touch / Cute Charm / Effect Spore). The engine's enumerate path applies them once
@@ -9362,9 +9548,9 @@ fn realized_per_hit_damaging_hit(
     b: &mut Branch, side: SideId, md: &crate::data::MoveData, cur: &mut RealizedCursor,
 ) {
     let base = b.draws.len();
-    let cands: Vec<Branch> = apply_contact_secondaries(b.clone(), side, md)
+    let cands: Vec<Branch> = apply_cursed_body(b.clone(), side, md)
         .into_iter()
-        .flat_map(|sb| apply_cursed_body(sb, side, md))
+        .flat_map(|sb| apply_contact_secondaries(sb, side, md))
         .collect();
     // Nothing rolled and nothing applied: the common case, no cursor movement.
     if cands.len() == 1 && cands[0].draws.len() == base {
@@ -10743,11 +10929,28 @@ fn execute_status_move(
                 let boost = b.state.side(foe).boost(BoostIndex::Attack);
                 (t.stat(crate::ids::StatIndex::Attack) as f32 * boost_multiplier(boost)) as i16
             };
+            // Liquid Ooze is `onSourceTryHeal`, and its `canOoze` list is exactly
+            // `['drain', 'leechseed', 'strengthsap']` (`data/abilities.ts:2360`) — enumerated from
+            // the pin, not guessed. The engine had it on `drain` only. `battle.heal` runs
+            // `runEvent('TryHeal')` at `sim/battle.ts:2284`, BEFORE the `target.hp >= target.maxhp`
+            // bail at :2288 ("for things like Liquid Ooze, the Heal event still happens when
+            // nothing is healed"), so the ooze damage is the FULL sapped amount and lands even on
+            // a user at full HP — it must not be capped by missing HP the way the heal is.
+            //
+            // rb1745 d26 t20: Bellossom's Strength Sap into a Liquid Ooze Tentacruel. PS takes
+            // Bellossom from 202 to 0; the engine healed it 166.
             let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
-            let amount = atk_val.min(maxhp - hp);
-            if amount > 0 {
-                let slot = b.state.side(side).active_index;
-                push(&mut b, Instruction::Heal { side, slot, amount });
+            let slot = b.state.side(side).active_index;
+            if b.state.side(foe).active().ability == crate::ids::Ability::LiquidOoze {
+                let dmg = atk_val.min(hp);
+                if dmg > 0 {
+                    push(&mut b, Instruction::Damage { side, slot, amount: dmg });
+                }
+            } else {
+                let amount = atk_val.min(maxhp - hp);
+                if amount > 0 {
+                    push(&mut b, Instruction::Heal { side, slot, amount });
+                }
             }
             if apply_boost_clamped(&mut b, foe, BoostIndex::Attack, -1) < 0 {
                 react_to_stat_drop(&mut b, foe);
@@ -12075,7 +12278,17 @@ fn apply_end_of_turn_inner(
             let f = b.state.side(other).active();
             (f.max_hp - f.hp, b.state.side(other).active_index)
         };
-        if !heal_blocked(b, other) {
+        // Liquid Ooze on the SEEDED mon turns the seeder's payout into damage — `leechseed` is
+        // on its `canOoze` list (`data/abilities.ts:2360`) alongside `drain` and `strengthsap`.
+        // Heal Block still suppresses the heal; it does not suppress the ooze, which is a
+        // `this.damage` inside `onSourceTryHeal` and never reaches `heal`'s Heal-Block gate.
+        if b.state.side(side).active().ability == crate::ids::Ability::LiquidOoze {
+            let f_hp = b.state.side(other).active().hp;
+            let dmg = drain.min(f_hp);
+            if dmg > 0 {
+                push(b, Instruction::Damage { side: other, slot: fslot, amount: dmg });
+            }
+        } else if !heal_blocked(b, other) {
             let heal = drain.min(f_room);
             if heal > 0 {
                 push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
