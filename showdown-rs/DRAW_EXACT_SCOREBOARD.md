@@ -1,11 +1,227 @@
 # DRAW-EXACT — Phase 1 first scoreboard
 
-Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the whole rail in one command.
-PS pin: `b9dc987d`. **Corpus: 912 games.** 111 audited traces / 3831 move units
-(`harness/cosim-traces/`), 401 `gen9randombattle` seed fixtures (`harness/seed-fixtures/`,
-seeds 1000-1400) and 400 more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). All three are
-committed; the SIDECARS the fixtures were built from stay gitignored and are regenerable with
-`bash harness/record-seeds.sh <first> <last>` (deterministic, byte-identical).
+Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the customgame rail in one
+command. **`bash harness/gate-rb.sh [out-set]`** — the NEW real-format rail. PS pin: `b9dc987d`.
+
+**Two corpora now, and they are not interchangeable.**
+
+* **1013 games total.** The customgame rail is 912: 111 audited traces / 3831 move units
+  (`harness/cosim-traces/`), 401 seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) and 400
+  more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). The randbats rail is 101
+  (`harness/seed-fixtures-rb/`, seeds 5001-5100 + 5139).
+* Every one of the 912 STAMPS `format: gen9randombattle` and was **played as `gen9customgame`**,
+  because `cosim.mjs` used to rewrite the formatid. Only the 101 are real random battles.
+  `cosim::trace::ruleset_for` keys off a separate, explicit `ruleset` field for exactly this
+  reason; absent ⇒ customgame.
+
+---
+
+# ==== RULESET TRANCHE — configurable formats + the first real-format corpus (2026-07-27) ====
+
+**HEADLINE: format rules are configurable, and `[Gen 9] Random Battle` is now a gated corpus —
+93 / 101 byte-exact from seed (92.1%), init-aligned 101 / 101.** The customgame rail moved
+868 → **870 / 912** as a side effect, with the newly-non-exact set EMPTY at all ten commits.
+
+## What landed
+
+| # | commit | what |
+|---|--------|------|
+| 1 | `ab1068e` | **`engine::ruleset::Ruleset`** — one `Copy` struct on `State`, two presets, `from_format` |
+| 2 | `f7ecaf2` | **the `trunc` arm** — 13-bit Speed wrap, the 10000 Speed cap, 16-bit damage |
+| 3 | `b3c6f03` | **Sleep Clause Mod** — the block emits PS's message/hint pair; H4 assertion; 6 tests |
+| 4 | `100d3bf` | **recorder** — real formatid, synthetic `start` decision, `sleepclausemod` pseudo-weather |
+| 5 | `fd2ef0b` | **the corpus** (101 games, 88 exact) + `hp_frac`'s 99 clamp + `maybe_trapped` |
+| 6 | `d5bd66f` | `hitStepTryImmunity` is moveStep 3 — hoisted above every move special case |
+| 7 | `cb2eaa5` | Pressure taxes the CALLER's PP for the CALLED move's targets |
+| 8 | `e36decc` | slp / frz return `undefined` on WAKE / THAW — the BeforeMove ladder continues |
+| 9 | `c1208d3` | a Struggling action has STRUGGLE's priority, not the empty slot's |
+| 10 | `840ce8e` | Queenly Majesty / Dazzling / Armor Tail never block a SELF-targeting priority move |
+
+Commits 6-10 are parity fixes found by the new corpus: 88 → 93. Two of them (8) also paid on the
+old rail (rb1418, rb1555).
+
+## The `Ruleset` design as landed
+
+`Ruleset` is a small all-scalar `Copy` struct built once at battle init and never mutated. It sits
+**on `State`**, replacing the old bare `sleep_clause: bool`, so the interior of `generate.rs` can
+read it without a parameter threaded through 13k lines — but it is deliberately **absent from the
+field manifest** `cosim::diff` / `cosim::digest` walk. It is battle CONFIGURATION, not battle
+state.
+
+Two presets, `GEN9_CUSTOM_GAME` (exactly the pre-tranche behaviour, and the default everywhere
+including `State::EMPTY`) and `GEN9_RANDOM_BATTLE`. Flags, and which layer each lives in:
+
+| flag | layer | draws? |
+|---|---|---|
+| `sleep_clause` | core | **yes** — suppresses the `random(2,5)` duration roll |
+| `bit_truncation` | core | **yes, indirectly** — Speed wrap → turn order → tie shuffles |
+| `endless_battle_clause` | core | no — `false` in both presets, unimplemented behind the flag |
+| `infer_foe_trapping_abilities` | request | no |
+| `report_exact_hp`, `emit_debug_lines`, `illusion_level_mod`, `cancel_mod`, `rule_lines` | protocol | no |
+| `team_preview` | protocol + entry contract | no |
+| `max_team_size`, `max_move_count`, `picked_team_size` | request shape | no |
+
+**The stamping hazard, and how it was defused.** All 912 committed recordings claim
+`gen9randombattle` and were played as customgame. So the resolver does **not** key off `format`.
+A new, explicit, optional `ruleset` field on the trace and the fixture names the formatid actually
+handed to `new Battle`; **absent ⇒ `gen9customgame`**, which is what every legacy recording really
+was. An unknown id errors loudly. Zero fixture churn, and the two stamps cannot disagree.
+
+**The entry contract** is one shared helper, `trace::first_decision_state(&ruleset)` — decision 0
+is `"teampreview"` with Team Preview and `"start"` without. `runPickTeam` is a complete no-op in a
+no-preview format, so the recorder emits a SYNTHETIC decision 0 carrying the draws `battle.start()`
+consumed and the board at the first move request: the exact role a teampreview decision plays.
+Decision 1 onward is shape-identical, so `replay.rs` / `seedgate.rs` / `drawdiff.rs` /
+`protocol_emit.rs` needed one predicate rather than four format-aware rewrites.
+
+**Recorder change that made it possible:** p2 is held out of the `new Battle` options and added
+with `battle.setPlayer('p2', …)` AFTER `instrumentPrng` — `setPlayer` is what calls `start()`
+(`sim/battle.ts:3279`), and without Team Preview `start()` runs the whole `'start'` action and
+turn-1 setup inline. Only the no-preview arm defers, so the Team-Preview arm stays byte-identical
+to how the 912 were recorded and their sidecars stay regenerable.
+
+## The trunc arm: **the 13-bit Speed wrap is real, and the SPEC's example is wrong**
+
+`RULESET_SPEC.md` §9 predicts 504 → +6 2016 → Scarf 3024 → Tailwind 6048 → Swift Swim 12096 →
+"wraps to 3904". **It does not.** `getStat` caps Speed at 10000 (`sim/pokemon.ts:638`) BEFORE
+`getActionSpeed` truncates (`:649`), and that cap carries the same `!format.battle?.trunc` guard —
+so it fires in exactly the formats that also truncate. 12096 caps to 10000, then truncs to
+**1808**.
+
+> **The reachable action-speed range under randbats is `[0, 8191]` for raw ≤ 8191, `[0, 1808]` for
+> raw in `[8192, 10000]`, and the single value 1808 for every raw above that. `(1808, 8191]` is
+> unreachable BY WRAPPING.** The practical wrap window is raw Speed 8192..10000 — 1809 wide, not
+> "everything past 8192". Raw 8192 truncates to exactly **0**, which both inverts turn order
+> against any ordinary foe and drops the mon into the speed-0 tie group the field-effect handlers
+> occupy (H4's second edge case).
+
+**No wrap was observed in the 101-game corpus** — 92.1% exactness was reached without one, and no
+divergence label mentions turn order. That is the expected result: randbats levels are ≤ 100 and
+the wrap needs a +6 / Scarf / Tailwind / weather-ability stack on an already-fast mon. It is
+implemented, unit-tested (`crates/engine/tests/ruleset_trunc.rs`) and inert until it is not.
+
+**Known residual, documented at the call site.** PS interposes Trick Room's `speed = 10000 - speed`
+BETWEEN the cap and the truncation; the engine models Trick Room by inverting the comparison. The
+two induce the same order AND the same tie set for every Speed ≤ 1808 (there
+`trunc(10000 - s, 13) == 1808 - s`, strictly decreasing), so a disagreement needs Trick Room and a
+>1808 effective Speed at once. Fixing it means making ~20 comparison sites read a signed action
+speed instead of flipping — not worth the regression surface.
+
+The 16-bit damage truncation is implemented and, as predicted, unreachable at legal levels (base
+damage would have to reach 65536).
+
+## Sleep Clause Mod
+
+Mechanics were already right; this tranche added the evidence and PS's output.
+`Instruction::SleepClauseBlocked` is a protocol-only marker (apply and reverse are both `{}`)
+pushed at all five status sites and rendered as PS's exact pair — **both lines on every
+activation**, because `hint()` is called without its `once` argument (`sim/battle.ts:3092`), and
+**no `|-fail|` after them**, because the block makes `didAnything` `null` rather than `false`.
+
+Each of the five sites is now `pre_clause` / `clause` / `applies` rather than a flat conjunction.
+That is not cosmetic: subOrder 5 means the clause runs LAST, so a Safeguard or Misty Terrain block
+short-circuits before it and PS prints nothing. The old flat form could not tell those apart.
+
+`Ruleset::set_status_rule_handlers()` is H4's assertion, with a test: the clause's tuple in a
+`SetStatus` list is `(∞, 0, 0, 5, 0)` and nothing in either preset shares it, so it is
+shuffle-neutral. A second subOrder-5 Rule would cost one `prng.shuffle` per SetStatus.
+
+**Corpus composition, from PS's own `battle.log`** (the recorder now stamps
+`sleepClauseActivations` / `sleepInflictions`, because a blocked sleep leaves NO trace in the
+serialized state — it is the absence of a status and of a draw):
+
+> **Sleep is rare in gen-9 randbats: 5 of 100 games inflict any sleep at all.** Four of the base
+> 100 exercise the clause (rb5008, rb5012, rb5021, rb5086; 5 activations). rb5139 was recorded
+> from a 5101-5200 scan to clear the ≥5 bar — that scan found exactly ONE more clause game in 100.
+> A directed tranche, not a bigger blind range, is the way to raise this.
+
+## Observation layer
+
+**`hp_frac`'s missing 99 clamp is fixed** — a live bug independent of the format work.
+`getHealth` does `ceil(100*hp/maxhp)` and then forces 99 whenever `hp < maxhp`; we did
+`.clamp(1, 100)`. A 403/404 mon rendered `100/100` where PS says `99/100` — the log claimed an
+untouched mon. Reachable for any `maxhp > 100` at `hp = maxhp - 1`. It never fired because
+customgame's `format.debug` puts every recording on the exact-HP arm.
+
+`HpStyle::for_ruleset` derives the style from `report_exact_hp` at all three call sites. **`HP
+Percentage Mod` is NOT the switch** — `reportPercentages || gen >= 7` takes the percent branch
+either way in gen 9; the real switch is `format.debug`. The request JSON's own `condition` is
+always exact regardless (`getHealth().secret`).
+
+`generate::maybe_trapped` implements the `FoeMaybeTrapPokemon` sweep (17 gen-9 species carry Arena
+Trap / Shadow Tag / Magnet Pull, enumerated from the pin), and `replay.rs` now compares `trapped`
+and `maybeTrapped` **separately** under a ruleset that runs the sweep. Conflating them was only
+sound while customgame skipped it: under randbats a mon facing a Sand Veil Dugtrio gets
+`maybeTrapped: true` on a perfectly legal switch.
+
+**Illusion Level Mod is a flag with no implementation surface** — the engine does not model
+Illusion at all (the ability appears only in Trace's exclusion list). Flagged for whoever adds it.
+
+## Five roots the real format found, and the shape they share
+
+1. **`hitStepTryImmunity` is moveStep 3, before accuracy (4).** `status_try_immunity_fails` was
+   correct but sat 700 lines BELOW the `md.id` special-case chain, and Trick/Switcheroo is IN that
+   chain and emits its own accuracy draw — under a comment asserting Sticky Hold blocks "later, at
+   `onTakeItem`". It does not. Now hoisted to the top of `execute_status_move`.
+2. **Pressure taxes the CALLER's PP, for the CALLED move's targets** (`battle-actions.ts:472-483`).
+   Sleep Talk has `pp: 10`, so it is a `callerMoveForPressure`: a Sleep Talk that rolls a
+   foe-targeting move into a Pressure holder costs **2 PP of Sleep Talk** and 0 of what it called.
+3. **`slp` / `frz` `onBeforeMove` return `undefined` when the mon WAKES or THAWS** — `false` only
+   while it stays asleep/frozen. So a mon that woke this turn still runs Truant (9), Disable/Taunt
+   (7/6/5), **confusion (3) and Attract (2)**. The engine returned straight into the move
+   machinery. Everything below slp/frz is now one function with three callers.
+4. **A Struggling action has Struggle's priority.** `runMove` swaps the move out
+   (`battle-actions.ts:255-275`) before `getActionSpeed` reads `action.move.priority`. The engine
+   read the empty slot's — so a Choice-locked mon out of PP on Protect Struggled at **+4**.
+5. **Queenly Majesty / Dazzling / Armor Tail read the move's TARGET, not just its priority.**
+   `source.isAlly(dazzlingHolder)` in `onFoeTryMove(target, source, move)` means "the move's
+   resolved target is the holder" — so a SELF-targeting priority move (Protect, Detect, King's
+   Shield) is never blocked. The engine failed the foe's Protect.
+
+> **Four of those five are "two engine copies of one PS computation drifted", and in three of them
+> the OTHER copy was already right** — `status_try_immunity_fails` vs the Trick branch, the
+> BeforeMove ladder vs the sleep short-circuit, Psychic Terrain's `target != User` vs Queenly
+> Majesty's missing one. Burn-downs XII and XIII said this about hand-copied LISTS and duplicated
+> COMPUTATIONS. It is now the single most productive thing to grep for: when you find a PS
+> predicate implemented in the engine, look for the second implementation before doing anything
+> else.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| **Seed gate, randbats 101** | `bash harness/gate-rb.sh` | **93 / 101 = 92.1%**; init-aligned **101 / 101** |
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111** (ABSOLUTE INVARIANT, held at every commit) |
+| Seed gate, pinned 401 | `SEED_GATE=1 cosim harness/seed-fixtures/*.fx.json.gz` | **393 / 401 = 98.0%** |
+| Seed gate, fresh 400 | `SEED_GATE=1 cosim harness/seed-fixtures-fresh/*.fx.json.gz` | **366 / 400 = 91.5%** |
+| **Seed gate, all 912** | `bash harness/gate-912.sh` | **870 / 912 = 95.4%**; init-aligned **912 / 912** |
+| Draw differ, audited | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; zero `rust extra` |
+| Draw differ, randbats | `DRAW_DIFF=1 cosim harness/seed-sidecars-rb/*.json.gz` | **3688 / 3712 = 99.35%** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831**, EXACTNESS 100.00% |
+| State sweep, randbats | `cosim harness/seed-sidecars-rb/*.json.gz` | **99.62%**, coverage 100.00% |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine + cosim tests | `cargo test --release -p engine -p cosim -j 2` | 17 suites, 102 tests, green |
+
+## The 8 remaining randbats opens are ONE class
+
+`rb5021 rb5026 rb5037 rb5039 rb5059 rb5064 rb5073 rb5100` — **all eight are the damage/HP
+asymptote**, the same class that is 31 of the 42 customgame opens. Five report
+`draws-match/state-diff` on a bare `hp`, two report a `result random[16]` (the differ picked a
+different damage roll because the HP it had to reproduce was off), and rb5021 is a **one-HP** Giga
+Drain difference with the draws matching exactly.
+
+rb5021 also carries a finding worth keeping even though it costs nothing: the engine emits FIVE
+pre-move shuffles where PS emits four, and FOUR post-move where PS emits five. The totals are
+equal, so the stream stays aligned and the game's only divergence is the 1 HP — but there is a
+real ordering difference between the pre-move `BeforeTurn`/`Update` bracket and the post-move one
+hiding under an accidentally-matching count.
+
+**Recommendation for the next tranche.** The randbats corpus is at 92.1% after ONE tranche, versus
+87.0% for the fresh customgame 400 when it was new and 91.5% now after fourteen. There is nothing
+format-shaped left in it — take the damage/HP asymptote, on either rail, with the differ's
+`randomChance[3, 10]@contact-status` (a `rust extra`) and the 7-unit
+`ps unconsumed shuffle[2, 0, 2]@generic` class as the two named leads.
 
 ---
 
