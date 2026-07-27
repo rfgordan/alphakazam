@@ -2755,10 +2755,15 @@ fn record_move_use(b: &mut Branch, side: SideId, move_id: crate::ids::MoveId) {
     if new_streak != prev_streak {
         push(b, Instruction::SetMoveStreak { side, previous: prev_streak, new: new_streak });
     }
-    // Any non-Protect action breaks the Protect chain.
-    if !is_protect_move(move_id) && prev_stall != 0 {
-        push(b, Instruction::SetStallCounter { side, previous: prev_stall, new: 0 });
-    }
+    // NOTE: a non-Protect action does NOT clear the chain here. PS's `stall` volatile carries the
+    // `onStallMove` denominator in `effectState.counter` and is only deleted by a FAILED stall
+    // roll or by its own `duration: 2` running out — using something else never touches it, so
+    // the counter survives to the end of the turn and is cleared with the volatile in the
+    // residual pass (`apply_end_of_turn_inner`, gated on the this-turn Protect marker), which is
+    // exactly PS's lifetime. rb1239 d64 t51 catches the difference at a mid-turn boundary: the
+    // Toxapex used Baneful Bunker on t50 and Toxic on t51, and PS's snapshot after the Toxic
+    // still holds `stall` with `counter: 3`.
+    let _ = prev_stall;
     // Hidden-info: using a move reveals that slot to the foe. (Struggle has no slot; skip it.)
     let slot_bit = b.state.side(side).active().moves.iter()
         .position(|m| m.id == move_id)
@@ -3327,6 +3332,15 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
     // Punch / Thunderclap can tell whether the target is attacking. The second mover's foe
     // (the first) has already acted, so it stays None.
     first.foe_pending_move = Some(b.state.side(second.side).active().moves[second.move_idx as usize].id);
+    // PS's queued action names a POKEMON, and `runAction`'s `case 'move'` opens with
+    // `if (!action.pokemon.isActive) return false` — so a second mover the FIRST mover forced off
+    // the field (Dragon Tail / Whirlwind / Roar / Circle Throw, Red Card, Eject Button) never
+    // acts, and the replacement that took its slot does not inherit the action. The engine's
+    // action names only a SIDE, so pin the party slot here and compare after the first move.
+    // rb1360 d6 t6: both sides pick Dragon Tail, p1's is faster, PS's draw stream ENDS at the
+    // drag `sample[4]` — the engine went on to spend the incoming Empoleon's Roost PP and emit
+    // two more Update shuffles (PS's `return false` also skips the trailing 2882 Update).
+    let second_slot = b.state.side(second.side).active_index;
     let mut out = Vec::new();
     // The prune between the movers is what kills the branch cross-product in Sample mode:
     // the second mover executes on one sampled first-move outcome instead of all of them.
@@ -3339,7 +3353,10 @@ fn sequence_two_moves(b: Branch, mut first: Action, second: Action, exec: &mut E
         // it.  Do not use merely `first mover is alive` here: if it has a replacement available
         // PS can continue the queue, and that broader condition regresses valid Memento/status
         // cases.
-        if fb.state.side(second.side).active().is_alive() && !battle_over(&fb.state) {
+        if fb.state.side(second.side).active_index == second_slot
+            && fb.state.side(second.side).active().is_alive()
+            && !battle_over(&fb.state)
+        {
             if flinched {
                 // The move is cancelled, but the BeforeMove handlers above flinch's priority
                 // still run (sleep tick / thaw roll / Truant toggle / recharge consumption). The
@@ -8623,7 +8640,12 @@ fn consume_lum_if_statused(b: &mut Branch, side: SideId) {
             push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
         }
         push(b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
-        on_item_lost(b, side);
+        // A Chesto is EATEN (`eatItem`), so PS records it in `lastItem` / `ateBerry` — the state
+        // the engine calls `last_berry` and Harvest / Cud Chew / Cheek Pouch read. This site
+        // called the bare item-lost hook and recorded nothing. rb1347 d61 t56: a Trick hands a
+        // sleeping Vaporeon the Chesto and it wakes on the spot; PS ends with
+        // `lastItem: chestoberry`, the engine with none.
+        on_berry_eaten_id(b, side, Item::ChestoBerry);
     }
 }
 
