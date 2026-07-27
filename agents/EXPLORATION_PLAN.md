@@ -152,3 +152,32 @@ written go/kill in `EXPERIMENTS.md` (append rows there; this file only defines t
 BC-init + R-NaD regularization + aux value heads, evaluated with the search wrapper) — not a
 fleet of parallel long runs. Anything that didn't clear its gate gets a one-line epitaph in
 `EXPERIMENTS.md` and its code left behind a flag.
+
+---
+
+## Decision review (2026-07-27, windows 1–5 complete)
+
+**Every cheap alternative lost to plain league PPO at probe scale.** E1 BC-init and kickstart
+(heuristic teacher plays from hidden info — 51% clone ceiling), E2 value-search (the GAE critic
+cannot rank off-policy successors; search LOSES to its own policy head), E4 R-NaD-lite
+(exploitability got worse at both η), E3 NFSP-lite (the history-average is more exploitable
+than the final policy). Full rows + diagnoses in `EXPERIMENTS.md`. Total spend: ~2.5h of box
+time — the program worked as designed: five directions de-risked for less compute than one
+evening of the main run.
+
+**The surviving thesis:** the strong references (mcts@100ms: 0.86 vs our best; foul-play vs
+night4: 0.90) win through SEARCH, and the single prerequisite our stack is missing is a value
+function trained to be a game evaluator rather than a variance-reduction critic. Everything
+graduating points there:
+
+1. **W6 (in flight):** `--aux` heads probe — the one existing lever aimed at
+   representation/value quality — with the E2 search gate re-tested on its endpoint.
+2. **E5 (gate MET via E2 branch B):** Metamon-template human-replay corpus. Replay outcomes are
+   exactly the grounded, off-policy value signal the search gate asked for — pursue as the next
+   multi-day build, subject to sign-off.
+3. **Value-as-evaluator training** (new lever, cheap to probe): an auxiliary value target on
+   UNSHAPED terminal outcome with longer horizon (or n-step targets decoupled from GAE), so the
+   critic means "who wins from here" rather than "what shaped return does the current policy
+   collect" — then retest the search gate.
+4. **Main line:** scale2 continues (0.280 vs heuristic @160M, entropy healthy, exploited to
+   only 0.235 by a 10M best-response — the most robust policy this program has measured).
