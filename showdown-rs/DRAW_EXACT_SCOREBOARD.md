@@ -6,6 +6,262 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== BURN-DOWN XI — certification (2026-07-27) ====
+
+**HEADLINE: 497 / 512 full games byte-exact from seed (97.1%), up from 484; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Nine parity commits, every one PS-source-grounded, judged by the exact-SET diff on BOTH corpora
+at every step: **the newly-non-exact set was EMPTY at all nine.** 13 games / 9 parity commits =
+**1.44 games/commit**; per-commit yield 2, 2, 3, 1, 1, 1, 1, 1, 1 — **no commit flipped zero**,
+so the revised early-stop line (<1 game/commit over three consecutive landings) was never
+approached. The tranche stopped on its 10-commit budget, not on yield.
+
+**This tranche spent the fixture-regeneration budget** (twice — see below) and used it to land
+the two changes that were parked precisely for it: the STAB/Tera root and the Roost encoding
+artifact. It also closed the whole named `struggle` cluster, which was three games.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim … seed-fixtures/*.fx.json.gz` | **497 / 512 = 97.1%**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, 0 unsupported |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** — 4832 / 4832 states, 3829 / 3829 move units |
+| Transplant continuation | `node harness/transplant-gate.mjs` | **79 / 110 OK**, 17 diverge, 0 fail, 14 skip, 1812 decisions — the documented baseline, unmoved |
+| Protocol log-parity | `PROTOCOL_EMIT=… cosim` then `node harness/protocol-parity.mjs` | 27 games, **508 semantic**, 4808 cosmetic (see the note below) |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+| Cosim tests | `cargo test --release -p cosim -j 2` | 4 / 4 (two new round-trip fixtures) |
+
+> **Protocol-parity number correction.** The scoreboard has carried **525 semantic** since
+> burn-down VII. That number was measured against a `harness/protocol-logs/` directory that had
+> gone stale (only 4 of its 108 files are tracked). Regenerating the logs at the PRE-tranche
+> commit gives **511**, and at the certifying commit **508** — so 525 was never a live reading,
+> and this tranche moved the true number by −3. Regenerate the logs before quoting it.
+
+## The roots landed (in commit order)
+
+| # | commit | root | games |
+|---|--------|------|-------|
+| 1 | `ee73a8c` | **PS's live `pokemon.types` becomes real engine state** — the STAB/Tera root and the Roost encoding artifact, together, with the fixture regeneration they needed | 484 → 486 (rb1119, rb1125) |
+| 2 | `9644b0a` | **`Battle.boost()` refuses outright when the boosted mon's side has no living foes** (`gen > 5 && !target.side.foePokemonLeft()`, `sim/battle.ts:2028`) — `move.selfBoost` is the one engine site downstream of PS's `faintMessages` | 486 → 488 (rb1233, rb1310) |
+| 3 | `7855252` | **Struggle is a REQUEST-time verdict, not a PP test** — `getMoves` returns `[]` when every slot is DISABLED, and the request turns that into Struggle. The whole named cluster | 488 → 491 (rb1024, rb1103, rb1231) |
+| 4 | `71cb405` | **A berry brought into range by end-of-turn chip is eaten at the residual action's TRAILING Update**, not at the chip — the residual queue fires no `eachEvent('Update')` of its own | 491 → 492 (rb1030) |
+| 5 | `89e46de` | **Encore's `failencore` flag list was 6 of PS's 18** — Sleep Talk is the one randbats hits | 492 → 493 (rb1387) |
+| 6 | `b5aeb38` | **`twoturnmove` OUTLIVES the strike** — the volatile alone is not "still charging"; only the pair with its marker volatile is | 493 → 494 (rb1345) |
+| 7 | `3ddaa2a` | Three independent singletons: a **dragged-out mon's queued action never runs**; the **Protect `stall` counter is not cleared by acting**; a **Chesto is EATEN** (records `lastItem`) | 494 → 495 (rb1239) |
+| 8 | `cca90f4` | **Ice Face RESTORES the moment snow starts** (`onWeatherChange` / `onStart`), not on the next switch-in | 495 → 496 (rb1253) |
+| 9 | `37742f1` | **The Disguise / Ice Face arms skipped `spreadMoveHit` step 4 (`selfDrops`)** and went straight to step 5 | 496 → 497 (rb1093) |
+| 10 | this commit | docs | — |
+
+## The structural change: `Pokemon::live_types` — PS's `pokemon.types`, verbatim
+
+Standing blocker for three tranches, and the reason this tranche needed a regeneration budget.
+
+The engine stored ONE type list (`types`) meaning "effective typing" — PS's `getTypes()`, with
+Tera folded in and Roost's Flying stripped out. PS stores the RAW array and resolves both at
+lookup time, and two of its lookups read the raw array directly. So the engine now stores both:
+
+- **`types`** — unchanged meaning: the RESOLVED typing every damage/immunity site already reads.
+- **`live_types`** — PS's `pokemon.types` verbatim. Tera does not touch it (`getTypes`
+  short-circuits on `terastallized` before reading it) and neither does Roost (whose `onType`
+  filters the RESULT, not the array). `base_types` stays the SPECIES typing (PS's `baseTypes`).
+
+What that bought, in one batch:
+
+1. **STAB (rb1125).** PS's `isSTAB` is
+   `move.forceSTAB || pokemon.hasType(type) || pokemon.getTypes(false, true).includes(type)`
+   (`sim/battle-actions.ts:1768`), and `getTypes(false, true)` returns `this.types` — the LIVE
+   array. The engine fed `species_types(attacker.species)`, so a Meowscarada turned Poison by
+   Protean and then Terastallized into Dark still got Grass STAB on Flower Trick, killed the
+   Gastrodon PS left at 27/331, and swallowed PS's next accuracy roll.
+2. **Roost typing (rb1119).** The digest and the state diff now compare `live_types`, which no
+   encoding touches, so the artifact is gone BY CONSTRUCTION — the resolved value is a function
+   of `live_types` + `terastallized`/`tera_type` + the `Roosted` marker, and the marker is
+   already masked as a single-turn flag. `convert.rs` applies the Flying filter when it sees the
+   volatile (so a state converted mid-Roost still simulates forward), and
+   `restore_roost_typing_side` restores to `live_types` instead of the species types.
+   (rb1119 turned out to be a TERA state mislabelled as a Roost one — the fix landed it anyway.)
+3. **`export.rs:317-325`'s latent bug**, fixed: it recovered PS's array from `base_types` for a
+   terastallized mon, which is right only when the typing was never changed. It writes
+   `live_types` now. Two new round-trip unit tests cover the three-way split (effective / live /
+   base) and the Roost window.
+
+**Instruction model.** `ChangeTypes` keeps the EFFECTIVE typing and a new `ChangeLiveTypes`
+carries the array, because the two move independently: an ENFORCED `setType` (`setSpecies`,
+`transformInto`) rewrites the array under a terastallized mon whose effective typing does not
+move, and Tera / Roost move the effective typing with the array standing still. `TransformData`
+carries both for the same reason. Sites audited against PS: Protean/Libero and Double Shock push
+both; Tera and Roost push only `ChangeTypes`; switch-out (`clearVolatile` ->
+`setSpecies(baseSpecies)`) and faint/revive reset the array **even under Tera**; `transformInto`
+copies the TARGET's `getTypes(true, true)` (its live array, `roost.typeWas` unfiltered) rather
+than the target's resolved typing.
+
+## The two fixture regenerations, and what moved
+
+| batch | trigger | files touched | decision digests moved | non-digest bytes |
+|---|---|---|---|---|
+| commit 1 | `digest.rs` swapped `types` → `live_types`; `convert.rs` derives `types` | **397 / 401** | **11012 / 19381** | zero |
+| commit 6 | `convert.rs` stopped reading a bare `twoturnmove` as `Charging` | **2 / 401** | **2 / 19381** | zero |
+
+The first number looks alarming and is exactly right: from the moment a mon Terastallizes, every
+later decision digests its PRE-tera array instead of `[tera]`, and 397 of 401 randbats games
+contain at least one Tera. The second is the whole population of its change — the two mid-turn
+boundaries in the corpus that fall between a charged strike and the end of its turn.
+
+Regenerate with
+`MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`
+and diff old-vs-new digest arrays before believing any count.
+
+## Recurring shapes this tranche made explicit
+
+> **A decision PS makes at REQUEST time cannot be re-derived mid-turn.** Struggle is the
+> canonical case (commit 3): `getMoves` runs when the request is built, and PS's
+> `onOverrideAction` only redirects an already-chosen action — it never re-consults `disabled`.
+> Evaluating the predicate at execution time got rb1231 d14 wrong in the opposite direction
+> before the flag was hoisted onto `Action`. The same shape is why a dragged-out mon's action
+> dies (commit 7): PS's queue names a POKEMON, the engine's action names a SIDE.
+
+> **`onUpdate` handlers fire ONLY at an `eachEvent('Update')`, and the residual queue contains
+> none.** Every berry trigger is an `onUpdate`. The engine ran its pinch-berry check inline at
+> residual order ~14; PS runs it at `runAction`'s trailing Update (`sim/battle.ts:2882`), after
+> the whole queue — which is why Harvest (28/2) sees a hand the engine had already emptied
+> (commit 4).
+
+> **A PS "flag list" hand-copied into the engine is a liability.** Encore's `failencore` set was
+> six of eighteen (commit 5). Enumerate them from the pin —
+> `Dex.forGen(9).moves.all().filter(m => m.flags.X)` — and paste the whole thing with the
+> command in the comment.
+
+> **A block that returns `0` from `onDamage` keeps the target LIVE**, so `spreadMoveHit` runs the
+> REST of its numbered steps — not just the secondaries the engine already knew about. Disguise
+> and Ice Face both skipped step 4, `selfDrops` (commit 9). The step table is in
+> `apply_self_drop`'s doc comment; step 4 precedes step 5.
+
+## The 15 still-open games — the evidenced table
+
+`DBG_DIFF`'s FIRST divergent field per game, at the certifying commit.
+
+```
+  rb1011 d43 t33  s0#3.hp 140/77
+  rb1012 d60 t52  s0#2.hp 138/185
+  rb1040 d2  t3   s0#0.hp 230/217
+  rb1108 d4  t5   s0#2.hp 89/73 + status None/Burn
+  rb1126 d7  t5   s1.volatiles bit28 UNBURDEN missing + s1#5.hp 396/275 + item Sitrus/None
+  rb1184 d5  t6   s1#4.hp 196/142
+  rb1191 d17 t14  s0#1.hp 25/33                        PS shuffle@thunderbolt vs rust accuracy
+  rb1236 d37 t29  s0#4.hp 51/18
+  rb1244 d10 t7   s1#4.ability Trace/WaterAbsorb       PS-unconsumed sample[1]@trace
+  rb1314 d45 t38  s1#0.item LightClay/None             surfaces at a Revival Blessing
+  rb1326 d50 t40  s1.substitute_hp 66/48 + s1#2.times_hit 2/1
+  rb1347 d69 t64  s1#1.hp 245/259                      was d61; commit 7 advanced it 8
+  rb1348 d12 t11  s0#1.hp 159/107 + s1.boost.def 1/0   rust-extra randomChance@accuracy
+  rb1359 d7  t7   s0#0.types [Normal,Fire]/[Normal,None] + move0 None/transform
+  rb1360 d7  t6   s0#0.hp 99/105                       was d6; commit 7 advanced it 1 — see below
+```
+
+**Volatile bit key** (discriminant = bit index, `volatile.rs`): 4 Encore, 28 Unburden,
+38 StatsRaisedThisTurn, 39 StatsLoweredThisTurn.
+
+**The PRNG-offset class is no longer empty — it has exactly ONE member, and it is diagnosed.**
+`PRNG_TRACE` over all 15 (309 boundary lines) shows fourteen aligning step-for-step with PS's
+cumulative advance count through their first divergence. The exception is **rb1360**, below.
+
+### NEW named open, fully diagnosed and NOT fixed: the trailing 2882 Update after a DRAG
+
+**rb1360 d6 t6.** Both sides pick Dragon Tail; p1's is faster and drags Dipplin out for
+Empoleon. PS's draw stream for the unit is eleven draws and **ENDS at the drag `sample[4]`**;
+the engine emits a twelfth, a `shuffle[2, 0, 2]@update`. The unit's DIGEST matches — this is a
+pure draw-count bug — and `PRNG_TRACE` reports `engine=53 ps=52` at the d7 boundary, the corpus's
+only remaining offset.
+
+It is the burn-down-X lever in a new costume: **`pokemon.speed` is a cache**, and the move
+action's trailing `eachEvent('Update')` (`sim/battle.ts:2882`) sorts on whatever the last
+`updateSpeed()` saw — which for this action is the board BEFORE the drag, carrying **Dipplin's**
+Speed against Hydrapple's (untied). The engine sorts the post-drag board, where **Empoleon** ties
+Hydrapple, and draws a shuffle PS never draws. `MOVE_TIE_SPEEDS` is the existing hook; the
+residual action already does exactly this with `pre_residual_speeds`. It wants a
+`pre_move_speeds` capture around `run_move_action`, which is a broader change than a tranche's
+last commit should carry.
+
+### Clusters worth naming (by DIVERGENT FIELD, per trap #1 — never by move name)
+
+There are **none**. Every one of the 15 is, as far as the evidence goes, a singleton: eight are
+a bare `hp` disagreement with no second field, and the seven that carry a second field carry a
+different one each (status, volatiles+item, ability, item, substitute_hp, boost.def, types+move).
+The two-game Sitrus signature that looked like a cluster mid-tranche (rb1030 + rb1126) split:
+rb1030 was the residual-Update ordering (commit 4) and rb1126's berry difference is downstream of
+a 121-HP damage gap, i.e. a symptom, not the root.
+
+## Named opens carried forward
+
+- **The rb1360 drag-Update cache**, above — the single best-diagnosed remaining lever.
+- `apply_end_of_turn`'s **`switched` parameter is still vestigial** (and still threads through
+  `apply_end_of_turn_inner`). Delete both when `request.rs` is next touched.
+- The engine's **Imposter** copies the target's BOOSTED Speed into `storedStats`; the **BeforeMove
+  ladder's confusion / Attract / paralysis half** still has no witness; **Rampage BeforeMove-cancel
+  at `n == 1`**, **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**,
+  **Magnet Rise's `onTry` failure** — all unchanged.
+- Deliberately NOT modelled in the `AfterMove` list, for want of a witness: the mover's own
+  `onAfterMove` handlers and the MOVE's own `onAfterMove`.
+- **Ice Face's `onStart` restore** and the **`selfDrops` fix in the Ice Face arm** both landed
+  without a corpus witness (they are the same PS source as their witnessed twins). Neither moved
+  a game; both are correctness.
+
+## Asymptote assessment — the corpus is NOT mined out, but its shared structure is
+
+The revised early-stop was "re-check after three landings; if the yield falls below 1 game per
+commit, write the assessment". It never did — the nine parity commits went 2, 2, 3, 1, 1, 1, 1,
+1, 1 and **not one of them flipped zero games**. The tranche stopped on budget. So the honest
+reading is:
+
+- **The last multi-game roots are gone.** Burn-down X said "every one of the 28 is now a
+  singleton" and was wrong twice — the `struggle` cluster really was one root over three games,
+  and the `selfBoost` refusal took two. This tranche's evidence table supports NO cluster at all:
+  the 15 survivors share no divergent field pair, and the one signature that repeated split into
+  two unrelated roots on inspection. Expect **1 game/commit** from here, and expect the work per
+  game to be a full mechanic each time.
+- **Eight of the fifteen are a bare `hp` mismatch with no second field**, which is the most
+  expensive shape to localize: `DBG_INSTR` shows a damage number, and the root is somewhere in a
+  ~40-term modifier chain. The seven with a second field (rb1108's Burn, rb1126's Unburden,
+  rb1244's Trace, rb1314's Light Clay, rb1326's substitute_hp, rb1348's boost.def, rb1359's
+  transform) are the cheap tail and should be taken first.
+- **Would +400 fresh seeds regrow shared classes?** Probably yes, and this is the recommendation
+  if the next tranche wants games/commit back above 1.5. The argument is empirical: every
+  multi-game root this campaign has closed was found because two or more games happened to hit
+  the same mechanic, and the rate at which that happens scales with corpus size, not with how
+  long you stare at a fixed corpus. At 497/512 the current corpus yields ~15 open games; a fresh
+  401-game batch at the same 97% exactness would yield ~12 more, drawn from a DIFFERENT sample of
+  mechanics, and any mechanic that appears twice across the union becomes a cluster. The cost is
+  ~2 minutes of recording (`bash harness/record-seeds.sh 1401 1800`) plus a fixture build.
+  The counter-argument is that the marginal open game is now a rare mechanic BY CONSTRUCTION —
+  the common ones are all modelled — so a fresh batch's opens will also be rare mechanics, and
+  rare mechanics collide less often. Both effects are real; the empirical test is cheap enough
+  that it should just be run.
+- **The corpus has NOT reached its evidenced ceiling.** Fifteen games with fifteen concrete
+  first-divergent fields, one of them (rb1360) diagnosed to the PS line, is not an exhausted
+  frontier — it is a queue. The ceiling claim would need the opens to be unlocalizable or to
+  require unmodellable state, and neither is true of any of them.
+
+## Recommendation for the next tranche
+
+1. **rb1360 first** — it is diagnosed to the line, it is the corpus's only PRNG offset, and the
+   `pre_move_speeds` capture it needs is the same shape the residual action already has.
+2. **Then the seven with a second field**, cheapest first: rb1359 (transform, and its `types`
+   diff is now readable against `live_types`), rb1314 (an item that is wrong on a FAINTED mon and
+   only surfaces at a Revival Blessing — walk it backwards from the revive), rb1244 (Trace),
+   rb1348, rb1326, rb1108, rb1126.
+3. **Then decide the fresh-seeds question with data, not argument**: record seeds 1401-1800,
+   build fixtures, run the gate once. If the new batch's opens share ANY divergent-field
+   signature with the current 15, the shared-class well is not dry.
+4. `PRNG_TRACE` is a one-command confirmation, not a triage tool — with one offset left it will
+   say "aligned" fourteen times out of fifteen. **`DBG_INSTR` remains the primary tool.**
+
+---
+
 # ==== BURN-DOWN X — certification (2026-07-27) ====
 
 **HEADLINE: 484 / 512 full games byte-exact from seed (94.5%), up from 476; init-aligned

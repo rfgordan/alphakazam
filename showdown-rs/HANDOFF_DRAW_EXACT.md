@@ -1,27 +1,77 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**BURN-DOWN X (2026-07-27): 484/512 full games byte-exact from seed (94.5%), up from 476;
+**BURN-DOWN XI (2026-07-27): 497/512 full games byte-exact from seed (97.1%), up from 484;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
 Differ 99.53% (3813/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
-engine tests 12 suites green. Kill criteria NOT triggered (1.33 games/commit over 6 parity commits;
-longest sub-line run is ZERO). `convert.rs` untouched — no fixture regeneration.
+transplant 79/110 (baseline, unmoved); protocol parity 508 semantic; engine tests 12 suites,
+cosim tests 4/4. Kill criteria NOT triggered — 1.44 games/commit over 9 parity commits and
+**no commit flipped zero**; the tranche stopped on its 10-commit budget.
 
-**THE HEADLINE IS NOT THE COUNT — IT IS THAT THE PRNG-OFFSET CLASS IS EMPTY.** All six of
-burn-down IX's localized offset games are closed, and `PRNG_TRACE` re-run over ALL 29 remaining
-open games shows every one aligning step-for-step with PS's cumulative advance count through and
-including the unit where its state first diverges (753 boundary lines, zero delta mismatches).
-**Every open game is now a pure MECHANICS bug on an aligned stream** — including the ten the gate
-still labels with a draw-CLASS name; those are same-step-count disagreements, not miscounts.
+**This tranche SPENT the fixture-regeneration budget, twice.** `convert.rs`, `digest.rs`,
+`diff.rs` and `export.rs` all moved. Regenerate with
+`MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`
+and diff the old/new digest arrays before believing any count — the first batch moved 11012 of
+19381 decision digests across 397 files (every decision after a Tera), the second moved 2.
 
-**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN X" — before anything else.**
-It carries the 29-game evidenced table (first divergent FIELD per game, volatile bits decoded) and
-the only two multi-game clusters the evidence supports.
+**THE STRUCTURAL CHANGE: `Pokemon::live_types` is PS's `pokemon.types`, VERBATIM.** The engine
+now stores both type lists. `types` keeps its old meaning — the RESOLVED typing (`getTypes()`,
+Tera folded in, Roost's Flying stripped) that every damage/immunity site reads. `live_types` is
+the raw array PS actually stores: Tera does not touch it (`getTypes` short-circuits before
+reading it) and neither does Roost (whose `onType` filters the RESULT). `base_types` stays the
+SPECIES typing. **The digest and the state diff compare `live_types`** — the resolved value is a
+function of it plus `terastallized`/`tera_type` plus the (already-masked) `Roosted` marker, so
+comparing it is strictly the PS-truth comparison AND it retired the Roost encoding artifact by
+construction. `ChangeTypes` (effective) and the new `ChangeLiveTypes` (the array) are separate
+instructions because the two move independently: an ENFORCED `setType` (`setSpecies`,
+`transformInto`) rewrites the array under a terastallized mon whose effective typing does not
+move. **When you touch typing, ask which of the three lists you mean.**
 
-**Which tool to reach for has therefore CHANGED.** `PRNG_TRACE` has done its job; use it now only
-to CONFIRM a game is stream-clean (one command, seconds). The primary tool is **`DBG_INSTR=1`**
-(with `DBG_GAME`/`DBG_I`) — the only thing that localizes a `draws-match/state-diff` unit — backed
-by `DBG_DIFF=1` for the divergent field.
+**THE PRNG-OFFSET CLASS HAS EXACTLY ONE MEMBER AND IT IS DIAGNOSED — rb1360.** `PRNG_TRACE` over
+all 15 open games (309 boundary lines) shows fourteen aligned step-for-step through their first
+divergence. rb1360 d6 emits ONE draw too many: the trailing `eachEvent('Update')` after a move
+that DRAGGED a mon in (`sim/battle.ts:2882`) sorts on the pre-drag cached Speed, so PS's outgoing
+Dipplin is untied against Hydrapple while the engine ties the incoming Empoleon and shuffles.
+It is the `pokemon.speed`-is-a-cache lever again; it wants a `pre_move_speeds` capture around
+`run_move_action`, the way the residual action already has `pre_residual_speeds`. **Take it
+first.**
+
+**The other fourteen are pure MECHANICS bugs on an aligned stream, and there is NO cluster left.**
+Eight are a bare `hp` mismatch with no second field (the most expensive shape); the seven with a
+second field are the cheap tail. Full evidenced table in the scoreboard's BURN-DOWN XI section.
+
+**Four rules this tranche added, each of which cost a landing to learn:**
+
+1. **A decision PS makes at REQUEST time cannot be re-derived mid-turn.** Struggle is decided by
+   `getMoves` when the request is built (`getMoves` returns `[]` when every slot is DISABLED, not
+   merely out of PP — `sim/pokemon.ts:1042`, `:1104`), and `onOverrideAction` only REDIRECTS an
+   already-chosen action; it never re-consults `disabled`. `Action::struggling` carries the
+   turn-start verdict. The same shape is why a dragged-out mon's queued action dies: PS's queue
+   names a POKEMON (`if (!action.pokemon.isActive) return false`), the engine's names a SIDE.
+2. **`onUpdate` handlers fire ONLY at an `eachEvent('Update')`, and the residual queue contains
+   none.** Every berry trigger is an `onUpdate`, so a berry brought into range by end-of-turn chip
+   is eaten at `runAction`'s TRAILING Update (2882), after the whole queue — which is why Harvest
+   (28/2) sees a hand the engine had already emptied.
+3. **A hand-copied PS flag list is a liability.** Encore's `failencore` set was six of eighteen.
+   Enumerate from the pin — `Dex.forGen(9).moves.all().filter(m => m.flags.X)` — and paste the
+   whole thing with the command in the comment.
+4. **A block that returns `0` from `onDamage` keeps the target LIVE**, so `spreadMoveHit` runs the
+   REST of its numbered steps. Disguise and Ice Face both skipped step 4 (`selfDrops`) and went
+   straight to step 5. Step 4 precedes step 5; the table is in `apply_self_drop`'s doc comment.
+
+**A number to stop quoting: protocol parity is NOT 525.** That reading was taken against a stale
+`harness/protocol-logs/` (only 4 of its 108 files are tracked). Regenerated at the pre-tranche
+commit it is **511**; at the certifying commit **508**. Always `PROTOCOL_EMIT=` before quoting it.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN XI" — before anything else.**
+It carries the 15-game evidenced table (first divergent FIELD per game, volatile bits decoded),
+the two fixture-regeneration diffs, and the ASYMPTOTE ASSESSMENT (including the case for and
+against recording +400 fresh seeds, which is the cheapest open question in the campaign).
+
+**Which tool to reach for.** `PRNG_TRACE` is a one-command CONFIRMATION, not a triage tool — with
+one offset left it will say "aligned" fourteen times out of fifteen. The primary tool is
+**`DBG_INSTR=1`** (with `DBG_GAME`/`DBG_I`) — the only thing that localizes a
+`draws-match/state-diff` unit — backed by `DBG_DIFF=1` for the divergent field.
 
 > **`PRNG_TRACE=<game-prefix>`** prints, at every unit boundary, the engine's absolute PRNG
 > position (steps replayed from the seed) against PS's cumulative recorded advance count. The first
@@ -110,7 +160,8 @@ Traps that keep costing cycles:
 2. **`pokemon.speed` is a CACHE, refreshed only by `updateSpeed()`** — at `commitChoices`, at each
    `insertChoice`, before each move action, and at the START of the residual action. Every
    `eachEvent`/`speedSort` in between reads the stale value. `MOVE_TIE_SPEEDS` is the engine's hook
-   for this; `switch_entry_speed` is the switch-bracket case.
+   for this; `switch_entry_speed` is the switch-bracket case. **The one site still unmodelled is a
+   move action's TRAILING 2882 Update after that move DRAGGED a mon in — rb1360.**
 3. **A hit-loop change must keep a `damage_inputs` snapshot straddling EVERY step-7 handler**,
    drawing or not (burn-down VIII's regression: rb1198 / rb1302 / rb1395).
 4. **A cancel/immunity check below the `md.category == MoveCategory::Status` dispatch in
@@ -120,6 +171,14 @@ Traps that keep costing cycles:
 6. **A speed-tie `shuffle` is NOT always state-neutral** (rb1250's double switch).
 7. **An indented block in a `///` doc comment compiles as a Rust DOCTEST** — `text`-fence pasted PS.
 8. **A draw-CLASS label is not a root label.**
+9. **A predicate PS evaluates at REQUEST time must not be re-evaluated mid-turn.** Struggle
+   legality is the type case; `onOverrideAction` redirects an action, it does not re-decide it.
+   Anything of that shape belongs on `Action`, captured from the turn-START board.
+10. **The engine's action names a SIDE; PS's names a POKEMON.** Any "did the right mon act?"
+   question (drag, Red Card, Eject Button) needs the party slot pinned before the first move.
+11. **`onUpdate` is not "whenever the state changes"** — it is `eachEvent('Update')`, and the
+   residual queue fires none. Berries eaten by end-of-turn chip land at the 2882 Update.
+12. **A PS flag list copied by hand rots.** Enumerate it from the pin and paste the whole set.
 
 Frames that paid off and are worth keeping:
 - **`switchIn`'s order** (`sim/battle-actions.ts:135-155`): slot swap → `initEffectState` →

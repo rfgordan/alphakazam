@@ -1,7 +1,9 @@
 # Exporter / Protocol — status & open-item specs (ps-export branch)
 
 Round-trip 4832/4832 · sweep 3831/3831 · smoke 18/18 · transplant **79/110** exact
-(1812 decisions) · protocol parity 27 games: **r5 semantic-ZERO, c1 = 2** (270→2),
+(1812 decisions) · protocol parity 27 games, **508 semantic / 4808 cosmetic** at burn-down XI
+(the long-quoted 525 was measured against a STALE `harness/protocol-logs/` — only 4 of its 108
+files are tracked; always `PROTOCOL_EMIT=` before quoting it): **r5 semantic-ZERO, c1 = 2** (270→2),
 most games single-digit; 5 randbats outliers (r9/r19/r3/r10/r12) are engine-REPLAY
 divergences, not emitter gaps.
 
