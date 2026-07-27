@@ -5007,7 +5007,20 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
             let pri = modified_priority(&b.state, side, &md);
             let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
-            if pri > 0 && !mb && !side_targeting {
+            // PS's test is `source.isAlly(dazzlingHolder) || move.target === 'all'`
+            // (`data/abilities.ts:3679`), and in `onFoeTryMove(target, source, move)` the args are
+            // (move USER, move TARGET, move) — `runEvent('TryMove', pokemon, target, move)`. So it
+            // reads "the move's resolved TARGET is the ability holder (or its ally)". **A
+            // SELF-TARGETING priority move is therefore never blocked**: its target is its own
+            // user, which is the holder's foe.
+            //
+            // The engine blocked on priority alone. rb5051 d35 t31: a Regigigas Protects (+4,
+            // target `self`) across from a Queenly Majesty holder; the engine failed the Protect,
+            // let a High Jump Kick through for 196, and PS's only draw for the whole turn is the
+            // residual protect/stall shuffle. Psychic Terrain — the same predicate, 15 lines
+            // below — already carried the `target != User` exemption. Two copies, one right.
+            let self_targeting = md.target == crate::data::MoveTarget::User;
+            if pri > 0 && !mb && !side_targeting && !self_targeting {
                 b.move_failed = true; // blocked → moveThisTurnResult false
                 return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
             }
