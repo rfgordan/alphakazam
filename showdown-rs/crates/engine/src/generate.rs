@@ -8836,7 +8836,19 @@ fn emit_sub_secondary_rolls(b: &mut Branch, side: SideId, md: &crate::data::Move
     if b.state.side(side).active().ability == crate::ids::Ability::SheerForce {
         return;
     }
-    if md.secondary_chance > 0 || extra_secondary_roll_move(md.id) {
+    // A Substitute does NOT stop `secondaries()` from rolling. `spreadMoveHit` records a sub hit
+    // as `damage[i] === true`, and its target filter is
+    // `if (!damage[i] && damage[i] !== 0) targets[i] = false` (sim/battle-actions.ts:1108-1110) —
+    // `true` is truthy, so the target survives into step 5 and `secondaries()` rolls its
+    // `random(100)` per secondary (sim/battle-actions.ts:1364). Only the EFFECT is then blocked.
+    //
+    // `secondary_chance` is the codegen's view, which is blind to a secondary whose payload is an
+    // `onHit` closure (Tri Attack, Dire Claw) — those moves are modelled by their own handlers and
+    // report chance 0, so they need naming here or their sub-hit roll goes missing.
+    // rb1033 d42: Tri Attack into a Substitute — PS rolls `random[100]@triattack`, the engine
+    // rolled nothing and ran one draw behind for the rest of the game.
+    let closure_secondary = matches!(md.id.to_id(), "triattack" | "direclaw");
+    if md.secondary_chance > 0 || extra_secondary_roll_move(md.id) || closure_secondary {
         draw(b, "random", &[100], 0, "secondary");
     }
     if md.flinch_chance > 0 {
