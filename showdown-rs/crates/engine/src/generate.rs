@@ -4929,6 +4929,42 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_crash_damage(&mut b, side, &md);
             return vec![b];
         }
+        // Well-Baked Body (+2 Def vs a Fire move) and Wind Rider (+1 Atk vs a `wind`-flagged
+        // move) are the same `onTryHit` -> `return null` shape as every ability above, and the
+        // damaging path already models both — but only there, inside the `connects` test. A
+        // STATUS move of the matching type fell through this whole block to the accuracy draw.
+        //
+        // Enumerated from the pin rather than recalled: the gen9 abilities whose `onTryHit`
+        // blocks on a move TYPE or FLAG are exactly dryskin / earthEater / flashfire /
+        // lightningrod / motordrive / sapsipper / soundproof / stormdrain / voltabsorb /
+        // waterabsorb / wellbakedbody / windrider / bulletproof (plus goodasgold, magicbounce,
+        // oblivious, overcoat, sturdy, telepathy, wonderguard, which are handled elsewhere or
+        // are singles-irrelevant). Well-Baked Body and Wind Rider were the two missing here.
+        //
+        // rb1432 t49 / rb1650 t11: Will-O-Wisp (Fire, 85% accurate) into a Dachsbun. PS runs
+        // `hitStepTryHitEvent` at step 2 and `hitStepAccuracy` at step 5
+        // (`sim/battle-actions.ts:551-563`), so the whole unit draws NOTHING and Dachsbun ends
+        // at +2 Def, unburned. The engine rolled `randomChance(85,100)`, burned it, and ran a
+        // draw ahead from there.
+        //
+        // Soundproof / Bulletproof block with no side effect at all; the `flag_immune` test on
+        // the damaging path had them, this path did not (Roar into a Soundproof holder).
+        let flag_blocked = (md.flag_sound && fa == A::Soundproof)
+            || (md.flag_bullet && fa == A::Bulletproof)
+            || (is_wind_move(md.id) && fa == A::WindRider);
+        if affects_foe_mon
+            && (flag_blocked || (md.typ == Type::Fire && fa == A::WellBakedBody))
+            && !mb
+            && b.state.side(foe).active().is_alive()
+        {
+            if fa == A::WellBakedBody {
+                raise_boost(&mut b, foe, BoostIndex::Defense, 2);
+            } else if fa == A::WindRider {
+                raise_boost(&mut b, foe, BoostIndex::Attack, 1);
+            }
+            apply_crash_damage(&mut b, side, &md);
+            return vec![b];
+        }
     }
 
     // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
