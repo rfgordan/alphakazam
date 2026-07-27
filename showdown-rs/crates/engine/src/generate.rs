@@ -2264,13 +2264,16 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 apply_end_of_turn(b, switched)
                     .into_iter()
                     .map(|mut nb| {
-                        // PS `endTurn` resets `statsRaisedThisTurn` / `statsLoweredThisTurn` on
+                        // PS `nextTurn` resets `statsRaisedThisTurn` / `statsLoweredThisTurn` on
                         // every active after the residuals run (battle.ts:1675-1676) — drop the
-                        // volatiles at the same boundary. But `turnLoop` returns on `this.ended`
-                        // (:2974) BEFORE calling `endTurn()`, so a residual faint that ends the
-                        // battle leaves both markers standing in the terminal state. Same rule the
-                        // `activeTurns` bump below already follows.
-                        if battle_over(&nb.state) {
+                        // volatiles at the same boundary, but ONLY when PS actually reaches
+                        // `nextTurn`. See `next_turn_reached`: an empty active slot means a
+                        // replacement bracket follows and `clear_stats_raised_markers` makes the
+                        // call there instead. Clearing here would fire BEFORE those replacements,
+                        // which is the wrong side of PS's order (rb1529: Reuniclus's Intimidate
+                        // marker was dropped at a residual PS never ran, three replacement
+                        // switch-ins before the battle ended).
+                        if !next_turn_reached(&nb.state) {
                             return nb;
                         }
                         for s in [SideId::One, SideId::Two] {
@@ -2345,20 +2348,41 @@ pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instructi
     b.ins
 }
 
+/// Does PS reach `nextTurn()` from this board — i.e. is the turn actually going to END here?
+///
+/// `go()` (`sim/battle.ts`) drains its action queue and only then calls `nextTurn()`, and it
+/// returns early on `this.ended` OR `this.requestState`. Both early exits show up in state as the
+/// same thing: an active slot with a fainted mon in it. If a side is wiped the battle ended; if it
+/// still has a bench, `checkFainted` raised a `switch` request and the turn is suspended until the
+/// replacement lands. Either way the per-turn bookkeeping `nextTurn` does — the
+/// `statsRaisedThisTurn` / `statsLoweredThisTurn` reset — has NOT happened yet.
+fn next_turn_reached(state: &State) -> bool {
+    [SideId::One, SideId::Two].iter().all(|&s| state.side(s).active().is_alive())
+}
+
 /// `statsRaisedThisTurn` / `statsLoweredThisTurn` are cleared in exactly two PS places: on the
 /// OUTGOING mon inside `switchIn` (`sim/battle-actions.ts:123-124`, already covered by the
 /// switch-out volatile reset) and on every ACTIVE mon inside `nextTurn`
 /// (`sim/battle.ts:1675-1676`). A faint replacement is followed by the rest of the turn and then
 /// that `nextTurn`, so the replacement entry APIs stand in for it here.
 ///
-/// **Unless the battle ENDED.** `go()`'s action loop returns on `this.ended` before reaching
-/// `nextTurn()`, so a replacement that leaves a side with no living Pokémon — a Sticky Web
-/// entry that finishes the last mon, a Stealth Rock that kills the replacement outright —
-/// freezes both markers into the terminal state. `apply_end_of_turn`'s clear already carries
-/// the same `battle_over` guard; the replacement path was missing it, which cost three fresh
-/// games (rb1433, rb1529, rb1628) whose final recorded state is exactly that terminal one.
+/// **Unless the turn never gets there.** `go()` runs its action queue and only then calls
+/// `nextTurn()`, and it returns early on BOTH `this.ended` and `this.requestState` — so the
+/// markers freeze into the recorded state whenever the replacement leaves an active slot
+/// EMPTY. Two shapes, one predicate:
+///
+/// - the replacement kills itself on entry and its side still has a live bench, so PS issues
+///   ANOTHER switch request and returns from `go()` before `nextTurn` (rb1529: Suicune and
+///   then Scovillain each enter into Spikes + Stealth Rock and die on the way in, while
+///   Reuniclus keeps the `statsLoweredThisTurn` that the foe's Intimidate gave it);
+/// - the replacement kills itself on entry and the side is now EMPTY, so the battle ends
+///   (rb1433: Sticky Web sits on both sides, both replacements take −1 Spe, and Stealth Rock
+///   finishes the 20-HP Houndstone).
+///
+/// A fainted active covers both — `battle_over` implies one. `apply_end_of_turn`'s own clear
+/// carried only the `this.ended` half; both now go through `next_turn_reached`.
 fn clear_stats_raised_markers(state: &mut State) {
-    if battle_over(state) {
+    if !next_turn_reached(state) {
         return;
     }
     for side in [SideId::One, SideId::Two] {
