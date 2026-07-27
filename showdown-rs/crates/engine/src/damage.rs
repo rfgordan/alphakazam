@@ -165,6 +165,12 @@ pub struct DamageInput {
     /// after type/burn/Life Orb — e.g. Multiscale (×0.5), Filter (×0.75). `(1, 1)` = none.
     pub final_num: i64,
     pub final_den: i64,
+    /// `Ruleset::bit_truncation` — PS ends `modifyDamage` with `tr(baseDamage, 16)`
+    /// (`sim/battle-actions.ts:1845`, and `:1863` for confusion damage), i.e. damage is reduced
+    /// mod 65536 in every real format. `[Gen 9] Custom Game` replaces `trunc` with `Math.trunc`,
+    /// which ignores the `bits` argument, so our whole corpus was calibrated with this OFF.
+    /// Unreachable at legal levels (a 16-bit overflow needs base damage ≥ 65536) but free.
+    pub trunc_16: bool,
 }
 
 /// The pre-roll base damage: `floor(floor((2*level/5+2) * power * atk / def) / 50) + 2`.
@@ -308,6 +314,11 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         }
         // Final defender modifier (Multiscale, Filter, ...).
         d = modify(d, input.final_num, input.final_den);
+        // `sim/battle-actions.ts:1845` — "16-bit truncation happens even later, and can truncate
+        // to 0". A no-op below 65536, which is everything at legal levels.
+        if input.trunc_16 {
+            d = ((d as u32) % 65536) as i64;
+        }
         out[roll as usize] = d.max(1) as i16;
     }
     out
@@ -382,6 +393,7 @@ mod tests {
             adaptability: false,
             tera_shell: false,
             freeze_dry: false,
+            trunc_16: false,
             final_num: 1,
             final_den: 1,
         };

@@ -604,7 +604,40 @@ fn effective_speed_opts(state: &State, side: SideId, at_entry: bool) -> i32 {
     if !at_entry && p.ability == SlowStart && s.active_turns <= 5 {
         spe *= 0.5;
     }
-    spe as i32
+    action_speed_trunc(state, spe as i32)
+}
+
+/// The tail of PS's `getStat('spe')` + `getActionSpeed()` — the two steps our whole corpus never
+/// saw, because `[Gen 9] Custom Game` sets `battle: { trunc: Math.trunc }` and both are gated on
+/// the format NOT doing that.
+///
+/// 1. `sim/pokemon.ts:638` — `if (statName === 'spe' && stat > 10000 && !this.battle.format.battle?.trunc)
+///    stat = 10000;` The Speed cap is SKIPPED in customgame (its `format.battle.trunc` is truthy)
+///    and applied everywhere else.
+/// 2. `sim/pokemon.ts:649` — `return this.battle.trunc(speed, 13);` With the real `Dex#trunc`
+///    (`sim/dex.ts:363`) that is `(speed >>> 0) % 8192`; with `Math.trunc` the `bits` argument is
+///    ignored outright and nothing happens.
+///
+/// This is the ONE place either step belongs: every engine read of "the Speed an action sorts on"
+/// goes through `effective_speed`, which models `pokemon.speed` = `updateSpeed()` =
+/// `getActionSpeed()` (`sim/pokemon.ts:557`).
+///
+/// **Known residual — Trick Room.** PS interposes `speed = 10000 - speed` BETWEEN the cap and the
+/// truncation, so under Trick Room it truncates `10000 - s`, while the engine models Trick Room by
+/// inverting the comparison instead. The two agree exactly wherever `s <= 1808`: there
+/// `trunc(10000 - s, 13) == 1808 - s`, which is strictly decreasing in `s`, so "descending
+/// truncated 10000-s" and "ascending s" induce the same order AND the same tie set (both are
+/// `s1 == s2`). 1808 is far above any Speed reachable without a +6/Scarf/Tailwind stack, so the
+/// disagreement needs Trick Room AND a >1808 effective Speed simultaneously. Flagged, not fixed:
+/// fixing it means making the ~20 comparison sites read a signed action speed rather than
+/// flipping, which is not worth the regression surface here.
+#[inline]
+fn action_speed_trunc(state: &State, spe: i32) -> i32 {
+    if !state.ruleset.bit_truncation {
+        return spe; // format.battle.trunc = Math.trunc: no cap, no wrap.
+    }
+    let capped = spe.min(10000).max(0) as i64;
+    state.ruleset.trunc(capped, 13) as i32
 }
 
 /// The Speed PS caches for a mon that JUST switched in, which every shuffle of the switch bracket
@@ -6740,6 +6773,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         adaptability,
         tera_shell,
         freeze_dry: is_freeze_dry(md),
+        trunc_16: b.state.ruleset.bit_truncation,
         final_num: fmod,
         final_den: 4096,
     };
@@ -11567,6 +11601,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         adaptability: false,
         tera_shell: false,
         freeze_dry: false,
+        trunc_16: state.ruleset.bit_truncation,
         final_num: 1,
         final_den: if screened { 2 } else { 1 },
     };
