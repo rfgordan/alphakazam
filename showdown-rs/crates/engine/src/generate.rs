@@ -2149,6 +2149,38 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     branches
 }
 
+/// How many EXTRA `getAllActive()` speedSorts a forced replacement's switch-in abilities fire by
+/// CHANGING the field.
+///
+/// PS's `runSwitch` (sim/battle-actions.ts:175-190) is speedSort → `fieldEvent('SwitchIn')` →
+/// the switch action's trailing runAction Update — the 3-draw bracket `replacement_bracket_tied`
+/// already accounts for. But a switch-in ability that sets weather or terrain runs
+/// `Field.setWeather` / `setTerrain`, and each of those ENDS with
+/// `eachEvent('WeatherChange')` / `eachEvent('TerrainChange')` (sim/field.ts:87 / :155) — one more
+/// `getAllActive()` speedSort, i.e. one more tie-gated `shuffle[2,0,2]` INSIDE the bracket,
+/// between its speedSort and its trailing Update. The move path emits these via
+/// `emit_field_change_shuffle`; the gate's forced-replacement path applies the switch with
+/// `switch_into` (state only) and so never saw them.
+///
+/// Witness rb1362 d21: a fainted p1 is replaced by a Drizzle Politoed on a Speed-tied board; PS
+/// records FOUR `shuffle[2,0,2]`, the third tagged `drizzle`/`SwitchIn`. The engine consumed three
+/// and ran one draw behind for the rest of the game (surfacing at d24 as a `randomChance@par`
+/// class label — an OFFSET symptom, not a paralysis bug).
+///
+/// Counted by replaying the real `switch_into` on a clone and diffing the field, so the ability
+/// table stays in one place (`apply_switch_in_ability`). Replacements are applied in order, so a
+/// second switch-in that re-sets the SAME weather correctly counts nothing.
+pub fn replacement_field_change_draws(state: &State, replacements: &[(SideId, u8)]) -> usize {
+    let mut st = *state;
+    let mut n = 0;
+    for &(side, slot) in replacements {
+        let (w, t) = (st.weather, st.terrain);
+        let _ = switch_into(&mut st, side, slot);
+        n += (st.weather != w) as usize + (st.terrain != t) as usize;
+    }
+    n
+}
+
 /// Apply a (forced) switch-in directly to `state`: reset the outgoing active's boosts
 /// and volatiles, change the active slot, and apply entry hazards. Used by the
 /// differential harness to apply post-faint replacement switches.

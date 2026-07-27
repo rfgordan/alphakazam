@@ -219,6 +219,37 @@ fn consume(prng: &mut PsPrng, kind: &str, args: &[i32]) -> i64 {
     }
 }
 
+/// Number of raw `next()` advances the recorded draws of a decision represent.
+fn rec_draw_advances(d: &GateDecision<'_>) -> u64 {
+    let mut n = 0u64;
+    for dr in d.draws {
+        let kind = dr.get("kind").and_then(Value::as_str).unwrap_or("");
+        let args: Vec<i64> = dr.get("args").and_then(Value::as_array).map(|a| {
+            a.iter().filter_map(Value::as_i64).collect()
+        }).unwrap_or_default();
+        n += if kind == "shuffle" {
+            let (start, end) = (args[1], args[2]);
+            (end - 1 - start).max(0) as u64
+        } else {
+            1
+        };
+    }
+    n
+}
+
+/// Steps from the game's seed to `cur`'s state, by replay. `None` if unreachable within `cap`.
+/// Used only by the `PRNG_TRACE` localizer, which needs the engine's absolute stream position.
+fn prng_offset(limbs: [u16; 4], cur: &PsPrng, cap: u64) -> Option<u64> {
+    let mut p = PsPrng::from_limbs(limbs);
+    for k in 0..cap {
+        if p == *cur {
+            return Some(k);
+        }
+        p.next();
+    }
+    None
+}
+
 /// Consume the recorded draws of a decision purely for their PRNG-stream shape (used for the
 /// teampreview action, which the engine does not model — it only advances the stream).
 fn consume_recorded(prng: &mut PsPrng, d: &GateDecision<'_>) {
@@ -250,6 +281,16 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> (usize,
         }
         let rep = &outcomes[cands[0]].draws[pos];
         let res = consume(prng, rep.kind, &rep.args);
+        if DBG_UNIT.with(|c| c.get()) && std::env::var("DBG_SELECT").is_ok() {
+            let mut shapes: Vec<String> = cands.iter()
+                .map(|&i| format!("{}{:?}={}@{}", outcomes[i].draws[pos].kind, outcomes[i].draws[pos].args,
+                                  outcomes[i].draws[pos].result, outcomes[i].draws[pos].site))
+                .collect();
+            shapes.sort();
+            shapes.dedup();
+            eprintln!("  SEL pos={pos} cands={} rep={}{:?}@{} res={res} shapes={:?}",
+                      cands.len(), rep.kind, rep.args, rep.site, shapes);
+        }
         if rep.kind == "shuffle" {
             live = cands;
         } else if rep.kind == "random" && rep.args == [100] {
@@ -354,6 +395,18 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
             && std::env::var("DBG_I").ok().and_then(|v| v.parse::<usize>().ok()).is_none_or(|di| di == i);
         DBG_UNIT.with(|c| c.set(dbg_on));
         if dbg_on { eprintln!("=== {name} d{i} t{} ===", dp.turn); }
+        // PRNG_TRACE: print the engine's absolute stream position against PS's cumulative recorded
+        // advance count at every unit boundary. The FIRST unit where they part is the unit whose
+        // draw COUNT is wrong — which is what localizes an offset game (a `result random[16]`
+        // first-divergence label names the unit that *reads* the misaligned stream, not the one
+        // that misaligned it).
+        if std::env::var("PRNG_TRACE").ok().is_some_and(|g| name.starts_with(&g)) {
+            let ps_cum: u64 = g.decisions[..i].iter().map(rec_draw_advances).sum::<u64>()
+                + init_gender_rolls(g) as u64;
+            let eng = prng_offset(limbs, &prng, 100_000);
+            let mark = if eng == Some(ps_cum) { "" } else { "  <<< OFFSET" };
+            eprintln!("[PRNG] {name} d{i} t{} engine={:?} ps={ps_cum}{mark}", dp.turn, eng);
+        }
         // Beat Up pairs each participant's base power with a distinct per-hit roll, so its realized
         // total depends on PS's CURRENT side.pokemon array order (active-first, swap-tracked). The
         // engine stores a fixed canonical slot order, so feed it PS's array order (the recorded
@@ -549,6 +602,13 @@ fn step_unit(
             engine::generate::trace_replacement_sample(state, side_id(side), slot, foe_replacement)
         })
         .count();
+    // A switch-in ability that CHANGES weather/terrain fires one extra `eachEvent` speedSort inside
+    // the replacement bracket (see `replacement_field_change_draws`). Measured on the PRE-swap
+    // board, in replacement order.
+    let field_change_draws = engine::generate::replacement_field_change_draws(
+        state,
+        &replacements.iter().map(|&(s, sl)| (side_id(s), sl)).collect::<Vec<_>>(),
+    );
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
         engine::generate::switch_into_pair(state, [
@@ -591,6 +651,12 @@ fn step_unit(
             for _ in 0..3 {
                 let _ = consume(prng, "shuffle", &[2, 0, 2]);
             }
+        }
+        // ...plus the switch-in abilities' own field-change `eachEvent`s. Same tie predicate
+        // (`eachEvent` reads the cached `pokemon.speed` here too), same `shuffle[2,0,2]` shape, so
+        // only the COUNT matters to the stream.
+        for _ in 0..field_change_draws {
+            let _ = consume(prng, "shuffle", &[2, 0, 2]);
         }
     }
     // Trace's switch-in `sample(1)` for each tracing replacement (after the switch bracket, in the
