@@ -141,6 +141,26 @@ impl Ruleset {
         }
     }
 
+    /// How many `Rule` handlers this ruleset contributes to a `SetStatus` handler list at
+    /// subOrder 5 — **SPEC H4, the assertion that must never exceed 1.**
+    ///
+    /// `resolvePriority` (`sim/battle.ts:950`) gives every `Rule` effect subOrder 5, and
+    /// `comparePriority` sorts order -> priority -> speed -> subOrder -> effectOrder. Sleep
+    /// Clause Mod's tuple in a `SetStatus` list is `(∞, 0, 0, 5, 0)`; in both presets nothing
+    /// else shares it (the format itself defines no `onSetStatus`, there is no second Rule
+    /// pseudo-weather, and no weather condition has one), so the clause is **shuffle-neutral**.
+    /// Add Freeze Clause Mod or Stadium Sleep Clause to a preset and the tie group becomes size
+    /// 2, which costs one `prng.shuffle` per `SetStatus` — a draw every gate would then miss.
+    ///
+    /// (The other way into that tie group is a Pokemon whose `getActionSpeed` truncates to
+    /// exactly 0 — reachable only under `bit_truncation`, at raw Speed exactly 8192. That one
+    /// falls out of `effective_speed` naturally and needs no flag.)
+    pub const fn set_status_rule_handlers(&self) -> u32 {
+        // Only `sleepclausemod` qualifies today; see RULESET_SPEC.md §0's inventory of which
+        // rules become pseudo-weathers at all.
+        self.sleep_clause as u32
+    }
+
     /// PS's `Dex#trunc` (`sim/dex.ts:363`) under this ruleset: `(num >>> 0) % 2**bits` when the
     /// format leaves `battle.trunc` alone, and `Math.trunc` (a no-op on an already-integral
     /// value, `bits` ignored) when the format overrides it.

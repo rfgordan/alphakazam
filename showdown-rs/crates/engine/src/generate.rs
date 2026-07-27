@@ -9367,11 +9367,18 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
         // band 11). The status result value is a draw-and-discard for the DP path; the band is
         // what the seed-gate/differ realized selection reads.
         for (p, status, res) in [(0.11, Status::Sleep, 0i64), (0.10, Status::Paralysis, 11), (0.09, Status::Poison, 21)] {
-            let applies = status_applies(b.state.side(side).active(), status)
-                && !status_blocked_by_field(&b.state, side, status)
-                && !(status == Status::Sleep && sleep_clause_blocks(&b.state, side));
+            // PS order at `SetStatus`: ability immunities -> terrains (subOrder 2) ->
+            // Safeguard (4) -> Sleep Clause Mod (5, LAST). So the clause is only ever REACHED
+            // when every earlier gate passed, and only then does it speak.
+            let pre_clause = status_applies(b.state.side(side).active(), status)
+                && !status_blocked_by_field(&b.state, side, status);
+            let clause = pre_clause && status == Status::Sleep && sleep_clause_blocks(&b.state, side);
+            let applies = pre_clause && !clause;
             let mut proc = scaled(&b, p);
             draw(&mut proc, "random", &[100], res, "effectspore");
+            if clause {
+                push(&mut proc, Instruction::SleepClauseBlocked { side });
+            }
             if !applies {
                 // The roll lands in this band but the status fails: no state change, but the band
                 // is retained so realized selection reads the correct threshold.
@@ -9890,15 +9897,20 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     let mut applied_sleep = false;
     let mut applied_status_now = false;
-    if target_eligible
+    let pre_clause = target_eligible
         && md.secondary_status != Status::None
         && status_applies_src(proc.state.side(foe).active(), md.secondary_status,
             proc.state.side(side).active().ability == crate::ids::Ability::Corrosion,
             matches!(proc.state.side(side).active().ability,
                 crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze))
-        && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
-        && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
-    {
+        && !status_blocked_by_field(&proc.state, foe, md.secondary_status);
+    let clause = pre_clause
+        && md.secondary_status == Status::Sleep
+        && sleep_clause_blocks(&proc.state, foe);
+    if clause {
+        push(&mut proc, Instruction::SleepClauseBlocked { side: foe });
+    }
+    if pre_clause && !clause {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
         applied_status_now = true;
@@ -10065,10 +10077,14 @@ fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData)
         let mut pb = scaled(&b, chance / 3.0);
         draw(&mut pb, "random", &[100], 0, "secondary");
         draw(&mut pb, "sample", &[3], idx as i64, "secondary");
-        let can_apply = alive
+        let pre_clause = alive
             && status_applies_src(pb.state.side(foe).active(), status, corrosion, breaker)
-            && !status_blocked_by_field(&pb.state, foe, status)
-            && !(status == Status::Sleep && sleep_clause_blocks(&pb.state, foe));
+            && !status_blocked_by_field(&pb.state, foe, status);
+        let clause = pre_clause && status == Status::Sleep && sleep_clause_blocks(&pb.state, foe);
+        let can_apply = pre_clause && !clause;
+        if clause {
+            push(&mut pb, Instruction::SleepClauseBlocked { side: foe });
+        }
         if can_apply {
             let slot = pb.state.side(foe).active_index;
             push(&mut pb, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: status });
@@ -11143,14 +11159,17 @@ fn execute_status_move(
         set_weather(&mut hit, md.weather, turns);
     }
     let mut applied_sleep = false;
-    if md.status != Status::None
+    let pre_clause = md.status != Status::None
         && !foe_immune
         && status_applies_src(hit.state.side(foe).active(), md.status,
             hit.state.side(side).active().ability == crate::ids::Ability::Corrosion,
             status_breaker)
-        && !status_blocked_by_field(&hit.state, foe, md.status)
-        && !(md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe))
-    {
+        && !status_blocked_by_field(&hit.state, foe, md.status);
+    let clause = pre_clause && md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe);
+    if clause {
+        push(&mut hit, Instruction::SleepClauseBlocked { side: foe });
+    }
+    if pre_clause && !clause {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
         applied_sleep = md.status == Status::Sleep;
@@ -12885,12 +12904,15 @@ fn apply_end_of_turn_inner(
             .into_iter()
             .flat_map(|mut x| {
                 let p = x.state.side(side).active();
-                if p.is_alive()
+                let pre_clause = p.is_alive()
                     && p.status == Status::None
                     && status_applies(p, Status::Sleep)
-                    && !status_blocked_by_field(&x.state, side, Status::Sleep)
-                    && !sleep_clause_blocks(&x.state, side)
-                {
+                    && !status_blocked_by_field(&x.state, side, Status::Sleep);
+                if pre_clause && sleep_clause_blocks(&x.state, side) {
+                    push(&mut x, Instruction::SleepClauseBlocked { side });
+                    return vec![x];
+                }
+                if pre_clause {
                     let slot = x.state.side(side).active_index;
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
                     mark_slept_by_foe(&mut x, side);

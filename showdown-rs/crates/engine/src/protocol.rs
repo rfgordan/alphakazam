@@ -259,6 +259,16 @@ fn emit_instruction(
             let p = &s.sides[side.index()].pokemon[slot as usize];
             out.push(format!("|-terastallize|{}|{}", ident(s, side, slot), type_name(p.tera_type)));
         }
+        // `data/rulesets.ts:1386` — verbatim, and both lines EVERY time (PS's `hint()` here is
+        // called without the `once` argument, `sim/battle.ts:3092`). No `|-fail|` follows: the
+        // block makes `didAnything` `null`, not `false` (`sim/battle-actions.ts:1244-1252`).
+        SleepClauseBlocked { .. } => {
+            out.push("|-message|Sleep Clause Mod activated.".to_string());
+            out.push(
+                "|-hint|Sleep Clause Mod prevents players from putting more than one of their                  opponent's Pok\u{e9}mon to sleep at a time"
+                    .to_string(),
+            );
+        }
         _ => {}
     }
 }
