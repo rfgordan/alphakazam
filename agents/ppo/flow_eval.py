@@ -133,6 +133,40 @@ def _heuristic_actions_rust(vec, envs, mask, rng, stats: dict | None = None) -> 
     return out
 
 
+def make_mcts_opponent(time_ms: int = 100):
+    """pmariglia's perfect-information MCTS as a flow-eval opponent (EXPLORATION_PLAN P0b).
+
+    Sequential and heavy (~time_ms per acting env per step) — eval windows only, small
+    num_envs. Comparisons against it must respect the plan's matched-time rule: report
+    per-action wall clock for BOTH arms next to any win-rate.
+    """
+    from .baselines import MctsBaseline
+    m = MctsBaseline(time_ms)
+
+    class _Shim:  # the minimal `Battle` surface MctsBaseline reads
+        __slots__ = ("vec", "e")
+
+        def __init__(self, vec, e):
+            self.vec, self.e = vec, e
+
+        def state_json(self):
+            return self.vec.state_json(self.e)
+
+    def fn(vec, envs, mask, rng):
+        # Don't spend time_ms searching rows whose side is not acting — the engine discards
+        # those actions anyway (same reasoning as `_heuristic_actions_rust`).
+        acting = {s: np.asarray(vec.acting_all(s), dtype=bool) for s in {s for _, s in envs}}
+        rows = [i for i, (e, s) in enumerate(envs) if acting[s][e]]
+        out = np.zeros(len(envs), dtype=np.int64)
+        if rows:
+            battles = [_Shim(vec, envs[i][0]) for i in rows]
+            sides = [envs[i][1] for i in rows]
+            out[rows] = m.actions(None, None, mask[rows], battles=battles, sides=sides)
+        return out
+
+    return fn
+
+
 def make_scripted_heuristic(stats: dict | None = None):
     """A `(vec, envs, mask_rows, rng) -> actions` callable playing `HeuristicBaseline`.
 

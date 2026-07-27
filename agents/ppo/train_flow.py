@@ -140,6 +140,26 @@ def train(args):
     slots = OpponentSlots(args.opponent_slots, lambda: build_model(cfg, env, device, aux=cfg.aux),
                           device, scripted=scripted_opps)
 
+    # --exploit: best-response probe (EXPLORATION_PLAN P0a). The league is replaced by ONE frozen
+    # target policy; the learner's win-rate curve against it IS the exploitability proxy — a
+    # target that gets exploited fast/high is far from equilibrium.
+    exploit_net = None
+    if args.exploit:
+        eck = torch.load(args.exploit, map_location=device, weights_only=False)
+        if not (isinstance(eck, dict) and "model" in eck):
+            eck = {"model": eck}  # bare state_dict (e.g. anchor.pt); dims come from the CLI cfg
+        embed = {"n_mons": env.n_mons, "cols": env.id_columns, "vocab": env.vocab,
+                 "dim": eck.get("embed_dim", cfg.embed_dim)}
+        exploit_net = ActorCritic(env.obs_dim, env.n_actions,
+                                  eck.get("hidden_dim", cfg.hidden_dim),
+                                  eck.get("n_hidden_layers", cfg.n_hidden_layers),
+                                  embed=embed, aux=False).to(device)
+        exploit_net.load_state_dict(eck["model"])
+        exploit_net.eval()
+        for prm in exploit_net.parameters():
+            prm.requires_grad_(False)
+        print(f"[exploit] target: {args.exploit} (step {eck.get('global_step', '?')})")
+
     # The anchor is the run's random-init policy, frozen before any training — the fixed reference
     # that says whether the agent has learned anything at all.
     anchor = build_model(cfg, env, device, aux=False)
@@ -165,7 +185,7 @@ def train(args):
     for prm in anchor.parameters():
         prm.requires_grad_(False)
     # Seed the reservoir so the first updates have something to play that is not just `random`.
-    if not league.snapshots():
+    if exploit_net is None and not league.snapshots():
         league.add(model, global_step)
 
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, env.obs_dim, env.n_actions, device,
@@ -211,7 +231,8 @@ def train(args):
     while not _STOP and (indefinite or global_step < cfg.total_steps):
         update += 1
         # Fresh draw from the reservoir each rollout, so an update sees several past selves.
-        slots.assign(league, model.state_dict())
+        if exploit_net is None:
+            slots.assign(league, model.state_dict())
         for t in range(cfg.rollout_steps):
             obs_l, ids_l, mask_l, _ = env.learner_view()
             obs_o, ids_o, mask_o, _ = env.opponent_view()
@@ -221,8 +242,11 @@ def train(args):
             mask_t = torch.as_tensor(mask_l, device=device)
             with torch.no_grad():
                 action, log_prob, _, value = model.act(obs_t, mask_t, obs_ids=ids_t)
-            opp_action = slots.actions(obs_o, ids_o, mask_o, opp_rng,
-                                       vec=env.vec, sides=1 - env.learner_side)
+            if exploit_net is None:
+                opp_action = slots.actions(obs_o, ids_o, mask_o, opp_rng,
+                                           vec=env.vec, sides=1 - env.learner_side)
+            else:
+                opp_action = greedy_actions(exploit_net, obs_o, ids_o, mask_o, device)
 
             reward, done, active, dyn, outcome = env.step(action.cpu().numpy(), opp_action)
 
@@ -241,7 +265,8 @@ def train(args):
                 window.append(1 if r > 0 else (-1 if r < 0 else 0))
                 # Credit the result to the opponent that actually played it — that is what makes
                 # the PFSP weights mean anything.
-                league.record(slots.env_key(int(e)), 1.0 if r > 0 else (0.0 if r < 0 else 0.5))
+                if exploit_net is None:
+                    league.record(slots.env_key(int(e)), 1.0 if r > 0 else (0.0 if r < 0 else 0.5))
 
         with torch.no_grad():
             obs_l, ids_l, mask_l, _ = env.learner_view()
@@ -252,6 +277,9 @@ def train(args):
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
         stats = ppo_update(model, opt, buffer.flat_view(), cfg, batch)
 
+        # In exploit mode nothing clears the window; keep it a sliding recent-form estimate.
+        if exploit_net is not None and len(window) > 50_000:
+            del window[:-50_000]
         win_rate = float(np.mean([r == 1 for r in window])) if window else float("nan")
         sps = int((global_step - start_step) / max(1e-9, time.time() - start))
         print(f"update {update:>8}  step {global_step:>12,}  games {total_games:>7}  "
@@ -261,7 +289,7 @@ def train(args):
         logger.metrics({"update": update, "step": global_step, "games": total_games,
                         "win_rate_vs_snapshot": win_rate, "sps": sps, **stats})
 
-        if args.snapshot_every and update % args.snapshot_every == 0:
+        if exploit_net is None and args.snapshot_every and update % args.snapshot_every == 0:
             league.add(model, global_step)
             window.clear()
             print(f"    [league +snapshot @ step {global_step:,}; "
@@ -315,6 +343,13 @@ def train(args):
             save(update)
 
     save(update)
+    if exploit_net is not None:
+        recent = window[-20_000:]
+        summary = {"target": args.exploit, "steps": global_step, "games": total_games,
+                   "exploiter_wr_recent": float(np.mean([r == 1 for r in recent])) if recent else None,
+                   "recent_n": len(recent)}
+        (run_dir / "exploit.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"[exploit] RESULT {json.dumps(summary)}")
     if _STOP:
         print(f"[train_flow] stopped cleanly at update {update}, step {global_step:,}")
     else:
@@ -360,6 +395,10 @@ def main():
                         "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
     p.add_argument("--target-kl", type=float, default=0.0,
                    help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
+    p.add_argument("--exploit", type=str, default=None, metavar="CKPT",
+                   help="best-response probe: train ONLY against this frozen checkpoint "
+                        "(league disabled); the learner's win-rate curve is the "
+                        "exploitability proxy (EXPLORATION_PLAN P0a)")
     p.add_argument("--eval-every", type=int, default=25,
                    help="powered eval vs fixed baselines every N updates (0 = never)")
     p.add_argument("--eval-games", type=int, default=300, help="games per baseline eval")

@@ -75,6 +75,12 @@ training at all, wrap the existing checkpoint in 1-ply search at eval time.
 - Needs one bridge addition: clone-env + step-pair + read-successor (the `Battle` API has most
   of it; ~a day).
 - **Evals:** search-wrapped vs raw policy head-to-head, and both vs heuristic (300 games each).
+- **Fairness rule (applies to every search comparison in this program):** hold wall-clock per
+  action roughly constant across the arms being compared. A search wrapper that "wins" by
+  spending 100ms where the raw policy spends 2ms has shown nothing about the method — give the
+  matched arm the same budget (e.g. value-search tuned to ~100ms/action is compared against
+  `mcts@100ms`, and against a raw-policy arm at its native speed AND reported per-action times
+  alongside every result). Depth/sample count is chosen to fit the time budget, not fixed.
 - **Go:** search ≥ raw + 10pts vs heuristic → the value net already supports search; this
   unlocks the whole program — search-augmented training (AlphaZero-style targets), deeper
   ply, and eventually belief-state search (ReBeL proper, which needs the set-inference work
@@ -117,6 +123,14 @@ public-info by construction — so cloning the VISIBLE player's choices sidestep
 hidden-info reconstruction. Real scope (~2–4 days): scraper, protocol→decision-point converter,
 dedup/quality filters. **Gate:** only starts if E1 shows warm-starts transfer to PPO, or E2
 shows value quality is the bottleneck (replay outcomes give a grounded value signal).
+
+**Template: Metamon** (Grigsby et al. 2025 — human-level competitive Pokémon via offline RL on
+~1M+ Showdown replays). Steal shamelessly: their spectator→player trajectory reconstruction
+(backfilling hidden info from what the replay eventually reveals), replay-quality/rating
+filters, filtered & advantage-weighted BC rather than vanilla cloning, and the
+offline-pretrain → online-finetune recipe. Check whether their open-sourced parsed-replay
+datasets/pipeline cover gen9randombattle before building a scraper from scratch; if they stop
+at earlier gens, reuse the pipeline design against our own gen9 scrape.
 
 ---
 
