@@ -4647,6 +4647,39 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // SECOND time, where PS goes back to using Blood Moon.
         move_id = crate::ids::MoveId::from_id("struggle").unwrap_or(crate::ids::MoveId::None);
     }
+    // **`runEvent('OverrideAction')` is the FIRST thing `runMove` does** (`battle-actions.ts:228`),
+    // before `getActiveMove` builds the object every `onModifyType` / `onModifyMove` then edits.
+    // Encore's handler (`data/moves.ts:4754`) returns the encored move id whenever the chosen move
+    // is not it, so an Encore that lands EARLIER IN THE SAME TURN redirects an action that was
+    // already chosen. PS's exclusions are exactly `struggle`, Z/Max, and an external (Dancer) move;
+    // the multi-turn guard is the engine's own and is kept.
+    //
+    // This used to sit ~130 lines DOWN, after the whole move-modifier chain, and re-assigned `md =
+    // move_data(enc.0)` — throwing away every modifier and leaving `move_id` pointing at the move
+    // the player picked. rb1734 d30 t24: a Prankster Encore locks an Arceus-Electric that chose
+    // Recover into Judgment; the engine substituted RAW Judgment, i.e. **Normal**-type, because the
+    // Zap Plate's `onModifyType` had been applied to Recover's `MoveData` and then discarded — and
+    // Normal is IMMUNE to the Ghost-type Sableye in front of it. So the move failed at moveStep 3
+    // with no accuracy roll (`PS-unconsumed randomChance[100, 100]@judgment`) where PS KO'd the
+    // Sableye. The redirect itself was never the bug; its POSITION was.
+    let mut move_idx = move_idx;
+    let mut move_id = move_id;
+    if !struggling && !external {
+        let enc = b.state.side(side).encore;
+        if enc.0 != crate::ids::MoveId::None
+            && b.state.side(side).pending_move == crate::state::PendingMove::None
+        {
+            if let Some(enc_slot) =
+                b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0)
+            {
+                if enc_slot as u8 != move_idx {
+                    move_idx = enc_slot as u8;
+                    move_id = enc.0;
+                }
+            }
+        }
+    }
+    let move_idx = move_idx;
     let move_id = move_id;
     let mut md = if struggling {
         let mut m = crate::data::MoveData::none();
@@ -4810,21 +4843,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let mut move_idx = move_idx;
     let slot = b.state.side(side).active_index;
 
-    // Encore: the user is locked into its encored move — the chosen slot is overridden
-    // (PS onOverrideAction). Skipped while committed to a multi-turn move or Struggling.
-    let enc = b.state.side(side).encore;
-    if enc.0 != crate::ids::MoveId::None
-        && !struggling
-        && !external
-        && b.state.side(side).pending_move == crate::state::PendingMove::None
-    {
-        if let Some(enc_slot) = b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0) {
-            if enc_slot as u8 != move_idx {
-                move_idx = enc_slot as u8;
-                md = move_data(enc.0);
-            }
-        }
-    }
     // A rampaging mon (Outrage / Thrash / ...) is locked into its move and pays no PP on
     // continuation turns.
     let rampaging_now = matches!(b.state.side(side).pending_move, crate::state::PendingMove::Rampaging(..));
