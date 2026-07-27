@@ -605,10 +605,11 @@ fn step_unit(
     // A switch-in ability that CHANGES weather/terrain fires one extra `eachEvent` speedSort inside
     // the replacement bracket (see `replacement_field_change_draws`). Measured on the PRE-swap
     // board, in replacement order.
-    let field_change_draws = engine::generate::replacement_field_change_draws(
-        state,
-        &replacements.iter().map(|&(s, sl)| (side_id(s), sl)).collect::<Vec<_>>(),
-    );
+    let repl_sides: Vec<(engine::state::SideId, u8)> =
+        replacements.iter().map(|&(s, sl)| (side_id(s), sl)).collect();
+    let field_change_draws = engine::generate::replacement_field_change_draws(state, &repl_sides);
+    // Same PRE-swap board: the incoming mon's cached Speed predates its own entry effects.
+    let bracket_tied = engine::generate::replacement_bracket_tied(state, &repl_sides);
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
         engine::generate::switch_into_pair(state, [
@@ -641,7 +642,12 @@ fn step_unit(
     // engine's annotated switch bracket (generate.rs) covers only VOLUNTARY move+switch pivots; this
     // consumes the forced-replacement bracket the gate would otherwise skip (a state-neutral drift
     // that only surfaces at the next Speed-sensitive roll). Off a tie: 0 draws → no effect.
-    if !pre_end_turn && !replacements.is_empty() && engine::generate::replacement_bracket_tied(state, replaced) {
+    if DBG_UNIT.with(|c| c.get()) && !replacements.is_empty() {
+        eprintln!("  BRACKET replacements={replacements:?} pre_end_turn={pre_end_turn} tied={bracket_tied} fieldchange={field_change_draws} post_spe=[{},{}]",
+            engine::generate::effective_speed(state, side_id(0)),
+            engine::generate::effective_speed(state, side_id(1)));
+    }
+    if !pre_end_turn && !replacements.is_empty() && bracket_tied {
         let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
             1 // simultaneous both-sides double faint: only the second switch sees both actives alive
         } else {

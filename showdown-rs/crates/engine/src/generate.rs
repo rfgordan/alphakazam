@@ -615,17 +615,31 @@ fn effective_speed_opts(state: &State, side: SideId, at_entry: bool) -> i32 {
 ///   * the Protosynthesis / Quark Drive Speed boost (both `onStart`).
 /// A weather/terrain Speed ability (Chlorophyll, Swift Swim, Surge Surfer) has no such gate and
 /// DOES apply, as do paralysis, Choice Scarf and Tailwind.
-fn switch_entry_speed(state: &State, side: SideId) -> i32 {
-    effective_speed_opts(state, side, true)
+/// It is computed on the PRE-switch board with the incoming party mon in the slot: `insertChoice`
+/// runs after `switchIn`'s slot swap but before `runSwitch`, so the mon is `clearVolatile`-fresh
+/// (no boosts, no volatiles, `abilityState` re-initialised) and NOTHING the entry does has
+/// happened — no hazards, no `onStart`, no Imposter transform (rb1057 d24: a Ditto replaces into a
+/// +1 Venomoth; PS caches Ditto's own pre-transform Speed, the engine read the copied one), and no
+/// weather the switch-in's OWN ability is about to set.
+fn switch_entry_speed(pre: &State, side: SideId, slot: u8) -> i32 {
+    let mut st = *pre;
+    let s = st.side_mut(side);
+    s.active_index = slot;
+    s.boosts = [0; 7];
+    s.volatiles = Default::default();
+    s.active_turns = 0;
+    effective_speed_opts(&st, side, true)
 }
 
 /// Run `f` with the switch bracket's cached Speeds installed as the Update tie speeds: the mon that
-/// just entered on `entered` uses `switch_entry_speed`, the other side its live (already-cached)
-/// Speed. See `switch_entry_speed` for why the two differ.
-fn with_switch_bracket_speeds(b: &mut Branch, entered: SideId, f: impl FnOnce(&mut Branch)) {
+/// just entered on `entered` uses `switch_entry_speed` off the PRE-switch board `pre`, the other
+/// side its live (already-cached) Speed. See `switch_entry_speed` for why the two differ.
+fn with_switch_bracket_speeds(
+    b: &mut Branch, pre: &State, entered: SideId, slot: u8, f: impl FnOnce(&mut Branch),
+) {
     let prev = MOVE_TIE_SPEEDS.with(|c| c.get());
     let mut sp = [effective_speed(&b.state, SideId::One), effective_speed(&b.state, SideId::Two)];
-    sp[entered as usize] = switch_entry_speed(&b.state, entered);
+    sp[entered as usize] = switch_entry_speed(pre, entered, slot);
     MOVE_TIE_SPEEDS.with(|c| c.set(Some(sp)));
     f(b);
     MOVE_TIE_SPEEDS.with(|c| c.set(prev));
@@ -669,20 +683,24 @@ fn actives_speed_tied(state: &State) -> bool {
 /// applies replacements via `switch_into` (state only), so it consumes this bracket separately —
 /// gated on exactly this predicate (both actives alive and equal `effective_speed`).
 ///
-/// `replaced[i]` marks a side whose active JUST entered via this replacement, and therefore sorts on
+/// Called on the PRE-swap board with the replacement list; a side that IS replacing sorts on
 /// `switch_entry_speed` — the Speed PS cached at `queue.insertChoice({choice:'runSwitch'})`, before
-/// entry hazards and before any switch-in ability's `onStart`. Ground-truthed on c3c2s82 d49
-/// (Iron Crown replaces a fainted Grimmsnarl into Sticky Web: stored Spe 324, live 216 — exactly the
-/// foe Deoxys-Defense's 216 — yet PS consumes ZERO draws, because its cache still reads 324) and on
-/// rb1369 d44 / rb1310 d11, which are the Slow Start half of the same rule.
-pub fn replacement_bracket_tied(state: &State, replaced: [bool; 2]) -> bool {
-    let sp: Vec<i32> = (0..2)
-        .map(|i| {
-            let side = if i == 0 { SideId::One } else { SideId::Two };
-            if replaced[i] { switch_entry_speed(state, side) } else { effective_speed(state, side) }
-        })
-        .collect();
-    let alive = state.side(SideId::One).active().is_alive() && state.side(SideId::Two).active().is_alive();
+/// entry hazards and before any switch-in `onStart`/transform — and a side that is not sorts on its
+/// live (already-cached) Speed. Ground-truthed on c3c2s82 d49 (Iron Crown replaces a fainted
+/// Grimmsnarl into Sticky Web: stored Spe 324, live 216 — exactly the foe Deoxys-Defense's 216 —
+/// yet PS consumes ZERO draws, because its cache still reads 324), on rb1369 d44 / rb1310 d11 (the
+/// Slow Start half of the same rule, one in each direction) and on rb1057 d24 (an Imposter Ditto
+/// replaces into a +1 Venomoth: PS caches Ditto's own Speed, not the copied one).
+///
+/// Replacements are applied in order, so a second one sees the first's board.
+pub fn replacement_bracket_tied(pre: &State, replacements: &[(SideId, u8)]) -> bool {
+    let mut st = *pre;
+    let mut sp = [effective_speed(pre, SideId::One), effective_speed(pre, SideId::Two)];
+    for &(side, slot) in replacements {
+        sp[side as usize] = switch_entry_speed(&st, side, slot);
+        let _ = switch_into(&mut st, side, slot);
+    }
+    let alive = st.side(SideId::One).active().is_alive() && st.side(SideId::Two).active().is_alive();
     alive && sp[0] == sp[1]
 }
 
@@ -2082,10 +2100,11 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
             // switch(B)'s switch-out Update sees A already swapped in. (c1 d45.)
             for &(side, target) in &order {
                 emit_switch_pre_update(b); // switch-out :83 (pre-swap board)
+                let pre = b.state;
                 apply_switch(b, side, target);
                 // All three sort on the Speed cached at `insertChoice({runSwitch})`, i.e. before
                 // this switch's hazards and switch-in ability — see `switch_entry_speed`.
-                with_switch_bracket_speeds(b, side, |b| {
+                with_switch_bracket_speeds(b, &pre, side, target, |b| {
                     emit_update(b); // switch runAction Update (2882)
                     emit_update(b); // runSwitch getAllActive speedSort
                     emit_update(b); // runSwitch runAction Update (2882)
@@ -2097,6 +2116,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
             for b in &mut branches {
                 // Switch-out `eachEvent('Update')` (battle-actions.ts:83) — PRE-swap board.
                 emit_switch_pre_update(b);
+                let pre = b.state;
                 apply_switch(b, side, target);
                 // POST-swap switch bracket (each a `shuffle[2,0,2]` iff both actives alive and
                 // equal effective_speed on the POST-swap board): the `switch` action's runAction
@@ -2111,7 +2131,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 // this switch's hazards and switch-in ability — see `switch_entry_speed`.
                 // (rb1021 d58: Magnezone switches into Sticky Web on a 151==151 tie; PS's cached
                 // 151 ties and fires all three, the post-hazard live 100 does not.)
-                with_switch_bracket_speeds(b, side, |b| {
+                with_switch_bracket_speeds(b, &pre, side, target, |b| {
                     emit_update(b); // switch action runAction Update
                     emit_update(b); // runSwitch getAllActive speedSort
                     emit_update(b); // runSwitch runAction Update
