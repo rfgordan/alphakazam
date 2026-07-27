@@ -1,5 +1,66 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN XII (2026-07-27): 503/512 pinned games byte-exact from seed (98.2%), up from 497;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step. AND — the fresh-seed question
+is settled: 400 NEW games (seeds 1401-1800) were recorded and gated, and they come in at
+348/400 = 87.0%.** Seven parity commits, newly-non-exact EMPTY at all seven. Differ 99.53%
+(3813/3831), zero `rust extra`; sweep 3831/3831; round-trip PASS; engine 12 suites + cosim green.
+
+**THE HEADLINE FINDING: the pinned corpus is not mined out of bugs, only of ITS OWN bugs.** Eleven
+points of exactness separate the fresh half from the pinned half. Two of this tranche's roots were
+found on one corpus and paid on the other — **Beak Blast** was diagnosed on pinned rb1108 and
+flipped fresh rb1453/rb1616/rb1719; **Cramorant** was diagnosed from a fresh three-game `.species`
+cluster and has NO pinned witness at all. Shared classes regrow with corpus size. The
+recommendation is to commit the fresh fixtures and gate on 912 games.
+
+**The fresh sidecars are on disk (`harness/seed-sidecars/rb14xx..rb18xx`, gitignored) but their
+fixtures are NOT committed.** Rebuild with
+`MAKE_FIXTURE=<dir> target/release/cosim harness/seed-sidecars/rb1[4-8]*.json.gz`.
+
+**REPO HAZARD, hit for real this tranche.** `engines` is a TRACKED symlink pointing at the MAIN
+worktree's own `engines` path. Merging `prng-exact` into `main` checks it out there, turning it
+into a self-loop and destroying the gitignored PS clone underneath. The clone was re-fetched at the
+pin (`git init; git fetch --depth 1 origin b9dc987d…; git checkout FETCH_HEAD`). Untrack the
+symlink or rename the clone before the next merge.
+
+**The nine pinned opens, evidenced (`DBG_DIFF` on the SIDECAR — a slim fixture has no `stateAfter`
+and can only ever say `state-digest`):** six are a bare `hp` with no second field (rb1011 rb1012
+rb1040 rb1184 rb1236 rb1347); rb1126 is `volatiles bit28 UNBURDEN` + a 121-HP damage gap it is
+downstream of; rb1191 carries a `PS shuffle@thunderbolt vs rust randomChance@accuracy` label;
+rb1314 is an `item` wrong on a FAINTED mon that only surfaces at a Revival Blessing.
+**The PRNG-offset class is EMPTY again** — rb1360 was its last member and commit 1 closed it.
+
+**The 52 fresh opens are triaged in the scoreboard by first divergent FIELD.** 25 bare `hp`,
+10 `volatiles`, and four named multi-game clusters — the biggest being **`Volatiles` bits 38/39
+(`StatsRaisedThisTurn` / `StatsLoweredThisTurn`), five games, take it first.**
+
+**Five rules this tranche cost a landing each to learn:**
+
+1. **A cache is refreshed only where PS refreshes it, and `insertChoice` (`sim/battle-queue.ts:374`)
+   is the only site that refreshes ONE mon's `pokemon.speed`.** A DRAG bypasses it — `switchIn`
+   with `isDrag` calls `runSwitch` directly (`sim/battle-actions.ts:145-150`) — so the incoming mon
+   sorts on the value every BENCHED mon carries: its unboosted `storedStats.spe`, because
+   `clearVolatile` ends in `setSpecies(baseSpecies)` which ends in
+   `this.speed = this.storedStats.spe` (`sim/pokemon.ts:1419`). **Checked, not assumed: 197714
+   benched snapshots in the 401 sidecars, ZERO mismatches.** When a rule can be checked against the
+   recorded corpus, check it.
+2. **`formeChange(sp, effect)` vs `formeChange(sp, effect, /*isPermanent*/ true)` is the whole
+   difference between a forme that survives a switch and one that does not** — `isPermanent`
+   rewrites `baseSpecies`, and `clearVolatile` restores to `baseSpecies`. Mimikyu-Busted and
+   Palafin-Hero pass `true`; Gulp Missile does not.
+3. **A hand-copied PS list is a liability, and a second copy of a COMPUTATION is a list too.** The
+   engine held three copies of "modified priority" and only the turn-order one carried Triage.
+   Enumerate from the pin and keep one function.
+4. **PS's serialized `baseTypes` is NOT the restore target** — it is frozen at construction from
+   `baseSpecies.types` (`sim/pokemon.ts:446-447`), before `setSpecies` runs `ModifySpecies`. A
+   Rusted Shield Zamazenta serializes `["Fighting"]` and restores to `["Fighting","Steel"]`.
+5. **`apply_post_damage` runs BEFORE the deferred `apply_damaging_hit_step7`; PS's order is the
+   reverse.** Anything reading state that a faint clears must fire at the faint site.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN XII" — before anything else.**
+
+---
+
 **BURN-DOWN XI (2026-07-27): 497/512 full games byte-exact from seed (97.1%), up from 484;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
