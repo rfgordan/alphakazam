@@ -559,7 +559,19 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             }
             "twoturnmove" => {
                 let mv = MoveId::from_id(s(vv, "move")).unwrap_or(MoveId::None);
-                side.pending_move = PendingMove::Charging(mv);
+                // `twoturnmove` OUTLIVES the strike. PS's charge `onTryMove` is
+                // `if (attacker.removeVolatile(move.id)) return;` (`data/moves.ts:1716`): it drops
+                // the MOVE-SPECIFIC marker volatile and lets the strike through, leaving
+                // `twoturnmove` (duration 2) standing until the end-of-turn duration tick. So
+                // `twoturnmove` WITHOUT its marker means "already struck this turn", which is the
+                // engine's `PendingMove::None` — the field means "committed to strike NEXT turn".
+                // Only the pair means charging. Visible at rb1345 d42, a mid-turn faint request
+                // right after Eternatus' charged Meteor Beam connects.
+                let charging = mv != MoveId::None
+                    && vols.contains_key(mv.to_id().as_ref() as &str);
+                if charging {
+                    side.pending_move = PendingMove::Charging(mv);
+                }
             }
             "lockedmove" => {
                 side.volatiles.insert(VolatileStatus::LockedMove);

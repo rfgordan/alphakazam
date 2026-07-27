@@ -260,9 +260,13 @@ fn volatiles_obj(side: &Side, weather_is_sun: bool, terrain_is_electric: bool) -
             simple(&mut v, "mustrecharge");
         }
         PendingMove::Charging(mv) => {
-            // Two-turn charge/semi-invuln: PS adds `twoturnmove` (which `convert` reads for the
-            // charging move) plus a per-move marker volatile which `convert` skips — omit it.
+            // Two-turn charge/semi-invuln: PS's `twoturnmove` condition adds BOTH itself and a
+            // per-move marker volatile (`attacker.addVolatile(effect.id)`,
+            // `data/conditions.ts:293`). Both are required — `convert` reads the charging move
+            // off `twoturnmove` but keys "still charging" on the MARKER, because the strike turn
+            // drops only the marker and leaves `twoturnmove` standing until its duration expires.
             v.insert("twoturnmove".into(), json!({ "move": mv.to_id() }));
+            v.insert(mv.to_id().to_string(), json!({}));
         }
         PendingMove::Rampaging(mv, remaining) => {
             // PS's lockedmove ends via `onAfterMove` when `duration === 1`; at a decision boundary
