@@ -3932,9 +3932,24 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
         }
         VolatileStatus::Encore => {
             // Fails unless the target's last move is encorable and still on its set with PP.
+            // PS `encore`'s `onStart` (`data/moves.ts:4737`) bails on
+            // `move.isZ || move.isMax || move.flags['failencore'] || !moveSlot || moveSlot.pp <= 0`.
+            // The `failencore` set below is the COMPLETE gen-9 flag list at the pin, enumerated
+            // with `Dex.forGen(9).moves.all().filter(m => m.flags.failencore)` — the engine used
+            // to carry six of these eighteen. rb1387 d36 t32 is the witness for the one that
+            // matters in randbats: a Lapras whose last move is **Sleep Talk** (`data/moves.ts:617`
+            // carries `failencore: 1`) cannot be Encored, because `lastMove` is the CALLER — PS's
+            // `actions.useMove` path never overwrites it with the called move. The engine held an
+            // Encore PS did not, locked the Lapras out of Freeze-Dry, and swallowed its draw.
             let last = b.state.side(foe).last_used_move;
             let encorable = last != crate::ids::MoveId::None
-                && !matches!(last.to_id(), "struggle" | "encore" | "mimic" | "mirrormove" | "sketch" | "transform")
+                && !matches!(
+                    last.to_id(),
+                    "assist" | "blazingtorque" | "combattorque" | "copycat" | "dynamaxcannon"
+                        | "encore" | "magicaltorque" | "mefirst" | "metronome" | "mimic"
+                        | "mirrormove" | "naturepower" | "noxioustorque" | "sketch" | "sleeptalk"
+                        | "struggle" | "transform" | "wickedtorque"
+                )
                 && b.state.side(foe).active().moves.iter().any(|m| m.id == last && m.pp > 0);
             if encorable {
                 let dur = if foe_moves_later { 3 } else { 4 };
