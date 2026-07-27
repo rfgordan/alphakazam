@@ -10908,6 +10908,26 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             // (r6: two Cud Chew holders tie on the ABILITY residual → same). Only faint-surviving
             // handlers (item / status / ability) are collected; every volatile/side/terrain residual is
             // wiped by `clearVolatile` on faint.
+            // ...and because `clearVolatile` already ran, the Speed this handler sorts on is the
+            // mon's UNBOOSTED, volatile-free Speed. `clearVolatile` zeroes `this.boosts` and empties
+            // `this.volatiles` (sim/pokemon.ts:1509), and `runAction`'s `case 'residual'` calls
+            // `updateSpeed()` at its START (sim/battle.ts:2835) — AFTER `faintMessages` — so the
+            // cache the sort reads is recomputed from the cleared board. Status, item and the side
+            // conditions survive, so paralysis / Choice Scarf / Tailwind still count.
+            //
+            // rb1021 d102 t91 is the witness: p1's Magnezone sits at spe −1 under its own side's
+            // Sticky Web (`pokemon.speed` 100 in the sidecar at d101, boosts.spe −1) and is KO'd by
+            // Sylveon's Hyper Voice. PS's residual list is the two Leftovers holders at speed
+            // **151 and 151** — Magnezone's web drop is gone with its boosts — so they TIE and PS
+            // draws one `shuffle[2,0,2]`. The engine read the live boosted 100, saw no tie, made no
+            // draw and ran −1 behind for the rest of the game.
+            let speed = {
+                let mut st = *state;
+                let sm = st.side_mut(side);
+                sm.boosts = [0; 7];
+                sm.volatiles = Default::default();
+                effective_speed(&st, side) as i64
+            };
             let mut fpush = |order: i64, sub: i64| hs.push(ResHandler { order, speed, sub_order: sub });
             // Grassy Terrain's per-active heal is a FIELD handler collected per active
             // (`findFieldEventHandlers(field, 'onResidual', undefined, active)`, battle.ts:503) —
