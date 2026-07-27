@@ -160,6 +160,16 @@ def train(args):
             prm.requires_grad_(False)
         print(f"[exploit] target: {args.exploit} (step {eck.get('global_step', '?')})")
 
+    # E4 (R-NaD-lite): regularize the reward toward a slowly-refreshed reference policy —
+    # r' = r − η·(log π(a|s) − log π_ref(a|s)) on the learner's acting steps. DeepNash's core
+    # convergence trick, applied to the learner side only (the league plays the other seat).
+    rnad_ref = None
+    if args.rnad_eta > 0:
+        rnad_ref = build_model(cfg, env, device, aux=False)
+        rnad_ref.eval()
+        for prm in rnad_ref.parameters():
+            prm.requires_grad_(False)
+
     # The anchor is the run's random-init policy, frozen before any training — the fixed reference
     # that says whether the agent has learned anything at all.
     anchor = build_model(cfg, env, device, aux=False)
@@ -234,9 +244,14 @@ def train(args):
     window: list[int] = []
     start, start_step = time.time(), global_step
 
+    if rnad_ref is not None:
+        rnad_ref.load_state_dict(model.state_dict())  # ref starts AT the (possibly resumed) policy
+
     opp_rng = np.random.default_rng(cfg.seed ^ 0xBEEF)
     while not _STOP and (indefinite or global_step < cfg.total_steps):
         update += 1
+        if rnad_ref is not None and update % args.rnad_ref_every == 0:
+            rnad_ref.load_state_dict(model.state_dict())
         # Fresh draw from the reservoir each rollout, so an update sees several past selves.
         if exploit_net is None:
             slots.assign(league, model.state_dict())
@@ -265,8 +280,15 @@ def train(args):
 
             reward, done, active, dyn, outcome = env.step(action.cpu().numpy(), opp_action)
 
+            reward_t = torch.as_tensor(reward, device=device)
+            if rnad_ref is not None:
+                with torch.no_grad():
+                    _, ref_lp, _, _ = rnad_ref.act(obs_t, mask_t, action=action, obs_ids=ids_t)
+                act_f = torch.as_tensor(active.astype(np.float32), device=device)
+                reward_t = reward_t - args.rnad_eta * (log_prob - ref_lp) * act_f
+
             buffer.add(t, obs_t, mask_t, action, log_prob, value,
-                       torch.as_tensor(reward, device=device),
+                       reward_t,
                        torch.as_tensor(done, device=device),
                        obs_ids=ids_t,
                        opp_action=torch.as_tensor(opp_action, device=device) if cfg.aux else None,
@@ -415,6 +437,11 @@ def main():
                         "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
     p.add_argument("--target-kl", type=float, default=0.0,
                    help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
+    p.add_argument("--rnad-eta", type=float, default=0.0,
+                   help=">0: R-NaD-style reward regularization toward a reference policy, "
+                        "r' = r − η(log π − log π_ref) on acting steps (E4)")
+    p.add_argument("--rnad-ref-every", type=int, default=50,
+                   help="refresh the R-NaD reference to the current policy every N updates")
     p.add_argument("--kickstart-coef", type=float, default=0.0,
                    help=">0: distill toward the Rust heuristic's action with this coefficient, "
                         "annealed linearly to 0 over --kickstart-anneal-steps (E1 arm c)")
