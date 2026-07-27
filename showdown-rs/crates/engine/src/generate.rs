@@ -3478,13 +3478,26 @@ fn fixed_damage_amount(md: &crate::data::MoveData, state: &State, side: SideId) 
     })
 }
 
-/// A move's effective priority, including Prankster (+1 to the user's status moves).
-fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
-    let md = move_data(state.side(side).active().moves[move_idx as usize].id);
+/// PS's `getActionSpeed` priority: the move's base priority run through the FULL
+/// `ModifyPriority` handler set, which in gen 9 is exactly four handlers — Prankster
+/// (`data/abilities.ts:3380`, +1 to the user's status moves), Gale Wings (`:1543`, +1 to a Flying
+/// move at full HP), Triage (`:5129`, **+3 to any move with `flags.heal`**) and Grassy Glide's own
+/// `onModifyPriority` (`data/moves.ts:7664`, +1 on Grassy Terrain while grounded).
+/// (`Dex.forGen(9).abilities.all().filter(a => a.onModifyPriority)` -> galewings, prankster,
+/// triage; `data/moves.ts` -> grassyglide. Mycelium Might's −0.1 is FRACTIONAL and never crosses
+/// the `> 0.1` tests below.)
+///
+/// This is the value every `priority > 0.1` predicate reads: `getActionSpeed` writes it back onto
+/// the ActiveMove (`if (this.gen > 5) action.move.priority = priority`, `sim/battle.ts:2670`), so
+/// the priority BLOCKERS — Psychic Terrain, Dazzling / Queenly Majesty / Armor Tail — see the
+/// boosted number, not the dex one. Keeping one function for all of them is the point: the two
+/// blockers used to carry their own hand-copied three-handler list and both missed Triage
+/// (rb1348 d12 t11 — a Triage Comfey's Draining Kiss is +3 and Psychic Terrain blocks it dead,
+/// zero draws in PS's whole unit; the engine rolled the move and dealt 69).
+fn modified_priority(state: &State, side: SideId, md: &crate::data::MoveData) -> i8 {
+    let p = state.side(side).active();
     let mut pri = md.priority;
-    if md.category == MoveCategory::Status
-        && state.side(side).active().ability == crate::ids::Ability::Prankster
-    {
+    if md.category == MoveCategory::Status && p.ability == crate::ids::Ability::Prankster {
         pri += 1;
     }
     if md.id.to_id() == "grassyglide"
@@ -3493,18 +3506,19 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     {
         pri += 1;
     }
-    if state.side(side).active().ability == crate::ids::Ability::GaleWings
-        && md.typ == Type::Flying
-        && state.side(side).active().hp >= state.side(side).active().max_hp
-    {
+    if p.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && p.hp >= p.max_hp {
         pri += 1;
     }
-    // Triage: +3 priority to moves with the heal flag (drain moves like Draining Kiss, and
-    // recovery moves). PS `onModifyPriority`.
-    if md.flag_heal && state.side(side).active().ability == crate::ids::Ability::Triage {
+    if md.flag_heal && p.ability == crate::ids::Ability::Triage {
         pri += 3;
     }
     pri
+}
+
+/// A move's effective priority (turn order), by move slot. See [`modified_priority`].
+fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
+    let md = move_data(state.side(side).active().moves[move_idx as usize].id);
+    modified_priority(state, side, &md)
 }
 
 pub(crate) fn move_order(state: &State, a: &Action, b: &Action) -> Order {
@@ -4676,19 +4690,20 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Prankster / Gale Wings / Grassy Glide boosts count; foeSide-targeting moves exempt).
     {
         let holder = b.state.side(foe).active();
-        if holder.is_alive() && holder.ability == crate::ids::Ability::QueenlyMajesty {
+        // All THREE of PS's `onFoeTryMove` abilities carry the identical block
+        // (`Dex.forGen(9).abilities.all().filter(a => a.onFoeTryMove)` -> armortail, dazzling,
+        // queenlymajesty; `data/abilities.ts:215`, `:1290`, `:3671`). The engine listed one.
+        if holder.is_alive()
+            && matches!(
+                holder.ability,
+                crate::ids::Ability::QueenlyMajesty
+                    | crate::ids::Ability::Dazzling
+                    | crate::ids::Ability::ArmorTail
+            )
+        {
             let atk = b.state.side(side).active();
             let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
-            let mut pri = md.priority;
-            if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
-                pri += 1;
-            }
-            if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
-                pri += 1;
-            }
-            if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
-                pri += 1;
-            }
+            let pri = modified_priority(&b.state, side, &md);
             let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
             if pri > 0 && !mb && !side_targeting {
                 b.move_failed = true; // blocked → moveThisTurnResult false
@@ -4705,17 +4720,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         && b.state.side(foe).active().is_alive()
         && is_grounded(&b.state, foe)
     {
-        let atk = b.state.side(side).active();
-        let mut pri = md.priority;
-        if md.category == MoveCategory::Status && atk.ability == crate::ids::Ability::Prankster {
-            pri += 1;
-        }
-        if atk.ability == crate::ids::Ability::GaleWings && md.typ == Type::Flying && atk.hp >= atk.max_hp {
-            pri += 1;
-        }
-        if md.id.to_id() == "grassyglide" && b.state.terrain == crate::ids::Terrain::Grassy && is_grounded(&b.state, side) {
-            pri += 1;
-        }
+        let pri = modified_priority(&b.state, side, &md);
         if pri > 0 {
             b.move_failed = true; // blocked → moveThisTurnResult false
             return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
