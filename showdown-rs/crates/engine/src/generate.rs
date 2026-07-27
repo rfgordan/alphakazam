@@ -11909,9 +11909,10 @@ fn apply_end_of_turn_inner(
             }
         }
 
-        // Sitrus Berry can also fire here if end-of-turn chip drops the holder to ≤ 1/2.
-        apply_pinch_berry(b, side);
-
+        // NOTE: the pinch-berry check does NOT belong here. A berry's trigger is an `onUpdate`
+        // handler, and PS runs no `eachEvent('Update')` anywhere inside the residual action —
+        // the first one is `runAction`'s trailing Update (`sim/battle.ts:2882`), AFTER the whole
+        // residual queue. It is applied there, at the end of this function.
     }
 
     // Active-mon countdowns: Taunt / Encore / Disable tick and clear; Yawn ticks and puts the
@@ -12425,6 +12426,27 @@ fn apply_end_of_turn_inner(
             })
             .collect();
     }
+    // `runAction`'s trailing `eachEvent('Update')` (`sim/battle.ts:2882`) — the STATE half. Every
+    // berry trigger is an `onUpdate` handler and the residual action fires no Update of its own,
+    // so a Sitrus that end-of-turn chip brought into range is eaten HERE, after the whole residual
+    // queue, not at the chip.
+    //
+    // rb1030 d67 t59 is the witness and it is only visible because of **Harvest**, which sits at
+    // residual order 28/2 — inside the queue. PS: the Arboliva is still holding its Sitrus when
+    // Harvest rolls, so `!pokemon.item` is false and nothing is regrown; the trailing Update then
+    // eats the berry, leaving `item: None` / `lastItem: Sitrus`. The engine ate the berry at the
+    // chip (ten-plus orders early), so Harvest found an empty hand, rolled its 50%, and put the
+    // berry straight back.
+    //
+    // Runs before the `activeTurns` bump below, matching PS: the 2882 Update is part of the
+    // residual ACTION, while `nextTurn` is the later `endTurn`.
+    for nb in &mut out {
+        if battle_over(&nb.state) {
+            continue;
+        }
+        run_update_event(nb);
+    }
+
     // Advance the active mon's turn counter (Fake Out / First Impression / Slow Start / Stakeout).
     // PS does this in `nextTurn()` (battle.ts:1762) — NOT in the residual phase — which is reached
     // only after the whole turn survives to `endTurn()`. Two consequences the residual-phase
