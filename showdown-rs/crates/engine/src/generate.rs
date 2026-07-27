@@ -2345,11 +2345,22 @@ pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instructi
     b.ins
 }
 
-/// Faint replacements resolve inside a pseudo-turn of their own in PS: after the switch-in
-/// (and its abilities — Download, Intimidate reactions, ...) another `endTurn` runs, whose
-/// per-mon bookkeeping resets `statsRaisedThisTurn` on every active. The replacement entry
-/// APIs (`switch_into` / `switch_into_pair`) therefore never leave the marker set.
+/// `statsRaisedThisTurn` / `statsLoweredThisTurn` are cleared in exactly two PS places: on the
+/// OUTGOING mon inside `switchIn` (`sim/battle-actions.ts:123-124`, already covered by the
+/// switch-out volatile reset) and on every ACTIVE mon inside `nextTurn`
+/// (`sim/battle.ts:1675-1676`). A faint replacement is followed by the rest of the turn and then
+/// that `nextTurn`, so the replacement entry APIs stand in for it here.
+///
+/// **Unless the battle ENDED.** `go()`'s action loop returns on `this.ended` before reaching
+/// `nextTurn()`, so a replacement that leaves a side with no living Pokémon — a Sticky Web
+/// entry that finishes the last mon, a Stealth Rock that kills the replacement outright —
+/// freezes both markers into the terminal state. `apply_end_of_turn`'s clear already carries
+/// the same `battle_over` guard; the replacement path was missing it, which cost three fresh
+/// games (rb1433, rb1529, rb1628) whose final recorded state is exactly that terminal one.
 fn clear_stats_raised_markers(state: &mut State) {
+    if battle_over(state) {
+        return;
+    }
     for side in [SideId::One, SideId::Two] {
         state.side_mut(side).volatiles.remove(VolatileStatus::StatsRaisedThisTurn);
         state.side_mut(side).volatiles.remove(VolatileStatus::StatsLoweredThisTurn);
