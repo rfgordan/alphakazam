@@ -39,13 +39,20 @@ class SnapshotLeague:
     RANDOM = "random"
 
     def __init__(self, pool_dir, keep: int = 20, pfsp_power: float = 2.0,
-                 window: int = 512, mode: str = "frontier", random_weight: float = 0.25):
+                 window: int = 512, mode: str = "frontier", random_weight: float = 0.25,
+                 scripted_weights: dict[str, float] | None = None):
         self.pool_dir = Path(pool_dir)
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.keep = keep
         self.pfsp_power = pfsp_power
         self.mode = mode
         self.random_weight = random_weight
+        # Scripted (non-checkpoint) opponents beyond `random`, key -> base weight. The proven
+        # poke-env curriculum trained against the heuristic directly (base weight 2 vs self 0.5)
+        # — win-rate against an opponent the agent never faces in training is pure transfer, and
+        # scale1 showed how slow that is (0.18 vs heuristic at 26M steps). Keys here must have a
+        # matching callable in `OpponentSlots.scripted`.
+        self.scripted_weights = dict(scripted_weights or {})
         self.results: dict[str, deque] = {}
         self._window = window
 
@@ -82,6 +89,9 @@ class SnapshotLeague:
         # 0.25 base lands near 5%, and shrinks further as the reservoir grows.
         if self.random_weight > 0 or not w:
             w[self.RANDOM] = (self.random_weight * self._pfsp(self.RANDOM)) if w else 1.0
+        for k, base in self.scripted_weights.items():
+            if base > 0:
+                w[k] = base * self._pfsp(k)
         tot = sum(w.values())
         return {k: v / tot for k, v in w.items()} if tot > 0 else {self.RANDOM: 1.0}
 
@@ -116,9 +126,12 @@ class OpponentSlots:
     reassignment is `keep` small state-dict loads, not `num_envs` of them.
     """
 
-    def __init__(self, n_slots: int, make_net, device):
+    def __init__(self, n_slots: int, make_net, device, scripted: dict | None = None):
         self.n = n_slots
         self.device = device
+        # Scripted opponents: key -> callable `(vec, envs, mask_rows, rng) -> actions`, where
+        # `envs` is [(env_idx, side), ...] — the signature `flow_eval._heuristic_actions` has.
+        self.scripted = dict(scripted or {})
         self.nets = []
         for _ in range(n_slots):
             net = make_net()
@@ -129,10 +142,10 @@ class OpponentSlots:
         self.keys = [SnapshotLeague.RANDOM] * n_slots
 
     def assign(self, league: SnapshotLeague, fallback_state_dict):
-        """Resample each slot's opponent. Slots drawing `random` act uniformly (no forward)."""
+        """Resample each slot's opponent. Scripted slots (`random`, heuristic, …) load no net."""
         self.keys = league.sample(self.n)
         for i, k in enumerate(self.keys):
-            if k == SnapshotLeague.RANDOM:
+            if k == SnapshotLeague.RANDOM or k in self.scripted:
                 continue
             path = league.pool_dir / k
             try:
@@ -151,8 +164,14 @@ class OpponentSlots:
         return self.keys[env_idx % self.n]
 
     @torch.no_grad()
-    def actions(self, obs, ids, mask, rng: np.random.Generator) -> np.ndarray:
-        """Opponent action for every env, one forward per slot over that slot's env block."""
+    def actions(self, obs, ids, mask, rng: np.random.Generator,
+                vec=None, sides=None) -> np.ndarray:
+        """Opponent action for every env, one forward per slot over that slot's env block.
+
+        `vec`/`sides` (the engine vector and each env's opponent side) are only needed when a
+        scripted opponent is in the league — it plays from the engine's true state, not the
+        encoded obs.
+        """
         n_envs = obs.shape[0]
         out = np.zeros(n_envs, dtype=np.int64)
         idx = np.arange(n_envs)
@@ -163,6 +182,10 @@ class OpponentSlots:
             if self.keys[s] == SnapshotLeague.RANDOM:
                 m = mask[sel]
                 out[sel] = (rng.random(m.shape) * m).argmax(axis=1)
+                continue
+            if self.keys[s] in self.scripted:
+                envs = [(int(e), int(sides[e])) for e in sel]
+                out[sel] = self.scripted[self.keys[s]](vec, envs, mask[sel], rng)
                 continue
             logits, _ = self.nets[s].forward(
                 torch.as_tensor(obs[sel], device=self.device),

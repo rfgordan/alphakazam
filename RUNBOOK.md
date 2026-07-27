@@ -28,9 +28,21 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/node-v22.14.0-linux-x64/bin:$PATH"
 ## 1. Start a run
 
 ```sh
-agents/scripts/launch_train.sh runs/scale1 --num-envs 4096 --rollout-steps 32 \
-    --minibatch-size 16384 --update-epochs 2
+agents/scripts/launch_train.sh runs/scale2 \
+    --num-envs 4096 --rollout-steps 32 --minibatch-size 16384 \
+    --update-epochs 4 --target-kl 0.03 \
+    --hidden-dim 1024 --n-hidden-layers 3 --embed-dim 48 \
+    --shaping-coef 0.15 --league-heuristic-weight 4.0 \
+    --snapshot-every 10 --pool-size 24 --opponent-slots 4 --pfsp-mode frontier \
+    --eval-every 25 --eval-games 300 --ckpt-every 10 \
+    --wandb --wandb-project deep-showdown
 ```
+
+This is the scale2 recipe (post-scale1 diagnosis): the scripted heuristic in the training league
+(`--league-heuristic-weight`), PBRS shaping with the faints term (`--shaping-coef`), KL-guarded
+extra epochs (`--target-kl`), and a 10M-param trunk — the env is CPU-bound, so model capacity is
+close to free (6.9 ms forward for 4096 envs on the A100). scale1's settings (self-play-only
+league, sparse reward, 256×2 trunk) plateaued at 0.18 vs heuristic by 26M steps.
 
 Detached (`setsid` + `nohup`), so it survives your shell, your SSH session, and this agent's
 process tree. It starts two things:
@@ -60,26 +72,28 @@ win-rate history all live in `runs/<name>/training_state.pt`, so relaunching aga
 directory continues exactly where it stopped. Stopping is always safe — SIGTERM finishes the
 current update and checkpoints first.
 
-Detached, auto-resuming, with the cosim sidecar (survives closing the terminal):
+Detached, auto-resuming, with the cosim sidecar (survives closing the terminal) —
+`resume.sh` carries the canonical scale2 flags so nothing needs pasting:
 
 ```sh
-cd /home/user/alphakazam/agents
-agents/scripts/launch_train.sh runs/scale1 \
-    --num-envs 4096 --rollout-steps 32 --minibatch-size 16384 --update-epochs 2 \
-    --ckpt-every 10 --snapshot-every 10 --pool-size 24 --opponent-slots 4 \
-    --pfsp-mode frontier --eval-every 25 --eval-games 200 \
-    --wandb --wandb-project deep-showdown
+cd /home/user/alphakazam
+agents/scripts/resume.sh                 # runs/scale2 by default
 ```
+
+Architecture flags (`--hidden-dim` etc.) are restored from the run's own checkpoint on resume,
+so they never need repeating — and a wrong value is corrected, not crashed on.
 
 In the foreground instead, if you want the output live (no watchdog, no sidecar — Ctrl-C
 checkpoints and exits):
 
 ```sh
 cd /home/user/alphakazam/agents
-.venv/bin/python -m ppo.train_flow --resume runs/scale1 \
-    --num-envs 4096 --rollout-steps 32 --minibatch-size 16384 --update-epochs 2 \
+.venv/bin/python -m ppo.train_flow --resume runs/scale2 \
+    --num-envs 4096 --rollout-steps 32 --minibatch-size 16384 \
+    --update-epochs 4 --target-kl 0.03 --shaping-coef 0.15 \
+    --league-heuristic-weight 4.0 \
     --ckpt-every 10 --snapshot-every 10 --pool-size 24 --opponent-slots 4 \
-    --pfsp-mode frontier --eval-every 25 --eval-games 200 \
+    --pfsp-mode frontier --eval-every 25 --eval-games 300 \
     --wandb --wandb-project deep-showdown
 ```
 

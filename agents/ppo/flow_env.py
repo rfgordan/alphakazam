@@ -108,12 +108,24 @@ class FlowEnvVec:
 
     # ---- stepping ------------------------------------------------------------------------
 
+    # Faint-count differential weight inside Φ. team_hp is a [0,1] team fraction while faints are
+    # counts, so 0.5 makes a full 6-faint sweep worth 3× a full HP lead — the same 3:1
+    # faints-to-HP ratio as the proven poke-env recipe (Φ = 0.5·HPdiff + 1.5·faints). A faint
+    # already zeroes its mon's HP contribution; this term adds the discontinuity on top, because
+    # "barely alive" and "gone" differ by far more than the last sliver of HP.
+    FAINT_W = 0.5
+
     def _potential(self, sides: np.ndarray) -> np.ndarray:
-        """Φ = learner-relative team-HP differential (the PBRS potential)."""
+        """Φ = learner-relative team-HP differential + faint differential (the PBRS potential)."""
         red = sides == RED
-        mine = np.where(red, self.vec.team_hp_all(RED), self.vec.team_hp_all(BLUE))
-        theirs = np.where(red, self.vec.team_hp_all(BLUE), self.vec.team_hp_all(RED))
-        return (mine - theirs).astype(np.float32)
+        hp_r, hp_b = self.vec.team_hp_all(RED), self.vec.team_hp_all(BLUE)
+        f_r = np.asarray(self.vec.faints_all(RED), dtype=np.float32)
+        f_b = np.asarray(self.vec.faints_all(BLUE), dtype=np.float32)
+        mine = np.where(red, hp_r, hp_b)
+        theirs = np.where(red, hp_b, hp_r)
+        f_mine = np.where(red, f_r, f_b)
+        f_theirs = np.where(red, f_b, f_r)
+        return ((mine - theirs) + self.FAINT_W * (f_theirs - f_mine)).astype(np.float32)
 
     def _team_hp_pair(self, sides: np.ndarray):
         red = sides == RED

@@ -98,6 +98,19 @@ def _heuristic_actions(heur, vec, envs, mask, rng, stats: dict | None = None) ->
     return out
 
 
+def make_scripted_heuristic(stats: dict | None = None):
+    """A `(vec, envs, mask_rows, rng) -> actions` callable playing `HeuristicBaseline`.
+
+    Shared by the eval ladder and the training league (`OpponentSlots.scripted`) so the opponent
+    the agent trains against is the SAME implementation it is evaluated against. Raises on
+    import failure — a league configured to include the heuristic must not silently train
+    without it.
+    """
+    from .baselines import HeuristicBaseline
+    heur = HeuristicBaseline()
+    return lambda vec, envs, mask, rng: _heuristic_actions(heur, vec, envs, mask, rng, stats)
+
+
 def evaluate_flow(model, opponent, device, n_games: int = 300, num_envs: int = 128,
                   team_pool: str | None = None, seed: int = 12345, max_requests: int = 600,
                   max_steps: int = 20_000) -> dict:

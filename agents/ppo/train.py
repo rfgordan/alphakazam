@@ -120,8 +120,11 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
 
     obs_ids = data.get("obs_ids")  # present only when the model uses embeddings
     use_aux = "opp_action" in data  # auxiliary prediction labels present
+    target_kl = getattr(cfg, "target_kl", 0.0)
     last = {}
     for _ in range(cfg.update_epochs):
+        if target_kl > 0 and last.get("approx_kl", 0.0) > target_kl:
+            break  # policy has moved far enough off the sampling distribution; more epochs hurt
         np.random.shuffle(idx)
         for start in range(0, batch_size, cfg.minibatch_size):
             mb = torch.as_tensor(idx[start:start + cfg.minibatch_size], device=data["obs"].device)

@@ -32,7 +32,7 @@ import torch
 from .buffer import RolloutBuffer
 from .config import PPOConfig
 from .flow_env import FlowEnvVec
-from .flow_eval import HEURISTIC_STATS, evaluate_flow, standard_baselines
+from .flow_eval import HEURISTIC_STATS, evaluate_flow, make_scripted_heuristic, standard_baselines
 from .league import OpponentSlots, SnapshotLeague
 from .model import ActorCritic
 from .run_logger import RunLogger
@@ -80,7 +80,7 @@ def train(args):
         update_epochs=args.update_epochs, minibatch_size=args.minibatch_size,
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         embed_dim=args.embed_dim, seed=args.seed, device=args.device or "auto",
-        shaping_coef=args.shaping_coef, aux=args.aux,
+        shaping_coef=args.shaping_coef, aux=args.aux, target_kl=args.target_kl,
     )
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -100,15 +100,38 @@ def train(args):
         print("[train_flow] WARNING: no team pool loaded — every env replays the same fixed "
               "debug matchup. This is not a real training distribution.")
 
+    # Peek at the saved state BEFORE building the model: architecture belongs to the run, not to
+    # whatever flags this relaunch happened to pass — resuming a 1024-wide run with the default
+    # --hidden-dim 256 must not die on a state_dict shape mismatch.
+    ck = None
+    if args.resume and state_path.exists():
+        ck = torch.load(state_path, map_location=device, weights_only=False)
+        for k in ("hidden_dim", "n_hidden_layers", "embed_dim"):
+            if k in ck and getattr(cfg, k) != ck[k]:
+                print(f"[train_flow] resume: {k} {getattr(cfg, k)} -> {ck[k]} (from checkpoint)")
+                setattr(cfg, k, ck[k])
+
     model = build_model(cfg, env, device, aux=cfg.aux)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
 
     # League, not a single frozen self. Training only against the most recent snapshot lets the
     # pair co-adapt and forget everything it stopped seeing; the reservoir keeps past checkpoints
     # in the mix, PFSP-weighted (see ppo/league.py).
+    # Scripted league members beyond `random`. The heuristic is the important one: the eval
+    # opponent must also be a TRAINING opponent, or win-rate against it is pure transfer from
+    # self-play (scale1: 0.18 at 26M steps; the poke-env recipe, which trained on it at base
+    # weight 2, hit 0.46 in its first 22 minutes).
+    scripted_opps: dict = {}
+    scripted_weights: dict[str, float] = {}
+    heur_stats: dict = {}
+    if args.league_heuristic_weight > 0:
+        scripted_opps["heuristic"] = make_scripted_heuristic(heur_stats)
+        scripted_weights["heuristic"] = args.league_heuristic_weight
     league = SnapshotLeague(run_dir / "pool", keep=args.pool_size, pfsp_power=args.pfsp_power,
-                            mode=args.pfsp_mode, random_weight=args.random_weight)
-    slots = OpponentSlots(args.opponent_slots, lambda: build_model(cfg, env, device, aux=cfg.aux), device)
+                            mode=args.pfsp_mode, random_weight=args.random_weight,
+                            scripted_weights=scripted_weights)
+    slots = OpponentSlots(args.opponent_slots, lambda: build_model(cfg, env, device, aux=cfg.aux),
+                          device, scripted=scripted_opps)
 
     # The anchor is the run's random-init policy, frozen before any training — the fixed reference
     # that says whether the agent has learned anything at all.
@@ -116,8 +139,7 @@ def train(args):
     anchor_path = run_dir / "anchor.pt"
 
     global_step, update, total_games = 0, 0, 0
-    if args.resume and state_path.exists():
-        ck = torch.load(state_path, map_location=device, weights_only=False)
+    if ck is not None:
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
         global_step, update, total_games = ck["global_step"], ck["update"], ck["total_games"]
@@ -158,7 +180,8 @@ def train(args):
                     "league": league.save_state(), "global_step": global_step,
                     "update": update, "total_games": total_games,
                     "obs_dim": env.obs_dim, "n_actions": env.n_actions,
-                    "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers},
+                    "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
+                    "embed_dim": cfg.embed_dim},
                    state_path)
         # A separate, weights-only artifact per checkpoint — this is what the on-policy cosim
         # sidecar and offline evals load, and it must never be a half-written training_state.
@@ -191,7 +214,8 @@ def train(args):
             mask_t = torch.as_tensor(mask_l, device=device)
             with torch.no_grad():
                 action, log_prob, _, value = model.act(obs_t, mask_t, obs_ids=ids_t)
-            opp_action = slots.actions(obs_o, ids_o, mask_o, opp_rng)
+            opp_action = slots.actions(obs_o, ids_o, mask_o, opp_rng,
+                                       vec=env.vec, sides=1 - env.learner_side)
 
             reward, done, active, dyn, outcome = env.step(action.cpu().numpy(), opp_action)
 
@@ -235,6 +259,13 @@ def train(args):
             window.clear()
             print(f"    [league +snapshot @ step {global_step:,}; "
                   f"pool={len(league.snapshots())}] {json.dumps(league.stats())[:220]}", flush=True)
+            if heur_stats.get("fallbacks"):
+                # The scripted league heuristic degrading to random would silently gut the
+                # curriculum — same failure mode the eval path warns about, so warn here too.
+                print(f"    [league] !! heuristic fallbacks {heur_stats['fallbacks']}"
+                      f"/{heur_stats.get('calls', 0)} ({heur_stats.get('last_error', '?')})",
+                      flush=True)
+                heur_stats.clear()
             # `metrics()` keeps only scalars, so flatten the league summary — otherwise the whole
             # dict is silently dropped from W&B and only reaches metrics.jsonl.
             st = league.stats()
@@ -310,6 +341,11 @@ def main():
                    help="frontier = contested opponents first; hard = whoever currently beats us")
     p.add_argument("--random-weight", type=float, default=0.25,
                    help="fixed share of league sampling given to the uniform-random opponent")
+    p.add_argument("--league-heuristic-weight", type=float, default=0.0,
+                   help="PFSP base weight for the scripted heuristic as a TRAINING opponent "
+                        "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
+    p.add_argument("--target-kl", type=float, default=0.0,
+                   help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
     p.add_argument("--eval-every", type=int, default=25,
                    help="powered eval vs fixed baselines every N updates (0 = never)")
     p.add_argument("--eval-games", type=int, default=300, help="games per baseline eval")
