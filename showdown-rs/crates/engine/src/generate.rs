@@ -8870,8 +8870,7 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
     let alive = d.is_alive();
     // Shield Dust / Covert Cloak strip the flinch secondary via PS `ModifySecondaries` BEFORE
     // the roll — no draw. The shield is inert on a fainted mon.
-    let shielded = alive
-        && (d.ability == crate::ids::Ability::ShieldDust || d.item == Item::CovertCloak);
+    let shielded = d.ability == crate::ids::Ability::ShieldDust || d.item == Item::CovertCloak;
     if shielded {
         return vec![b];
     }
@@ -9155,10 +9154,8 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
         && b.state.side(side).active().ability != crate::ids::Ability::SheerForce
     {
         let foe = side.other();
-        let alive = b.state.side(foe).active().is_alive();
-        let shielded = alive
-            && (b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
-                || b.state.side(foe).active().item == Item::CovertCloak);
+        let shielded = b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+            || b.state.side(foe).active().item == Item::CovertCloak;
         if !shielded {
             draw(&mut b, "random", &[100], 0, "secondary");
         }
@@ -9174,11 +9171,18 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     let has_self = md.secondary_self_boosts.iter().any(|&x| x != 0);
     let alive = b.state.side(foe).active().is_alive();
     // Shield Dust / Covert Cloak strip target-facing (non-`self`) secondaries via PS
-    // `ModifySecondaries` BEFORE the `random(100)` roll — so no draw at all. The shield is only
-    // active while the mon is on the field alive (a fainted mon's ability is inert).
-    let shielded = alive
-        && (b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
-            || b.state.side(foe).active().item == Item::CovertCloak);
+    // `ModifySecondaries` BEFORE the `random(100)` roll — so no draw at all.
+    //
+    // The shield does NOT need the target to be alive. PS gates an ability's handlers on
+    // `ignoringAbility()`, whose only liveness test is `!this.isActive` (sim/pokemon.ts:866) —
+    // and `isActive` is cleared in `faintMessages` (sim/battle.ts:2579), which runs at the END of
+    // the action. A target that just fainted TO THIS MOVE is still in its slot with `isActive`
+    // true, so its Shield Dust still strips the secondary and PS makes no roll.
+    // rb1343 d34: Flamethrower KOs a 22-HP Shield Dust Ribombee. PS rolls nothing after the damage
+    // roll; the engine saw a dead target, dropped the shield, rolled the 10% burn and ran one draw
+    // ahead for the rest of the game.
+    let shielded = b.state.side(foe).active().ability == crate::ids::Ability::ShieldDust
+        || b.state.side(foe).active().item == Item::CovertCloak;
     let target_eligible = alive && !shielded;
     // Shield Dust / Covert Cloak remove target-facing secondaries, but PS preserves a
     // secondary's `self` payload (Fiery Dance can still boost its user, including on a KO).
@@ -9330,9 +9334,8 @@ fn apply_triattack_secondary(b: Branch, side: SideId, md: &crate::data::MoveData
     // Shield Dust / Covert Cloak strip the secondary BEFORE the roll (no draw); a fainted-but-
     // present target still rolls (the `trySetStatus` merely no-ops), so gate only on the shield.
     let alive = b.state.side(foe).active().is_alive();
-    let shielded = alive
-        && (b.state.side(foe).active().ability == Ab::ShieldDust
-            || b.state.side(foe).active().item == Item::CovertCloak);
+    let shielded = b.state.side(foe).active().ability == Ab::ShieldDust
+        || b.state.side(foe).active().item == Item::CovertCloak;
     if shielded {
         return vec![b];
     }
@@ -9382,9 +9385,8 @@ fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData)
         return vec![b];
     }
     let alive = b.state.side(foe).active().is_alive();
-    let shielded = alive
-        && (b.state.side(foe).active().ability == Ab::ShieldDust
-            || b.state.side(foe).active().item == Item::CovertCloak);
+    let shielded = b.state.side(foe).active().ability == Ab::ShieldDust
+        || b.state.side(foe).active().item == Item::CovertCloak;
     if shielded {
         return vec![b];
     }
