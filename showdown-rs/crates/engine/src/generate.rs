@@ -2806,6 +2806,9 @@ fn pressure_affected(md: &crate::data::MoveData, user_is_ghost: bool) -> bool {
 fn apply_switch_in_ability(b: &mut Branch, side: SideId) {
     use crate::ids::Ability::*;
     let ability = b.state.side(side).active().ability;
+    // Ice Face's `onStart` is the same restore as its `onWeatherChange` (`data/abilities.ts:1926`):
+    // a Noice Eiscue entering hail / snowscape is Eiscue again immediately. State-only.
+    restore_ice_face(b, side);
     let weather = match ability {
         Drought | OrichalcumPulse => Weather::Sun,
         Drizzle => Weather::Rain,
@@ -6670,6 +6673,45 @@ fn break_ice_face(b: &mut Branch, foe: SideId) {
     push(b, Instruction::SetTimesHit {
         side: foe, slot, previous: cur, new: cur.saturating_add(1).min(250),
     });
+}
+
+/// The inverse of [`break_ice_face`] — PS Ice Face's `onStart` / `onWeatherChange`
+/// (`data/abilities.ts:1926` and `:1963`): a LIVING, untransformed Eiscue-Noice whose holder is
+/// standing in hail or snowscape forme-changes straight back to Eiscue. It is not a "next
+/// switch-in" restore; it fires the moment the weather turns.
+///
+/// rb1253 d12 t10: the foe uses Snowscape and PS's Eiscue-Noice is `eiscue` again in the very
+/// next serialized state. State-only on both sides (`formeChange` makes no draw), and the two
+/// formes differ only in Def/Spe, so this is a species + stats swap.
+fn restore_ice_face(b: &mut Branch, side: SideId) {
+    if !matches!(b.state.weather, Weather::Snow) {
+        return;
+    }
+    let Some(noice) = crate::ids::Species::from_id("eiscuenoice") else { return };
+    let Some(eiscue) = crate::ids::Species::from_id("eiscue") else { return };
+    let p = b.state.side(side).active();
+    if p.ability != crate::ids::Ability::IceFace || p.species != noice || p.transformed || !p.is_alive() {
+        return;
+    }
+    let level = p.level;
+    let base = crate::data::base_stats(eiscue);
+    let mut stats = p.stats;
+    for (si, stat) in [
+        crate::ids::StatIndex::Attack, crate::ids::StatIndex::Defense,
+        crate::ids::StatIndex::SpecialAttack, crate::ids::StatIndex::SpecialDefense,
+        crate::ids::StatIndex::Speed,
+    ].into_iter().enumerate() {
+        stats[si + 1] = crate::damage::compute_stat(
+            base[si + 1], 31, 85, level, crate::ids::Nature::Serious, stat,
+        );
+    }
+    let previous = transform_data_of(&b.state, side);
+    let mut new = previous;
+    new.species = eiscue;
+    new.stats = stats;
+    let slot = b.state.side(side).active_index;
+    let previous_base_moves = b.state.side(side).active().base_moves;
+    push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
 }
 
 /// Where `apply_damage_hit_rolls` gets each hit's crit + damage roll.
@@ -10901,6 +10943,9 @@ fn set_weather(b: &mut Branch, weather: Weather, turns: i8) {
         new_turns: turns,
     });
     refresh_proto_quark(b); // PS Protosynthesis `onWeatherChange`
+    for s in [SideId::One, SideId::Two] {
+        restore_ice_face(b, s); // PS Ice Face `onWeatherChange`
+    }
 }
 
 /// Set or increment a hazard on `target`'s side (capped at its max layers).
