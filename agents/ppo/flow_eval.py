@@ -98,14 +98,42 @@ def _heuristic_actions(heur, vec, envs, mask, rng, stats: dict | None = None) ->
     return out
 
 
+def _heuristic_actions_rust(vec, envs, mask, rng, stats: dict | None = None) -> np.ndarray:
+    """The Rust port of `HeuristicBaseline`, batched: one bridge call for the whole env block.
+
+    The Python path costs ~400µs/env (a full `state_json` round-trip per env per step) and was
+    measured at 83% of trainer wall time once the heuristic joined the league; the Rust port is
+    action-exact (enforced by `probes/heuristic_parity.py`) and ~three orders of magnitude
+    cheaper. -1 rows are "no opinion" (the states where the Python version raises or has no
+    legal pick) and fall back to a random legal action, counted like the Python path counts them.
+    """
+    sides = np.zeros(vec.num_envs, dtype=np.int64)
+    rows = np.array([e for e, _ in envs], dtype=np.int64)
+    sides[rows] = [s for _, s in envs]
+    acts = np.asarray(vec.heuristic_actions_all(sides), dtype=np.int64)[rows]
+    out = np.empty(len(envs), dtype=np.int64)
+    for row, a in enumerate(acts):
+        if a < 0 or not mask[row][a]:
+            if stats is not None:
+                stats["fallbacks"] = stats.get("fallbacks", 0) + 1
+            legal = np.flatnonzero(mask[row])
+            a = int(rng.choice(legal)) if legal.size else 0
+        out[row] = a
+    if stats is not None:
+        stats["calls"] = stats.get("calls", 0) + len(envs)
+    return out
+
+
 def make_scripted_heuristic(stats: dict | None = None):
     """A `(vec, envs, mask_rows, rng) -> actions` callable playing `HeuristicBaseline`.
 
     Shared by the eval ladder and the training league (`OpponentSlots.scripted`) so the opponent
-    the agent trains against is the SAME implementation it is evaluated against. Raises on
-    import failure — a league configured to include the heuristic must not silently train
-    without it.
+    the agent trains against is the SAME implementation it is evaluated against. Uses the Rust
+    port when the bridge has it (anything built after the heuristic joined the league), the
+    Python original otherwise.
     """
+    if hasattr(se.FlowVec, "heuristic_actions_all"):
+        return lambda vec, envs, mask, rng: _heuristic_actions_rust(vec, envs, mask, rng, stats)
     from .baselines import HeuristicBaseline
     heur = HeuristicBaseline()
     return lambda vec, envs, mask, rng: _heuristic_actions(heur, vec, envs, mask, rng, stats)
@@ -188,11 +216,8 @@ def standard_baselines(anchor_net, device, team_pool: str | None):
     if anchor_net is not None:
         out.append(("anchor-init", anchor_net))
     try:
-        from .baselines import HeuristicBaseline
-        heur = HeuristicBaseline()
         stats: dict = {}
-        out.append(("heuristic",
-                    lambda vec, envs, mask, rng: _heuristic_actions(heur, vec, envs, mask, rng, stats)))
+        out.append(("heuristic", make_scripted_heuristic(stats)))
         HEURISTIC_STATS.clear()
         HEURISTIC_STATS.update({"ref": stats})
     except Exception as e:  # never let an eval import take down training

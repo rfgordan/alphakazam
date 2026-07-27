@@ -905,6 +905,168 @@ fn flow_choice(state: &State, side: SideId, action: u8) -> PlayerChoice {
 }
 
 /// Phase-aware (N=13) legal mask for `side` under the pending `req`.
+/// `_matchup` from `agents/ppo/baselines.py::HeuristicBaseline`, arithmetic-identical: f32
+/// type-chart values widened to f64 exactly where the Python side crosses `type_effectiveness`,
+/// same operation order, raw (unclamped) HP like the JSON path exposes.
+fn heuristic_matchup(mon: &engine::state::Pokemon, opp: &engine::state::Pokemon) -> f64 {
+    use engine::damage::type_multiplier;
+    const SPEED_COEF: f64 = 0.1;
+    const HP_COEF: f64 = 0.4;
+    let best = |att: &[engine::ids::Type], def: [engine::ids::Type; 2]| -> f64 {
+        att.iter()
+            .filter(|&&t| t != engine::ids::Type::None)
+            .map(|&t| type_multiplier(t, def) as f64)
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    let off = best(&mon.types, opp.types);
+    let off = if off.is_finite() { off } else { 1.0 };
+    let deff = best(&opp.types, mon.types);
+    let deff = if deff.is_finite() { deff } else { 1.0 };
+    let mut score = off - deff;
+    score += if mon.stats[5] > opp.stats[5] {
+        SPEED_COEF
+    } else if opp.stats[5] > mon.stats[5] {
+        -SPEED_COEF
+    } else {
+        0.0
+    };
+    score += HP_COEF * (mon.hp as f64 / mon.max_hp.max(1) as f64);
+    score -= HP_COEF * (opp.hp as f64 / opp.max_hp.max(1) as f64);
+    score
+}
+
+/// Faithful port of `agents/ppo/baselines.py::HeuristicBaseline._action_for` (itself a port of
+/// poke-env's SimpleHeuristicsPlayer), evaluated directly on engine state. The Python version
+/// costs ~400µs/env (a full `state_json` serialize + `json.loads` per env per step) and was
+/// measured at 83% of trainer wall time when league slots draw the heuristic; this one is
+/// rayon-parallel and three orders of magnitude cheaper. Action-exactness against the Python
+/// implementation is enforced by `agents/probes/heuristic_parity.py` — any change here must keep
+/// the two in lockstep, or the training opponent silently diverges from the eval opponent.
+///
+/// Returns -1 when the heuristic has no opinion (non-acting request, no legal action, or a state
+/// the Python port would have raised on) — the caller falls back to a random legal action and
+/// counts the event.
+fn heuristic_action_of(state: &State, req: Request, side: SideId) -> i64 {
+    use engine::damage::type_multiplier;
+    const SWITCH_THRESHOLD: f64 = -2.0;
+
+    let mask = flow_legal_mask(state, req, side);
+    if !mask.iter().any(|&b| b) {
+        return -1;
+    }
+    let sd = state.side(side);
+    let od = state.side(side.other());
+    let (ai, oi) = (sd.active_index as usize, od.active_index as usize);
+    if ai >= 6 || oi >= 6 {
+        return -1; // the Python port IndexErrors here and falls back; mirror that
+    }
+    let active = &sd.pokemon[ai];
+    let opp = &od.pokemon[oi];
+    let bench: Vec<usize> = (0..6).filter(|&s| s != ai).collect();
+    let legal_moves: Vec<usize> = (0..4).filter(|&i| mask[i]).collect();
+    let legal_switch: Vec<usize> = (0..5).filter(|&k| mask[4 + k]).collect();
+
+    // Should we switch out? (a good reserve exists AND we're in a bad spot). Boosts live on the
+    // SIDE in this engine; boosts[..5] = [atk, def, spa, spd, spe].
+    let mut should_switch = false;
+    if !legal_switch.is_empty()
+        && legal_switch
+            .iter()
+            .any(|&k| heuristic_matchup(&sd.pokemon[bench[k]], opp) > 0.0)
+    {
+        let b = &sd.boosts;
+        let phys = active.stats[1] >= active.stats[3];
+        should_switch = b[1] <= -3
+            || b[3] <= -3
+            || (b[0] <= -3 && phys)
+            || (b[2] <= -3 && !phys)
+            || heuristic_matchup(active, opp) < SWITCH_THRESHOLD;
+    }
+
+    if !legal_moves.is_empty() && !(should_switch && !legal_switch.is_empty()) {
+        let alive =
+            |p: &engine::state::Pokemon| p.species != engine::ids::Species::None && p.hp > 0;
+        let n_opp = od.pokemon.iter().filter(|p| alive(p)).count();
+        let n_self = sd.pokemon.iter().filter(|p| alive(p)).count();
+
+        // Hazards: set them up early; clear our own if any exist.
+        for &i in &legal_moves {
+            let id = active.moves[i].id.to_id();
+            let hazard_set = match id {
+                "spikes" => Some(od.side_conditions.spikes != 0),
+                "stealthrock" => Some(od.side_conditions.stealth_rock),
+                "stickyweb" => Some(od.side_conditions.sticky_web),
+                "toxicspikes" => Some(od.side_conditions.toxic_spikes != 0),
+                _ => None,
+            };
+            if let Some(already) = hazard_set {
+                if !already && n_opp >= 3 {
+                    return i as i64;
+                }
+            }
+            if (id == "rapidspin" || id == "defog")
+                && (sd.side_conditions.stealth_rock
+                    || sd.side_conditions.spikes != 0
+                    || sd.side_conditions.toxic_spikes != 0
+                    || sd.side_conditions.sticky_web)
+                && n_self >= 2
+            {
+                return i as i64;
+            }
+        }
+
+        // Setup: boost when at full HP in a favorable matchup and not maxed.
+        if active.hp >= active.max_hp
+            && heuristic_matchup(active, opp) > 0.0
+            && sd.boosts[..5].iter().copied().max().unwrap_or(0) < 6
+        {
+            for &i in &legal_moves {
+                let md = engine::data::move_data(active.moves[i].id);
+                let boost_total: i32 = md.self_boosts.iter().map(|&x| x as i32).sum();
+                if boost_total >= 2 && md.base_power == 0 {
+                    return i as i64;
+                }
+            }
+        }
+
+        // Best damaging move — strict `>` keeps Python `max()`'s first-of-ties semantics.
+        let mut best: Option<(usize, f64)> = None;
+        for &i in &legal_moves {
+            let md = engine::data::move_data(active.moves[i].id);
+            if md.base_power == 0 {
+                continue;
+            }
+            let stab = if active.types.contains(&md.typ) { 1.5 } else { 1.0 };
+            let acc = if md.accuracy > 0 { md.accuracy as f64 / 100.0 } else { 1.0 };
+            let sc = md.base_power as f64 * stab * type_multiplier(md.typ, opp.types) as f64 * acc;
+            if best.is_none_or(|(_, b)| sc > b) {
+                best = Some((i, sc));
+            }
+        }
+        if let Some((i, _)) = best {
+            return i as i64;
+        }
+    }
+
+    // Switch to the best-matchup reserve (again first-of-ties, ascending k).
+    if !legal_switch.is_empty() {
+        let mut best = (legal_switch[0], f64::NEG_INFINITY);
+        for &k in &legal_switch {
+            let m = heuristic_matchup(&sd.pokemon[bench[k]], opp);
+            if m > best.1 {
+                best = (k, m);
+            }
+        }
+        return 4 + best.0 as i64;
+    }
+    // Python's terminal fallback: the first legal action (e.g. a Struggle-fallback move slot, or
+    // only zero-power moves legal with an empty bench).
+    match mask.iter().position(|&b| b) {
+        Some(i) => i as i64,
+        None => -1,
+    }
+}
+
 fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTIONS_FLOW] {
     let mut mask = [false; N_ACTIONS_FLOW];
     if !acting_for(req, side) {
@@ -1102,6 +1264,33 @@ impl FlowVec {
             dst.copy_from_slice(&flow_legal_mask(&f.state, f.request(), sd));
         }
         Array2::from_shape_vec((n, N_ACTIONS_FLOW), flat).unwrap().into_pyarray_bound(py)
+    }
+
+    /// (N,) scripted-heuristic action for every env, from `sides[i]`'s perspective (0/1).
+    /// -1 where the heuristic has no opinion (non-acting request, or a state the Python
+    /// implementation would raise on) — see [`heuristic_action_of`]. The Python-side wrapper
+    /// falls back to a random legal action there and counts the event.
+    fn heuristic_actions_all<'py>(
+        &self,
+        py: Python<'py>,
+        sides: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let sv = sides.as_slice()?.to_vec();
+        let n = self.flows.len();
+        if sv.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "sides must have length {n} (got {})",
+                sv.len()
+            )));
+        }
+        let acts: Vec<i64> = py.allow_threads(|| {
+            self.flows
+                .par_iter()
+                .zip(sv.par_iter())
+                .map(|(f, &s)| heuristic_action_of(&f.state, f.request(), sid(s as u8)))
+                .collect()
+        });
+        Ok(Array1::from_vec(acts).into_pyarray_bound(py))
     }
 
     /// (N, OBS_DIM) f32 observations from `side`'s perspective.
