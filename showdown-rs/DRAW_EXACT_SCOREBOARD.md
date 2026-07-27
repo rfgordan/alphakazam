@@ -1,8 +1,184 @@
 # DRAW-EXACT — Phase 1 first scoreboard
 
 Reproduce: `cargo build --release -p cosim && DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz`
-PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
-`gen9randombattle` seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) — 512 games total.
+PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 `gen9randombattle`
+seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) — 512 games total. A further 400 fresh
+games (seeds 1401-1800) were recorded in burn-down XII as sidecars only; rebuild their fixtures
+with `MAKE_FIXTURE=<dir> target/release/cosim harness/seed-sidecars/rb1[4-8]*.json.gz`.
+
+---
+
+# ==== BURN-DOWN XII — certification (2026-07-27) ====
+
+**HEADLINE: 503 / 512 pinned-corpus games byte-exact from seed (98.2%), up from 497; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.** And, separately: **400
+FRESH games were recorded (seeds 1401-1800) and gated for the first time — 348 / 400 = 87.0%
+exact, init-aligned 400 / 400.**
+
+Seven parity commits, each PS-source-grounded, judged by the exact-SET diff on BOTH corpora at
+every step: **the newly-non-exact set was EMPTY at all seven.** Per-commit yield on the pinned
+corpus 1, 1, 1, 1, 1, 1, 0 — the trailing zero is the Cramorant commit, which has NO pinned
+witness at all and flipped **three** fresh games instead. Kill criterion (three consecutive
+zero-yield commits) not approached.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, pinned 512 | `SEED_GATE=1 cosim … seed-fixtures/*.fx.json.gz` | **503 / 512 = 98.2%**; init-aligned **512 / 512** |
+| Seed gate, FRESH 400 | seeds 1401-1800, fixtures built from the new sidecars | **348 / 400 = 87.0%**; init-aligned **400 / 400** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; zero `rust extra` |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, 0 unsupported |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS**, every convertible state |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+| Cosim tests | `cargo test --release -p cosim -j 2` | green |
+
+## The roots landed (in commit order)
+
+| # | commit | root | pinned |
+|---|--------|------|--------|
+| 1 | `68d3a7c` | **A DRAG never refreshes the incoming mon's Speed cache.** `switchIn(..., isDrag=true)` on gen ≥ 5 calls `runSwitch(pokemon)` DIRECTLY (`sim/battle-actions.ts:145-150`) instead of `queue.insertChoice({choice:'runSwitch'})` — and `insertChoice` is the ONLY caller of `updateSpeed()` (`sim/battle-queue.ts:374`) | 497 → 498 (rb1360) |
+| 2 | `990184f` | **A transformed mon's identity was wrong in TWO import fields** — `base_types` (element-wise patch) and `base_moves` (unrecoverable from a snapshot; now rebuilt from the packed teams) | 498 → 499 (rb1359) |
+| 3 | `70d474c` | **Trace is an `onUpdate` handler** — a failed copy RETRIES at every `eachEvent('Update')` until a traceable foe appears | 499 → 500 (rb1244) |
+| 4 | `2b004c1` | **The priority BLOCKERS carried their own hand-copied ModifyPriority list and it was missing Triage**; `onFoeTryMove` is three abilities, not one | 500 → 501 (rb1348) |
+| 5 | `bd70ee9` | **A FIXED-damage move ignored the target's Substitute** (and would not have counted `timesAttacked` if it had) | 501 → 502 (rb1326) |
+| 6 | `53b3c36` | **Beak Blast burns anything that makes CONTACT while the beak is heating** — wholly unmodelled | 502 → 503 (rb1108) |
+| 7 | `382fc45` | **Cramorant-Gulping / Gorging is NOT a permanent forme** — it reverts on switch-out and faint, and the missile fires from a Cramorant that FAINTED to the hit | 503 (no pinned witness); fresh +3 |
+| 8 | this commit | docs | — |
+
+## THE FRESH-SEED QUESTION, ANSWERED WITH DATA
+
+`bash harness/record-seeds.sh 1401 1800` — 400 games, 0 failures, 510 s, one node process. Fixtures
+built with `MAKE_FIXTURE=… cosim harness/seed-sidecars/rb1[4-8]*.json.gz`.
+
+**The fresh-game exact rate is 87.0% (348/400), against 98.2% on the pinned 512.** That gap is the
+whole answer to "is the pinned corpus mined out": it is not mined out of BUGS, it is mined out of
+*this sample's* bugs. Eleven points of exactness live in mechanics the 401 old seeds never touched.
+
+**Shared classes regrow — measured, not argued.** Two of this tranche's roots were found on one
+corpus and paid on the other:
+
+- **Beak Blast** was diagnosed from pinned rb1108 and flipped fresh **rb1453, rb1616, rb1719** as
+  well. Its pinned signature (`hp` + `status Burn`) recurs five times in the fresh batch.
+- **Cramorant** was diagnosed from the fresh batch's `.species` cluster (rb1459, rb1780, rb1783 all
+  reading `engine=cramorantgulping ps=cramorant`) and has NO pinned witness. It would never have
+  been found by staring at the 512.
+
+That is the empirical test burn-down XI asked for, and it comes out for recording more seeds.
+
+### The 52 fresh opens, by FIRST DIVERGENT FIELD (per trap #1 — never by move name)
+
+```
+  25  .hp                (bare, no second field — the expensive shape, same as the pinned tail)
+  10  .volatiles         rb1412 rb1418 rb1421 rb1433 rb1520 rb1529 rb1628 rb1649 rb1739 rb1778
+   3  .boost.atk         rb1430 rb1544 rb1681
+   2  .boost.def         rb1432 rb1650
+   2  .active_index      rb1760 + 1
+   1 each  field.terrain / .wish / .substitute_hp / .species / .sc.toxic_spikes / .sc.spikes /
+           .move0.pp / .item / .boost.spa / .active_turns
+```
+
+Named sub-clusters already visible inside that table, with the volatile bits decoded
+(discriminant = bit index, `volatile.rs`):
+
+- **bit 39 `StatsLoweredThisTurn`** — rb1433, rb1529, rb1739 (`ps=Volatiles(549755813888)`, engine 0).
+- **bit 38 `StatsRaisedThisTurn`** — rb1573, rb1628 (`ps=Volatiles(274877906944)`, engine 0), and
+  rb1573 pairs it with `boost.spa 3/2`. Five games on the two "stats moved this turn" markers.
+- **`.boost.def 0/2` + `hp` + `status Burn`** — rb1432, rb1650: PS grants +2 Def and NO burn where
+  the engine burns. A Fire-move absorber (Well-Baked Body shape) on a mon the engine burns instead.
+- **`.boost.atk` + `.boost.spa` both `0/2`** — rb1544, rb1681: a +2/+2 pair (Weakness Policy shape).
+- **Mimikyu** — rb1421 (`engine=mimikyubusted ps=mimikyu`) and rb1621 (`engine=mimikyu
+  ps=mimikyubusted`) point in OPPOSITE directions, so they are two roots, not one; do not merge them
+  with the Cramorant fix, whose `isPermanent` argument is exactly what separates the two species.
+
+**Triage verdict: of the 52, none is a re-run of a pinned open's diagnosed root** (all seven pinned
+roots this tranche closed are gone from both corpora), **and at least 12 sit in four fresh
+multi-game clusters.** They are NEW roots, and they are cheaper per game than the pinned tail.
+
+## The 9 still-open pinned games — the evidenced table
+
+`DBG_DIFF`'s FIRST divergent field per game, at the certifying commit (run the SIDECARS, not the
+fixtures — a slim fixture has no `stateAfter` and can only report `state-digest`).
+
+```
+  rb1011 d43 t33  s0#3.hp 140/77
+  rb1012 d60 t52  s0#2.hp
+  rb1040 d2  t3   s0#0.hp
+  rb1126 d7  t5   s1.volatiles bit28 UNBURDEN missing + s1#5.hp 396/275 + item Sitrus/None
+                                                       + last_berry None/Sitrus
+  rb1184 d5  t6   s1#4.hp
+  rb1191 d17 t14  s0#1.hp 25/33          PS shuffle@thunderbolt vs rust randomChance@accuracy
+  rb1236 d37 t29  s0#4.hp 51/18
+  rb1314 d45 t38  s1#0.item LightClay/None    surfaces at a Revival Blessing
+  rb1347 d69 t64  s1#1.hp
+```
+
+Six of the nine are a bare `hp` mismatch with no second field. rb1126's berry/Unburden difference is
+a SYMPTOM of a 121-HP damage gap, not a root. **The PRNG-offset class is empty again** — rb1360 was
+its last member and commit 1 closed it.
+
+## Rules this tranche added, each of which cost a landing to learn
+
+> **A cache is only refreshed where PS refreshes it, and `insertChoice` is the only site that
+> refreshes ONE mon's.** A drag bypasses it entirely, so the incoming mon sorts on the value every
+> BENCHED mon carries — its unboosted `storedStats.spe`, because `clearVolatile` ends in
+> `setSpecies(baseSpecies)` which ends in `this.speed = this.storedStats.spe` (`sim/pokemon.ts:1419`).
+> **Verified rather than assumed: 197714 benched snapshots across the 401 sidecars, ZERO with
+> `speed !== storedStats.spe`.** When a rule can be checked against the recorded corpus, check it —
+> it is one node script and it converts a guess into a fact.
+
+> **`formeChange(species, effect)` vs `formeChange(species, effect, /*isPermanent*/ true)` is the
+> entire difference between a forme that survives a switch and one that does not.** `isPermanent`
+> rewrites `baseSpecies`, and `clearVolatile`'s `setSpecies(this.baseSpecies)` is what reverts.
+> Mimikyu-Busted and Palafin-Hero pass `true`; Gulp Missile does not. Check the third argument
+> before deciding a forme is permanent.
+
+> **A hand-copied PS list is a liability — and the second copy of a computation is a list too.**
+> The engine had THREE copies of "modified priority" and only the turn-order one carried Triage.
+> Enumerate from the pin (`Dex.forGen(9).abilities.all().filter(a => a.onModifyPriority)`,
+> `…filter(a => a.onFoeTryMove)`) and keep ONE function.
+
+> **PS's serialized `baseTypes` is not the restore target.** It is frozen at construction from
+> `baseSpecies.types` (`sim/pokemon.ts:446-447`), BEFORE `setSpecies` runs `ModifySpecies` — so a
+> Rusted Shield Zamazenta serializes `["Fighting"]` while `clearVolatile` restores
+> `["Fighting","Steel"]`. Seven games broke on trusting the field.
+
+> **`apply_post_damage` runs BEFORE the deferred `apply_damaging_hit_step7`, and PS's order is the
+> reverse.** Anything that reads state a faint clears (the Gulp Missile forme) must fire at the
+> faint site, not wait for step 7. This is a latent ordering hazard for every future step-7 effect.
+
+## Named opens carried forward
+
+- The nine pinned games above, plus the 52 fresh ones.
+- **`Volatiles` bits 38/39 (`StatsRaisedThisTurn` / `StatsLoweredThisTurn`) are the single largest
+  fresh cluster (5 games)** and should be taken first in the next tranche.
+- `apply_end_of_turn`'s **`switched` parameter is still vestigial**; delete when `request.rs` is
+  next touched.
+- Unchanged from XI: the engine's **Imposter** copies the target's BOOSTED Speed into `storedStats`;
+  the **BeforeMove ladder's confusion / Attract / paralysis half** has no witness; **Rampage
+  BeforeMove-cancel at `n == 1`**, **Terapagos-Stellar's FAINT regression**, **Battle Bond's
+  once-per-stint guard**, **Magnet Rise's `onTry` failure**; the mover's own `onAfterMove` and the
+  MOVE's own `onAfterMove` are deliberately not in the `AfterMove` list.
+- **A repository hazard, not an engine one:** `engines` is a TRACKED symlink whose target is the
+  main worktree's own `engines` path. Merging `prng-exact` into `main` checks that symlink out AT
+  that path, turning it into a self-loop and destroying the gitignored PS clone underneath. It
+  happened during this tranche; the clone was re-fetched at the pin
+  (`git fetch --depth 1 origin b9dc987d…`). Either untrack the symlink or give the clone a
+  different name.
+
+## Recommendation for the next tranche
+
+1. **Record the fresh batch's fixtures into the repo and gate on 912 games, not 512.** The evidence
+   above says the marginal open game is cheaper in the fresh half, and four fresh clusters are
+   already named.
+2. **Take the `StatsRaised/LoweredThisTurn` cluster first** (5 games), then the `boost.def + Burn`
+   pair and the `+2 Atk / +2 SpA` pair (2 each).
+3. **The bare-`hp` tail is now 25 fresh + 6 pinned = 31 games and is the campaign's real asymptote.**
+   Nothing localizes them but `DBG_INSTR` to the first diverging instruction and PS source at the
+   pin, one modifier at a time.
+4. `PRNG_TRACE` remains a one-command CONFIRMATION; **`DBG_INSTR` is the triage tool**, and
+   `DBG_DIFF` must be run against a SIDECAR to name a field.
 
 ---
 
