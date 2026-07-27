@@ -2538,6 +2538,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     };
     if out_ability == crate::ids::Ability::NaturalCure && out_status != Status::None {
         push(b, Instruction::ChangeStatus { side, slot: previous, previous: out_status, new: Status::None });
+        clear_status_counter(b, side, previous);
     }
     if out_ability == crate::ids::Ability::Regenerator && out_hp > 0 && out_hp < out_max {
         let heal = (out_max / 3).min(out_max - out_hp);
@@ -3197,6 +3198,32 @@ fn truant_gate(b: &mut Branch, side: SideId) -> bool {
 /// the sleep counter / roll the 20% thaw, and Truant (9) toggles its loaf marker. The engine
 /// skips move execution for flinched mons wholesale, so those higher-priority effects are
 /// replayed here (PS runs handlers in descending priority until one returns false).
+/// Discard a cured status's counter.
+///
+/// PS's `cureStatus()` goes through `setStatus('')`, which REPLACES `pokemon.statusState` wholesale
+/// (`sim/pokemon.ts`) — so curing a status always throws its state away: the `slp` timer, the `tox`
+/// stage, everything. And `setStatus` of a NEW status re-initialises `statusState` before running
+/// the condition's `onStart`, so nothing a previous status left behind can ever be read by the next
+/// one.
+///
+/// The engine cured `status` at several sites and left `status_counter` standing, and the next
+/// status to land on that mon inherited it. The load-bearing case is WAKING UP: the sleep cancel
+/// wakes the mon at `counter == 1` and only cleared `status`, so the mon carried a phantom counter
+/// of 1 — and a Toxic applied later started at stage 1, making its FIRST residual deal 2·maxhp/16
+/// instead of 1·maxhp/16 (`tox`'s `onStart` sets `stage = 0` and `onResidual` increments, so the
+/// first tick is always stage 1). rb1030 d53 is the witness: p2's Indeedee sleeps at t30, wakes at
+/// t36, is Toxic'd by Trevenant at t46, and takes 34 instead of 17 at t47 — engine 61, PS 78, with
+/// `status_counter` engine 2 / PS 1. rb1300 d52 is the second.
+///
+/// Safe at every cure site: it is a no-op when the counter is already 0, which is every status
+/// except `slp` and `tox`.
+fn clear_status_counter(b: &mut Branch, side: SideId, slot: u8) {
+    let previous = b.state.side(side).pokemon[slot as usize].status_counter;
+    if previous != 0 {
+        push(b, Instruction::ChangeStatusCounter { side, slot, previous, new: 0 });
+    }
+}
+
 fn flinch_cancel_chain(mut b: Branch, side: SideId) -> Vec<Branch> {
     // Glaive Rush's drawback removal (BeforeMove priority 100) precedes every cancel.
     if b.state.side(side).volatiles.contains(VolatileStatus::GlaiveRush) {
@@ -3223,6 +3250,7 @@ fn flinch_cancel_chain(mut b: Branch, side: SideId) -> Vec<Branch> {
             }
             // Wakes, Truant (9) toggles, then flinch (8) cancels the move.
             push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+            clear_status_counter(&mut b, side, slot);
             truant_gate(&mut b, side);
             vec![b]
         }
@@ -3588,6 +3616,7 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         if is_defrost_move(move_id) {
             let slot = b.state.side(side).active_index;
             push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
+            clear_status_counter(&mut b, side, slot);
             if truant_gate(&mut b, side) {
                 return vec![b];
             }
@@ -3600,6 +3629,7 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         draw(&mut thawed, "randomChance", &[1, 5], 1, "frz");
         let slot = thawed.state.side(side).active_index;
         push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
+        clear_status_counter(&mut thawed, side, slot);
         // frz (priority 10) ran; Truant (9) is next — a thawed loafer stays put this turn.
         if truant_gate(&mut thawed, side) {
             out.push(thawed);
@@ -4391,6 +4421,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
         } else {
             push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+            clear_status_counter(&mut b, side, slot);
             // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
             // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
             if truant_gate(&mut b, side) {
@@ -7534,6 +7565,7 @@ fn apply_thaw_on_hit(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
     if d.is_alive() && d.status == Status::Freeze && thaws {
         let slot = b.state.side(foe).active_index;
         push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Freeze, new: Status::None });
+        clear_status_counter(b, foe, slot);
     }
 }
 
@@ -7581,6 +7613,7 @@ fn apply_sparkling_aria(b: &mut Branch, side: SideId, md: &crate::data::MoveData
     {
         let slot = b.state.side(foe).active_index;
         push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Burn, new: Status::None });
+        clear_status_counter(b, foe, slot);
     }
 }
 
@@ -10318,6 +10351,7 @@ fn execute_status_move(
                 if status != Status::None {
                     push(&mut b, Instruction::ChangeStatus { side, slot, previous: status, new: Status::None });
                 }
+                clear_status_counter(&mut b, side, slot);
                 push(&mut b, Instruction::ChangeItem { side, slot, previous: Item::ChestoBerry, new: Item::None });
                 on_berry_eaten_id(&mut b, side, Item::ChestoBerry);
             } else {
