@@ -1289,12 +1289,21 @@ fn encode_ps_state(
         .map_err(|u| pyo3::exceptions::PyValueError::new_err(format!("canonical: {}", u.0)))?;
     let mut state = cosim::convert::convert_state(&v, &canon)
         .map_err(|u| pyo3::exceptions::PyValueError::new_err(format!("convert: {}", u.0)))?;
-    // Mirrors `cosim::trace::sleep_clause_for_format` (not on the cosim *lib* surface, which is
-    // deliberately just convert+export). The harness builds every random-format battle as
-    // `gen9customgame` — random-battle teams are pre-generated so PS does not re-roll them from
-    // the battle seed — and gen9customgame carries no ruleset, so Sleep Clause Mod never applies.
-    let effective = if format.contains("random") { "gen9customgame" } else { format };
-    state.sleep_clause = effective != "gen9customgame";
+    // Ruleset selection. "gen9randombattle" is AMBIGUOUS at this boundary: every recording and
+    // the whole training pipeline to date labels battles with the *team* format while actually
+    // running them as gen9customgame (pre-generated teams, no ruleset) — so that spelling keeps
+    // its historical meaning and maps to the customgame ruleset. The REAL ladder ruleset (sleep
+    // clause, 16-bit truncation arm, maybeTrapped, percent HP) is an explicit opt-in via
+    // "gen9randombattle-real", matching recordings whose trace `ruleset` field says
+    // gen9randombattle (harness/seed-fixtures-rb/). Migrating the default is a deliberate
+    // future step, to be taken together with the sidecar's recordings.
+    state.ruleset = match format {
+        f if f.contains("random") && !f.ends_with("-real") => {
+            engine::ruleset::Ruleset::GEN9_CUSTOM_GAME
+        }
+        f => engine::ruleset::Ruleset::from_format(f.trim_end_matches("-real"))
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown format: {f}")))?,
+    };
 
     let sd = sid(side);
     let _ = py;
