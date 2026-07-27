@@ -170,8 +170,10 @@ night4: 0.90) win through SEARCH, and the single prerequisite our stack is missi
 function trained to be a game evaluator rather than a variance-reduction critic. Everything
 graduating points there:
 
-1. **W6 (in flight):** `--aux` heads probe — the one existing lever aimed at
-   representation/value quality — with the E2 search gate re-tested on its endpoint.
+1. **W6 (done — neutral):** `--aux` heads probe: free but insufficient — the search gate stayed
+   closed on its endpoint (search vs raw 0.31). Representation-level fixes don't repair a
+   critic whose *target* is wrong; the next value levers are target-level (below). Carry aux
+   into long runs anyway (zero cost, possible long-horizon payoff).
 2. **E5 (gate MET via E2 branch B):** Metamon-template human-replay corpus. Replay outcomes are
    exactly the grounded, off-policy value signal the search gate asked for — pursue as the next
    multi-day build, subject to sign-off.
