@@ -1936,6 +1936,15 @@ fn move_ignores_evasion(id: crate::ids::MoveId) -> bool {
     matches!(id.to_id(), "chipaway" | "darkestlariat" | "nihillight" | "sacredsword")
 }
 
+/// Whether a move ignores the target's DEFENSIVE stage (`ignoreDefensive: true`, data/moves.ts).
+/// The same four moves carry both flags, but they are two different PS fields and only the
+/// evasion one was wired: `getDamage` sets `defBoosts = 0` outright (`battle-actions.ts:1701`),
+/// for a negative stage as well as a positive one. rb1781 d5: Sacred Sword into a +1 Def
+/// Krookodile — PS deals 87, the engine divided through the 1.5x and dealt 59.
+fn move_ignores_defensive(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "chipaway" | "darkestlariat" | "nihillight" | "sacredsword")
+}
+
 /// The exact integer numerator PS passes to `randomChance(accuracy, 100)` at `hitStepAccuracy`:
 /// `move.accuracy` after `onModifyMove` (Hustle physical ×0.8, sun Thunder/Hurricane = 50), the
 /// `ModifyAccuracy` ×4096 chain (Compound Eyes 5325/4096, Wide Lens 4505/4096 — applied to the
@@ -6741,7 +6750,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     } else {
         b.state.side(side).boost(atk_boost_idx)
     };
-    let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
+    let def_boost = if attacker.ability == crate::ids::Ability::Unaware || move_ignores_defensive(md.id) {
+        0
+    } else {
+        b.state.side(foe).boost(def_boost_idx)
+    };
 
     // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
     // chainModify([5325, 4096]) — modifier 5325, NOT 13/10 (which rounds to 5324).
