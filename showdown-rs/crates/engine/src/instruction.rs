@@ -45,7 +45,13 @@ use crate::state::MoveSlot;
 pub struct TransformData {
     pub species: Species,
     pub stats: [i16; 6],
+    /// EFFECTIVE typing (`Pokemon::types`) — a terastallized mon keeps its Tera typing across
+    /// a forme change, so the producers leave this alone when `terastallized`.
     pub types: [Type; 2],
+    /// PS's `pokemon.types` (`Pokemon::live_types`). `transformInto` and `setSpecies` both call
+    /// `setType(..., /*enforce*/ true)`, which bypasses the "terastallized mons cannot have
+    /// their base type changed" guard — so this ALWAYS moves, tera or not.
+    pub live_types: [Type; 2],
     pub ability: Ability,
     pub moves: [MoveSlot; 4],
     pub transformed: bool,
@@ -192,7 +198,18 @@ pub enum Instruction {
     Reveal { side: SideId, slot: u8, moves: u8, flags: u8 },
 
     // --- transformations ---
+    /// Rewrite the EFFECTIVE typing (`Pokemon::types`, PS's `getTypes()`). Emitted on its own
+    /// for the two engine-side ENCODINGS of a PS lookup-time resolution — Terastallization
+    /// (`getTypes` short-circuits on `terastallized`; `pokemon.types` is untouched) and Roost's
+    /// Flying strip / restore (PS's `roost` volatile filters through `onType`). A REAL
+    /// `setType` pushes this together with [`Instruction::ChangeLiveTypes`].
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
+    /// Rewrite PS's `pokemon.types` array (`Pokemon::live_types`) — a real `setType`. Separate
+    /// from `ChangeTypes` because the two move independently: an enforced `setType`
+    /// (`setSpecies`, `transformInto`) rewrites the array under a terastallized mon whose
+    /// effective typing does NOT move, and Tera / Roost move the effective typing with the
+    /// array standing still.
+    ChangeLiveTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
     ChangeItem { side: SideId, slot: u8, previous: Item, new: Item },
     ChangeAbility { side: SideId, slot: u8, previous: Ability, new: Ability },
     ToggleTerastallized { side: SideId, slot: u8 },
@@ -260,6 +277,7 @@ impl State {
                     p.hp += new.stats[0] - previous.stats[0];
                 }
                 p.types = new.types;
+                p.live_types = new.live_types;
                 p.ability = new.ability;
                 p.moves = new.moves;
                 p.transformed = new.transformed;
@@ -386,6 +404,9 @@ impl State {
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
+            ChangeLiveTypes { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].live_types = new;
+            }
             ChangeItem { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].item = new;
             }
@@ -442,6 +463,7 @@ impl State {
                     p.hp -= new.stats[0] - previous.stats[0];
                 }
                 p.types = previous.types;
+                p.live_types = previous.live_types;
                 p.ability = previous.ability;
                 p.moves = previous.moves;
                 p.transformed = previous.transformed;
@@ -572,6 +594,9 @@ impl State {
             }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;
+            }
+            ChangeLiveTypes { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].live_types = previous;
             }
             ChangeItem { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].item = previous;

@@ -140,7 +140,9 @@ pub struct DamageInput {
     pub move_type: Type,
     pub attacker_types: [Type; 2],
     /// The attacker's *original* (pre-Tera) types — needed to detect a Tera into one of its
-    /// own types (which upgrades STAB to ×2). Equals `attacker_types` when not Terastallized.
+    /// PS `pokemon.getTypes(false, true)` — the attacker's LIVE, pre-terastallized type array
+    /// (`Pokemon::live_types`), which a Protean / Soak / Burn Up rewrite and Tera does not.
+    /// Only read when `terastallized`; equals `attacker_types` otherwise.
     pub attacker_base_types: [Type; 2],
     pub defender_types: [Type; 2],
     pub attack_stat: i16,

@@ -75,9 +75,20 @@ pub struct Pokemon {
     pub species: Species,
     pub level: u8,
 
-    /// Current effective typing. `base_types` is the original for moves like Roost /
-    /// abilities that restore it; `types` reflects type changes (Soak, tera, etc.).
+    /// Current EFFECTIVE typing — PS's `pokemon.getTypes()`. Tera is folded in (a
+    /// terastallized mon's `types` is `[tera_type]`) and Roost's Flying strip is applied,
+    /// because PS resolves both at lookup time and the engine stores the resolved value.
     pub types: [Type; 2],
+    /// PS's `pokemon.types` VERBATIM — the live, PRE-TERASTALLIZED type list that Protean /
+    /// Soak / Burn Up / Reflect Type / Transform / a forme change rewrite. Tera does NOT touch
+    /// it (`getTypes` short-circuits on `terastallized` before reading it) and neither does
+    /// Roost (whose `onType` filters `getTypes()`, not the array). It is the state PS's
+    /// `isSTAB` reads through `getTypes(false, true)` (`sim/battle-actions.ts:1768`), and it is
+    /// the field the digest / state diff compare — `types` is derivable from it plus
+    /// `terastallized` / `tera_type` / the `Roosted` marker.
+    pub live_types: [Type; 2],
+    /// The SPECIES' typing (PS's `pokemon.baseTypes`) — what `clearVolatile`'s
+    /// `setSpecies(baseSpecies)` restores `live_types` to on switch-out / faint.
     pub base_types: [Type; 2],
     /// Transform bookkeeping: `transformed` marks an active Transform/Imposter copy; the
     /// `base_*` fields hold what to restore when it switches out (PS reverts transform on
@@ -135,6 +146,7 @@ impl Pokemon {
         species: Species::None,
         level: 100,
         types: [Type::None, Type::None],
+        live_types: [Type::None, Type::None],
         base_types: [Type::None, Type::None],
         transformed: false,
         slept_by_foe: false,

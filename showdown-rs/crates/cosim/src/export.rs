@@ -312,16 +312,13 @@ fn export_pokemon(
 
     m.insert("gender".into(), json!(match p.gender { 1 => "M", 2 => "F", _ => "" }));
 
-    // PS keeps the RAW (pre-tera) `types` array and applies Tera at lookup via `terastallized`.
-    // `convert` overwrites `State.types` to the effective [tera] for a non-Stellar Tera, so the
-    // raw types are recovered from `base_types` in that case (they coincide otherwise). `convert`
-    // re-derives the effective typing from `terastallized` on the way back, so this round-trips.
-    let raw_types = if p.terastallized && p.tera_type != Type::Stellar {
-        p.base_types
-    } else {
-        p.types
-    };
-    m.insert("types".into(), types_array(raw_types));
+    // PS keeps the RAW (pre-tera, un-Roost-filtered) `types` array and resolves Tera and the
+    // `roost` `onType` filter at lookup time. That array IS `live_types`, verbatim — `convert`
+    // re-derives the engine's effective `types` from it, so this round-trips. (Before
+    // `live_types` existed this recovered the array from `base_types` for a terastallized mon,
+    // which is only right when the mon's typing was never changed — a latent exporter bug on
+    // exactly the state the STAB fix is about.)
+    m.insert("types".into(), types_array(p.live_types));
     m.insert("baseTypes".into(), types_array(p.base_types));
 
     if p.transformed {
@@ -810,6 +807,7 @@ mod tests {
         p.base_species = p.species;
         p.level = 100;
         p.types = [Type::Normal, Type::None];
+        p.live_types = p.types;
         p.base_types = p.types;
         p.hp = 200;
         p.max_hp = 200;
@@ -850,7 +848,8 @@ mod tests {
         a.hp = 90;
         a.terastallized = true;
         a.tera_type = Type::Water;
-        a.types = [Type::Water, Type::None];
+        a.types = [Type::Water, Type::None]; // effective typing = the Tera type
+        a.live_types = [Type::Normal, Type::None]; // PS's `types` array is untouched by Tera
         s.sides[0].pokemon[0] = a;
         s.sides[0].active_index = 0;
         s.sides[0].boosts = [1, -2, 0, 0, 3, 0, 0];
@@ -882,6 +881,48 @@ mod tests {
         s.sides[1].partial_trap_div = 8;
         s.sides[1].volatiles.insert(VolatileStatus::PartiallyTrapped);
 
+        assert_roundtrip(&s);
+    }
+
+    /// A mon whose LIVE typing was rewritten (Protean) and which then Terastallized — the exact
+    /// state PS's `isSTAB` reads through `getTypes(false, true)`. Three type lists, all
+    /// different: effective `[Dark]` (the Tera type), live `[Poison]` (what Protean wrote), base
+    /// `[Grass, Dark]` (the species). The old exporter recovered PS's `types` array from
+    /// `base_types` for a terastallized mon and would have written `[Grass, Dark]` here.
+    #[test]
+    fn roundtrip_live_types_under_tera() {
+        let mut s = State::EMPTY;
+        s.turn = 5;
+        let mut a = base_mon("meowscarada", "flowertrick");
+        a.base_types = [Type::Grass, Type::Dark];
+        a.live_types = [Type::Poison, Type::None];
+        a.terastallized = true;
+        a.tera_type = Type::Dark;
+        a.types = [Type::Dark, Type::None];
+        s.sides[0].pokemon[0] = a;
+        s.sides[0].active_index = 0;
+        s.sides[0].tera_used = true;
+        s.sides[1].pokemon[0] = base_mon("gastrodon", "icebeam");
+        s.sides[1].active_index = 0;
+        assert_roundtrip(&s);
+    }
+
+    /// Roost: PS leaves `pokemon.types` alone and filters Flying out of `getTypes()` through the
+    /// volatile's `onType`, so the exported array must still carry Flying and `convert` must
+    /// re-derive the stripped effective typing from the `roost` volatile.
+    #[test]
+    fn roundtrip_roost_strips_only_effective_typing() {
+        let mut s = State::EMPTY;
+        s.turn = 7;
+        let mut a = base_mon("corviknight", "roost");
+        a.live_types = [Type::Flying, Type::Steel];
+        a.base_types = a.live_types;
+        a.types = [Type::None, Type::Steel]; // Flying filtered for the rest of the turn
+        s.sides[0].pokemon[0] = a;
+        s.sides[0].active_index = 0;
+        s.sides[0].volatiles.insert(VolatileStatus::Roosted);
+        s.sides[1].pokemon[0] = base_mon("blissey", "softboiled");
+        s.sides[1].active_index = 0;
         assert_roundtrip(&s);
     }
 }

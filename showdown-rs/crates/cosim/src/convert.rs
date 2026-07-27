@@ -213,6 +213,20 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
             .is_some_and(|t| t.is_empty());
     }
     convert_volatiles(active_v, &mut side)?;
+    // Roost is the second half of the effective-typing derivation. PS's `roost` condition
+    // filters Flying out of `getTypes()` via `onType` (`data/moves.ts:15460`) and never writes
+    // `pokemon.types`, so the serialized array still carries Flying; the engine stores the
+    // RESOLVED typing, so apply the filter here. `live_types` deliberately keeps PS's array.
+    // (`onStart` returns false for a terastallized target, so the volatile never coexists with
+    // Tera and no extra guard is needed.)
+    if side.volatiles.contains(VolatileStatus::Roosted) {
+        let p = &mut side.pokemon[active_slot as usize];
+        for t in p.types.iter_mut() {
+            if *t == Type::Flying {
+                *t = Type::None;
+            }
+        }
+    }
     // `statsRaisedThisTurn` is a per-Pokemon field (not a PS volatile): only the active can
     // have raised a stat this turn, so it maps onto the engine's active-only volatile. Reset
     // by PS at every `endTurn`, so it is only ever set on mid-turn snapshots.
@@ -345,6 +359,11 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     } else {
         Type::from_id(&tera_id).ok_or_else(|| unsup(format!("type:{tera_id}")))?
     };
+    // `types` as parsed above is PS's `pokemon.types` VERBATIM — the live, pre-tera array.
+    // Keep it as `live_types` (the STAB / digest / diff field) and derive the engine's
+    // EFFECTIVE typing from it. Roost's Flying strip is the other half of the derivation and
+    // is applied in `convert_volatiles`, which is the only place the `roost` volatile is known.
+    let live_types = types;
     if terastallized && tera_type != Type::Stellar {
         types = [tera_type, Type::None];
     }
@@ -402,6 +421,7 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         species,
         level,
         types,
+        live_types,
         base_types,
         transformed,
         slept_by_foe,

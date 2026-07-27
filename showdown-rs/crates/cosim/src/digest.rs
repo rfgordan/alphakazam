@@ -200,8 +200,13 @@ fn digest_side(d: &mut Digester, a: &Side, masked: bool) {
         }
         d.u16(p.item as u16);
         d.u16(p.ability as u16);
-        d.u8(p.types[0] as u8);
-        d.u8(p.types[1] as u8);
+        // PS's `pokemon.types` array, not the engine's resolved `types`. The resolved value is
+        // a function of this plus `terastallized` / `tera_type` (both digested below) and the
+        // `Roosted` marker (deliberately masked out above, like the other single-turn flags) —
+        // so digesting the array is strictly the PS-truth comparison AND it retires the Roost
+        // ENCODING artifact, where the engine's stripped Flying met PS's unstripped array.
+        d.u8(p.live_types[0] as u8);
+        d.u8(p.live_types[1] as u8);
         d.b(p.terastallized);
         d.u8(p.tera_type as u8);
         d.u8(p.times_hit);

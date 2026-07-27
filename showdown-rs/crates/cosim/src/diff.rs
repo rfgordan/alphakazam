@@ -130,7 +130,11 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
         }
         cmp!(out, p("item"), pa.item, pb.item);
         cmp!(out, p("ability"), pa.ability, pb.ability);
-        cmp!(out, p("types"), pa.types, pb.types);
+        // PS's `pokemon.types` ARRAY (`live_types`), matching `digest.rs`. The engine's resolved
+        // `types` adds nothing — it is that array plus `terastallized` / `tera_type` (compared
+        // below) and the `Roosted` marker, which is normalized away here like the other
+        // single-turn flags.
+        cmp!(out, p("types"), pa.live_types, pb.live_types);
         cmp!(out, p("terastallized"), pa.terastallized, pb.terastallized);
         cmp!(out, p("tera_type"), pa.tera_type, pb.tera_type);
         cmp!(out, p("times_hit"), pa.times_hit, pb.times_hit);

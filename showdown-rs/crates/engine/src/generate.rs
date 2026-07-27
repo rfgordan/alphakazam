@@ -1287,6 +1287,7 @@ fn transform_data_of(state: &State, side: SideId) -> crate::instruction::Transfo
         species: p.species,
         stats: p.stats,
         types: p.types,
+        live_types: p.live_types,
         ability: p.ability,
         moves: p.moves,
         transformed: p.transformed,
@@ -1311,6 +1312,17 @@ fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     let previous = transform_data_of(&b.state, side);
     let mut new = transform_data_of(&b.state, foe);
     new.stats[0] = previous.stats[0]; // HP is never copied
+    // PS `transformInto` (`sim/pokemon.ts:1295`) copies `pokemon.getTypes(true, true)` — the
+    // target's PRE-TERASTALLIZED live types, and explicitly `roost.typeWas` when the target is
+    // roosting, i.e. the target's `types` array UNFILTERED. That is `live_types`, not the
+    // target's effective typing. `setType(..., /*enforce*/ true)` writes it even when the USER
+    // is terastallized, but the user's own effective typing stays its Tera type.
+    new.live_types = b.state.side(foe).active().live_types;
+    new.types = if b.state.side(side).active().terastallized {
+        previous.types
+    } else {
+        new.live_types
+    };
     for m in new.moves.iter_mut() {
         if m.id != crate::ids::MoveId::None {
             let pp = crate::data::move_data(m.id).pp.min(5);
@@ -1909,6 +1921,10 @@ pub(crate) fn apply_tera(b: &mut Branch, side: SideId) {
         return;
     }
     if tera_type != Type::None && tera_type != Type::Stellar {
+        // EFFECTIVE typing only. PS never rewrites `pokemon.types` on Terastallization —
+        // `getTypes()` short-circuits on `terastallized` (`sim/pokemon.ts:2139`) — and the
+        // pre-tera live list is exactly what `isSTAB`'s `getTypes(false, true)` reads, so it
+        // must SURVIVE this.
         push(b, Instruction::ChangeTypes { side, slot, previous: prev, new: [tera_type, Type::None] });
     }
     push(b, Instruction::ToggleTerastallized { side, slot });
@@ -1970,6 +1986,7 @@ fn regress_fainted_tera_formes(b: &mut Branch) {
                 species: p.species,
                 stats: p.stats,
                 types: p.types,
+                live_types: p.live_types,
                 ability: p.ability,
                 moves: p.moves,
                 transformed: p.transformed,
@@ -2385,6 +2402,17 @@ pub(crate) fn apply_revive(b: &mut Branch, side: SideId, slot: u8) {
         }
         push(b, Instruction::ToggleTerastallized { side, slot });
     }
+    // Same reasoning for PS's `types` ARRAY: `faintMessages` runs `clearVolatile`, whose
+    // `setSpecies(this.baseSpecies)` calls `setType(species.types, /*enforce*/ true)` — so a mon
+    // that fainted after a Protean / Double Shock / forme change is back on the species typing.
+    // The engine leaves the stale array on the (hp = 0) mon, where nothing compares it; undo it
+    // here, where the revived mon starts being compared again.
+    {
+        let live = b.state.side(side).pokemon[slot as usize].live_types;
+        if live != base_types {
+            push(b, Instruction::ChangeLiveTypes { side, slot, previous: live, new: base_types });
+        }
+    }
     let heal = (max_hp / 2).max(1);
     push(b, Instruction::Heal { side, slot, amount: heal });
     // PS sets `status = ''` on the revived mon (a mon that fainted while statused keeps that
@@ -2496,14 +2524,22 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
             }
         }
     }
-    // Type changes (Protean/Libero, Conversion, Reflect Type, …) revert as the mon leaves
-    // the field — PS's clearVolatile resets `types` to baseTypes. A terastallized mon keeps
-    // its Tera typing across switches, so leave that untouched.
+    // Type changes (Protean/Libero, Conversion, Reflect Type, …) revert as the mon leaves the
+    // field: PS's `clearVolatile` ends with `setSpecies(this.baseSpecies)`, whose
+    // `setType(species.types, /*enforce*/ true)` bypasses the terastallized guard — so the
+    // `types` ARRAY always goes back to the species typing. The EFFECTIVE typing follows it
+    // only when the mon is not terastallized (Tera survives a switch).
     {
-        let p = b.state.side(side).active();
-        if !p.terastallized && p.types != p.base_types {
-            let slot = previous;
-            push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: p.base_types });
+        let (tera, cur, live, base) = {
+            let p = b.state.side(side).active();
+            (p.terastallized, p.types, p.live_types, p.base_types)
+        };
+        let slot = previous;
+        if !tera && cur != base {
+            push(b, Instruction::ChangeTypes { side, slot, previous: cur, new: base });
+        }
+        if live != base {
+            push(b, Instruction::ChangeLiveTypes { side, slot, previous: live, new: base });
         }
     }
     // Reset the outgoing active's boosts and volatiles (emit explicit deltas so the
@@ -4035,8 +4071,11 @@ fn revert_battle_only_forme(b: &mut Branch, side: SideId) {
             );
         }
         new.stats = stats;
+        // `setSpecies` -> `setType(species.types, /*enforce*/ true)`: PS's `types` array moves
+        // even under Tera; only the EFFECTIVE typing keeps the Tera type.
+        new.live_types = crate::data::species_types(base);
         if !p.terastallized {
-            new.types = crate::data::species_types(base);
+            new.types = new.live_types;
         }
     }
     let slot = b.state.side(side).active_index;
@@ -4053,7 +4092,10 @@ fn revert_transform(b: &mut Branch, side: SideId) {
     let new = crate::instruction::TransformData {
         species: p.base_species,
         stats: { let mut st = p.base_stats; st[0] = p.stats[0]; st },
-        types: p.base_types,
+        // `clearVolatile`'s `setSpecies(baseSpecies)` calls `setType(species.types, true)`, so
+        // PS's `types` array reverts to the SPECIES typing even for a terastallized reverter.
+        types: if p.terastallized { p.types } else { p.base_types },
+        live_types: p.base_types,
         ability: p.base_ability,
         moves: p.base_moves,
         transformed: false,
@@ -4339,7 +4381,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         {
             let slot = b.state.side(side).active_index;
             let prev = p.types;
+            let prev_live = p.live_types;
+            // A real `setType` — PS's `types` array moves with the effective typing (the
+            // guard above already excludes a terastallized user, whom `setType` refuses).
             push(&mut b, Instruction::ChangeTypes { side, slot, previous: prev, new: [md.typ, Type::None] });
+            if prev_live != [md.typ, Type::None] {
+                push(&mut b, Instruction::ChangeLiveTypes { side, slot, previous: prev_live, new: [md.typ, Type::None] });
+            }
             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::TypeShifted });
         }
     }
@@ -5504,7 +5552,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     if prev[1] == Type::Electric { Type::None } else { prev[1] },
                 ];
                 let slot = hb.state.side(side).active_index;
+                let prev_live = p.live_types;
+                // Double Shock's `onHit` is `pokemon.setType(...)` — a real type change, so
+                // PS's `types` array moves too. (The `hasType('Electric')` gate above already
+                // excludes a terastallized user, whom `setType` refuses.)
                 push(&mut hb, Instruction::ChangeTypes { side, slot, previous: prev, new });
+                if prev_live != new {
+                    push(&mut hb, Instruction::ChangeLiveTypes { side, slot, previous: prev_live, new });
+                }
             }
         }
         // Weakness Policy on the target (super-effective hit), then White Herb if the user's
@@ -6325,7 +6380,12 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         category: md.category,
         move_type: md.typ,
         attacker_types: attacker.types,
-        attacker_base_types: crate::data::species_types(attacker.species),
+        // PS's `isSTAB` second term is `pokemon.getTypes(false, true).includes(type)`
+        // (`sim/battle-actions.ts:1768`), and `getTypes(false, true)` returns `this.types` — the
+        // LIVE, pre-tera array a Protean / Soak / Burn Up already rewrote. NOT the species table
+        // (which is what this used to read: a Meowscarada turned Poison by Protean and then
+        // Terastallized into Dark still got Grass STAB on Flower Trick — rb1125 d2).
+        attacker_base_types: attacker.live_types,
         defender_types: def_types_eff,
         attack_stat: atk_stat as i16,
         defense_stat: def_stat.max(1) as i16,
@@ -7673,9 +7733,11 @@ fn apply_relic_song_forme(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
     new.species = target_forme;
     new.stats = stats;
     // The formes differ in typing too (Aria Normal/Psychic, Pirouette Normal/Fighting); a
-    // terastallized Meloetta keeps its tera typing.
+    // terastallized Meloetta keeps its tera typing, but `setSpecies`' enforced `setType` still
+    // rewrites PS's `types` array underneath it.
+    new.live_types = crate::data::species_types(target_forme);
     if !p.terastallized {
-        new.types = crate::data::species_types(target_forme);
+        new.types = new.live_types;
     }
     let slot = b.state.side(side).active_index;
     let previous_base_moves = b.state.side(side).active().base_moves;
@@ -10493,6 +10555,8 @@ fn execute_status_move(
                 if prev[0] == Type::Flying { Type::None } else { prev[0] },
                 if prev[1] == Type::Flying { Type::None } else { prev[1] },
             ];
+            // EFFECTIVE typing only: PS's `roost` volatile filters Flying out of `getTypes()`
+            // through `onType` and never touches `pokemon.types`, so no `ChangeLiveTypes`.
             push(&mut hit, Instruction::ChangeTypes { side, slot, previous: prev, new });
             push(&mut hit, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Roosted });
         }
@@ -10890,7 +10954,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         category: MoveCategory::Special,
         move_type: typ,
         attacker_types: caster.types,
-        attacker_base_types: caster.base_types,
+        attacker_base_types: caster.live_types,
         defender_types: target.types,
         attack_stat: caster.stat(crate::ids::StatIndex::SpecialAttack),
         defense_stat: target.stat(crate::ids::StatIndex::SpecialDefense).max(1),
@@ -11161,7 +11225,11 @@ fn restore_roost_typing_side(b: &mut Branch, side: SideId) {
         return;
     }
     let slot = b.state.side(side).active_index;
-    let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.base_types };
+    // Restore to the LIVE type array, not the species typing: a Protean / Double Shock user
+    // that then Roosts must come back to what `pokemon.types` actually holds. (PS has nothing
+    // to restore — removing the volatile stops the `onType` filter — so `live_types` never
+    // moved and is the ground truth here.)
+    let restored = if p.terastallized { [p.tera_type, Type::None] } else { p.live_types };
     if p.types != restored {
         push(b, Instruction::ChangeTypes { side, slot, previous: p.types, new: restored });
     }
