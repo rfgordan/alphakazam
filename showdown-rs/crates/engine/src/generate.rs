@@ -3910,7 +3910,7 @@ fn before_move_blocked_7_6_5(state: &State, side: SideId, md: &crate::data::Move
 pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let side = action.side;
     let mut b = b;
-    let (alive, status, confused) = {
+    let (alive, status, _confused) = {
         let p = b.state.side(side).active();
         (p.is_alive(), p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
     };
@@ -3924,10 +3924,29 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // confusion self-hit (1/3) and full paralysis (1/4 of the remainder) — both branches where
     // the move doesn't execute. The remaining "acts normally" branch equals prior behavior, so
     // these only *add* outcomes (no regression on the common path).
-    if !alive || status == Status::Sleep {
-        // The sleep-wake attempt toggles Truant inside `execute_move_inner` (slp's
-        // BeforeMove handler at priority 10 runs before Truant's 9).
+    if !alive {
         return dispatch_move_inner(b, action);
+    }
+    if status == Status::Sleep {
+        // slp's `onBeforeMove` (priority 10) ticks the counter and returns `false` — cancelling
+        // the attempt and short-circuiting `runEvent` — ONLY while the mon stays asleep. Gen-9
+        // sleep is a deterministic countdown, so whether this attempt wakes it is decidable here.
+        let (counter, early) = {
+            let p = b.state.side(side).active();
+            (p.status_counter, p.ability == crate::ids::Ability::EarlyBird)
+        };
+        let tick = if early { 2 } else { 1 };
+        if counter > tick {
+            // Still asleep: `execute_move_inner` owns the tick and the `sleepUsable`
+            // (Sleep Talk / Snore) exception, and nothing below slp runs.
+            return dispatch_move_inner(b, action);
+        }
+        // WAKES. The handler returns `undefined`, so the ladder CONTINUES — Truant (9),
+        // Disable/Taunt (7/6/5), confusion (3), Attract (2). `execute_move_inner`'s own wake
+        // block is a no-op after this (it re-reads the status, which is now None).
+        let slot = b.state.side(side).active_index;
+        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+        clear_status_counter(&mut b, side, slot);
     }
     // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
     // PS frz `onBeforeMove` (priority 10) rolls `randomChance(1, 5)` to thaw.
@@ -3941,10 +3960,9 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
             let slot = b.state.side(side).active_index;
             push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
             clear_status_counter(&mut b, side, slot);
-            if truant_gate(&mut b, side) {
-                return vec![b];
-            }
-            return dispatch_move_inner(b, action);
+            // Thawed: frz's handler returned `undefined`, so the rest of the ladder runs
+            // (Truant included — `before_move_lower_ladder` owns the gate now).
+            return before_move_lower_ladder(b, action);
         }
         let mut frozen = scaled(&b, 0.80);
         draw(&mut frozen, "randomChance", &[1, 5], 0, "frz");
@@ -3954,14 +3972,37 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         let slot = thawed.state.side(side).active_index;
         push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
         clear_status_counter(&mut thawed, side, slot);
-        // frz (priority 10) ran; Truant (9) is next — a thawed loafer stays put this turn.
-        if truant_gate(&mut thawed, side) {
-            out.push(thawed);
-        } else {
-            out.extend(dispatch_move_inner(thawed, action));
-        }
+        // frz (priority 10) returned `undefined` on the thaw; Truant (9) and everything below
+        // it still run.
+        out.extend(before_move_lower_ladder(thawed, action));
         return out;
     }
+    before_move_lower_ladder(b, action)
+}
+
+/// The tail of PS's `BeforeMove` ladder, everything BELOW slp / frz (priority 10): Truant (9),
+/// Disable (7) / Throat Chop / Heal Block / Gravity (6) / Taunt (5), confusion (3), Attract (2),
+/// paralysis (1).
+///
+/// Three callers, and that is the point. `runEvent` short-circuits only on a handler that returns
+/// `false`, and **slp's and frz's handlers return `undefined` when the mon WAKES or THAWS** —
+/// they return `false` only when it stays asleep/frozen. So a mon that woke this turn, or thawed
+/// this turn, still runs every handler below, exactly like an awake one.
+///
+/// rb5043 d45 t37 is the witness for the sleep half: a confused, sleeping Staraptor is hit by
+/// Hurricane, wakes on the expiry turn, and PS immediately rolls its confusion
+/// `randomChance(33, 100)` — it hits itself, `random(16)` for the damage, and faints. The engine
+/// returned straight into the move machinery on `status == Sleep`, skipped the confusion / Attract
+/// / paralysis handlers entirely, and let the Roost through with 183 HP where PS has 0.
+///
+/// Status is re-read from the CURRENT board rather than captured before the wake, so the
+/// paralysis branch is skipped for a just-woken mon without a special case.
+fn before_move_lower_ladder(b: Branch, action: Action) -> Vec<Branch> {
+    let side = action.side;
+    let (status, confused) = {
+        let p = b.state.side(side).active();
+        (p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
+    };
     // Truant: PS onBeforeMove priority 9 — below mustrecharge (11) and slp/frz (10), above
     // flinch (8), Disable, confusion (3) and paralysis (1). The volatile marks "loaf on this
     // attempt"; the toggle fires on every attempt that reaches this point, including ones a
