@@ -17,7 +17,6 @@ under `train/*` and every eval under `eval/<baseline>/*`, keyed by environment s
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -38,13 +37,13 @@ class RunLogger:
         if wandb_project:
             try:
                 import wandb
-                # A stable id derived from the run directory, so every resume/relaunch CONTINUES
-                # one W&B run instead of minting a new id per process (scale2 shattered into four
+                # Stable id = run-dir basename with resume="allow" — the SAME scheme
+                # train_long.py (the nightX runs) used — so every resume/relaunch CONTINUES one
+                # W&B run instead of minting a new id per process (scale2 shattered into six
                 # W&B runs in an afternoon of restarts before this).
                 run_name = os.path.basename(self.dir)
-                stable_id = hashlib.sha1(os.path.abspath(self.dir).encode()).hexdigest()[:16]
                 wandb.init(project=wandb_project, name=run_name, dir=self.dir,
-                           id=stable_id, resume="allow")
+                           id=run_name.replace("/", "-"), resume="allow")
                 self._wandb = wandb
                 print(f"wandb: project '{wandb_project}' run '{os.path.basename(self.dir)}'")
             except Exception as e:  # not installed / not logged in -> fall back to files only
@@ -59,19 +58,23 @@ class RunLogger:
     def metrics(self, d: dict):
         self._metrics.write(json.dumps({"wall": round(time.time() - self.start, 1), **d}) + "\n")
         if self._wandb:
-            step = d.get("step")
-            payload = {f"train/{k}": v for k, v in d.items()
-                       if isinstance(v, (int, float)) and k not in ("step", "update")}
-            self._wandb.log(payload, step=step)
+            # Bare keys (sps, entropy, approx_kl, …) with step=global_step — the exact layout
+            # train_long.py gave the nightX runs, so scale curves overlay them in one panel.
+            payload = {k: v for k, v in d.items() if isinstance(v, (int, float))}
+            self._wandb.log(payload, step=d.get("step"))
 
     def eval(self, d: dict):
         self._eval.write(json.dumps({"wall": round(time.time() - self.start, 1), **d}) + "\n")
         if self._wandb:
             bl = d["baseline"]
             self._wandb.log({
-                f"eval/{bl}/win_rate": d["win_rate"],
+                # `eval/<name>` as a plain win-rate scalar matches nightX (`eval/heuristic` IS
+                # night4's heuristic-wr curve); the rest ride along under a detail suffix.
+                f"eval/{bl}": d["win_rate"],
                 f"eval/{bl}/draws": d["draws"],
                 f"eval/{bl}/avg_turns": d["avg_turns"],
+                f"eval/{bl}/ci_low": d.get("ci_low", 0.0),
+                f"eval/{bl}/ci_high": d.get("ci_high", 1.0),
             }, step=d.get("step"))
 
     def checkpoint_path(self, update: int) -> str:

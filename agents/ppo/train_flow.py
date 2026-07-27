@@ -273,16 +273,23 @@ def train(args):
                       f"/{heur_stats.get('calls', 0)} ({heur_stats.get('last_error', '?')})",
                       flush=True)
                 heur_stats.clear()
-            # `metrics()` keeps only scalars, so flatten the league summary — otherwise the whole
-            # dict is silently dropped from W&B and only reaches metrics.jsonl.
+            # `metrics()` keeps only scalars, so flatten the league summary into the
+            # `pool/<opp>/{wr,weight}` keys train_long.py used for the nightX runs — snapshots
+            # aggregate under `self` (mean wr over played snapshots / summed weight), which is
+            # the nightX name for the frozen-checkpoint opponent.
             st = league.stats()
-            wrs = [v["wr"] for k, v in st.items() if k != league.RANDOM and v["n"] > 0]
-            logger.metrics({"update": update, "step": global_step,
-                            "league": st,
-                            "pool_size": len(league.snapshots()),
-                            "league_random_w": st.get(league.RANDOM, {}).get("w", 0.0),
-                            "league_random_wr": st.get(league.RANDOM, {}).get("wr", 0.0),
-                            "league_mean_wr": (sum(wrs) / len(wrs)) if wrs else 0.5})
+            scripted = {league.RANDOM, *league.scripted_weights}
+            flat = {"update": update, "step": global_step, "league": st,
+                    "pool_size": len(league.snapshots())}
+            for k in scripted:
+                if k in st:
+                    flat[f"pool/{k}/wr"] = st[k]["wr"]
+                    flat[f"pool/{k}/weight"] = st[k]["w"]
+            snaps = {k: v for k, v in st.items() if k not in scripted}
+            played = [v["wr"] for v in snaps.values() if v["n"] > 0]
+            flat["pool/self/wr"] = (sum(played) / len(played)) if played else 0.5
+            flat["pool/self/weight"] = sum(v["w"] for v in snaps.values())
+            logger.metrics(flat)
 
         # --- absolute progress: fixed opponents, the only curve that means anything on its own ---
         if args.eval_every and update % args.eval_every == 0:
