@@ -6462,6 +6462,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .map(|mut sb| {
                     apply_damaging_hit_step7(&mut sb, side, &md, false);
                     apply_spin_clear(&mut sb, side, &md);
+                    // `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` — the frz thaw of
+                    // a `thawsTarget` move lives HERE, after the secondary that would have burned.
+                    apply_thaw_after_secondary(&mut sb, side, foe, &md);
                     sb
                 })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
@@ -8616,13 +8619,38 @@ fn apply_thermal_exchange(b: &mut Branch, foe: SideId, md: &crate::data::MoveDat
     }
 }
 
-/// A frozen target thaws when hit by a damaging Fire-type move or one of the `thawsTarget`
-/// moves (Scald / Steam Eruption / Matcha Gotcha / Hydro Steam — PS frz `onHit`).
+/// `frz.onDamagingHit` (`data/conditions.ts:116`): a damaging FIRE-type move (Polar Flare
+/// excepted) cures the freeze as part of the hit.
 fn apply_thaw_on_hit(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    if md.typ == Type::Fire && md.category != MoveCategory::Status && md.id.to_id() != "polarflare" {
+        cure_freeze(b, foe);
+    }
+}
+
+/// `frz.onAfterMoveSecondary` (`data/conditions.ts:111-115`): a `thawsTarget` move (Scald /
+/// Steam Eruption / Matcha Gotcha / Hydro Steam) cures the freeze **after the secondaries**, at
+/// `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` (`battle-actions.ts:1026`).
+///
+/// The position is the whole mechanic. A frozen target hit by Scald is STILL FROZEN when
+/// `secondaries()` tries the 30% burn, so `setStatus` fails on the already-statused mon and the
+/// thaw then leaves it with NO status at all. The engine cured at `onHit` — before the
+/// secondaries — and the same roll produced a burn. rb1711 d14: a frozen Bellibolt switches into
+/// a Scald, PS ends the turn statusless at 170 HP and the engine burned it, then took the 20-HP
+/// burn residual, landing at 150.
+///
+/// PS skips the whole event under Sheer Force (`afterMoveSecondaryEvent`'s guard) — and Sheer
+/// Force also strips the secondary, so a Sheer Force Scald neither burns nor thaws.
+fn apply_thaw_after_secondary(b: &mut Branch, side: SideId, foe: SideId, md: &crate::data::MoveData) {
+    let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce
+        && md.secondary_chance > 0;
+    if !sheer_force && matches!(md.id.to_id(), "scald" | "steameruption" | "matchagotcha" | "hydrosteam") {
+        cure_freeze(b, foe);
+    }
+}
+
+fn cure_freeze(b: &mut Branch, foe: SideId) {
     let d = b.state.side(foe).active();
-    let thaws = (md.typ == Type::Fire && md.category != MoveCategory::Status)
-        || matches!(md.id.to_id(), "scald" | "steameruption" | "matchagotcha" | "hydrosteam");
-    if d.is_alive() && d.status == Status::Freeze && thaws {
+    if d.is_alive() && d.status == Status::Freeze {
         let slot = b.state.side(foe).active_index;
         push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Freeze, new: Status::None });
         clear_status_counter(b, foe, slot);
@@ -13483,7 +13511,15 @@ fn apply_end_of_turn_inner(
         }
         return out_h;
     }
-    for side in [SideId::One, SideId::Two] {
+    // Speed order, not side order: two Harvest holders make two consecutive, IDENTICALLY-SHAPED
+    // `randomChance[1,2]` draws, so the differ cannot tell them apart but the SELECTOR must —
+    // the seed gate hands the first recorded result to whichever holder the engine rolls first.
+    // The residual handler list is `speedSort`ed, so the FASTER holder rolls first. rb5073 d51:
+    // a Tropius (base Spe 51, berry still held, roll discarded) and an Exeggutor-Alola (base 45,
+    // berry eaten) both carry Harvest+Sitrus; PS's pair is `False, True`, and rolling side-One
+    // first gave the Exeggutor the False, so its Sitrus never regrew and never healed the 78 HP
+    // that `hitStepMoveHitLoop`'s Update would have eaten it for.
+    for side in residual_side_order(&out_h[0].state) {
         out_h = out_h
             .into_iter()
             .flat_map(|b| {
