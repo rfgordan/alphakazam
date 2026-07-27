@@ -153,6 +153,23 @@ Three leads, all localized:
    One is Tera Shell's halve position, the other the Stellar STAB rule; 3 HP twice on two different
    sides of the same species is unlikely to be coincidence.
 
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111** (ABSOLUTE INVARIANT, held at every commit) |
+| Seed gate, pinned 401 | `SEED_GATE=1 cosim harness/seed-fixtures/*.fx.json.gz` | **397 / 401 = 99.0%** (was 395) |
+| Seed gate, fresh 400 | `SEED_GATE=1 cosim harness/seed-fixtures-fresh/*.fx.json.gz` | **386 / 400 = 96.5%** (was 372) |
+| **Seed gate, all 912** | `bash harness/gate-912.sh` | **894 / 912 = 98.0%** (was 878) |
+| **Seed gate, randbats 101** | `bash harness/gate-rb.sh` | **96 / 101 = 95.0%** (was 94); init-aligned 101 / 101 |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831**, EXACTNESS **100.00%**, coverage 100.00% |
+| State sweep, randbats | `cosim harness/seed-sidecars-rb/*.json.gz` | 3702 / 3712 = **99.73%**, coverage 100.00% |
+| Draw differ, audited | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; **zero `rust extra`** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** — 3829/3829 move units, 4832/4832 states |
+| Engine + cosim tests | `cargo test --release -p engine -p cosim -j 2` | all suites green (5 new files, 27 new tests) |
+| Pivot property fuzz | `PIVOT_FUZZ_GAMES=200000 cargo test -p engine --test pivot_landing_bench` | **0 violations / 200 000** (12 / 20 000 pre-fix) |
+
 ## Asymptote assessment
 
 **Not an exhausted seam, but the cluster supply is.** Eight commits, per-commit yield across the two
