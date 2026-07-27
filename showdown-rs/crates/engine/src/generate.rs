@@ -10882,7 +10882,7 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
                 _ => {}
             }
             match p.ability {
-                Ab::Hydration => fpush(5, 3),
+                Ab::Hydration | Ab::ShedSkin => fpush(5, 3),
                 Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => fpush(28, 2),
                 Ab::HungerSwitch | Ab::ShieldsDown => fpush(29, 7),
                 _ => {}
@@ -10946,7 +10946,12 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             // the order-`false` stall/protect tie. The engine previously omitted it, shortening
             // the list by one and mis-sizing the tail shuffle (`[2,0,2]`/`[3,1,3]` where PS has
             // `[3,1,3]`/`[4,2,4]`). Verified as the ONLY residual handler missing corpus-wide.
-            Ab::Hydration => push(5, 3),
+            // Shed Skin is the same slot: `onResidualOrder: 5, onResidualSubOrder: 3`
+            // (data/abilities.ts:4142-4151), and like Hydration its `pokemon.status` test lives
+            // INSIDE the callback, so the handler is collected for every living holder. No corpus
+            // residual shuffle has ever fired with a Shed Skin holder on the field, so this is
+            // reasoned from the pin rather than measured; it cannot change any recorded shuffle.
+            Ab::Hydration | Ab::ShedSkin => push(5, 3),
             Ab::SpeedBoost | Ab::BadDreams | Ab::Harvest | Ab::CudChew | Ab::Moody | Ab::Pickup | Ab::SlowStart => push(28, 2),
             // Minior's Shields Down is an `onResidual` at order 29 with the default Ability
             // subOrder 7 — the same slot Hunger Switch occupies. rb1034 d32.
@@ -10975,6 +10980,15 @@ fn residual_handlers(state: &State) -> Vec<ResHandler> {
             if is_semi_invuln_move(m) {
                 push(FALSE, 2); // the move's own semi-invulnerability condition
             }
+        }
+        // `lockedmove` is the third of the same family: `duration: 2` AND a real `onResidual`
+        // (`data/conditions.ts:253-262`), no `onResidualOrder` → order `false`, Condition subOrder
+        // 2. A rampaging mon therefore contributes one handler for every turn its lock is live.
+        // Like Shed Skin above this is reasoned from the pin, not measured: no recorded residual
+        // shuffle in the 401-game corpus fired while a rampage was live, so the `full` census
+        // shows no `lockedmove` row either way. The gate below is the check.
+        if v.contains(V::LockedMove) {
+            push(FALSE, 2);
         }
         // Protect + Stall: PS registers a Residual handler (via `getKey:'duration'`,
         // battle.ts:487) for EACH duration-carrying volatile, independent of any onResidual
