@@ -5559,8 +5559,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 apply_target_secondary(hb, side, &md)
                     .into_iter()
                     .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
-                    .flat_map(|sb| apply_cursed_body(sb, side, &md)),
+                    .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md)),
             );
         }
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
@@ -5605,8 +5605,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             for mut sb in apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|x| apply_flinch_split(x, side, &md))
-                .flat_map(|x| apply_contact_secondaries(x, side, &md))
                 .flat_map(|x| apply_cursed_body(x, side, &md))
+                .flat_map(|x| apply_contact_secondaries(x, side, &md))
             {
                 match pivot {
                     Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
@@ -5924,8 +5924,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // ahead of the unordered contact-status set — a chip that faints the attacker must
                 // suppress its paralysis/burn. See `apply_damaging_hit_step7`.
                 .map(|mut sb| { apply_damaging_hit_step7(&mut sb, side, &md, false); sb })
-                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -9467,6 +9467,22 @@ fn apply_flinch_split(b: Branch, side: SideId, md: &crate::data::MoveData) -> Ve
 ///
 /// PS fires `runEvent('DamagingHit')` inside `spreadMoveHit` (battle-actions.ts:1142), i.e. ONCE
 /// PER CONNECTING HIT of `hitStepMoveHitLoop` — not once per move. The handlers that roll are
+/// **Order within the event: every TARGET handler, then every SOURCE handler.**
+/// `runEvent('DamagingHit')` is one of the four event ids that are NOT speed-sorted —
+/// `['Invulnerability', 'TryHit', 'DamagingHit', 'EntryHazard']` sort with
+/// `Battle.compareLeftToRightOrder` (`sim/battle.ts:789-790`), which is `order` ascending
+/// (undefined -> 4294967296, so the unordered handlers come LAST, after Rough Skin / Iron Barbs
+/// / Aftermath / Innards Out / Electromorphosis / Wind Power at order 1), then `priority`
+/// descending, then `index` — and for a single target every `index` is 0, so the sort is stable
+/// and the COLLECTION order survives. `findEventHandlers` collects the target's `on<Event>`
+/// first and pushes the source's `onSource<Event>` last, so a target's Cursed Body rolls before
+/// the attacker's Toxic Chain / Poison Touch regardless of either mon's Speed.
+///
+/// rb1520 d35 t27: Fezandipiti (Toxic Chain, Spe 210) Moonblasts a Banette (Cursed Body,
+/// Spe 174) to 0 HP. PS's stream is `cursedbody=false` then `toxicchain=true`; the engine ran
+/// the faster mon's handler first, read `false` as Toxic Chain and `true` as Cursed Body, and
+/// Disabled Moonblast where PS badly-poisoned nothing.
+///
 /// Cursed Body (`randomChance(3,10)` on the target), Toxic Chain (`onSourceDamagingHit`,
 /// `randomChance(3,10)` on the attacker) and the contact-status set (Static / Flame Body / Poison
 /// Point / Poison Touch / Cute Charm / Effect Spore). The engine's enumerate path applies them once
@@ -9482,9 +9498,9 @@ fn realized_per_hit_damaging_hit(
     b: &mut Branch, side: SideId, md: &crate::data::MoveData, cur: &mut RealizedCursor,
 ) {
     let base = b.draws.len();
-    let cands: Vec<Branch> = apply_contact_secondaries(b.clone(), side, md)
+    let cands: Vec<Branch> = apply_cursed_body(b.clone(), side, md)
         .into_iter()
-        .flat_map(|sb| apply_cursed_body(sb, side, md))
+        .flat_map(|sb| apply_contact_secondaries(sb, side, md))
         .collect();
     // Nothing rolled and nothing applied: the common case, no cursor movement.
     if cands.len() == 1 && cands[0].draws.len() == base {
