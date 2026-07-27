@@ -3,8 +3,8 @@
 Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the customgame rail in one
 command. **`bash harness/gate-rb.sh [out-set]`** — the real-format rail. PS pin: `b9dc987d`.
 
-**Current: 878 / 912 customgame (96.3%) and 94 / 101 randbats (93.1%). Read the ILLUSION TRANCHE
-section immediately below before anything else.**
+**Current: 894 / 912 customgame (98.0%) and 96 / 101 randbats (95.0%). Read the OFFSET & PIVOT
+TRANCHE section immediately below before anything else.**
 
 **Two corpora now, and they are not interchangeable.**
 
@@ -18,6 +18,162 @@ section immediately below before anything else.**
   reason; absent ⇒ customgame.
 
 ---
+
+# ==== OFFSET & PIVOT TRANCHE — the Toxic offset, the PivotLanding root, and five buckets (2026-07-27) ====
+
+**HEADLINE: 894 / 912 customgame (98.0%, up from 878) and 96 / 101 randbats (95.0%, up from 94).**
+Eight commits, newly-non-exact EMPTY on BOTH rails at every one, audited 111/111 at every one.
+
+| # | commit | what | 912 | rb |
+|---|--------|------|-----|----|
+| 1 | `55d46b1` | **gen-8 Toxic by a Poison-type never rolls accuracy** — and an already-statused target is not a reason to skip the roll | 881 | 95 |
+| 2 | `6faa812` | **`Pivot::Pause` belongs to the move that RUNS** — the `PivotLanding with no live bench` root | 881 | 95 |
+| 3 | `3a1bb4c` | **Mold Breaker suppresses `flags: { breakable: 1 }` and nothing else** | 886 | 95 |
+| 4 | `6ab73bd` | **Harvest rolls in SPEED order**; **`thawsTarget` cures the freeze AFTER the secondaries** | 888 | 96 |
+| 5 | `12772d3` | **Transform FIRES the copied ability**; the switch-out abilities read the LIVE one | 890 | 96 |
+| 6 | `912f71b` | the **nullifying-ability arms dropped the MISS branch and both `eachEvent('Update')`s** | 892 | 96 |
+| 7 | `888e80c` | **`ignoreDefensive` is a second flag** — only the `ignoreEvasion` half was wired | 893 | 96 |
+| 8 | `32d2ba7` | **Dry Skin's third handler**: `onFoeBasePower` x1.25 against Fire | 894 | 96 |
+
+## The offset lead, resolved: it was Toxic, and the d6 note was wrong
+
+The scoreboard's named lead — "rb1670 is an OFFSET bug wearing a damage bug's clothes" — was
+exactly right about the shape. `PRNG_TRACE=rb1670` put the first divergence at d42, one unit BEFORE
+the `result random[16]@secretsword` label, with `engine=141 ps=140`: **one phantom draw**. The unit
+is a Clodsire's Toxic behind a Substitute, and Clodsire is Poison/Ground.
+
+> **`hitStepAccuracy` hard-codes `move.alwaysHit || (move.id === 'toxic' && gen >= 8 &&
+> pokemon.hasType('Poison'))` into the `accuracy = true` arm (`battle-actions.ts:726`).** An
+> `accuracy === true` makes NO `randomChance` draw at all — a different thing from a numeric 100,
+> which still rolls `randomChance(100, 100)`.
+
+The rule now lives in `accuracy_forced_true` (stream) and `accuracy_of` (probability), next to No
+Guard and the weather-perfect moves, instead of an ad-hoc `md.id == "toxic"` guard that sat at ONE
+of the two status-move accuracy sites. The second site — the substitute-blocked early return —
+carried a `target_already_statused` gate justified by "d6 t58-62: Toxic on an already-paralyzed,
+subbed Garchomp draws nothing".
+
+> **d6's Toxic user is Toxtricity, Electric/POISON.** The observation was real and the explanation
+> was this rule wearing the wrong name. `hitStepTryImmunity` (`:661-684`) has no status check at
+> all and `setStatus` fails inside `moveHit`, long after step 4 — an already-statused target does
+> NOT suppress the accuracy roll. rb5039 d46 (Toxic into an already-badly-poisoned, subbed Keldeo,
+> engine one draw BEHIND) and rb1642 d35 (Will-O-Wisp, same shape) are the counter-witnesses.
+
+All three of the Keldeo / Secret Sword cluster closed on that one commit, plus rb1649.
+
+## The PivotLanding root
+
+**`Flow::run_turn` decides the pause from the CHOSEN move; `run_move_action` then substitutes the
+move.** Two substitutions it cannot see: **Struggle** (`no_usable_move`) and the **Encore
+`OverrideAction` redirect**. Every `match pivot` arm keys on the ACTION, so the substitute inherited
+the pause.
+
+The lethal instance, reproduced deterministically in
+`tests/pivot_pause_survives_move_substitution.rs`: a PP-stalled mon whose bench is entirely FAINTED
+picks Revival Blessing, which grants `Pivot::Pause` off `has_fainted_bench`; `no_usable_move`
+replaces it with Struggle; Struggle's damaging path pushes `PivotPending`; and Struggle's own
+recoil — applied AFTER the pivot match — then kills the user, so `resume_pivot` gets a request for
+a side with nothing alive at all.
+
+Two fixes: `run_move_action` re-derives the pause from the EXECUTED move (`Pivot::Target` is left
+alone — the verification paths supply it from the recorded choice, which IS the executed move), and
+every `PivotPending` site additionally requires `has_alive_bench`, which is PS's own gate —
+`sim/battle.ts:2904`, `if (switches[i] && !this.canSwitch(this.sides[i]))` clears `switchFlag` and
+drops the side out of `switches`.
+
+**`tests/pivot_landing_bench.rs` is the property**, as a random-play fuzz over small, hazard-laden,
+PP-starved boards built from pivots / draggers / Revival Blessing: **12 violations per 20 000 games
+against the pre-fix engine, 0 in 200 000 after.** `PIVOT_FUZZ_GAMES` sets the budget (default
+20 000, ~7 s). The `resume_pivot` / `resume_revive` eprintlns stay as tripwires.
+
+## Six rules this tranche cost a landing each to learn
+
+1. **A `breakable: 1` flag is the WHOLE of Mold Breaker.** `sim/battle.ts:836`. The engine blanked
+   the defender's ability wholesale in `compute_damage`, which deleted the abilities PS deliberately
+   left out of the flag — **Shadow Shield** (`flags: {}`, unlike Multiscale's `breakable: 1`) and the
+   four **Ruin** abilities — and suppressed nothing at all on the boost path, where **Contrary IS
+   `breakable: 1`**. New `ability_breakable()` is the pinned dex's 83 names. `Full Metal Body` is
+   `cantsuppress`, which is why the blocker set has to be filtered per-ability, not as a group.
+   `suppressingAbility` needs an ACTIVE MOVE, so Intimidate / Sticky Web / Octolock / a contact
+   ability's own drop are outside it.
+2. **Two identically-shaped consecutive draws are invisible to the differ and load-bearing for the
+   SELECTOR.** Two Harvest holders both roll `randomChance[1,2]`; the seed gate hands the first
+   recorded result to whichever the engine rolls first, and PS `speedSort`s the Residual list.
+   rb5073 d51 read `draws-match/state-diff` and was a pure ORDERING bug.
+3. **`frz.onAfterMoveSecondary`, not `onHit`.** A `thawsTarget` move cures the freeze at
+   `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` (`battle-actions.ts:1026`), so a frozen
+   target hit by Scald is STILL FROZEN when the 30% burn is tried and ends the turn with NO status.
+   The Fire-type arm is a different handler (`frz.onDamagingHit`) and stays inside the hit.
+4. **`transformInto` ends with `setAbility(target.ability, this, true)`, and `setAbility` runs
+   `singleEvent('Start', ability, ...)` for every gen > 3 — the copied ability ACTIVATES.** An
+   Imposter Ditto copying Intimidate Intimidates. And the switch-OUT abilities (Natural Cure,
+   Regenerator) read the LIVE ability, from `runEvent('BeforeSwitchOut')` before `clearVolatile()`,
+   so a Ditto-as-Klawf still has Regenerator when it leaves.
+5. **An early return out of the damaging path has to bring `miss_out` with it.** Both nullifying-
+   ability arms (Ice Face, Disguise) returned `out` alone, so the engine generated NO miss outcome —
+   and `replicate_select`, finding nothing that matches, falls through to "keep all" and takes the
+   only branch there is. They were also missing BOTH `eachEvent('Update')`s (970 and 1024): a
+   nullified hit is still a connecting hit.
+6. **`ignoreEvasion` and `ignoreDefensive` are two fields.** The same four moves (Chip Away,
+   Darkest Lariat, Nihil Light, Sacred Sword) carry both and only the accuracy half was wired.
+   The flag form is unconditional — `defBoosts = 0` for a negative stage too, which is what
+   separates it from the crit rule the engine already had.
+
+> **The "two engine copies drift" rule struck twice more, and once it was THREE.** The Toxic guard
+> existed at one of two status-move accuracy sites. The `miss_out` extend existed at one of three
+> early returns. When you find a PS predicate in the engine, grep for the second implementation —
+> and then for the third.
+
+## What is left, and the named leads
+
+**18 open on the customgame rail, 5 on randbats.** The bucket table is now nearly flat — the named
+clusters are spent. Re-run the bare-`hp` classifier before anything (`SEED_GATE=1 VERBOSE=1` over
+`harness/seed-sidecars/` gives the DIFF FIELD, which the slim fixtures cannot).
+
+| bucket | n | games |
+|---|---|---|
+| Terapagos (Tera Shell / Stellar STAB), both ≤3 HP | 2 | rb1347 rb1795 |
+| Regenerator / pivot, 1 HP | 1 | rb1572 |
+| singletons | 15 | rb1011 rb1012 rb1314 rb1416 rb1448 rb1464 rb1525 rb1573 rb1581 rb1629 rb1661 rb1681 rb1751 rb1760 rb1769 |
+| randbats | 5 | rb5021 rb5026 rb5037 rb5059 rb5100 |
+
+Three leads, all localized:
+
+1. **rb1448 d8 — a phantom 26-damage hit with no draws.** PS's whole unit is
+   `randomChance[33,100]@confusion` + `random[16]@confusion-damage` (Fake Out failed: the user was
+   not on its first turn). The engine emits the SAME two draws and then two `Damage` instructions,
+   26 and 16, where PS has one confusion hit of 69. A damage-instruction bug with a clean draw
+   stream — start from `DBG_INSTR` on that unit.
+2. **rb1661 d55 — Scale Shot with Loaded Dice.** PS's per-hit stream is
+   `crit, damage, shuffle[2,0,2]@scaleshot` five times over; the engine's shuffle goes missing after
+   one of them (`PS shuffle[2,0,2]@scaleshot (rust randomChance[1,24]@crit)`). Same class as the
+   Ice Face / Disguise Updates just fixed, in the realized-multi-hit loop.
+3. **The Terapagos pair are both exactly 3 HP** — rb1347 (Psychic into a Tera Shell holder, engine
+   118 vs PS 121) and rb1795 (a Stellar-terastallized Terapagos's Rapid Spin, engine 132 vs PS 129).
+   One is Tera Shell's halve position, the other the Stellar STAB rule; 3 HP twice on two different
+   sides of the same species is unlikely to be coincidence.
+
+## Asymptote assessment
+
+**Not an exhausted seam, but the cluster supply is.** Eight commits, per-commit yield across the two
+rails 4, 0, 5, 3, 2, 2, 1, 1 — **2.25 games/commit**, the highest of any tranche so far (Illusion
+1.8, ruleset 0.5, burn-down XIII 1.7). But the shape changed inside the tranche: the first four
+commits paid 12 games between them and the last four paid 6, and the table above now has one bucket
+of 2 and twenty singletons. The kill criterion (three consecutive commits flipping zero on both
+rails) was never approached — commit 2 flipped zero, but it is the trainer-crash root, not a parity
+commit.
+
+**Recommendation for the next tranche, in order:**
+
+1. Take the three named leads above — all three are draw-stream or instruction-stream bugs with the
+   unit already identified, which is a different and cheaper kind of work than the bare-`hp` tail.
+2. Record seeds 1801-2200. This recommendation is now three tranches old and the fresh half is still
+   1.6 points behind the pinned half (96.5% vs 98.8%) — much closer than the 5.5 it was, which is
+   itself evidence that the remaining tail is seed-independent mechanics rather than corpus gaps.
+3. The singleton tail wants a different instrument than the classifier: every one of the 15 is a
+   distinct species/item/ability interaction, and the classifier's value was clustering, which it
+   can no longer do.
+
 
 # ==== ILLUSION TRANCHE — the disguise, three named roots, and the bare-hp classifier (2026-07-27) ====
 

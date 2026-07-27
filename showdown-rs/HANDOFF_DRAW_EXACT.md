@@ -1,5 +1,68 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**OFFSET & PIVOT TRANCHE (2026-07-27): 894 / 912 customgame (98.0%, up from 878) and 96 / 101
+randbats (95.0%, up from 94).** Eight commits, newly-non-exact EMPTY on BOTH rails at every one,
+audited **111/111** at every one, 2.25 games/commit.
+
+**The scoreboard's named offset lead was right about the shape and the label named the wrong unit.**
+`PRNG_TRACE=rb1670` put the break one unit BEFORE the `result random[16]@secretsword` label, at
+`engine=141 ps=140` — one phantom draw, from a Clodsire's Toxic.
+
+> **`hitStepAccuracy` hard-codes `move.alwaysHit || (move.id === 'toxic' && gen >= 8 &&
+> pokemon.hasType('Poison'))` into the `accuracy = true` arm (`battle-actions.ts:726`).** An
+> `accuracy === true` makes NO draw; a numeric 100 still rolls `randomChance(100, 100)`.
+
+And the `target_already_statused` gate at the substitute-blocked accuracy site was **the same rule
+wearing the wrong name**: d6's Toxic user is **Toxtricity, Electric/POISON**. `hitStepTryImmunity`
+has no status check; `setStatus` fails inside `moveHit`, long after step 4. All three Keldeo games
+closed on that one commit.
+
+**The `PivotLanding with no live bench` root is fixed.** `Flow::run_turn` decides the pause from the
+CHOSEN move; `run_move_action` then substitutes it — **Struggle** (`no_usable_move`) or the **Encore
+`OverrideAction` redirect** — and every `match pivot` arm keys on the ACTION. A PP-stalled mon with
+an all-FAINTED bench picks Revival Blessing (pause granted off `has_fainted_bench`), Struggles,
+Struggle's damaging path pushes `PivotPending`, and Struggle's own recoil kills the user.
+`run_move_action` now re-derives the pause from the EXECUTED move and every `PivotPending` site
+requires `has_alive_bench` (PS's own gate, `sim/battle.ts:2904`). **`tests/pivot_landing_bench.rs`
+is the property**: 12 violations / 20 000 games before, 0 / 200 000 after; `PIVOT_FUZZ_GAMES` sets
+the budget. The `resume_pivot` / `resume_revive` eprintlns stay as tripwires.
+
+**Six rules this tranche cost a landing each:**
+
+1. **`flags: { breakable: 1 }` is the WHOLE of Mold Breaker** (`sim/battle.ts:836`). The engine
+   blanked the defender's ability wholesale in `compute_damage` — deleting **Shadow Shield**
+   (`flags: {}`, unlike Multiscale) and the four **Ruin** abilities — and suppressed nothing on the
+   boost path, where **Contrary IS breakable**. `ability_breakable()` is the pinned dex's 83 names.
+   `Full Metal Body` is `cantsuppress`: filter per-ability, never as a group. `suppressingAbility`
+   needs an ACTIVE MOVE, so Intimidate / Sticky Web / Octolock are outside it.
+2. **Two identically-shaped consecutive draws are invisible to the differ and load-bearing for the
+   SELECTOR.** Two Harvest holders both roll `randomChance[1,2]`; PS `speedSort`s the Residual list
+   so the FASTER holder rolls first. rb5073 d51 read `draws-match/state-diff` and was pure ordering.
+3. **`frz.onAfterMoveSecondary`, not `onHit`.** A `thawsTarget` move cures the freeze at
+   `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` (`battle-actions.ts:1026`) — so a
+   frozen target hit by Scald is still frozen when the burn is tried and ends with NO status.
+4. **`transformInto` ends with `setAbility(target.ability, this, true)` and `setAbility` runs
+   `singleEvent('Start', ability, ...)` — the copied ability ACTIVATES.** An Imposter Ditto copying
+   Intimidate Intimidates. And the switch-OUT abilities read the LIVE ability, from
+   `runEvent('BeforeSwitchOut')` before `clearVolatile()`.
+5. **An early return out of the damaging path must bring `miss_out` with it.** Both nullifying-
+   ability arms returned `out` alone, so the engine generated no miss outcome and
+   `replicate_select` fell through to the only branch there was. They were also missing BOTH
+   `eachEvent('Update')`s (970 / 1024) — a nullified hit is still a connecting hit.
+6. **`ignoreEvasion` and `ignoreDefensive` are two fields**, on the same four moves, and only the
+   accuracy half was wired. The flag form zeroes a NEGATIVE stage too.
+
+**Three named leads, all localized** (see the scoreboard for the reasoning):
+rb1448 d8 (a 26-damage instruction with a clean draw stream where PS has one 69 confusion hit),
+rb1661 d55 (a per-hit `shuffle@scaleshot` missing in the realized multi-hit loop — the same class
+as the Ice Face / Disguise Updates just fixed), and the Terapagos pair, both **exactly 3 HP** off in
+opposite directions.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "OFFSET & PIVOT TRANCHE" — before anything
+else.**
+
+---
+
 **ILLUSION TRANCHE (2026-07-27): 878 / 912 customgame (96.3%, up from 870) and 94 / 101 randbats
 (93.1%, up from 93). Illusion is modelled end-to-end.** Six parity commits, newly-non-exact EMPTY on
 BOTH rails at every one, 1.8 games/commit. Sweeps 100.00% audited / 99.73% randbats; differ 99.53%
