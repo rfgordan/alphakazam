@@ -258,7 +258,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -333,6 +333,18 @@ pub(crate) struct Branch {
     /// a thread-local cannot carry it); read by `run_move_action`'s trailing 2882 emit; reset at
     /// the top of every `run_move_action`. See `apply_drag` for the PS derivation.
     pub(crate) drag_tie_speeds: Option<[i32; 2]>,
+    /// Transient (NOT part of State): was the ATTACKER still standing at the moment PS runs a
+    /// move's `onAfterHit`?
+    ///
+    /// `onAfterHit` lives INSIDE `spreadMoveHit` (`sim/battle-actions.ts:1144`), guarded by
+    /// `pokemon.hp`, immediately after `runEvent('DamagingHit')`. Everything that can kill the
+    /// attacker afterwards — `move.recoil`, and Life Orb's `onAfterMoveSecondarySelf` at
+    /// `useMoveInner:533` — happens LATER. The engine applies both inside `apply_post_damage`,
+    /// which runs at the end of the hit loop and therefore BEFORE the `onAfterHit` payloads
+    /// (Ceaseless Edge's Spikes, Stone Axe's Stealth Rock, Glaive Rush's volatile). Testing
+    /// `is_alive()` at those sites asks the question one self-KO too late, so `apply_post_damage`
+    /// snapshots the answer here first. `true` when no damaging move has resolved.
+    pub(crate) after_hit_user_alive: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -2036,7 +2048,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -2266,7 +2278,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -2480,7 +2492,7 @@ pub fn replacement_field_change_draws(state: &State, replacements: &[(SideId, u8
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -2919,7 +2931,7 @@ fn retry_trace(b: &mut Branch, side: SideId) {
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -3494,7 +3506,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds, after_hit_user_alive: b.after_hit_user_alive }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -6166,22 +6178,34 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // Stone Axe sets Stealth Rock on the target's side whether the hit landed on the mon
         // OR its Substitute (PS has both `onAfterHit` and `onAfterSubDamage`), as long as the
         // user is still standing. Glaive Rush's self-drawback likewise applies on any hit.
-        if md.id.to_id() == "stoneaxe" && hb.state.side(side).active().is_alive() {
+        //
+        // "Still standing" means **at PS's `onAfterHit`**, which is inside `spreadMoveHit` and
+        // therefore ahead of `move.recoil` and Life Orb — both of which the engine has already
+        // applied by this point. rb1765 d6 t5: a 16-HP Life Orb Samurott-Hisui lands Ceaseless
+        // Edge and dies to the orb; PS lays the Spikes first and the engine, reading a corpse,
+        // laid none. See `Branch::after_hit_user_alive`.
+        if md.id.to_id() == "stoneaxe" && hb.after_hit_user_alive {
             apply_hazard(&mut hb, foe, SideConditionId::StealthRock);
         }
         // Ceaseless Edge lays a layer of Spikes on the target's side on any hit (PS
         // `onAfterHit`/`onAfterSubDamage`), as long as the user is still standing.
-        if md.id.to_id() == "ceaselessedge" && hb.state.side(side).active().is_alive() {
+        if md.id.to_id() == "ceaselessedge" && hb.after_hit_user_alive {
             apply_hazard(&mut hb, foe, SideConditionId::Spikes);
         }
-        if md.id.to_id() == "glaiverush" && hb.state.side(side).active().is_alive()
+        if md.id.to_id() == "glaiverush" && hb.after_hit_user_alive
             && !hb.state.side(side).volatiles.contains(VolatileStatus::GlaiveRush)
         {
             push(&mut hb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::GlaiveRush });
         }
         apply_relic_song_forme(&mut hb, side, &md);
         apply_throat_spray(&mut hb, side, &md);
-        apply_spin_clear(&mut hb, side, &md);
+        // `apply_spin_clear` USED to sit here. It is an `onAfterHit` payload (step 8) and it
+        // removes the SPINNER's OWN side conditions — which is the one onAfterHit effect that can
+        // be undone by a step-7 `onDamagingHit` handler laying a hazard on that same side.
+        // rb1591 d19 t17: a Ditto transformed into Glimmora uses Mortal Spin into the real
+        // Glimmora; PS's Toxic Debris (step 7) scatters a Toxic Spikes layer on the SPINNER's side
+        // and the spin (step 8) then wipes it — net zero. The engine ran the spin first and kept
+        // the layer. Moved to the step-7 boundary below, in both arms.
         apply_white_herb(&mut hb, side);
         // A Substitute blocks the target's own secondaries (boosts/status) and contact
         // abilities; otherwise split on the move's secondary, then the contact-status ability.
@@ -6200,6 +6224,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             emit_sub_secondary_rolls(&mut hb, side, &md);
             // Step 7 still closes the hit — the deferred no-draw event, gated on the sub.
             apply_damaging_hit_step7(&mut hb, side, &md, true);
+            apply_spin_clear(&mut hb, side, &md);
             vec![hb]
         } else {
             apply_beak_blast_burn(&mut hb, side, &md, foe_pending_move);
@@ -6229,7 +6254,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // orders Rough Skin / Iron Barbs (`onDamagingHitOrder: 1`) and Rocky Helmet (2)
                 // ahead of the unordered contact-status set — a chip that faints the attacker must
                 // suppress its paralysis/burn. See `apply_damaging_hit_step7`.
-                .map(|mut sb| { apply_damaging_hit_step7(&mut sb, side, &md, false); sb })
+                // ---- step 7 ends, step 8 (`onAfterHit`) begins ----
+                .map(|mut sb| {
+                    apply_damaging_hit_step7(&mut sb, side, &md, false);
+                    apply_spin_clear(&mut sb, side, &md);
+                    sb
+                })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .collect::<Vec<_>>()
@@ -7778,6 +7808,9 @@ fn apply_post_damage(
 ) {
     use crate::ids::Ability as Ab;
     let foe = side.other();
+    // PS's `onAfterHit` fired back inside `spreadMoveHit`, BEFORE any of the self-damage below.
+    // Snapshot its `pokemon.hp` guard now — see `Branch::after_hit_user_alive`.
+    b.after_hit_user_alive = b.state.side(side).active().is_alive();
     if any_damage {
         let aslot = b.state.side(side).active_index;
         // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt — unless the
