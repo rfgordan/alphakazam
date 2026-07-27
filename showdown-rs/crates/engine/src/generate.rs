@@ -807,7 +807,7 @@ fn weather_upkeep_faints(state: &State) -> bool {
             let immune = p.types.contains(&Type::Rock)
                 || p.types.contains(&Type::Ground)
                 || p.types.contains(&Type::Steel)
-                || matches!(p.ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat | Ab::SandStream);
+                || matches!(p.ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat);
             if immune { 0 } else { (p.max_hp / 16).max(1) }
         } else if p.ability == Ab::DrySkin && matches!(state.weather, Weather::Sun | Weather::HarshSun) {
             (p.max_hp / 8).max(1)
@@ -11133,11 +11133,19 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec
         let magic_guard = ability == Ab::MagicGuard;
 
         // Sandstorm chip — skipped for Rock/Ground/Steel types and sand-immune abilities.
+        // The immunity set is exactly PS's four `onImmunity` abilities (data/abilities.ts:3921
+        // sandforce, :3935 sandrush, :3962 sandveil, :3064 overcoat) plus Magic Guard. **Sand
+        // Stream is NOT one of them** — a Tyranitar/Hippowdon standing in its own sandstorm is
+        // chipped like anything else, and so is a Trace user that copied it. The types are
+        // `getTypes()`, i.e. the TERA type once terastallized (sim/pokemon.ts:2138-2141), which the
+        // engine already models by rewriting `types` on tera. rb1116 d7 (Tera Ghost Tyranitar:
+        // Leftovers +17 then sand -17, netting 251 -> the engine healed to 268) and rb1283 d17
+        // (a Gardevoir that Traced Sand Stream takes the chip).
         if effective_weather(&b.state) == Weather::Sand && !magic_guard {
             let immune = p.types.contains(&Type::Rock)
                 || p.types.contains(&Type::Ground)
                 || p.types.contains(&Type::Steel)
-                || matches!(ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat | Ab::SandStream);
+                || matches!(ability, Ab::SandVeil | Ab::SandRush | Ab::SandForce | Ab::Overcoat);
             if !immune {
                 let dmg = (maxhp / 16).max(1).min(b.state.side(side).active().hp);
                 if dmg > 0 {
