@@ -10484,6 +10484,39 @@ fn execute_status_move(
             .flat_map(|(idx, called_id)| {
                 let mut nb = scaled(&b, p);
                 draw(&mut nb, "sample", &[n], idx as i64, "sleeptalk");
+                // **Pressure taxes the CALLER, for the CALLED move's targets.**
+                // `useMoveInner` (`sim/battle-actions.ts:472-483`):
+                //   const callerMoveForPressure = sourceEffect && sourceEffect.pp ? sourceEffect : null;
+                //   if (!sourceEffect || callerMoveForPressure || sourceEffect.id === 'pursuit') {
+                //       let extraPP = 0;
+                //       for (const source of pressureTargets) { extraPP += runEvent('DeductPP', …) }
+                //       if (extraPP > 0) pokemon.deductPP(callerMoveForPressure || moveOrMoveName, extraPP);
+                //   }
+                // Sleep Talk has `pp: 10`, so it IS a `callerMoveForPressure`: the loop runs over
+                // the CALLED move's pressure targets and the extra PP comes off **Sleep Talk's own
+                // slot**. So a Sleep Talk that calls a foe-targeting move into a Pressure holder
+                // costs 2 PP of Sleep Talk and 0 of the called move.
+                // rb5098 d28 t24: a Guts mon Sleep Talks into a Pressure Slowbro; PS leaves Sleep
+                // Talk at 13 PP, the engine at 14.
+                let called_md = move_data(called_id);
+                let user_is_ghost = nb.state.side(side).active().types.contains(&Type::Ghost);
+                let foe_active = nb.state.side(side.other()).active();
+                if foe_active.is_alive()
+                    && foe_active.ability == crate::ids::Ability::Pressure
+                    && pressure_affected(&called_md, user_is_ghost)
+                {
+                    // `deductPP` resolves the slot by move id and bails at 0 PP.
+                    let slot = nb.state.side(side).active_index;
+                    let caller_idx = nb.state.side(side).active().moves.iter()
+                        .position(|m| m.id == md.id);
+                    if let Some(mi) = caller_idx {
+                        if nb.state.side(side).active().moves[mi].pp > 0 {
+                            push(&mut nb, Instruction::DecrementPp {
+                                side, slot, move_index: mi as u8, amount: 1,
+                            });
+                        }
+                    }
+                }
                 // `dispatch_move_inner`, not `execute_move`: PS's `useMove` skips the whole
                 // BeforeMove gauntlet (and the Glaive Rush drop that sits above it).
                 dispatch_move_inner(
