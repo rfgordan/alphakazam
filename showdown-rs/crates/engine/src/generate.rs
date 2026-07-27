@@ -2125,7 +2125,13 @@ fn embody_aspect_stat(ability: crate::ids::Ability) -> Option<BoostIndex> {
 
 /// One of the four `Ogerpon-*-Tera` formes.
 fn species_is_ogerpon_tera(species: crate::ids::Species) -> bool {
-    ["ogerpontealtera", "ogerponwellspringtera", "ogerponhearthflametera", "ogerponcornerstonetera"]
+    [
+        "ogerpontealtera", "ogerponwellspringtera", "ogerponhearthflametera", "ogerponcornerstonetera",
+        // Terapagos-Stellar carries `formeRegression` for the same reason (`formeChange` with no
+        // `source`, `sim/pokemon.ts:1449-1452`) and regresses all the way to the SET species —
+        // Terapagos, not Terapagos-Terastal — because PS restores from `set.species`.
+        "terapagosstellar",
+    ]
         .iter()
         .any(|n| crate::ids::Species::from_id(n) == Some(species))
 }
@@ -2157,8 +2163,31 @@ fn regress_fainted_tera_formes(b: &mut Branch) {
             let mut new = previous;
             new.species = p.base_species;
             new.ability = p.base_ability;
+            // PS restores from the SET (`battle.ts:2573`: `dex.species.get(pokemon.set.species ||
+            // pokemon.set.name)`), not from `baseSpecies`. For Ogerpon the two agree. For Terapagos
+            // they do NOT: Tera Shift's own permanent forme change already moved `baseSpecies` to
+            // Terapagos-Terastal, so a fainted Terapagos-Stellar goes back to plain **Terapagos**
+            // with **Tera Shift**, two steps down. rb1040 d10: the engine stopped at
+            // Terapagos-Terastal (791) where PS has Terapagos (789).
+            if Some(previous.species) == crate::ids::Species::from_id("terapagosstellar") {
+                if let Some(base) = crate::ids::Species::from_id("terapagos") {
+                    new.species = base;
+                    new.ability = crate::ids::Ability::TeraShift;
+                }
+            }
             if new.species == previous.species && new.ability == previous.ability {
                 continue;
+            }
+            // Ogerpon's four Tera formes share a base-stat line; **Terapagos-Stellar does not** —
+            // base HP 160 back down to Terapagos's 90 — and `formeChange` ends in `updateMaxHp`.
+            // Randbats spread (31 IV / 85 EV / neutral), the same assumption the Tera Shift entry
+            // forme change makes.
+            let (ob, nb) = (crate::data::base_stats(previous.species), crate::data::base_stats(new.species));
+            if ob != nb {
+                new.stats = respread_stats(ob, nb, p.stats, p.level);
+                if ob[0] != nb[0] {
+                    new.stats[0] = crate::damage::compute_hp(nb[0], 31, 85, p.level);
+                }
             }
             let previous_base_moves = p.base_moves;
             push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
@@ -4750,6 +4779,21 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             md.typ = t;
         }
     }
+    // Tera Starstorm: `onModifyType` (`data/moves.ts:19259`) makes it **Stellar** — and flips it
+    // physical on the same Atk-vs-SpA test Tera Blast uses — as soon as the user is
+    // Terapagos-Stellar, which is the forme Tera Shift's Terastallization produces. Without this
+    // the move stayed NORMAL, i.e. immune into any Ghost and resisted by Rock/Steel, and it took
+    // ordinary Normal STAB instead of the Stellar rule in `damage::stab_mod`.
+    if md.id.to_id() == "terastarstorm"
+        && Some(attacker.species) == crate::ids::Species::from_id("terapagosstellar")
+    {
+        md.typ = Type::Stellar;
+        if attacker.terastallized
+            && attacker.stat(crate::ids::StatIndex::Attack) > attacker.stat(crate::ids::StatIndex::SpecialAttack)
+        {
+            md.category = MoveCategory::Physical;
+        }
+    }
     // Tera Blast: when the user is Terastallized it becomes the tera type and uses whichever
     // of Atk/SpA is higher (so the category can flip to physical).
     if md.id.to_id() == "terablast" && attacker.terastallized {
@@ -6685,8 +6729,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let adaptability = attacker.ability == Ab::Adaptability;
     // Tera Shell: Terapagos-Terastal at full HP resists every hit by one extra step (breakable,
     // so `def_ab` already reflects Mold Breaker suppressing it).
+    // PS's guard set (`sim/pokemon.ts:2224`) is `category === 'Status' || id === 'struggle' ||
+    // !runImmunity(move) || totalTypeMod < 0 || hp < maxhp`. The first two are excluded here, the
+    // immunity one is moot (an immune move deals nothing anyway) and the `totalTypeMod < 0` one
+    // lives in `damage.rs` where the chart result is known.
     let tera_shell = def_ab == Ab::TeraShell
         && defender.hp == defender.max_hp
+        && md.category != MoveCategory::Status
+        && md.id.to_id() != "struggle"
         && crate::ids::Species::from_id("terapagosterastal") == Some(defender.species);
     // Returned for post-damage (contact punishers); also suppressed under Mold Breaker.
     let def_ability = def_ab;
@@ -7021,6 +7071,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             effective_weather(&b.state)
         },
         terastallized: attacker.terastallized,
+        defender_terastallized: defender.terastallized,
         tera_type: attacker.tera_type,
         life_orb: false,
         adaptability,
@@ -11989,6 +12040,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         attacker_burned: false,
         weather: state.weather,
         terastallized: caster.terastallized,
+        defender_terastallized: false,
         tera_type: caster.tera_type,
         life_orb: false,
         adaptability: false,

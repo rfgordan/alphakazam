@@ -151,6 +151,11 @@ pub struct DamageInput {
     pub attacker_burned: bool,
     pub weather: Weather,
     pub terastallized: bool,
+    /// The DEFENDER is Terastallized. Only Stellar reads it: `runEffectiveness`
+    /// (`sim/pokemon.ts:2211`) short-circuits the whole type chart with
+    /// `if (this.terastallized && move.type === 'Stellar') totalTypeMod = 1` — a Stellar move is
+    /// SUPER EFFECTIVE against any Terastallized target and exactly neutral against everyone else.
+    pub defender_terastallized: bool,
     pub tera_type: Type,
     /// Life Orb: ×1.3 final damage (recoil handled by the caller).
     pub life_orb: bool,
@@ -202,6 +207,33 @@ fn stab_mod(input: &DamageInput) -> (i64, i64) {
     // carries `Type::None` in its empty second slot, so guard against `None == None` matching.
     if mt == Type::None {
         return (1, 1);
+    }
+    // **The Stellar tera type replaces the whole STAB rule** (`battle-actions.ts:1774-1787`):
+    //
+    // ```ts
+    // if (pokemon.terastallized === 'Stellar') {
+    //     if (!pokemon.stellarBoostedTypes.includes(type) || move.stellarBoosted) {
+    //         stab = isSTAB ? 2 : [4915, 4096];
+    //         move.stellarBoosted = true;
+    //         if (pokemon.species.name !== 'Terapagos-Stellar') pokemon.stellarBoostedTypes.push(type);
+    //     }
+    // }
+    // ```
+    //
+    // So a Stellar-Tera'd mon gets ×2 on a move of one of its BASE types and ×1.2 on everything
+    // else — and `runEvent('ModifySTAB')` is skipped entirely on this arm.
+    //
+    // **The once-per-type memory (`stellarBoostedTypes`) is deliberately not modelled**: the only
+    // Stellar tera type the gen-9 randbats generator produces belongs to Terapagos, and
+    // Terapagos-Stellar is the one species PS never records the type for — so "always" is exactly
+    // right for every Stellar user in the corpus. A non-Terapagos Stellar user re-using a type
+    // would get the boost twice here and once in PS.
+    if input.terastallized && input.tera_type == Type::Stellar {
+        // `isSTAB` under a Stellar tera is `hasType(mt) || getTypes(false, true).includes(mt)`;
+        // `hasType` reads the tera type, which is Stellar, and no species has Stellar in its
+        // base types — so it reduces to the pre-tera type list.
+        let is_stab = input.attacker_base_types.contains(&mt);
+        return if is_stab { (2, 1) } else { (4915, 4096) };
     }
     // PS `pokemon.hasType(type)`.
     let has_type = if input.terastallized {
@@ -260,8 +292,13 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         return [0; 16];
     }
     // Type effectiveness as the two per-type multipliers, applied sequentially below.
-    let e0 = effectiveness_of(input.move_type, input.defender_types[0], input.freeze_dry);
-    let e1 = effectiveness_of(input.move_type, input.defender_types[1], input.freeze_dry);
+    // **Stellar never consults the type chart.** `runEffectiveness` (`sim/pokemon.ts:2210-2219`)
+    // opens with `if (this.terastallized && move.type === 'Stellar') { totalTypeMod = 1 }` and
+    // skips the per-type loop entirely — so a Stellar move is ×2 into ANY Terastallized target and
+    // exactly neutral into everyone else. Nothing is ever immune to it and nothing resists it.
+    let stellar = input.move_type == Type::Stellar;
+    let e0 = if stellar { 1.0 } else { effectiveness_of(input.move_type, input.defender_types[0], input.freeze_dry) };
+    let e1 = if stellar { 1.0 } else { effectiveness_of(input.move_type, input.defender_types[1], input.freeze_dry) };
     if e0 == 0.0 || e1 == 0.0 {
         return [0; 16];
     }
@@ -294,9 +331,28 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         // type, floor(÷2) for each resisted — all the ×2 first, then the ÷2. Applying each
         // type sequentially (halve-then-double) mis-rounds by 1 when they cancel, e.g. Bug
         // (×0.5 vs Poison, ×2 vs Psychic) vs Slowking-Galar = ×1, not ×1 − 1.
-        let up = (e0 == 2.0) as i32 + (e1 == 2.0) as i32;
-        let down = (e0 == 0.5) as i32 + (e1 == 0.5) as i32 + (input.tera_shell as i32);
-        let net = up - down;
+        let up = if stellar {
+            input.defender_terastallized as i32
+        } else {
+            (e0 == 2.0) as i32 + (e1 == 2.0) as i32
+        };
+        let down = if stellar { 0 } else { (e0 == 0.5) as i32 + (e1 == 0.5) as i32 };
+        let mut net = up - down;
+        // **Tera Shell REPLACES the net type mod with −1; it is not an extra resist step.**
+        // `Pokemon#runEffectiveness` (`sim/pokemon.ts:2220-2232`) computes `totalTypeMod` from the
+        // type chart and then, for a full-HP Terapagos-Terastal, `return -1` — but only after
+        // bailing out with `return totalTypeMod` when the move is Status, is Struggle, is immune,
+        // or is ALREADY resisted (`totalTypeMod < 0`). So:
+        //   neutral   0 -> -1   (×0.5)   — the only case the old "+1 down" got right
+        //   super    +1 -> -1   (×0.5)   — the old form gave ×1
+        //   4×       +2 -> -1   (×0.5)   — the old form gave ×2
+        //   resisted -1 -> -1   (×0.5)   — the old form gave ×0.25
+        // i.e. every hit a Tera Shell holder takes at full HP is exactly half, whatever the chart
+        // says. `input.tera_shell` is already false for Status moves and Struggle at the call site.
+        if input.tera_shell && net >= 0 {
+            net = -1;
+        }
+        let net = net;
         if net > 0 {
             d *= 1 << net;
         } else if net < 0 {
@@ -388,6 +444,7 @@ mod tests {
             attacker_burned: false,
             weather: Weather::None,
             terastallized: false,
+            defender_terastallized: false,
             tera_type: None,
             life_orb: false,
             adaptability: false,

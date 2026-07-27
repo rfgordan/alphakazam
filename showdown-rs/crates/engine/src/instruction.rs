@@ -320,11 +320,19 @@ impl State {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
                 p.species = new.species;
                 for i in 1..6 { p.stats[i] = new.stats[i]; }
-                // Forme changes (Tera Shift) can change max HP; damage taken is preserved.
+                // Forme changes (Tera Shift, Terapagos-Stellar's faint regression) can change max
+                // HP. PS's `updateMaxHp` (`sim/pokemon.ts:1499-1507`) is
+                // `this.hp = this.hp <= 0 ? 0 : Math.max(1, newMaxHP - (this.maxhp - this.hp))` —
+                // damage taken is preserved, but **a fainted mon stays at 0** rather than going
+                // negative when max HP SHRINKS. (The `max(1)` floor is not reproduced: it needs a
+                // live mon whose damage taken exceeds the new maximum, which no gen-9 forme change
+                // can produce, and clamping there would cost exact reversibility.)
                 if new.stats[0] != previous.stats[0] {
                     p.stats[0] = new.stats[0];
                     p.max_hp = new.stats[0];
-                    p.hp += new.stats[0] - previous.stats[0];
+                    if p.hp > 0 {
+                        p.hp += new.stats[0] - previous.stats[0];
+                    }
                 }
                 p.types = new.types;
                 p.live_types = new.live_types;
@@ -519,7 +527,9 @@ impl State {
                 if new.stats[0] != previous.stats[0] {
                     p.stats[0] = previous.stats[0];
                     p.max_hp = previous.stats[0];
-                    p.hp -= new.stats[0] - previous.stats[0];
+                    if p.hp > 0 {
+                        p.hp -= new.stats[0] - previous.stats[0];
+                    }
                 }
                 p.types = previous.types;
                 p.live_types = previous.live_types;
