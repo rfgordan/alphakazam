@@ -51,7 +51,8 @@ fn gen_instruction(state: &State, rng: &mut Lcg) -> Instruction {
     let s = state.side(side);
     let slot = s.active_index;
     let active = s.active();
-    match rng.below(12) {
+    match rng.below(13) {
+        12 => Instruction::ClearBoosts { side, previous: s.boosts },
         0 => {
             // Damage that won't underflow current HP.
             let max = active.hp.max(1) as u32;

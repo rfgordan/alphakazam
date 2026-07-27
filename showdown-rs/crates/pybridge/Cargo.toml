@@ -15,6 +15,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 engine = { path = "../engine" }
+# The PS<->engine state bridge (convert/export). Used by `export_state` to turn any live sim
+# state into a PS deserializeBattle-loadable snapshot for spot-checking.
+cosim = { path = "../cosim" }
 # `extension-module` is intentionally NOT enabled unconditionally: that feature tells pyo3 not to
 # link libpython, which makes a plain `cargo test` bin fail to link (no interpreter to supply the
 # symbols). maturin sets `PYO3_BUILD_EXTENSION_MODULE=1` for the real wheel build, so the shipped

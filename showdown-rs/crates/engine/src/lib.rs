@@ -18,6 +18,8 @@ pub mod ids;
 pub mod instruction;
 pub mod names;
 pub mod narrate;
+pub mod protocol;
+pub mod psprng;
 pub mod request;
 pub mod state;
 pub mod team;

@@ -10,7 +10,13 @@
 
 mod convert;
 mod diff;
+mod digest;
+mod drawdiff;
+mod fixture;
+mod export;
+mod protocol_emit;
 mod replay;
+mod seedgate;
 mod trace;
 
 use std::collections::BTreeMap;
@@ -43,6 +49,50 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let verbose = std::env::var("VERBOSE").is_ok();
+
+    // Draw-consumption differ mode: classify each unit DRAW-EXACT vs first-mismatch category,
+    // and print the burn-down scoreboard. Leaves the state-verification path untouched.
+    if std::env::var("DRAW_DIFF").is_ok() {
+        return run_draw_diff(&args);
+    }
+
+    // Raw seed→draw-stream gate: seed a PsPrng from the recorded battle seed and replay the
+    // recorded draw log in order, checking every non-shuffle draw's result reproduces. Validates
+    // the seed alignment (incl. the pre-turn-1 offset) and the PsPrng port at the call level,
+    // independent of the engine. RAW_DRAW_GATE=1 cosim <traces...>.
+    if std::env::var("RAW_DRAW_GATE").is_ok() {
+        return run_raw_draw_gate(&args);
+    }
+
+    // Slim seed-fixture builder: convert full v2 traces into `*.fx.json.gz` gate fixtures
+    // (per-decision state DIGESTS instead of full serialized states). MAKE_FIXTURE=<outdir>.
+    if let Ok(outdir) = std::env::var("MAKE_FIXTURE") {
+        return crate::fixture::run_make_fixture(&args, &outdir);
+    }
+
+    // Seed-driven full-battle Replicate gate (Phase 3 deliverable #2).
+    if std::env::var("SEED_GATE").is_ok() {
+        return crate::seedgate::run_seed_gate(&args);
+    }
+
+    // Exporter round-trip gate: for every corpus decision state S = convert(ps_snapshot), assert
+    // convert(export(S)) == S exactly. Certifies the State exporter is a right-inverse of convert.
+    if std::env::var("ROUNDTRIP_GATE").is_ok() {
+        return run_roundtrip_gate(&args);
+    }
+
+    // Transplant sampler: for each trace, export the engine State at a mid-game turn-start `move`
+    // decision as a `deserializeBattle`-loadable snapshot, alongside the transplant decision index
+    // so `harness/transplant-gate.mjs` can drive the recorded remainder in pinned PS.
+    if let Ok(outdir) = std::env::var("EXPORT_SAMPLE") {
+        return run_export_sample(&args, &outdir);
+    }
+
+    // Protocol-log emitter: replay each recorded game through the engine and write its PS protocol
+    // log (for the replay player / log-parity gate). PROTOCOL_EMIT=<outdir> cosim <traces>.
+    if let Ok(outdir) = std::env::var("PROTOCOL_EMIT") {
+        return protocol_emit::run_protocol_emit(&args, &outdir);
+    }
 
     let mut totals = Totals::default();
     let mut ps_commit: Option<String> = None;
@@ -209,6 +259,358 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_draw_diff(args: &[String]) -> ExitCode {
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let diff_label = std::env::var("DIFF_LABEL").ok();
+    let mut board = drawdiff::DrawScoreboard::default();
+    let mut ps_commit: Option<String> = None;
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        match &ps_commit {
+            None => ps_commit = Some(t.ps_commit.clone()),
+            Some(c) if *c != t.ps_commit => {
+                eprintln!("{path}: PS commit differs — corpus is mixed; refusing");
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        match drawdiff::draw_diff_trace(&t) {
+            Ok(units) => {
+                let (mut ex, mut mm, mut un) = (0u32, 0u32, 0u32);
+                for u in &units {
+                    board.add(u);
+                    match &u.class {
+                        drawdiff::DrawClass::Exact => ex += 1,
+                        drawdiff::DrawClass::Unsupported(_) => un += 1,
+                        drawdiff::DrawClass::Mismatch { label, detail, .. } => {
+                            mm += 1;
+                            if let Some(f) = &diff_label {
+                                if label.contains(f.as_str()) {
+                                    println!("MM {path} t{} | {label} | {detail}", u.turn);
+                                }
+                            }
+                        }
+                    }
+                }
+                if verbose {
+                    println!("=== {path} === units: {} | draw-exact {ex} | mismatch {mm} | unsupported {un}", units.len());
+                }
+            }
+            Err(u) => eprintln!("{path}: {}", u.0),
+        }
+    }
+    if let Some(c) = ps_commit {
+        println!("(ps {c})");
+    }
+    board.report();
+    ExitCode::SUCCESS
+}
+
+/// Consume one recorded draw from `prng` and return whether its result reproduces (shuffles are
+/// consumed but never checked — PS logs their order as null). `None` for an unknown kind.
+fn replay_recorded_draw(prng: &mut engine::psprng::PsPrng, dr: &serde_json::Value) -> Option<bool> {
+    use serde_json::Value;
+    let kind = dr.get("kind").and_then(Value::as_str)?;
+    let args: Vec<i64> = dr.get("args").and_then(Value::as_array)?
+        .iter().filter_map(Value::as_i64).collect();
+    let result = dr.get("result");
+    match kind {
+        "randomChance" => {
+            let got = prng.random_chance(args[0] as u32, args[1] as u32);
+            Some(result.and_then(Value::as_bool).map_or(true, |r| r == got))
+        }
+        "random" => {
+            let got = if args.len() == 2 {
+                prng.random_range(args[0] as u32, args[1] as u32)
+            } else {
+                prng.random_n(args[0] as u32)
+            };
+            Some(result.and_then(Value::as_i64).map_or(true, |r| r as u32 == got))
+        }
+        "sample" => {
+            let got = prng.sample_index(args[0] as u32);
+            Some(result.and_then(Value::as_i64).map_or(true, |r| r as u32 == got))
+        }
+        "shuffle" => {
+            // args [len,start,end]: Fisher-Yates over [start,end) consumes end-1-start draws.
+            let (start, end) = (args[1] as usize, args[2] as usize);
+            let mut s = start;
+            while s < end.saturating_sub(1) {
+                let _ = prng.random_range(s as u32, end as u32);
+                s += 1;
+            }
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Replay a game's full recorded draw stream through `prng` after burning `init` leading draws.
+/// Returns (all_strong_draws_ok, strong_draws_checked). Strong = non-shuffle (result checkable).
+fn replay_stream_with_init(t: &trace::Trace, limbs: [u16; 4], init: u32) -> (bool, u64) {
+    let mut prng = engine::psprng::PsPrng::from_limbs(limbs);
+    for _ in 0..init { let _ = prng.next(); }
+    let mut strong = 0u64;
+    for d in &t.decisions {
+        for dr in &d.draws {
+            match replay_recorded_draw(&mut prng, dr) {
+                Some(true) => { if dr.get("kind").and_then(|v| v.as_str()) != Some("shuffle") { strong += 1; } }
+                _ => return (false, strong),
+            }
+        }
+    }
+    (true, strong)
+}
+
+fn run_raw_draw_gate(args: &[String]) -> ExitCode {
+    // INIT_SCAN=1: report the per-game unlogged init-draw offset (find minimal `init` in 0..64
+    // reproducing the whole strong stream) to characterize the pre-turn-1 alignment convention.
+    if std::env::var("INIT_SCAN").is_ok() {
+        let mut hist: BTreeMap<i64, u32> = BTreeMap::new();
+        let mut none = 0u32;
+        for path in args {
+            let t = match trace::load_trace(path) { Ok(t) => t, Err(_) => continue };
+            let Some(limbs) = t.seed else { continue };
+            let mut found = None;
+            for init in 0..64u32 {
+                let (ok, n) = replay_stream_with_init(&t, limbs, init);
+                if ok && n >= 1 { found = Some(init); break; }
+            }
+            match found {
+                Some(init) => { *hist.entry(init as i64).or_default() += 1; }
+                None => { none += 1; println!("  NO-INIT-FITS: {path}"); }
+            }
+        }
+        println!("INIT-OFFSET histogram (init draws -> #games):");
+        for (init, c) in &hist { println!("  init={init:3}  {c} games"); }
+        println!("  no-fit: {none}");
+        return ExitCode::SUCCESS;
+    }
+    let mut games_ok = 0u32;
+    let mut games = 0u32;
+    let mut total_draws = 0u64;
+    let mut fails: Vec<String> = Vec::new();
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        let Some(limbs) = t.seed else {
+            fails.push(format!("{path}: no seed in trace"));
+            continue;
+        };
+        games += 1;
+        let mut prng = engine::psprng::PsPrng::from_limbs(limbs);
+        let mut ok = true;
+        let mut n = 0u64;
+        'outer: for d in &t.decisions {
+            for dr in &d.draws {
+                match replay_recorded_draw(&mut prng, dr) {
+                    Some(true) => { n += 1; }
+                    Some(false) => {
+                        ok = false;
+                        fails.push(format!("{path}: draw #{n} mismatch: {}", serde_json::to_string(dr).unwrap_or_default()));
+                        break 'outer;
+                    }
+                    None => {
+                        ok = false;
+                        fails.push(format!("{path}: draw #{n} unknown kind: {}", serde_json::to_string(dr).unwrap_or_default()));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        total_draws += n;
+        if ok { games_ok += 1; }
+    }
+    println!("RAW DRAW-STREAM GATE: {games_ok}/{games} games reproduce the full recorded draw stream ({total_draws} draws checked)");
+    for f in fails.iter().take(30) { println!("  {f}"); }
+    if games_ok == games { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Round-trip certification: `convert(export(convert(state_after))) == convert(state_after)` for
+/// every convertible decision state in the corpus. Headline is the `move`-request unit count.
+fn run_roundtrip_gate(args: &[String]) -> ExitCode {
+    let verbose = std::env::var("VERBOSE").is_ok();
+    let mut ps_commit: Option<String> = None;
+    // (converted, exact) tallied per request-state class.
+    let mut per_class: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let mut convert_failed: BTreeMap<String, u32> = BTreeMap::new();
+    let mut mismatch_cats: BTreeMap<String, u32> = BTreeMap::new();
+    let mut mismatches: Vec<String> = Vec::new();
+
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+        };
+        match &ps_commit {
+            None => ps_commit = Some(t.ps_commit.clone()),
+            Some(c) if *c != t.ps_commit => {
+                eprintln!("{path}: PS commit differs — refusing mixed corpus");
+                return ExitCode::FAILURE;
+            }
+            _ => {}
+        }
+        let Some(first) = t.decisions.first() else { continue };
+        let canon = match convert::Canonical::from_first_state(&first.state_after) {
+            Ok(c) => c,
+            Err(u) => { *convert_failed.entry(format!("canon:{}", u.0)).or_insert(0) += 1; continue; }
+        };
+        let name = path.rsplit('/').next().unwrap_or(path);
+        for d in &t.decisions {
+            let class = d.request_state.clone();
+            // Convert PS snapshot -> engine State (the input to the round-trip identity).
+            let state = match convert::convert_state(&d.state_after, &canon) {
+                Ok(s) => s,
+                Err(u) => {
+                    *convert_failed.entry(u.0.split([':', '[']).next().unwrap_or("?").to_string()).or_insert(0) += 1;
+                    continue;
+                }
+            };
+            // export -> convert back.
+            let json = export::export_state(&state, t.seed.unwrap_or([1, 2, 3, 4]));
+            let canon2 = match convert::Canonical::from_first_state(&json) {
+                Ok(c) => c,
+                Err(u) => {
+                    let e = per_class.entry(class.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    *mismatch_cats.entry(format!("export-canon:{}", u.0)).or_insert(0) += 1;
+                    mismatches.push(format!("{name} d{} t{} [{class}] export-canon: {}", d.index, d.turn, u.0));
+                    continue;
+                }
+            };
+            let back = match convert::convert_state(&json, &canon2) {
+                Ok(s) => s,
+                Err(u) => {
+                    let e = per_class.entry(class.clone()).or_insert((0, 0));
+                    e.0 += 1;
+                    *mismatch_cats.entry(format!("export-convert:{}", u.0.split([':', '[']).next().unwrap_or("?"))).or_insert(0) += 1;
+                    mismatches.push(format!("{name} d{} t{} [{class}] export-convert-failed: {}", d.index, d.turn, u.0));
+                    continue;
+                }
+            };
+            let e = per_class.entry(class.clone()).or_insert((0, 0));
+            e.0 += 1;
+            if back == state {
+                e.1 += 1;
+            } else {
+                let diffs = diff::diff_states(&state, &back);
+                for dd in &diffs {
+                    *mismatch_cats.entry(dd.category.clone()).or_insert(0) += 1;
+                }
+                let detail = diffs.iter().take(4).map(|d| d.detail.as_str()).collect::<Vec<_>>().join(" | ");
+                mismatches.push(format!("{name} d{} t{} [{class}] {detail}", d.index, d.turn));
+            }
+        }
+    }
+
+    println!("\n========== EXPORTER ROUND-TRIP GATE ==========");
+    if let Some(c) = &ps_commit { println!("(ps {c})"); }
+    let (mut tot_c, mut tot_e) = (0u32, 0u32);
+    for (class, (c, e)) in &per_class {
+        println!("  {class:12} converted {c:5}  exact {e:5}");
+        tot_c += c;
+        tot_e += e;
+    }
+    if let Some((c, e)) = per_class.get("move") {
+        println!("\nROUND-TRIP (move units): {e} / {c} exact");
+    }
+    println!("ROUND-TRIP (all states): {tot_e} / {tot_c} exact");
+    if !convert_failed.is_empty() {
+        println!("\nconvert-unsupported states (excluded from round-trip denominator):");
+        print_ranked("  reasons", &convert_failed);
+    }
+    if tot_e != tot_c {
+        println!("\nMISMATCH categories:");
+        print_ranked("  ", &mismatch_cats);
+        println!("\nfirst {} mismatches:", 30.min(mismatches.len()));
+        for m in mismatches.iter().take(30) {
+            println!("  {m}");
+        }
+        if verbose {
+            for m in mismatches.iter().skip(30) {
+                println!("  {m}");
+            }
+        }
+        ExitCode::FAILURE
+    } else {
+        println!("\nPASS: every convertible corpus state round-trips byte-exact.");
+        ExitCode::SUCCESS
+    }
+}
+
+/// Dump one transplant sample per trace: the exported (deserializeBattle-loadable) engine State
+/// at a mid-game turn-start `move` decision, plus the decision index so the harness can drive the
+/// recorded remainder. Writes `<outdir>/<name>.json` = {trace, name, decisionIndex, turn, seed,
+/// exported}. Skips games with no eligible clean boundary.
+fn run_export_sample(args: &[String], outdir: &str) -> ExitCode {
+    if let Err(e) = std::fs::create_dir_all(outdir) {
+        eprintln!("mkdir {outdir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut written = 0u32;
+    for path in args {
+        let t = match trace::load_trace(path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("{e}"); continue; }
+        };
+        let Some(first) = t.decisions.first() else { continue };
+        let canon = match convert::Canonical::from_first_state(&first.state_after) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Transplant point: a turn-start (non-midTurn) `move` decision at/after the game's
+        // midpoint whose state converts cleanly, with recorded choices for BOTH sides (so the
+        // continuation is drivable) and at least one decision of remainder.
+        let mid_turn_threshold = t.result.turns / 2;
+        let mut chosen: Option<usize> = None;
+        for (i, d) in t.decisions.iter().enumerate() {
+            if d.request_state != "move" || d.mid_turn { continue; }
+            if d.turn < mid_turn_threshold { continue; }
+            if i + 1 >= t.decisions.len() { continue; }
+            if !d.choices.contains_key("p1") || !d.choices.contains_key("p2") { continue; }
+            if convert::convert_state(&d.state_after, &canon).is_err() { continue; }
+            chosen = Some(i);
+            break;
+        }
+        let Some(i) = chosen else {
+            eprintln!("{path}: no eligible transplant boundary");
+            continue;
+        };
+        // Export the PRE-decision state: the recorded state_after of the decision BEFORE i is the
+        // state at which the transplant decision is being made. Decision i's own state_after is
+        // AFTER i resolves. So transplant from decision (i-1).state_after and replay from i.
+        // Guard: i>=1 (i is a move decision at/after midpoint, so a prior decision exists).
+        let pre = &t.decisions[i - 1];
+        let state = match convert::convert_state(&pre.state_after, &canon) {
+            Ok(s) => s,
+            Err(_) => { eprintln!("{path}: pre-state convert failed"); continue; }
+        };
+        let exported = export::export_state(&state, t.seed.unwrap_or([1, 2, 3, 4]));
+        let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".json.gz").trim_end_matches(".json");
+        let out = serde_json::json!({
+            "trace": path,
+            "name": name,
+            "transplantDecisionIndex": i,
+            "preDecisionIndex": i - 1,
+            "turn": t.decisions[i].turn,
+            "seed": t.seed,
+            "exported": exported,
+        });
+        let dest = format!("{outdir}/{name}.json");
+        match std::fs::write(&dest, serde_json::to_string(&out).unwrap()) {
+            Ok(_) => { written += 1; }
+            Err(e) => eprintln!("write {dest}: {e}"),
+        }
+    }
+    println!("EXPORT_SAMPLE: wrote {written} transplant snapshots to {outdir}");
+    ExitCode::SUCCESS
 }
 
 fn print_ranked(label: &str, map: &BTreeMap<String, u32>) {

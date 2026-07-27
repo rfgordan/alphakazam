@@ -48,7 +48,7 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
 
     // Sleep Clause Mod exists in ranked formats (incl. random battles) but not customgame
     // (the recorded-team corpora).
-    let sleep_clause = trace.format.contains("randombattle");
+    let sleep_clause = crate::trace::sleep_clause_for_format(&trace.format);
     let mut results = Vec::new();
     let mut i = 0;
     // The state each unit replays from: the previous decision boundary.
@@ -534,7 +534,7 @@ fn compare_distribution(
 /// Did `side_key`'s active faint (making its pending switch request a faint replacement
 /// rather than a pivot)? Decided from the request JSON itself: PS marks the slot in
 /// `forceSwitch` and the side's active condition shows `fnt` for faints.
-fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &str) -> bool {
+pub(crate) fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &str) -> bool {
     // Prefer the request: side.pokemon[active].condition endswith " fnt".
     if let Some(req) = sw.requests.get(side_key) {
         if let Some(mons) = req["side"]["pokemon"].as_array() {
@@ -554,7 +554,7 @@ fn active_fainted(pending_state: &Value, si: usize, sw: &Decision, side_key: &st
         .unwrap_or(false)
 }
 
-fn resolve_choice(
+pub(crate) fn resolve_choice(
     state: &State,
     si: usize,
     choice: &crate::trace::ChoiceRec,
@@ -566,6 +566,13 @@ fn resolve_choice(
             let side = &state.sides[si];
             let active = &side.pokemon[side.active_index as usize];
             let mid = r.move_id.as_deref().unwrap_or("");
+            if mid == "recharge" {
+                // PS's request for a `mustrecharge` mon offers the single pseudo-move
+                // "recharge" (sim/pokemon.ts `getMoveRequestData`), which is not on the set.
+                // The engine signals it through `pending_move == Recharging`: whatever slot is
+                // chosen, `before_move` cancels the attempt and clears the flag.
+                return Ok((MoveChoice::Move(0), r.tera));
+            }
             if mid == "struggle" {
                 // engine signals Struggle via a 0-pp chosen slot
                 let slot = active.moves.iter().position(|m| m.pp == 0).unwrap_or(0);
@@ -635,6 +642,10 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             if m != engine::ids::MoveId::None {
                 eng_moves = vec![m.to_id().to_string()];
             }
+        }
+        // A recharging mon's request is PS's single pseudo-move "recharge".
+        if side.pending_move == engine::state::PendingMove::Recharging {
+            eng_moves = vec!["recharge".to_string()];
         }
         eng_moves.sort();
         if ps_moves != eng_moves && ps_moves != vec!["struggle".to_string()] {

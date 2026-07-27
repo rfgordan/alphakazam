@@ -45,7 +45,13 @@ use crate::state::MoveSlot;
 pub struct TransformData {
     pub species: Species,
     pub stats: [i16; 6],
+    /// EFFECTIVE typing (`Pokemon::types`) — a terastallized mon keeps its Tera typing across
+    /// a forme change, so the producers leave this alone when `terastallized`.
     pub types: [Type; 2],
+    /// PS's `pokemon.types` (`Pokemon::live_types`). `transformInto` and `setSpecies` both call
+    /// `setType(..., /*enforce*/ true)`, which bypasses the "terastallized mons cannot have
+    /// their base type changed" guard — so this ALWAYS moves, tera or not.
+    pub live_types: [Type; 2],
     pub ability: Ability,
     pub moves: [MoveSlot; 4],
     pub transformed: bool,
@@ -122,6 +128,10 @@ pub enum Instruction {
 
     // --- boosts (stat stages of the active Pokémon) ---
     Boost { side: SideId, stat: BoostIndex, amount: i8 },
+    /// Zero ALL of a side's active boost stages in one delta (Haze / Clear Smog). `previous`
+    /// holds the stages to restore on reversal. State-equivalent to a run of `Boost` deltas, but a
+    /// single event so the display layer can render PS's grouped `|-clearallboost|`.
+    ClearBoosts { side: SideId, previous: [i8; BoostIndex::COUNT] },
 
     // --- volatiles ---
     ApplyVolatile { side: SideId, volatile: VolatileStatus },
@@ -143,12 +153,20 @@ pub enum Instruction {
 
     // --- moves ---
     DecrementPp { side: SideId, slot: u8, move_index: u8, amount: u8 },
+    /// Leppa Berry's `onEat` restores PP to a slot (PS `moveSlot.pp += 10`, capped at `maxpp`).
+    /// `amount` is the already-capped delta, so the inverse is a plain subtraction.
+    RestorePp { side: SideId, slot: u8, move_index: u8, amount: u8 },
     SetMoveDisabled { side: SideId, slot: u8, move_index: u8, disabled: bool },
 
     // --- consecutive-use tracking (active Pokémon; resets on switch) ---
     SetLastMove { side: SideId, previous: MoveId, new: MoveId },
+    /// PS `moveLastTurnResult === false` — the side's active's move last turn FAILED (immune /
+    /// missed / no-target / blocked). Read only by Stomping Tantrum's base-power doubler. Committed
+    /// once per move action (annotation path); engine-internal, not diffed.
+    SetLastMoveFailed { side: SideId, previous: bool, new: bool },
     SetMoveStreak { side: SideId, previous: u8, new: u8 },
     SetStallCounter { side: SideId, previous: u8, new: u8 },
+    SetStallTurns { side: SideId, previous: u8, new: u8 },
 
     // --- multi-turn move state (active Pokémon; resets on switch) ---
     SetPendingMove { side: SideId, previous: PendingMove, new: PendingMove },
@@ -180,7 +198,18 @@ pub enum Instruction {
     Reveal { side: SideId, slot: u8, moves: u8, flags: u8 },
 
     // --- transformations ---
+    /// Rewrite the EFFECTIVE typing (`Pokemon::types`, PS's `getTypes()`). Emitted on its own
+    /// for the two engine-side ENCODINGS of a PS lookup-time resolution — Terastallization
+    /// (`getTypes` short-circuits on `terastallized`; `pokemon.types` is untouched) and Roost's
+    /// Flying strip / restore (PS's `roost` volatile filters through `onType`). A REAL
+    /// `setType` pushes this together with [`Instruction::ChangeLiveTypes`].
     ChangeTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
+    /// Rewrite PS's `pokemon.types` array (`Pokemon::live_types`) — a real `setType`. Separate
+    /// from `ChangeTypes` because the two move independently: an enforced `setType`
+    /// (`setSpecies`, `transformInto`) rewrites the array under a terastallized mon whose
+    /// effective typing does NOT move, and Tera / Roost move the effective typing with the
+    /// array standing still.
+    ChangeLiveTypes { side: SideId, slot: u8, previous: [Type; 2], new: [Type; 2] },
     ChangeItem { side: SideId, slot: u8, previous: Item, new: Item },
     ChangeAbility { side: SideId, slot: u8, previous: Ability, new: Ability },
     ToggleTerastallized { side: SideId, slot: u8 },
@@ -248,6 +277,7 @@ impl State {
                     p.hp += new.stats[0] - previous.stats[0];
                 }
                 p.types = new.types;
+                p.live_types = new.live_types;
                 p.ability = new.ability;
                 p.moves = new.moves;
                 p.transformed = new.transformed;
@@ -270,6 +300,9 @@ impl State {
             }
             Boost { side, stat, amount } => {
                 self.side_mut(side).boosts[stat as usize] += amount;
+            }
+            ClearBoosts { side, .. } => {
+                self.side_mut(side).boosts = [0; BoostIndex::COUNT];
             }
             ApplyVolatile { side, volatile } => {
                 self.side_mut(side).volatiles.insert(volatile);
@@ -312,17 +345,26 @@ impl State {
             DecrementPp { side, slot, move_index, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp -= amount;
             }
+            RestorePp { side, slot, move_index, amount } => {
+                self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp += amount;
+            }
             SetMoveDisabled { side, slot, move_index, disabled } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].disabled = disabled;
             }
             SetLastMove { side, new, .. } => {
                 self.side_mut(side).last_used_move = new;
             }
+            SetLastMoveFailed { side, new, .. } => {
+                self.side_mut(side).last_move_failed = new;
+            }
             SetMoveStreak { side, new, .. } => {
                 self.side_mut(side).move_streak = new;
             }
             SetStallCounter { side, new, .. } => {
                 self.side_mut(side).stall_counter = new;
+            }
+            SetStallTurns { side, new, .. } => {
+                self.side_mut(side).stall_turns = new;
             }
             SetPendingMove { side, new, .. } => {
                 self.side_mut(side).pending_move = new;
@@ -362,6 +404,9 @@ impl State {
             ChangeTypes { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = new;
             }
+            ChangeLiveTypes { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].live_types = new;
+            }
             ChangeItem { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].item = new;
             }
@@ -371,9 +416,13 @@ impl State {
             ToggleTerastallized { side, slot } => {
                 let s = &mut self.sides[side.index()];
                 s.pokemon[slot as usize].terastallized = !s.pokemon[slot as usize].terastallized;
-                // Once-per-battle side flag. Recomputation is exact in both directions because
-                // the generator gates tera on !tera_used (a side toggles at most once).
-                s.tera_used = s.pokemon.iter().any(|p| p.terastallized);
+                // Once-spent-forever side flag (PS: an ally's tera nulls `canTerastallize` team-
+                // wide and it never un-nulls). `any(terastallized)` sets it when a mon teras; keep
+                // it STICKY so an un-tera toggle (a Terastallized mon that faints and is revived by
+                // Revival Blessing — PS `delete pokemon.terastallized`) doesn't clear it. Reverse
+                // recomputes `any()`, which restores the exact prior value at every real toggle
+                // site (pre-state always has tera_used == any() there).
+                s.tera_used = s.tera_used || s.pokemon.iter().any(|p| p.terastallized);
             }
             PivotPending { .. } => {}
             RevivePending { .. } => {}
@@ -414,6 +463,7 @@ impl State {
                     p.hp -= new.stats[0] - previous.stats[0];
                 }
                 p.types = previous.types;
+                p.live_types = previous.live_types;
                 p.ability = previous.ability;
                 p.moves = previous.moves;
                 p.transformed = previous.transformed;
@@ -436,6 +486,9 @@ impl State {
             }
             Boost { side, stat, amount } => {
                 self.side_mut(side).boosts[stat as usize] -= amount;
+            }
+            ClearBoosts { side, previous } => {
+                self.side_mut(side).boosts = previous;
             }
             ApplyVolatile { side, volatile } => {
                 self.side_mut(side).volatiles.remove(volatile);
@@ -478,6 +531,9 @@ impl State {
             DecrementPp { side, slot, move_index, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp += amount;
             }
+            RestorePp { side, slot, move_index, amount } => {
+                self.sides[side.index()].pokemon[slot as usize].moves[move_index as usize].pp -= amount;
+            }
             SetMoveDisabled { side, slot, move_index, .. } => {
                 // The only forward transition toggles disabled true/false; reversing a
                 // disable restores `!disabled`. We store the post-value, so invert it.
@@ -487,11 +543,17 @@ impl State {
             SetLastMove { side, previous, .. } => {
                 self.side_mut(side).last_used_move = previous;
             }
+            SetLastMoveFailed { side, previous, .. } => {
+                self.side_mut(side).last_move_failed = previous;
+            }
             SetMoveStreak { side, previous, .. } => {
                 self.side_mut(side).move_streak = previous;
             }
             SetStallCounter { side, previous, .. } => {
                 self.side_mut(side).stall_counter = previous;
+            }
+            SetStallTurns { side, previous, .. } => {
+                self.side_mut(side).stall_turns = previous;
             }
             SetPendingMove { side, previous, .. } => {
                 self.side_mut(side).pending_move = previous;
@@ -532,6 +594,9 @@ impl State {
             }
             ChangeTypes { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].types = previous;
+            }
+            ChangeLiveTypes { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].live_types = previous;
             }
             ChangeItem { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].item = previous;

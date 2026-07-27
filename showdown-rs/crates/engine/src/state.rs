@@ -75,9 +75,20 @@ pub struct Pokemon {
     pub species: Species,
     pub level: u8,
 
-    /// Current effective typing. `base_types` is the original for moves like Roost /
-    /// abilities that restore it; `types` reflects type changes (Soak, tera, etc.).
+    /// Current EFFECTIVE typing — PS's `pokemon.getTypes()`. Tera is folded in (a
+    /// terastallized mon's `types` is `[tera_type]`) and Roost's Flying strip is applied,
+    /// because PS resolves both at lookup time and the engine stores the resolved value.
     pub types: [Type; 2],
+    /// PS's `pokemon.types` VERBATIM — the live, PRE-TERASTALLIZED type list that Protean /
+    /// Soak / Burn Up / Reflect Type / Transform / a forme change rewrite. Tera does NOT touch
+    /// it (`getTypes` short-circuits on `terastallized` before reading it) and neither does
+    /// Roost (whose `onType` filters `getTypes()`, not the array). It is the state PS's
+    /// `isSTAB` reads through `getTypes(false, true)` (`sim/battle-actions.ts:1768`), and it is
+    /// the field the digest / state diff compare — `types` is derivable from it plus
+    /// `terastallized` / `tera_type` / the `Roosted` marker.
+    pub live_types: [Type; 2],
+    /// The SPECIES' typing (PS's `pokemon.baseTypes`) — what `clearVolatile`'s
+    /// `setSpecies(baseSpecies)` restores `live_types` to on switch-out / faint.
     pub base_types: [Type; 2],
     /// Transform bookkeeping: `transformed` marks an active Transform/Imposter copy; the
     /// `base_*` fields hold what to restore when it switches out (PS reverts transform on
@@ -135,6 +146,7 @@ impl Pokemon {
         species: Species::None,
         level: 100,
         types: [Type::None, Type::None],
+        live_types: [Type::None, Type::None],
         base_types: [Type::None, Type::None],
         transformed: false,
         slept_by_foe: false,
@@ -263,6 +275,15 @@ pub struct Side {
     /// Protect succeeds with probability 1/3^n; reset to 0 by any non-Protect action or a
     /// failed Protect. Reset on switch.
     pub stall_counter: u8,
+    /// Remaining duration of PS's `stall` volatile (duration 2, applied by a Protect-family use).
+    /// Tracked SEPARATELY from `stall_counter`: PS registers a Residual handler for the `stall`
+    /// volatile for as long as the volatile exists (its `getKey:'duration'` entry), which survives
+    /// ONE turn past the Protect (duration 2 → present through the next turn's residual even if the
+    /// holder used a non-Protect move that turn). `stall_counter` is the `onStallMove` success
+    /// denominator (3^n) and resets on any non-Protect action; it is the wrong signal for the
+    /// residual-handler-list length. Not compared by `diff_states` (engine-internal; PS carries it
+    /// as the volatile's `duration`). Reset on switch.
+    pub stall_turns: u8,
 
     /// This side has used its once-per-battle Terastallization. Derivable from
     /// `pokemon[].terastallized` during engine-only play, but stored explicitly because the
@@ -324,6 +345,7 @@ impl Side {
         last_move_failed: false,
         move_streak: 0,
         stall_counter: 0,
+        stall_turns: 0,
         tera_used: false,
         healing_wish: false,
         wish: (0, 0),

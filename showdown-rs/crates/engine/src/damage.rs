@@ -60,6 +60,21 @@ pub fn type_multiplier(att: Type, defender_types: [Type; 2]) -> f32 {
     type_effectiveness(att, defender_types[0]) * type_effectiveness(att, defender_types[1])
 }
 
+/// Per-defending-type effectiveness with Freeze-Dry's `onEffectiveness` applied.
+/// `data/moves.ts` `freezedry`: `onEffectiveness(typeMod, target, type) { if (type === 'Water')
+/// return 1; }`. PS's `runEffectiveness` sums a per-type EXPONENT, so returning 1 REPLACES the
+/// Ice-vs-Water -1 with +1 — x2 per Water type on the defender, i.e. x4 relative to the plain
+/// chart. It is a per-type override, so Water/Ground takes x2 (Water) x 2 (Ground) = x4.
+pub fn effectiveness_of(att: Type, def: Type, freeze_dry: bool) -> f32 {
+    if freeze_dry && def == Type::Water { 2.0 } else { type_effectiveness(att, def) }
+}
+
+/// `type_multiplier` with the Freeze-Dry override.
+pub fn type_multiplier_fd(att: Type, defender_types: [Type; 2], freeze_dry: bool) -> f32 {
+    effectiveness_of(att, defender_types[0], freeze_dry)
+        * effectiveness_of(att, defender_types[1], freeze_dry)
+}
+
 /// Nature multiplier (×1.1 / ×0.9 / ×1.0) for a given stat.
 pub fn nature_multiplier(nature: Nature, stat: StatIndex) -> f32 {
     let (boosted, lowered) = nature_stats(nature);
@@ -125,7 +140,9 @@ pub struct DamageInput {
     pub move_type: Type,
     pub attacker_types: [Type; 2],
     /// The attacker's *original* (pre-Tera) types — needed to detect a Tera into one of its
-    /// own types (which upgrades STAB to ×2). Equals `attacker_types` when not Terastallized.
+    /// PS `pokemon.getTypes(false, true)` — the attacker's LIVE, pre-terastallized type array
+    /// (`Pokemon::live_types`), which a Protean / Soak / Burn Up rewrite and Tera does not.
+    /// Only read when `terastallized`; equals `attacker_types` otherwise.
     pub attacker_base_types: [Type; 2],
     pub defender_types: [Type; 2],
     pub attack_stat: i16,
@@ -141,6 +158,9 @@ pub struct DamageInput {
     pub adaptability: bool,
     /// Tera Shell (Terapagos-Terastal at full HP): one extra resist step (PS onEffectiveness −1).
     pub tera_shell: bool,
+    /// Freeze-Dry: its own `onEffectiveness` makes every Water defending type ×2 (see
+    /// `effectiveness_of`).
+    pub freeze_dry: bool,
     /// A final defender-side damage modifier as a 4096-based ratio (num/den), applied
     /// after type/burn/Life Orb — e.g. Multiscale (×0.5), Filter (×0.75). `(1, 1)` = none.
     pub final_num: i64,
@@ -155,10 +175,21 @@ pub fn base_damage(level: u8, base_power: u16, attack: i16, defense: i16) -> i32
     (numerator / 50) + 2
 }
 
-/// The STAB modifier as a 4096-friendly ratio. Base STAB is ×1.5 (×2 with Adaptability).
-/// Terastallizing into one of the attacker's *original* types upgrades STAB to ×2 (×2.25
-/// with Adaptability); Tera into a new type keeps the move STAB-able for both the tera type
-/// and any matching original type at the normal rate.
+/// The STAB modifier as a 4096-friendly ratio, mirroring `battle-actions.ts:1762-1796`:
+///
+/// ```text
+/// isSTAB = move.forceSTAB || pokemon.hasType(type) || pokemon.getTypes(false, true).includes(type)
+/// stab   = isSTAB ? 1.5 : 1
+/// if (pokemon.terastallized === type && pokemon.getTypes(false, true).includes(type)) stab = 2
+/// stab   = runEvent('ModifySTAB', ...)          // Adaptability
+/// ```
+///
+/// The two type predicates are DIFFERENT for a terastallized Pokemon: `hasType` reads
+/// `getTypes()`, which for a Tera'd mon is EXACTLY `[teraType]`, while `getTypes(false, true)`
+/// is the pre-Tera list. Base STAB survives Tera through the second predicate — but
+/// Adaptability's `onModifySTAB` (`data/abilities.ts:44`) gates on `source.hasType(move.type)`,
+/// so after Terastallizing it only fires for moves of the TERA type. A Tera'd Adaptability mon
+/// attacking with one of its original (non-Tera) types therefore gets a plain ×1.5.
 fn stab_mod(input: &DamageInput) -> (i64, i64) {
     let mt = input.move_type;
     // Typeless moves (Struggle, confusion self-hit) never get STAB — but a mon's `types` array
@@ -166,21 +197,44 @@ fn stab_mod(input: &DamageInput) -> (i64, i64) {
     if mt == Type::None {
         return (1, 1);
     }
-    let (from_orig, from_tera) = if input.terastallized {
-        (input.attacker_base_types.contains(&mt), input.tera_type == mt)
+    // PS `pokemon.hasType(type)`.
+    let has_type = if input.terastallized {
+        input.tera_type == mt
     } else {
-        (input.attacker_types.contains(&mt), false)
+        input.attacker_types.contains(&mt)
     };
-    if !from_orig && !from_tera {
+    // PS `pokemon.getTypes(false, true)` — the pre-terastallized type list.
+    let base_has = if input.terastallized {
+        input.attacker_base_types.contains(&mt)
+    } else {
+        input.attacker_types.contains(&mt)
+    };
+    if !has_type && !base_has {
         return (1, 1);
     }
-    let double = from_orig && from_tera; // Tera into an original type
-    match (double, input.adaptability) {
+    let double = has_type && base_has && input.terastallized; // Tera into an original type
+    // Adaptability only applies where PS's `hasType` does.
+    match (double, input.adaptability && has_type) {
         (true, true) => (9216, 4096), // ×2.25
         (true, false) => (2, 1),      // ×2
         (false, true) => (2, 1),      // ×2
         (false, false) => (3, 2),     // ×1.5
     }
+}
+
+/// PS's `Battle#chainModify` (`sim/battle.ts:2334`): every handler inside ONE `runEvent`
+/// accumulates its factor into `this.event.modifier`, and `runEvent` applies the product ONCE
+/// at `battle.ts:932` (`relayVar = this.modify(relayVar, this.event.modifier)`). Applying each
+/// factor with its own `modify` instead rounds at every step and drifts by 1.
+/// `previous` and the result are 4096-scaled; identity is 4096.
+pub(crate) fn chain(previous: i64, num: i64, den: i64) -> i64 {
+    let next = num * 4096 / den; // trunc, PS `tr(numerator * 4096 / denominator)`
+    (previous * next + 2048) >> 12
+}
+
+/// PS's `modify` with an already-4096-scaled modifier (the accumulated `event.modifier`).
+pub(crate) fn modify_by(value: i64, modifier: i64) -> i64 {
+    (value * modifier + 2048 - 1) / 4096
 }
 
 /// PS's `modify`: `value * num/den` with 4096-based fixed point and round-half-up.
@@ -200,8 +254,8 @@ pub fn damage_rolls(input: &DamageInput) -> [i16; 16] {
         return [0; 16];
     }
     // Type effectiveness as the two per-type multipliers, applied sequentially below.
-    let e0 = type_effectiveness(input.move_type, input.defender_types[0]);
-    let e1 = type_effectiveness(input.move_type, input.defender_types[1]);
+    let e0 = effectiveness_of(input.move_type, input.defender_types[0], input.freeze_dry);
+    let e1 = effectiveness_of(input.move_type, input.defender_types[1], input.freeze_dry);
     if e0 == 0.0 || e1 == 0.0 {
         return [0; 16];
     }
@@ -327,6 +381,7 @@ mod tests {
             life_orb: false,
             adaptability: false,
             tera_shell: false,
+            freeze_dry: false,
             final_num: 1,
             final_den: 1,
         };

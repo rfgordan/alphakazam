@@ -12,6 +12,7 @@
 use engine::generate::{generate_instructions, MoveChoice};
 use engine::instruction::StateInstructions;
 use engine::narrate::narrate_turn;
+use engine::protocol::{protocol_turn, HpStyle};
 use engine::state::{SideId, State};
 use engine::team;
 use pyo3::prelude::*;
@@ -183,8 +184,10 @@ impl Battle {
     ///   done   — battle finished this turn
     ///   winner — -1 ongoing/draw, 0 Red, 1 Blue
     ///   lines  — natural-language commentary for the turn (empty unless `narrate=True`)
-    #[pyo3(signature = (action_red, action_blue, narrate = false))]
-    fn step(&mut self, action_red: u8, action_blue: u8, narrate: bool) -> (bool, i64, Vec<String>) {
+    ///   lines  — English commentary if `narrate=True`, else PS **protocol** lines if
+    ///            `protocol=True`, else empty (both off = zero cost on the hot path).
+    #[pyo3(signature = (action_red, action_blue, narrate = false, protocol = false))]
+    fn step(&mut self, action_red: u8, action_blue: u8, narrate: bool, protocol: bool) -> (bool, i64, Vec<String>) {
         let c1 = self.resolve(SideId::One, action_red);
         let c2 = self.resolve(SideId::Two, action_blue);
 
@@ -196,6 +199,10 @@ impl Battle {
         let idx = self.sample(&branches);
         let lines = if narrate {
             narrate_turn(&self.state, c1, c2, &branches[idx].instructions)
+        } else if protocol {
+            let mut out = Vec::new();
+            protocol_turn(&self.state, c1, c2, &branches[idx].instructions, HpStyle::Percent, &mut out);
+            out
         } else {
             Vec::new()
         };
@@ -203,6 +210,18 @@ impl Battle {
         self.state.turn += 1;
 
         (self.is_over(), self.winner(), lines)
+    }
+
+    /// Spot-check entry point (Rob's directive): serialize the current TRUE battle state as a PS
+    /// `State.deserializeBattle`-loadable snapshot (the same exporter the round-trip/transplant
+    /// gates certify). Drop the returned JSON into pinned Showdown to inspect the position live.
+    /// `seed` is the 4-limb PRNG seed written into the snapshot (default `[1,2,3,4]`).
+    #[pyo3(signature = (seed = None))]
+    fn export_state(&self, seed: Option<Vec<u16>>) -> String {
+        let s = seed
+            .and_then(|v| <[u16; 4]>::try_from(v).ok())
+            .unwrap_or([1, 2, 3, 4]);
+        cosim::export::export_state(&self.state, s).to_string()
     }
 
     /// The full *true* battle state (both sides, perfect information) as a JSON string, for
@@ -930,6 +949,8 @@ pub struct FlowVec {
     /// Per-env team-draw RNG (separate stream from Flow's internal outcome sampling).
     draw_rngs: Vec<Rng>,
     pool: Option<Arc<Vec<PoolTeam>>>,
+    /// When set, each Flow accumulates PS protocol lines (fetched per-env via `protocol_log`).
+    capture_protocol: bool,
 }
 
 /// The reproducible outcome-sampling seed for env `i` (matches the pre-pool behaviour).
@@ -939,8 +960,10 @@ fn flow_seed(seed: u64, i: usize) -> u64 {
 
 /// A fresh `Flow`: pool teams drawn with `draw_rng` (or the fixed matchup when there is no pool),
 /// seeded for outcome sampling by `outcome_seed`.
-fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64) -> Flow {
-    Flow::new(draw_state(pool, draw_rng), outcome_seed)
+fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64, capture: bool) -> Flow {
+    let mut f = Flow::new(draw_state(pool, draw_rng), outcome_seed);
+    f.set_protocol_capture(capture);
+    f
 }
 
 #[pymethods]
@@ -948,19 +971,20 @@ impl FlowVec {
     /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
     /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None))]
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false))]
     fn new(
         num_envs: usize,
         seed: u64,
         max_requests_per_episode: u32,
         team_pool: Option<String>,
+        capture_protocol: bool,
     ) -> PyResult<Self> {
         let pool = load_pool_opt(team_pool)?;
         let mut draw_rngs: Vec<Rng> = (0..num_envs)
             .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
             .collect();
         let flows = (0..num_envs)
-            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i)))
+            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i), capture_protocol))
             .collect();
         Ok(FlowVec {
             flows,
@@ -969,13 +993,37 @@ impl FlowVec {
             seed,
             draw_rngs,
             pool,
+            capture_protocol,
         })
+    }
+
+    /// Drain env `i`'s accumulated PS protocol lines (empty unless constructed with
+    /// `capture_protocol=True`). Call after `step_all` to log/replay the turns just resolved;
+    /// pair with `harness/make-replay.mjs` for a replay HTML.
+    fn protocol_log(&mut self, env: usize) -> PyResult<Vec<String>> {
+        let n = self.flows.len();
+        let f = self
+            .flows
+            .get_mut(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={n})")))?;
+        Ok(f.take_protocol_log())
     }
 
     /// Number of teams in the loaded pool (0 when running the fixed default matchup).
     #[getter]
     fn pool_size(&self) -> usize {
         self.pool.as_ref().map(|p| p.len()).unwrap_or(0)
+    }
+
+    /// Spot-check: env `i`'s current TRUE state as a PS `deserializeBattle`-loadable snapshot
+    /// (the certified exporter). Drop it into pinned Showdown to inspect the position live.
+    #[pyo3(signature = (env, seed = None))]
+    fn export_state(&self, env: usize, seed: Option<Vec<u16>>) -> PyResult<String> {
+        let f = self.flows.get(env).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={})", self.flows.len()))
+        })?;
+        let s = seed.and_then(|v| <[u16; 4]>::try_from(v).ok()).unwrap_or([1, 2, 3, 4]);
+        Ok(cosim::export::export_state(&f.state, s).to_string())
     }
 
     #[getter]
@@ -1116,6 +1164,7 @@ impl FlowVec {
         let max_requests = self.max_requests;
         let seed = self.seed;
         let pool = &self.pool;
+        let capture = self.capture_protocol;
         let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
             self.flows
                 .par_iter_mut()
@@ -1142,7 +1191,7 @@ impl FlowVec {
                         _ => (false, -1),
                     };
                     if done && auto_reset {
-                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i));
+                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i), capture);
                         *reqs = 0;
                     }
                     (done, winner)

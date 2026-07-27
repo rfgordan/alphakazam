@@ -213,6 +213,20 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
             .is_some_and(|t| t.is_empty());
     }
     convert_volatiles(active_v, &mut side)?;
+    // Roost is the second half of the effective-typing derivation. PS's `roost` condition
+    // filters Flying out of `getTypes()` via `onType` (`data/moves.ts:15460`) and never writes
+    // `pokemon.types`, so the serialized array still carries Flying; the engine stores the
+    // RESOLVED typing, so apply the filter here. `live_types` deliberately keeps PS's array.
+    // (`onStart` returns false for a terastallized target, so the volatile never coexists with
+    // Tera and no extra guard is needed.)
+    if side.volatiles.contains(VolatileStatus::Roosted) {
+        let p = &mut side.pokemon[active_slot as usize];
+        for t in p.types.iter_mut() {
+            if *t == Type::Flying {
+                *t = Type::None;
+            }
+        }
+    }
     // `statsRaisedThisTurn` is a per-Pokemon field (not a PS volatile): only the active can
     // have raised a stat this turn, so it maps onto the engine's active-only volatile. Reset
     // by PS at every `endTurn`, so it is only ever set on mid-turn snapshots.
@@ -345,6 +359,11 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     } else {
         Type::from_id(&tera_id).ok_or_else(|| unsup(format!("type:{tera_id}")))?
     };
+    // `types` as parsed above is PS's `pokemon.types` VERBATIM — the live, pre-tera array.
+    // Keep it as `live_types` (the STAB / digest / diff field) and derive the engine's
+    // EFFECTIVE typing from it. Roost's Flying strip is the other half of the derivation and
+    // is applied in `convert_volatiles`, which is the only place the `roost` volatile is known.
+    let live_types = types;
     if terastallized && tera_type != Type::Stellar {
         types = [tera_type, Type::None];
     }
@@ -402,6 +421,7 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         species,
         level,
         types,
+        live_types,
         base_types,
         transformed,
         slept_by_foe,
@@ -471,6 +491,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
                 side.volatiles.insert(VolatileStatus::HealBlock);
                 side.heal_block_turns = dur;
             }
+            "magnetrise" => {
+                side.volatiles.insert(VolatileStatus::MagnetRise);
+                side.magnet_rise_turns = dur;
+            }
             "perishsong" | "perish3" | "perish2" | "perish1" => {
                 side.volatiles.insert(VolatileStatus::PerishSong);
                 if let Some(n) = k.strip_prefix("perish").and_then(|n| n.parse::<u8>().ok()) {
@@ -483,6 +507,10 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
                 // PS stores the denominator (3^n, capped 729); the engine stores n.
                 let c = i(vv, "counter").max(1);
                 side.stall_counter = (c as f64).log(3.0).round() as u8;
+                // The `stall` volatile's remaining `duration` (2 on the Protect turn, 1 the turn
+                // after) drives the Residual handler-list length, INDEPENDENT of the counter (which
+                // can be reset to 0 by a non-Protect move or rounded to 0 by log3 on the turn-after).
+                side.stall_turns = (i(vv, "duration").max(1)) as u8;
             }
             "choicelock" => { side.volatiles.insert(VolatileStatus::ChoiceLock); }
             "saltcure" => { side.volatiles.insert(VolatileStatus::SaltCure); }
@@ -507,18 +535,22 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "noretreat" => { side.volatiles.insert(VolatileStatus::NoRetreat); }
             "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
             "flashfire" => { side.volatiles.insert(VolatileStatus::FlashFire); }
-            "magnetrise" => {
-                side.volatiles.insert(VolatileStatus::MagnetRise);
-                side.magnet_rise_turns = dur;
-            }
-            // Focus Punch / Beak Blast add a duration-1 priority-charge marker at turn start; it is
-            // gone by every turn boundary and drives no cross-turn state (the engine re-derives the
-            // fail / burn-on-contact from within-turn damage records), so a mid-turn snapshot's
-            // marker maps to nothing.
-            "focuspunch" | "beakblast" => {}
             "truant" => { side.volatiles.insert(VolatileStatus::Truant); }
-            "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
-            "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }
+            // `fromBooster` marks a Booster-Energy-sourced boost: PS's `onWeatherChange` /
+            // `onTerrainChange` removes a FIELD-sourced boost the moment the sun / Electric Terrain
+            // lapses but keeps a Booster one, so the flag is load-bearing state, not cosmetics.
+            "protosynthesis" => {
+                side.volatiles.insert(VolatileStatus::Protosynthesis);
+                if vv.get("fromBooster").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    side.volatiles.insert(VolatileStatus::ProtoBooster);
+                }
+            }
+            "quarkdrive" => {
+                side.volatiles.insert(VolatileStatus::QuarkDrive);
+                if vv.get("fromBooster").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    side.volatiles.insert(VolatileStatus::ProtoBooster);
+                }
+            }
             "focusenergy" | "dragoncheer" => { side.volatiles.insert(VolatileStatus::FocusEnergy); }
             "unburden" => { side.volatiles.insert(VolatileStatus::Unburden); }
             "mustrecharge" => {
@@ -527,7 +559,19 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             }
             "twoturnmove" => {
                 let mv = MoveId::from_id(s(vv, "move")).unwrap_or(MoveId::None);
-                side.pending_move = PendingMove::Charging(mv);
+                // `twoturnmove` OUTLIVES the strike. PS's charge `onTryMove` is
+                // `if (attacker.removeVolatile(move.id)) return;` (`data/moves.ts:1716`): it drops
+                // the MOVE-SPECIFIC marker volatile and lets the strike through, leaving
+                // `twoturnmove` (duration 2) standing until the end-of-turn duration tick. So
+                // `twoturnmove` WITHOUT its marker means "already struck this turn", which is the
+                // engine's `PendingMove::None` — the field means "committed to strike NEXT turn".
+                // Only the pair means charging. Visible at rb1345 d42, a mid-turn faint request
+                // right after Eternatus' charged Meteor Beam connects.
+                let charging = mv != MoveId::None
+                    && vols.contains_key(mv.to_id().as_ref() as &str);
+                if charging {
+                    side.pending_move = PendingMove::Charging(mv);
+                }
             }
             "lockedmove" => {
                 side.volatiles.insert(VolatileStatus::LockedMove);
@@ -702,6 +746,7 @@ const KNOWN_VOLATILES: &[&str] = &[
     "attract", "torment", "destinybond", "glaiverush", "partiallytrapped", "protosynthesis",
     "quarkdrive", "mustrecharge", "twoturnmove", "lockedmove", "roost", "protect", "endure",
     "flinch", "charge", "focusenergy", "dragoncheer", "unburden", "throatchop", "healblock",
+    "magnetrise",
     "trapped", "trapper", "ingrain", "noretreat", "octolock", "chillyreception",
 ];
 

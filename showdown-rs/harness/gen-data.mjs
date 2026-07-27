@@ -39,7 +39,7 @@ const weatherRs = (s) => {
 
 // Boost effects PS implements via onHit callbacks (invisible to field extraction).
 const MANUAL_TARGET_BOOSTS = { partingshot: { atk: -1, spa: -1 } };
-const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock' };
+const VOLATILE = { confusion:'Confusion', substitute:'Substitute', leechseed:'LeechSeed', taunt:'Taunt', encore:'Encore', disable:'Disable', protect:'Protect', endure:'Endure', flinch:'Flinch', roost:'Roost', charge:'Charge', yawn:'Yawn', perishsong:'PerishSong', destinybond:'DestinyBond', curse:'Curse', nightmare:'Nightmare', attract:'Attract', torment:'Torment', saltcure:'SaltCure', glaiverush:'GlaiveRush', partiallytrapped:'PartiallyTrapped', focusenergy:'FocusEnergy', dragoncheer:'FocusEnergy', throatchop:'ThroatChop', healblock:'HealBlock', magnetrise:'MagnetRise' };
 const volatileRs = (s) => s && VOLATILE[s] ? `Some(VolatileStatus::${VOLATILE[s]})` : 'None';
 
 // boosts object -> [atk,def,spa,spd,spe,accuracy,evasion]
@@ -109,7 +109,11 @@ moves.forEach((m, i) => {
 	// boosts when target is self feed the user's PRIMARY boosts (Close Combat, Leaf Storm — these
 	// survive Sheer Force). A 100%-chance self-SECONDARY (Trailblaze spe, Power-Up Punch atk) is a
 	// secondary, so Sheer Force removes it — keep it in a separate field.
-	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, m.selfBoost && m.selfBoost.boosts, selfTarget ? m.boosts : null);
+	const selfBoostsObj = Object.assign({}, m.self && m.self.boosts, selfTarget ? m.boosts : null);
+		// `selfBoost.boosts` (Clanging Scales / Scale Shot / Clangorous Soulblaze) is a DISTINCT PS path:
+		// applied at battle-actions.ts:521 via `moveHit` with NO `random(100)` roll, unlike `self.boosts`
+		// above (which rolls in `selfDrops`). Own field so the engine applies it draw-free.
+		const selfBoostOnlyObj = m.selfBoost && m.selfBoost.boosts ? m.selfBoost.boosts : null;
 	const targetBoostsObj = !selfTarget ? m.boosts : null;
 	const fields = [
 		`id: MoveId(${idx})`,
@@ -125,7 +129,9 @@ moves.forEach((m, i) => {
 		`self_switch: ${!!m.selfSwitch}`,
 		`force_switch: ${!!m.forceSwitch}`,
 		`self_boosts: ${boostsRs(selfBoostsObj)}`,
+		`self_boost_chance: ${(m.self && m.self.boosts && m.self.chance) || 0}`,
 		`secondary_self_boosts: ${boostsRs(secSelfBoosts)}`,
+		`self_boost_only: ${boostsRs(selfBoostOnlyObj)}`,
 		`target_boosts: ${boostsRs(MANUAL_TARGET_BOOSTS[m.id] || targetBoostsObj)}`,
 		`secondary_chance: ${secChance}`,
 		`secondary_boosts: ${boostsRs(sec && sec.boosts)}`,
@@ -148,11 +154,21 @@ moves.forEach((m, i) => {
 		`flag_heal: ${!!(m.flags && m.flags.heal)}`,
 		`flag_powder: ${!!(m.flags && m.flags.powder)}`,
 		`flag_bypass_sub: ${!!(m.flags && m.flags.bypasssub)}`,
+		`flag_protect: ${!!(m.flags && m.flags.protect)}`,
+		`flag_charge: ${!!(m.flags && m.flags.charge)}`,
+		`flag_nosleeptalk: ${!!(m.flags && m.flags.nosleeptalk)}`,
+		`sleep_usable: ${m.sleepUsable === true}`,
 		`pp: ${m.pp || 0}`,
 		`target: ${targetRs(m.target)}`,
+		`non_ghost_target: ${targetRs(m.nonGhostTarget || m.target)}`,
+		`flag_mustpressure: ${!!(m.flags && m.flags.mustpressure)}`,
 		`crit_ratio: ${m.critRatio || 1}`,
 		`always_crit: ${m.willCrit === true}`,
 		`self_destruct: ${!!m.selfdestruct}`,
+		// Runtime-only flags (PS stamps these on the *active* move, not the dex entry):
+		// `move.typeChangerBoosted` (the -ate abilities) and Analytic's willMove() condition.
+		`type_changer_boosted: false`,
+		`analytic_boosted: false`,
 	];
 	moveRows.push(`    MoveData { ${fields.join(', ')} },`);
 });

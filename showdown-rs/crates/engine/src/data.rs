@@ -60,6 +60,13 @@ pub struct MoveData {
     /// Base PP (before PP Ups; PS default sets carry max PP Ups = ×8/5).
     pub pp: u8,
     pub target: MoveTarget,
+    /// PS `move.nonGhostTarget` — the target Curse's `onModifyMove` (data/moves.ts:3277)
+    /// substitutes for a non-Ghost user. Equal to `target` for every other move.
+    pub non_ghost_target: MoveTarget,
+    /// PS `flags.mustpressure` — Pressure taxes this move even when `getMoveTargets` would
+    /// otherwise hand it no pressure targets (Spikes / Stealth Rock / Toxic Spikes / Imprison /
+    /// Snatch / Tera Blast).
+    pub flag_mustpressure: bool,
     /// Crit-stage bonus from the move itself (1 = normal, 2 = high-crit like Slash, ...).
     pub crit_ratio: u8,
     /// Always crits (Wicked Blow, Surging Strikes, Flower Trick, ...).
@@ -82,9 +89,17 @@ pub struct MoveData {
     /// Stat-stage changes applied to the *user* (Close Combat self-drop, Swords Dance). These are
     /// primary effects and survive Sheer Force.
     pub self_boosts: [i8; BoostIndex::COUNT],
+    /// PS `move.self.chance`: `selfDrops` always rolls one `random(100)` for a `self.boosts`
+    /// payload, but applies it only when `chance` is undefined or the roll came in under it.
+    /// `0` = no chance field = always applies. Diamond Storm (50) is the only gen9 move with one.
+    pub self_boost_chance: u8,
     /// User stat-stages from a 100%-chance self-SECONDARY (Trailblaze +Spe, Power-Up Punch +Atk).
     /// Being a secondary, Sheer Force removes these (and makes the move Sheer-Force-eligible).
     pub secondary_self_boosts: [i8; BoostIndex::COUNT],
+    /// User stat-stages from PS `move.selfBoost` (Clanging Scales/Scale Shot −Def, Clangorous
+    /// Soulblaze). Applied at battle-actions.ts:521 via `moveHit` — distinct from `self.boosts`
+    /// (which rolls a `random(100)` in `selfDrops`): `selfBoost` rolls NOTHING.
+    pub self_boost_only: [i8; BoostIndex::COUNT],
     /// Stat-stage changes a status move applies to the *target* (Growl, Charm, ...).
     pub target_boosts: [i8; BoostIndex::COUNT],
 
@@ -128,6 +143,27 @@ pub struct MoveData {
     pub flag_powder: bool,
     /// `bypasssub` flag: sound moves, Taunt, Encore, ... act through a Substitute.
     pub flag_bypass_sub: bool,
+    /// `protect` flag: the move is blocked by Protect/Detect/… (PS `checkMoveBypassesProtect`,
+    /// sim/battle.ts:1300-1308). Roar/Whirlwind/Perish Song and the field moves lack it.
+    pub flag_protect: bool,
+    /// `charge` flag: two-turn moves (Solar Beam, Fly, Dig, Meteor Beam, ...). Sleep Talk's
+    /// callable pool excludes them (PS `sleeptalk` `onHit`).
+    pub flag_charge: bool,
+    /// `nosleeptalk` flag: the move cannot be called by Sleep Talk (PS `sleeptalk` `onHit`).
+    pub flag_nosleeptalk: bool,
+    /// PS `sleepUsable`: the move executes even while the user is asleep (Sleep Talk, Snore).
+    /// The slp `onBeforeMove` still ticks the sleep counter, it just does not cancel.
+    pub sleep_usable: bool,
+
+    // ---- RUNTIME flags (never set in the generated table; stamped by `execute_move_inner`
+    // so that `compute_damage` can fold the handler into the single `onBasePower` chain) ----
+    /// PS `move.typeChangerBoosted === this.effect`: an `-ate` ability (Pixilate / Refrigerate /
+    /// Aerilate / Galvanize) retyped this move, so its `onBasePower` (priority 23) contributes
+    /// `chainModify([4915, 4096])` (data/abilities.ts:3263-3266 and siblings).
+    pub type_changer_boosted: bool,
+    /// Analytic's `onBasePower` (priority 21) condition already evaluated at move time —
+    /// no other active still `willMove()` (data/abilities.ts:110-125).
+    pub analytic_boosted: bool,
 }
 
 impl MoveData {
@@ -142,6 +178,8 @@ impl MoveData {
             priority,
             pp: 0,
             target: MoveTarget::Normal,
+            non_ghost_target: MoveTarget::Normal,
+            flag_mustpressure: false,
             crit_ratio: 1,
             always_crit: false,
             self_destruct: false,
@@ -152,7 +190,9 @@ impl MoveData {
             self_switch: false,
             force_switch: false,
             self_boosts: [0; BoostIndex::COUNT],
+            self_boost_chance: 0,
             secondary_self_boosts: [0; BoostIndex::COUNT],
+            self_boost_only: [0; BoostIndex::COUNT],
             target_boosts: [0; BoostIndex::COUNT],
             secondary_chance: 0,
             secondary_boosts: [0; BoostIndex::COUNT],
@@ -175,6 +215,12 @@ impl MoveData {
             flag_heal: false,
             flag_powder: false,
             flag_bypass_sub: false,
+            flag_protect: false,
+            flag_charge: false,
+            flag_nosleeptalk: false,
+            sleep_usable: false,
+            type_changer_boosted: false,
+            analytic_boosted: false,
         }
     }
 }
