@@ -17,6 +17,7 @@ under `train/*` and every eval under `eval/<baseline>/*`, keyed by environment s
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -37,7 +38,13 @@ class RunLogger:
         if wandb_project:
             try:
                 import wandb
-                wandb.init(project=wandb_project, name=os.path.basename(self.dir), dir=self.dir)
+                # A stable id derived from the run directory, so every resume/relaunch CONTINUES
+                # one W&B run instead of minting a new id per process (scale2 shattered into four
+                # W&B runs in an afternoon of restarts before this).
+                run_name = os.path.basename(self.dir)
+                stable_id = hashlib.sha1(os.path.abspath(self.dir).encode()).hexdigest()[:16]
+                wandb.init(project=wandb_project, name=run_name, dir=self.dir,
+                           id=stable_id, resume="allow")
                 self._wandb = wandb
                 print(f"wandb: project '{wandb_project}' run '{os.path.basename(self.dir)}'")
             except Exception as e:  # not installed / not logged in -> fall back to files only
