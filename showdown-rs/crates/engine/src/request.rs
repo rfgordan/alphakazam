@@ -48,6 +48,7 @@ pub enum Request {
     Terminal { winner: i64 },
 }
 
+#[derive(Clone, Copy)]
 enum Pending {
     Turn,
     Pivot { side: SideId, second: Option<Action>, switched: [bool; 2], pass_sub: bool },
@@ -65,6 +66,9 @@ enum Pause {
 }
 
 /// A battle advanced request-by-request with sampled stochastics.
+/// `Clone` supports one-ply lookahead: clone, submit a joint action, read the successor —
+/// without disturbing the live battle (protocol capture is cheap to clone when off).
+#[derive(Clone)]
 pub struct Flow {
     pub state: State,
     pub rng: u64,

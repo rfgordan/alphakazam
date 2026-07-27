@@ -207,8 +207,14 @@ def evaluate_flow(model, opponent, device, n_games: int = 300, num_envs: int = 1
             is_learner = learner_side == side
             act = np.zeros(num_envs, dtype=np.int64)
             if is_learner.any():
-                act[is_learner] = _policy_actions(model, obs[is_learner], ids[is_learner],
-                                                  mask[is_learner], device)
+                # The "model" arm may itself be a callable agent (e.g. the E2 value-search
+                # wrapper) with the same signature scripted opponents use.
+                if callable(model) and not isinstance(model, torch.nn.Module):
+                    l_envs = [(int(e), side) for e in np.flatnonzero(is_learner)]
+                    act[is_learner] = model(env.vec, l_envs, mask[is_learner], rng)
+                else:
+                    act[is_learner] = _policy_actions(model, obs[is_learner], ids[is_learner],
+                                                      mask[is_learner], device)
             opp_rows = ~is_learner
             if opp_rows.any():
                 if opponent == "random":

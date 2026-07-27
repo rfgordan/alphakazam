@@ -1266,6 +1266,94 @@ impl FlowVec {
         Array2::from_shape_vec((n, N_ACTIONS_FLOW), flat).unwrap().into_pyarray_bound(py)
     }
 
+    /// One-ply joint-action lookahead for env `e` from `side`'s perspective (EXPLORATION_PLAN
+    /// E2). Only valid at a Turn request (both sides acting). For every joint pair
+    /// (a_self, a_opp) in the 13×13 action grid with both actions legal, a CLONE of the battle
+    /// is advanced one request with an rng derived from `seed` and the pair index, and the
+    /// successor is returned encoded from `side`'s view.
+    ///
+    /// Returns `(obs [169, OBS_DIM], ids [169, ID_DIM], done [169], outcome [169], valid [169])`
+    /// — row `a_self * 13 + a_opp`; `outcome` is ±1/0 from `side`'s view when `done`, else 0;
+    /// invalid pairs are zero rows. Call again with a different `seed` for a fresh stochastic
+    /// draw per pair (the caller averages samples).
+    fn lookahead_obs<'py>(
+        &self,
+        py: Python<'py>,
+        env: usize,
+        side: u8,
+        seed: u64,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<i64>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+    )> {
+        let f = self
+            .flows
+            .get(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("env out of range"))?;
+        if !matches!(f.request(), Request::Turn) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lookahead_obs is only valid at a Turn request",
+            ));
+        }
+        let me = sid(side);
+        let my_mask = flow_legal_mask(&f.state, f.request(), me);
+        let opp_mask = flow_legal_mask(&f.state, f.request(), me.other());
+        const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
+        let obs_dim = engine::encode::OBS_DIM;
+        let id_dim = engine::encode::ID_DIM;
+        let mut obs = vec![0f32; P * obs_dim];
+        let mut ids = vec![0i64; P * id_dim];
+        let mut done = vec![false; P];
+        let mut outcome = vec![0f32; P];
+        let mut valid = vec![false; P];
+        py.allow_threads(|| {
+            obs.par_chunks_mut(obs_dim)
+                .zip(ids.par_chunks_mut(id_dim))
+                .zip(done.par_iter_mut())
+                .zip(outcome.par_iter_mut())
+                .zip(valid.par_iter_mut())
+                .enumerate()
+                .for_each(|(p, ((((o, idr), d), out), v))| {
+                    let (ai, aj) = (p / N_ACTIONS_FLOW, p % N_ACTIONS_FLOW);
+                    if !my_mask[ai] || !opp_mask[aj] {
+                        return;
+                    }
+                    let mut sim = f.clone();
+                    // Distinct, deterministic stream per (seed, pair) — splitmix64 mix.
+                    let mut z = seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(p as u64 + 1));
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    sim.rng = z ^ (z >> 27);
+                    let c_me = flow_choice(&sim.state, me, ai as u8);
+                    let c_opp = flow_choice(&sim.state, me.other(), aj as u8);
+                    let (c0, c1) = if me == SideId::One { (c_me, c_opp) } else { (c_opp, c_me) };
+                    let next = sim.submit([Some(c0), Some(c1)]);
+                    o.copy_from_slice(&engine::encode::encode(&sim.state, me));
+                    idr.copy_from_slice(&engine::encode::encode_ids(&sim.state, me));
+                    if let Request::Terminal { winner } = next {
+                        *d = true;
+                        *out = if winner < 0 {
+                            0.0
+                        } else if winner == me.index() as i64 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
+                    }
+                    *v = true;
+                });
+        });
+        Ok((
+            Array2::from_shape_vec((P, obs_dim), obs).unwrap().into_pyarray_bound(py),
+            Array2::from_shape_vec((P, id_dim), ids).unwrap().into_pyarray_bound(py),
+            Array1::from_vec(done).into_pyarray_bound(py),
+            Array1::from_vec(outcome).into_pyarray_bound(py),
+            Array1::from_vec(valid).into_pyarray_bound(py),
+        ))
+    }
+
     /// (N,) scripted-heuristic action for every env, from `sides[i]`'s perspective (0/1).
     /// -1 where the heuristic has no opinion (non-acting request, or a state the Python
     /// implementation would raise on) — see [`heuristic_action_of`]. The Python-side wrapper
