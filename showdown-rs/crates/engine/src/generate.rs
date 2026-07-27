@@ -5377,14 +5377,21 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // battle-actions.ts:1127-1129) and still runs step 5, `secondaries()`. rb1038 t5: Throat
         // Chop into an intact Eiscue — PS rolls `random[100]` and the target ends the turn with
         // the `throatchop` volatile even though the hit dealt nothing.
-        apply_damage_secondaries(&mut hb, side, &md, false);
-        out.extend(
-            apply_target_secondary(hb, side, &md)
-                .into_iter()
-                .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
-                .flat_map(|sb| apply_cursed_body(sb, side, &md)),
-        );
+        // `spreadMoveHit` step 4, `selfDrops`, runs BEFORE step 5's `secondaries()` and this
+        // branch skipped it — see the Disguise arm below for the witness and the reasoning.
+        for mut hb in apply_self_drop(hb, side, &md)
+            .into_iter()
+            .flat_map(|x| if external { vec![x] } else { start_rampage_lock(x, side, move_id) })
+        {
+            apply_damage_secondaries(&mut hb, side, &md, false);
+            out.extend(
+                apply_target_secondary(hb, side, &md)
+                    .into_iter()
+                    .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                    .flat_map(|sb| apply_cursed_body(sb, side, &md)),
+            );
+        }
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -5412,26 +5419,36 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         draw(&mut hb, "random", &[16], 0, "damage-roll");
         emit_modifydamage_shuffle(&mut hb);
         bust_disguise(&mut hb, foe);
-        // `onDamage` returns 0, a NUMBER — the target stays live and `secondaries()` still runs
-        // (same shape as Ice Face above; data/abilities.ts:960-968).
-        apply_damage_secondaries(&mut hb, side, &md, false);
-        for mut sb in apply_target_secondary(hb, side, &md)
+        // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
+        // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
+        // `move.self.boosts` payload with its `random(100)` — and it sits AHEAD of step 5's
+        // `secondaries()`. Both this arm and the Ice Face arm above went straight to step 5.
+        // rb1093 d22 t17: Ice Hammer into an intact Mimikyu — PS rolls `random[100]@icehammer`
+        // and takes the user's Spe to −3; the engine made no roll and stopped at −2.
+        let dropped: Vec<Branch> = apply_self_drop(hb, side, &md)
             .into_iter()
-            .flat_map(|x| apply_flinch_split(x, side, &md))
-            .flat_map(|x| apply_contact_secondaries(x, side, &md))
-            .flat_map(|x| apply_cursed_body(x, side, &md))
-        {
-            match pivot {
-                Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
-                    emit_pivot_trailing_update(&mut sb);
-                    let pre = sb.state;
-                    apply_switch(&mut sb, side, t);
-                    emit_switch_bracket(&mut sb, &pre, side, t);
-                },
-                Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
-                Pivot::Stay => {}
+            .flat_map(|x| if external { vec![x] } else { start_rampage_lock(x, side, move_id) })
+            .collect();
+        for mut hb in dropped {
+            apply_damage_secondaries(&mut hb, side, &md, false);
+            for mut sb in apply_target_secondary(hb, side, &md)
+                .into_iter()
+                .flat_map(|x| apply_flinch_split(x, side, &md))
+                .flat_map(|x| apply_contact_secondaries(x, side, &md))
+                .flat_map(|x| apply_cursed_body(x, side, &md))
+            {
+                match pivot {
+                    Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(&mut sb);
+                        let pre = sb.state;
+                        apply_switch(&mut sb, side, t);
+                        emit_switch_bracket(&mut sb, &pre, side, t);
+                    },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Stay => {}
+                }
+                out.push(sb);
             }
-            out.push(sb);
         }
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
