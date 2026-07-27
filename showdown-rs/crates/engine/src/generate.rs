@@ -2392,6 +2392,15 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // in — PS clears the linked `trapped`/`partiallytrapped` when the trapper's `clearVolatile`
     // runs. The leaving mon's own trapping volatiles are cleared below via `ALL_VOLATILES`.
     clear_foe_sourced_traps(b, side.other());
+    // `moveLastTurnResult` — the flag Stomping Tantrum's doubler reads — is a PER-MON field that
+    // `clearVolatile` wipes on switch-out (sim/pokemon.ts:1546-1547), and the incoming mon's own
+    // copy was wiped the same way when IT last left. The engine keeps one flag per SIDE and only
+    // ever writes it from a move action, so a failed move left it set across the switch.
+    // rb1243 d11: a Walking Wake MISSES Hydro Pump on turn 8, Amoonguss comes in on turn 9 and uses
+    // Stomping Tantrum on turn 10 — PS deals 64, the engine doubled the base power and dealt 126.
+    if b.state.side(side).last_move_failed {
+        push(b, Instruction::SetLastMoveFailed { side, previous: true, new: false });
+    }
     // A traced / copied ability reverts on switch-out (Transform handles its own below).
     {
         let p = b.state.side(side).active();
