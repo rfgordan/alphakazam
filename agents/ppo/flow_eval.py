@@ -111,16 +111,25 @@ def _heuristic_actions_rust(vec, envs, mask, rng, stats: dict | None = None) -> 
     rows = np.array([e for e, _ in envs], dtype=np.int64)
     sides[rows] = [s for _, s in envs]
     acts = np.asarray(vec.heuristic_actions_all(sides), dtype=np.int64)[rows]
+    # Callers hand the heuristic their FULL env block, including rows whose side is not acting
+    # at this request (the engine discards those actions). The Rust port returns -1 there; that
+    # is routine, not a degraded baseline — only an acting row with no heuristic action counts
+    # toward the "baseline NOT trustworthy" alarm.
+    acting = {s: np.asarray(vec.acting_all(s), dtype=bool) for s in {s for _, s in envs}}
     out = np.empty(len(envs), dtype=np.int64)
-    for row, a in enumerate(acts):
+    n_acting = 0
+    for row, ((e, s), a) in enumerate(zip(envs, acts)):
+        is_acting = bool(acting[s][e])
+        n_acting += is_acting
         if a < 0 or not mask[row][a]:
-            if stats is not None:
+            if stats is not None and is_acting:
                 stats["fallbacks"] = stats.get("fallbacks", 0) + 1
+                stats.setdefault("last_error", "rust port returned no action on an acting row")
             legal = np.flatnonzero(mask[row])
             a = int(rng.choice(legal)) if legal.size else 0
         out[row] = a
     if stats is not None:
-        stats["calls"] = stats.get("calls", 0) + len(envs)
+        stats["calls"] = stats.get("calls", 0) + n_acting
     return out
 
 
