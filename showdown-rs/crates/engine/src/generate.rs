@@ -3751,6 +3751,28 @@ fn unarm_rampage_on_cancel(b: &mut Branch, side: SideId) {
     }
 }
 
+/// The `BeforeMove` handlers at priorities 7 / 6 / 5 — Disable (`onBeforeMovePriority: 7`),
+/// Throat Chop / Heal Block / Gravity (6) and Taunt (5). Each returns `false`, and PS's
+/// `runEvent` short-circuits there, so NOTHING below them runs: not confusion's countdown and
+/// 1/3 roll (3), not Attract's 1/2 (2), not paralysis' 1/4 (1), and not `deductPP`.
+///
+/// Enumerated from the pin rather than recalled — the full descending ladder is
+/// `100` Glaive Rush / Grudge / Rage / Chilly Reception (marker removal, never a cancel),
+/// `11` mustrecharge, `10` slp + frz, `9` Truant, `8` flinch, `7` Disable, `6` Gravity +
+/// Heal Block + Throat Chop, `5` Taunt, `3` confusion, `2` Attract, `1` par, `0` choicelock +
+/// Gorilla Tactics, `-1` Destiny Bond. Everything at 8 and above is handled by `execute_move`'s
+/// earlier gates; this is the 7/6/5 rung, and it belongs ABOVE the 3/2/1 draw ladder.
+fn before_move_blocked_7_6_5(state: &State, side: SideId, md: &crate::data::MoveData) -> bool {
+    let s = state.side(side);
+    // Disable: only the named move.
+    (s.disable.0 != crate::ids::MoveId::None && s.disable.0 == md.id)
+        // Throat Chop: sound moves. Heal Block: heal-flag moves (incl. drains).
+        || (s.volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound)
+        || (s.volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal)
+        // Taunt: every status move.
+        || (s.taunt_turns > 0 && md.category == MoveCategory::Status)
+}
+
 /// Execute one move, first splitting on confusion: a confused, awake mon has a 1/3 chance to
 /// hit itself instead of acting. The 2/3 "acts normally" branch is identical to no-confusion
 /// behavior, so this only *adds* the self-hit outcomes (no regression on the common path).
@@ -3819,6 +3841,27 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         && truant_gate(&mut b, side)
     {
         return vec![b];
+    }
+    // Disable (7), Throat Chop / Heal Block / Gravity (6) and Taunt (5) come NEXT in PS's
+    // `BeforeMove` ladder — above confusion (3), Attract (2) and paralysis (1). `runEvent`
+    // short-circuits on the first handler that returns false, so a mon whose move one of these
+    // cancels never reaches the lower handlers: **no paralysis roll, no Attract roll, no
+    // confusion countdown, and no PP.** The engine ran them the other way round, inside
+    // `execute_move_inner`, below this whole ladder.
+    //
+    // rb1493 d46 t39 is the witness: a paralyzed Chansey picks Heal Bell, Ursaring's Throat Chop
+    // lands first, and PS's unit records the four Throat Chop draws and NOTHING else — no
+    // `randomChance[1, 4]@par`. The engine rolled it, went one draw ahead of PS for the rest of
+    // the game, and the offset first showed up a unit later as a missing Seismic Toss accuracy.
+    // (rb1649 is the same shape.)
+    {
+        let attacker = b.state.side(side).active();
+        let mid = action.external_move.unwrap_or(attacker.moves[action.move_idx as usize].id);
+        let struggling = action.external_move.is_none()
+            && (attacker.moves[action.move_idx as usize].pp == 0 || action.struggling);
+        if !struggling && before_move_blocked_7_6_5(&b.state, side, &move_data(mid)) {
+            return vec![b];
+        }
     }
     // Confusion counts down on each move attempt and ends ("snapped out") at 0, in which
     // case the mon acts normally this turn (PS decrements before the 1/3 roll).
@@ -4662,21 +4705,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // was asleep AND taunted had its move cancelled by Taunt with the sleep counter untouched:
     // rb1009 d4 (a Dondozo asleep on 3 selects Rest, Froslass Taunts it first — PS ticks 3 -> 2)
     // and rb1356 d58 (the same shape with Coil).
-    if !struggling {
-        let dis = b.state.side(side).disable;
-        if dis.0 != crate::ids::MoveId::None && dis.0 == md.id {
-            return vec![b];
-        }
-        // Throat Chop: sound moves fail. Heal Block: heal-flag moves (incl. drains) fail.
-        if b.state.side(side).volatiles.contains(VolatileStatus::ThroatChop) && md.flag_sound {
-            return vec![b];
-        }
-        if b.state.side(side).volatiles.contains(VolatileStatus::HealBlock) && md.flag_heal {
-            return vec![b];
-        }
-        if b.state.side(side).taunt_turns > 0 && md.category == MoveCategory::Status {
-            return vec![b];
-        }
+    // `execute_move` already ran this ladder for a real move action, ahead of confusion /
+    // attract / paralysis. It stays here for the CALLED entries that reach
+    // `dispatch_move_inner` directly (Sleep Talk, Dancer, a bounced move), which never pass
+    // through `execute_move`. One predicate, `before_move_blocked_7_6_5`, for both.
+    if !struggling && before_move_blocked_7_6_5(&b.state, side, &md) {
+        return vec![b];
     }
 
     // --- multi-turn move commitment (charge / semi-invulnerable / recharge) ---
