@@ -4152,7 +4152,17 @@ fn revert_battle_only_forme(b: &mut Branch, side: SideId) {
     let pirouette = crate::ids::Species::from_id("meloettapirouette").unwrap_or(crate::ids::Species::None);
     let hangry = crate::ids::Species::from_id("morpekohangry").unwrap_or(crate::ids::Species::None);
     let meteor = crate::ids::Species::from_id("miniormeteor").unwrap_or(crate::ids::Species::None);
-    let (base, restat) = if p.species == pirouette {
+    // Cramorant-Gulping / Cramorant-Gorging revert on switch-out and on faint. Gulp Missile's
+    // `onSourceTryPrimaryHit` calls `source.formeChange(forme, effect)` with NO `isPermanent`
+    // (`data/abilities.ts` gulpmissile), so `baseSpecies` stays `cramorant` and `clearVolatile`'s
+    // `setSpecies(this.baseSpecies)` puts it back. That is the DIFFERENCE from Mimikyu-Busted and
+    // Palafin-Hero, whose `formeChange(..., true)` rewrites `baseSpecies` and therefore sticks.
+    // All three Cramorant formes share stats and typing, so no restat.
+    let gulping = crate::ids::Species::from_id("cramorantgulping").unwrap_or(crate::ids::Species::None);
+    let gorging = crate::ids::Species::from_id("cramorantgorging").unwrap_or(crate::ids::Species::None);
+    let (base, restat) = if p.species == gulping || p.species == gorging {
+        (crate::ids::Species::from_id("cramorant").unwrap_or(crate::ids::Species::None), false)
+    } else if p.species == pirouette {
         (crate::ids::Species::from_id("meloetta").unwrap_or(crate::ids::Species::None), true)
     } else if p.species == hangry {
         (crate::ids::Species::from_id("morpeko").unwrap_or(crate::ids::Species::None), false)
@@ -7646,6 +7656,13 @@ fn apply_post_damage(
     // volatiles are removed the moment their partner clears on faint (before residuals).
     // Likewise a faint releases the OPPONENT's infatuation (Attract's source is gone).
     if !b.state.side(foe).active().is_alive() {
+        // Gulp Missile fires from a Cramorant that FAINTED to the hit: PS's `onDamagingHit` guard
+        // is `if (!source.hp || !source.isActive || target.isSemiInvulnerable()) return` — it tests
+        // the ATTACKER's HP, never the holder's, and step 7 precedes `faintMessages`. The engine
+        // runs `apply_post_damage` ahead of the deferred `apply_damaging_hit_step7`, so the
+        // forme-revert below would erase the loaded forme before the missile ever fired. Firing it
+        // here first is idempotent — step 7's call re-reads the species and finds plain Cramorant.
+        apply_gulp_missile(b, foe.other(), foe);
         revert_transform(b, foe);
         revert_battle_only_forme(b, foe);
         if b.state.side(side).volatiles.contains(VolatileStatus::Trapped) {
