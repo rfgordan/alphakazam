@@ -1103,10 +1103,19 @@ async function main() {
 		});
 	}
 
+	// Corpus-composition witnesses, scanned off PS's own protocol log. `sleepClauseActivations`
+	// is the only hard evidence that a recording EXERCISED Sleep Clause Mod (the block leaves no
+	// trace in the serialized state — it is the absence of a status and of a `random(2,5)`).
+	const sleepClauseActivations =
+		battle.log.filter(l => l.startsWith('|-message|Sleep Clause Mod activated.')).length;
+	const sleepInflictions = battle.log.filter(l => /^\|-status\|.*\|slp$/.test(l)).length;
+
 	const trace = {
 		version: 2,
 		psCommit: PS_COMMIT,
 		format: FORMAT,
+		sleepClauseActivations,
+		sleepInflictions,
 		seed,
 		// The formatid actually handed to `new Battle` — the ONLY stamp `Ruleset::from_format`
 		// keys off. `format` above is merely what --format was set to.
@@ -1127,7 +1136,7 @@ async function main() {
 	} else {
 		fs.writeFileSync(OUT, body);
 	}
-	console.log(`wrote ${OUT}: ${decisions.length} decisions, ${trace.result.turns} turns, winner=${trace.result.winner}, ps=${PS_COMMIT.slice(0, 12)}`);
+	console.log(`wrote ${OUT}: ${decisions.length} decisions, ${trace.result.turns} turns, winner=${trace.result.winner}, slp=${sleepInflictions}, clause=${sleepClauseActivations}, ps=${PS_COMMIT.slice(0, 12)}`);
 }
 
 main();

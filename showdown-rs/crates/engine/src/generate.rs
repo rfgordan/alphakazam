@@ -1697,6 +1697,83 @@ pub fn is_trapped(state: &State, side: SideId) -> bool {
     false
 }
 
+/// PS `pokemon.maybeTrapped` — the request-JSON flag that says "a switch here MIGHT be refused,
+/// so the client must not let you take it back".
+///
+/// `nextTurn` (`sim/battle.ts:1723-1755`) resets `trapped = maybeTrapped = false`, runs
+/// `TrapPokemon` and `MaybeTrapPokemon` (which pick up the foe's REAL ability through
+/// `onFoeTrapPokemon` / `onFoeMaybeTrapPokemon`), and then sweeps **every ability the foe's
+/// apparent species could legally have** with `singleEvent('FoeMaybeTrapPokemon', ability, …)`.
+/// That sweep is skipped entirely by:
+///
+/// ```ts
+/// if ((ruleTable.has('+hackmons') || !ruleTable.has('obtainableabilities')) && !this.format.team) continue;
+/// ```
+///
+/// `[Gen 9] Custom Game` satisfies BOTH halves — no `obtainableabilities`, no `format.team` — so
+/// our entire recorded corpus has never seen it. `[Gen 9] Random Battle` fails both (Obtainable
+/// is in its ruleset and `team: 'random'`), so it runs. This is a genuine customgame->randbats
+/// delta in the request layer, hence `Ruleset::infer_foe_trapping_abilities`.
+///
+/// No PRNG (`singleEvent` has no handler list and never speed-sorts) — request shape only. And
+/// `maybeTrapped` does NOT reject a switch; only `trapped` does. Conflating the two is wrong the
+/// moment this flag can be set by an ability the foe does not actually have.
+///
+/// The three `onFoeMaybeTrapPokemon` handlers (`data/abilities.ts:203, 2477, 4117`) each add
+/// `isAdjacent` (always true in singles) to the same condition their real trap uses, with
+/// `!pokemon.knownType` disjuncts that are dead here — types are public in our model.
+pub fn maybe_trapped(state: &State, side: SideId) -> bool {
+    use crate::ids::Ability as Ab;
+    if is_trapped(state, side) {
+        return true;
+    }
+    if !state.ruleset.infer_foe_trapping_abilities {
+        return false;
+    }
+    let me = state.side(side).active();
+    if !me.is_alive() || me.types.contains(&Type::Ghost) || me.item == Item::ShedShell {
+        return false;
+    }
+    let foe = state.side(side.other()).active();
+    if !foe.is_alive() {
+        return false;
+    }
+    // PS skips the ability the foe ACTUALLY has ("pokemon event was already run above"), which is
+    // exactly the `is_trapped` case handled at the top.
+    species_possible_trap_abilities(foe.species)
+        .iter()
+        .filter(|&&ab| ab != foe.ability)
+        .any(|&ab| match ab {
+            Ab::ArenaTrap => is_grounded(state, side),
+            Ab::MagnetPull => me.types.contains(&Type::Steel),
+            Ab::ShadowTag => me.ability != Ab::ShadowTag,
+            _ => false,
+        })
+}
+
+/// Every gen-9 species carrying Arena Trap / Shadow Tag / Magnet Pull in ANY ability slot,
+/// enumerated from the pinned dex (`b9dc987d`) with PS's own two skips applied:
+/// `abilitySlot === 'H' && species.unreleasedHidden` (none of these), and
+/// `ruleTable.has('-ability:…')` (randbats bans no abilities).
+///
+/// Hardcoded rather than generated because the whole table is 17 species and the alternative is
+/// widening the 9k-line generated `gen.rs` for three abilities. The `*Past` entries
+/// (Gengar-Mega, Wobbuffet, Wynaut, Meltan) cannot be produced by the gen-9 randbats generator;
+/// they are listed so the function is a property of the DEX, not of one generator's pool.
+fn species_possible_trap_abilities(sp: crate::ids::Species) -> &'static [crate::ids::Ability] {
+    use crate::ids::Ability as Ab;
+    const ARENA: &[Ab] = &[Ab::ArenaTrap];
+    const SHADOW: &[Ab] = &[Ab::ShadowTag];
+    const MAGNET: &[Ab] = &[Ab::MagnetPull];
+    match sp.to_id() {
+        "diglett" | "dugtrio" | "trapinch" => ARENA,
+        "gothita" | "gothorita" | "gothitelle" | "wobbuffet" | "wynaut" | "gengarmega" => SHADOW,
+        "geodudealola" | "graveleralola" | "golemalola" | "magnemite" | "magneton" | "nosepass"
+        | "magnezone" | "probopass" | "meltan" => MAGNET,
+        _ => &[],
+    }
+}
+
 /// Clear the foe-sourced traps (partial trap / Mean Look-family / Octolock) on `victim`'s active
 /// when the trapper leaves the field. In singles the trapper is always the current opposing
 /// active, so any switch-out of it ends these; self-traps (Ingrain / No Retreat) are untouched.

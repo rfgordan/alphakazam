@@ -651,22 +651,41 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             out.push(format!("moves[{side_key}]: ps={ps_moves:?} engine={eng_moves:?}"));
         }
 
-        // Trapping legality is a CERTIFIED property: PS's request switch-lock must equal the
-        // engine's `is_trapped(...) || committed`. In singles PS reports volatile/locked traps as
+        // Trapping legality is a CERTIFIED property. PS reports volatile/locked traps as
         // `trapped: true` and ability traps (hidden `tryTrap(true)`: Arena Trap / Shadow Tag /
-        // Magnet Pull) as `maybeTrapped: true` — with types public both mean "switch rejected".
-        // PS omits both flags when the side has no one to switch to (`canSwitchIn == 0`), so the
-        // comparison is gated on a live bench. `committed` covers the rampage/charge/recharge
-        // lock (PendingMove), which PS also reports as trapped.
+        // Magnet Pull) as `maybeTrapped: true`; with types public and the foe's real ability
+        // known, both mean "switch rejected". PS omits both flags when the side has no one to
+        // switch to (`canSwitchIn == 0`), so the comparison is gated on a live bench.
+        // `committed` covers the rampage/charge/recharge lock (PendingMove), which PS also
+        // reports as trapped.
+        //
+        // UNDER RANDBATS THE TWO FLAGS COME APART and must be compared separately: `nextTurn`
+        // additionally sweeps every ability the foe's SPECIES could have
+        // (`sim/battle.ts:1741-1752`), so a mon facing a Dugtrio with Sand Veil gets
+        // `maybeTrapped: true` while the switch is perfectly legal. Conflating them was only
+        // sound because customgame skips that sweep entirely.
+        let sid = crate::convert::side_id(si);
         let committed = !matches!(side.pending_move, engine::state::PendingMove::None);
-        let ps_trapped = matches!(act.get("trapped"), Some(Value::Bool(true)))
-            || matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
-        let engine_trapped = committed || engine::generate::is_trapped(state, crate::convert::side_id(si));
         let has_bench = side.pokemon.iter().enumerate().any(|(i, p)| {
             i as u8 != side.active_index && p.species != engine::ids::Species::None && p.is_alive()
         });
-        if has_bench && ps_trapped != engine_trapped {
-            out.push(format!("trapped[{side_key}]: ps={ps_trapped} engine={engine_trapped}"));
+        let engine_trapped = committed || engine::generate::is_trapped(state, sid);
+        if state.ruleset.infer_foe_trapping_abilities {
+            let ps_hard = matches!(act.get("trapped"), Some(Value::Bool(true)));
+            let ps_maybe = matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
+            let eng_maybe = committed || engine::generate::maybe_trapped(state, sid);
+            if has_bench && ps_hard != engine_trapped {
+                out.push(format!("trapped[{side_key}]: ps={ps_hard} engine={engine_trapped}"));
+            }
+            if has_bench && ps_maybe != eng_maybe {
+                out.push(format!("maybeTrapped[{side_key}]: ps={ps_maybe} engine={eng_maybe}"));
+            }
+        } else {
+            let ps_trapped = matches!(act.get("trapped"), Some(Value::Bool(true)))
+                || matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
+            if has_bench && ps_trapped != engine_trapped {
+                out.push(format!("trapped[{side_key}]: ps={ps_trapped} engine={engine_trapped}"));
+            }
         }
 
         // Tera availability.

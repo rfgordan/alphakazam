@@ -127,7 +127,8 @@ impl Flow {
     /// Emit one resolved turn's protocol block (no-op when capture is off).
     fn emit_protocol(&mut self, pre: &State, m1: MoveChoice, m2: MoveChoice, ins: &[Instruction]) {
         if let Some(log) = &mut self.protocol_log {
-            crate::protocol::protocol_turn(pre, m1, m2, ins, crate::protocol::HpStyle::Percent, log);
+            let style = crate::protocol::HpStyle::for_ruleset(&pre.ruleset);
+            crate::protocol::protocol_turn(pre, m1, m2, ins, style, log);
         }
     }
 
@@ -454,7 +455,8 @@ impl Flow {
         // Protocol: the switch-in(s) + entry-hazard damage / switch-in ability effects, in order,
         // from `switch_into`'s returned instruction stream.
         if let Some(log) = &mut self.protocol_log {
-            crate::protocol::emit_instructions(&pre, &ins, crate::protocol::HpStyle::Percent, log);
+            let style = crate::protocol::HpStyle::for_ruleset(&pre.ruleset);
+            crate::protocol::emit_instructions(&pre, &ins, style, log);
         }
         self.after_turn();
     }

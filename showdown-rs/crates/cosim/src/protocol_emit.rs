@@ -126,10 +126,11 @@ fn replicate_select(outcomes: &[AnnotatedOutcome], prng: &mut PsPrng) -> usize {
 }
 
 /// Emit the full protocol log for one game, or an error label.
-fn emit_game(t: &Trace, hp_style: HpStyle) -> Result<Vec<String>, String> {
+fn emit_game(t: &Trace, hp_override: Option<HpStyle>) -> Result<Vec<String>, String> {
     let Some(limbs) = t.seed else { return Err("no-seed".into()) };
     let Some(first) = t.decisions.first() else { return Err("empty".into()) };
     let ruleset = crate::trace::ruleset_for(t.ruleset.as_deref(), &t.format)?;
+    let hp_style = hp_override.unwrap_or_else(|| HpStyle::for_ruleset(&ruleset));
     if first.request_state != crate::trace::first_decision_state(&ruleset) {
         return Err(format!("first-{}", first.request_state));
     }
@@ -283,7 +284,14 @@ pub fn run_protocol_emit(args: &[String], outdir: &str) -> ExitCode {
         eprintln!("mkdir {outdir}: {e}");
         return ExitCode::FAILURE;
     }
-    let hp_style = if std::env::var("PROTOCOL_EXACT").is_ok() { HpStyle::Exact } else { HpStyle::Percent };
+    // Default now follows the RULESET (`format.debug` -> exact HP), so a customgame recording
+    // renders exact HP like PS does and a randbats one renders percent HP with the 99 clamp.
+    // `PROTOCOL_EXACT` / `PROTOCOL_PERCENT` still force either arm for A/B work.
+    let hp_override = match (std::env::var("PROTOCOL_EXACT").is_ok(), std::env::var("PROTOCOL_PERCENT").is_ok()) {
+        (true, _) => Some(HpStyle::Exact),
+        (_, true) => Some(HpStyle::Percent),
+        _ => None,
+    };
     let mut ok = 0u32;
     let mut fail = 0u32;
     for path in args {
@@ -295,7 +303,7 @@ pub fn run_protocol_emit(args: &[String], outdir: &str) -> ExitCode {
             }
         };
         let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".json.gz").trim_end_matches(".json");
-        match emit_game(&t, hp_style) {
+        match emit_game(&t, hp_override) {
             Ok(lines) => {
                 let dest = format!("{outdir}/{name}.log");
                 if let Err(e) = std::fs::write(&dest, lines.join("\n")) {

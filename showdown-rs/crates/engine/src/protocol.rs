@@ -32,13 +32,36 @@ use crate::ids::{BoostIndex, Item, MoveCategory, Status, Terrain, Type, Weather}
 use crate::instruction::{Instruction, SideConditionId};
 use crate::state::{SideId, State};
 
-/// How to render HP in `|-damage|`/`|-heal|`/`|switch|` lines.
+/// How to render HP in the SHARED (foe/spectator-visible) half of `|-damage|`/`|-heal|`/
+/// `|switch|` lines. PS decides this in `Pokemon#getHealth` (`sim/pokemon.ts:2060`).
+///
+/// Note what does NOT decide it: `HP Percentage Mod`. The percent branch is
+/// `if (this.battle.reportPercentages || this.battle.gen >= 7)`, so in gen 9 it is taken with or
+/// without the rule — the rule is inert beyond its `|rule|` line. The real switch is
+/// `battle.reportExactHP = !!format.debug` (`sim/battle.ts:225`), which takes an EARLIER branch,
+/// and `format.debug` is a `[Gen 9] Custom Game` field. That is why our customgame corpus shows
+/// exact HP and a real random battle does not.
+///
+/// The SECRET half — your own request JSON's `condition` field — is always exact either way
+/// (`side.getRequestData()` uses `getHealth().secret`, `sim/pokemon.ts:1158`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HpStyle {
-    /// PS public spectator form: `cur/100` (percent of max, ceil like PS), plus `fnt` at 0.
+    /// PS public spectator form: `pct/100`, `ceil(100*hp/maxhp)` clamped DOWN to 99 whenever
+    /// `hp < maxhp`; `0 fnt` at 0.
     Percent,
     /// Exact form: `cur/max`.
     Exact,
+}
+
+impl HpStyle {
+    /// The style PS would use for the shared stream under `rs`.
+    pub fn for_ruleset(rs: &crate::ruleset::Ruleset) -> HpStyle {
+        if rs.report_exact_hp {
+            HpStyle::Exact
+        } else {
+            HpStyle::Percent
+        }
+    }
 }
 
 /// Emit the PS protocol lines for one resolved turn. `a1`/`a2` are side-One/side-Two choices;
@@ -302,7 +325,18 @@ fn details(p: &crate::state::Pokemon) -> String {
     }
 }
 
-/// HP fraction. `Percent`: PS public form — `ceil(100*cur/max)/100`, `0 fnt` at 0. `Exact`: `cur/max`.
+/// HP fraction, `Pokemon#getHealth` (`sim/pokemon.ts:2060-2100`) verbatim.
+///
+/// ```ts
+/// let percentage = Math.ceil(100 * this.hp / this.maxhp);
+/// if (percentage === 100 && this.hp < this.maxhp) percentage = 99;
+/// ```
+///
+/// **The 99 clamp was missing** (RULESET_SPEC.md §2 / H7) — a live bug the moment we emit
+/// percent HP, and reachable for any `maxhp > 100` at `hp = maxhp - 1`: a 403/404 Blissey
+/// rendered `100/100` where PS says `99/100`, i.e. the log claimed a mon was untouched. It never
+/// fired on our corpus only because customgame's `format.debug` puts every recording on the
+/// `Exact` arm.
 fn hp_frac(cur: i16, max: i16, style: HpStyle) -> String {
     if cur <= 0 {
         return "0 fnt".to_string();
@@ -311,9 +345,35 @@ fn hp_frac(cur: i16, max: i16, style: HpStyle) -> String {
         HpStyle::Exact => format!("{}/{}", cur, max),
         HpStyle::Percent => {
             let m = max.max(1) as i32;
-            let pct = ((cur as i32 * 100 + m - 1) / m).clamp(1, 100); // ceil, min 1 while alive
-            format!("{}/100", pct)
+            let mut pct = (cur as i32 * 100 + m - 1) / m; // ceil(100*cur/max)
+            if pct == 100 && cur < max {
+                pct = 99;
+            }
+            format!("{}/100", pct.clamp(1, 100))
         }
+    }
+}
+
+#[cfg(test)]
+mod hp_tests {
+    use super::*;
+
+    #[test]
+    fn percent_matches_ps_get_health() {
+        // The clamp: one HP short of full on a >100-max mon is 99, not 100.
+        assert_eq!(hp_frac(404, 404, HpStyle::Percent), "100/100");
+        assert_eq!(hp_frac(403, 404, HpStyle::Percent), "99/100");
+        assert_eq!(hp_frac(400, 404, HpStyle::Percent), "99/100");
+        // ceil, not round.
+        assert_eq!(hp_frac(1, 404, HpStyle::Percent), "1/100");
+        assert_eq!(hp_frac(202, 404, HpStyle::Percent), "50/100");
+        assert_eq!(hp_frac(203, 404, HpStyle::Percent), "51/100");
+        // maxhp <= 100: ceil already never reports a false 100 for hp < max, and the clamp is a
+        // no-op there (99/100 would be wrong for 99/100 real HP — PS agrees, since hp < maxhp).
+        assert_eq!(hp_frac(99, 100, HpStyle::Percent), "99/100");
+        assert_eq!(hp_frac(100, 100, HpStyle::Percent), "100/100");
+        assert_eq!(hp_frac(0, 404, HpStyle::Percent), "0 fnt");
+        assert_eq!(hp_frac(403, 404, HpStyle::Exact), "403/404");
     }
 }
 
