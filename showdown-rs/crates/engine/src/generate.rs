@@ -726,6 +726,38 @@ pub fn replacement_bracket_tied(pre: &State, replacements: &[(SideId, u8)]) -> b
     alive && sp[0] == sp[1]
 }
 
+/// Whether `commitChoices`' `queue.sort()` over a SIMULTANEOUS both-sides forced replacement ties.
+///
+/// A forced replacement is answered through the normal choice flow, so `commitChoices`
+/// (sim/battle.ts) clears the queue, commits both sides' choices and calls `this.queue.sort()`
+/// BEFORE `turnLoop` — one `speedSort` over the two `instaswitch` actions (order 3). They share
+/// order and priority, so they tie ⟺ their `action.speed` values are equal, and
+/// `action.speed = action.pokemon.getActionSpeed()` (sim/battle.ts:2681) is recomputed LIVE from
+/// the OUTGOING mon — the one that just fainted. `faintMessages` ran `clearVolatile(false)` on it
+/// (sim/battle.ts:2576), so that Speed carries no boosts and no volatiles; its status, item and the
+/// side conditions survive. One replacement alone cannot tie: `speedSort` returns immediately on a
+/// list of length 1.
+///
+/// This is a draw the gate never consumed. It precedes both the `insertChoice` `random(0, 2)` and
+/// the replacement BRACKET — which sort the INCOMING mons — and is independent of them: rb1271 d10
+/// fires this one alone, rb1329 d23 fires the other two alone.
+///
+/// Witness rb1271 d10 t8: Brambleghast's Rapid Spin and Tauros's Flare Blitz KO each other at t7,
+/// both sides replace at t8, and PS's only draw for the whole unit is one `shuffle[2, 0, 2]` whose
+/// group is `[{choice:'instaswitch', p1: Brambleghast, order 3, speed 209}, {choice:'instaswitch',
+/// p2: Tauros, order 3, speed 209}]`. The incoming pair (Torkoal / Iron Bundle) is NOT tied, so the
+/// bracket contributes nothing and the engine consumed zero draws for the unit.
+pub fn replacement_queue_sort_tied(pre: &State) -> bool {
+    let spe = |side: SideId| {
+        let mut st = *pre;
+        let s = st.side_mut(side);
+        s.boosts = [0; 7];
+        s.volatiles = Default::default();
+        effective_speed(&st, side)
+    };
+    spe(SideId::One) == spe(SideId::Two)
+}
+
 /// Whether `ability` can be copied by Trace (PS `onUpdate` skips a `notrace`/self-referential
 /// ability — the copy never fires and no `sample` is drawn). Shared by the switch-in Trace copy
 /// and the seed gate's forced-replacement trace-draw accounting.

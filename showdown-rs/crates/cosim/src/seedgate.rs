@@ -610,6 +610,10 @@ fn step_unit(
     let field_change_draws = engine::generate::replacement_field_change_draws(state, &repl_sides);
     // Same PRE-swap board: the incoming mon's cached Speed predates its own entry effects.
     let bracket_tied = engine::generate::replacement_bracket_tied(state, &repl_sides);
+    // A SIMULTANEOUS both-sides replacement makes up to two draws BEFORE the bracket, on two
+    // different Speed pairs. Both predicates are measured on the PRE-swap board.
+    let both_sides_replace = replacements.len() == 2 && replacements[0].0 != replacements[1].0;
+    let queue_sort_tied = both_sides_replace && engine::generate::replacement_queue_sort_tied(state);
     let mut replaced = [false; 2];
     if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
         engine::generate::switch_into_pair(state, [
@@ -646,6 +650,34 @@ fn step_unit(
         eprintln!("  BRACKET replacements={replacements:?} pre_end_turn={pre_end_turn} tied={bracket_tied} fieldchange={field_change_draws} post_spe=[{},{}]",
             engine::generate::effective_speed(state, side_id(0)),
             engine::generate::effective_speed(state, side_id(1)));
+    }
+    // A SIMULTANEOUS both-sides forced replacement makes up to TWO draws before the bracket, on two
+    // DIFFERENT Speed pairs. Both were missing; both are one `next()` and both are gated on the two
+    // sides replacing at once (with only one replacement neither can fire).
+    //
+    // 1. `commitChoices`' `queue.sort()` — one `speedSort` over the two `instaswitch` actions
+    //    (order 3), run before `turnLoop`. It ties on the OUTGOING, just-fainted mons'
+    //    `getActionSpeed()`; see `replacement_queue_sort_tied`. Witness rb1271 d10 t8: the whole
+    //    unit's only PS draw is `shuffle[2,0,2]` over
+    //    `[{choice:'instaswitch', p1: Brambleghast, order 3, speed 209}, {…, p2: Tauros, 209}]`.
+    //    The INCOMING pair (Torkoal 85 / Iron Bundle 257) is untied, so nothing else fires.
+    //
+    // 2. `switchIn`'s `queue.insertChoice({choice:'runSwitch'})` (sim/battle-queue.ts:364-397).
+    //    `instaswitch` is order 3 and `runSwitch` is 101, so the FIRST replacement's `runSwitch`
+    //    sorts BEHIND the second side's still-pending `instaswitch` and is still in the queue when
+    //    the second replacement inserts its own. The two `runSwitch` actions share order and
+    //    priority, so `comparePriority` returns 0 on equal Speed, `firstIndex !== lastIndex`, and
+    //    `insertChoice` picks the slot with `this.battle.random(firstIndex, lastIndex + 1)` — a bare
+    //    `random(0, 2)`, NOT a shuffle. `insertChoice` calls `pokemon.updateSpeed()` on the INCOMING
+    //    mon first, so it ties on exactly the bracket's pair (`switch_entry_speed`, pre-entry).
+    //    Witness rb1329 d23 t16: PS records `random[0, 2] = 1` and then the three bracket shuffles
+    //    over [Stonjourner 179, Great Tusk 179]; the outgoing pair (Squawkabilly 205 / Qwilfish 189)
+    //    is untied, so draw 1 does not fire there.
+    if queue_sort_tied {
+        let _ = consume(prng, "shuffle", &[2, 0, 2]);
+    }
+    if both_sides_replace && bracket_tied {
+        let _ = consume(prng, "random", &[0, 2]);
     }
     if !pre_end_turn && !replacements.is_empty() && bracket_tied {
         let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
