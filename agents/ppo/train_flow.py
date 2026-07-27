@@ -255,6 +255,14 @@ def train(args):
             else:
                 opp_action = greedy_actions(exploit_net, obs_o, ids_o, mask_o, device)
 
+            # Kickstart: the Rust heuristic's opinion on the LEARNER's request (cheap — one
+            # rayon call), stored as a distillation target while the anneal is live.
+            teacher_t = None
+            if args.kickstart_coef > 0 and global_step < args.kickstart_anneal_steps:
+                teacher_np = np.asarray(env.vec.heuristic_actions_all(env.learner_side),
+                                        dtype=np.int64)
+                teacher_t = torch.as_tensor(teacher_np, device=device)
+
             reward, done, active, dyn, outcome = env.step(action.cpu().numpy(), opp_action)
 
             buffer.add(t, obs_t, mask_t, action, log_prob, value,
@@ -263,7 +271,8 @@ def train(args):
                        obs_ids=ids_t,
                        opp_action=torch.as_tensor(opp_action, device=device) if cfg.aux else None,
                        dyn_target=torch.as_tensor(dyn, device=device) if cfg.aux else None,
-                       active=torch.as_tensor(active.astype(np.float32), device=device))
+                       active=torch.as_tensor(active.astype(np.float32), device=device),
+                       teacher_action=teacher_t)
             global_step += cfg.num_envs
 
             for e in np.flatnonzero(done):
@@ -282,7 +291,11 @@ def train(args):
                 torch.as_tensor(mask_l, device=device),
                 obs_ids=torch.as_tensor(ids_l, device=device))
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
-        stats = ppo_update(model, opt, buffer.flat_view(), cfg, batch)
+        data = buffer.flat_view()
+        if args.kickstart_coef > 0:
+            frac = max(0.0, 1.0 - global_step / max(1, args.kickstart_anneal_steps))
+            data["kick_coef"] = args.kickstart_coef * frac
+        stats = ppo_update(model, opt, data, cfg, batch)
 
         # In exploit mode nothing clears the window; keep it a sliding recent-form estimate.
         if exploit_net is not None and len(window) > 50_000:
@@ -402,6 +415,10 @@ def main():
                         "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
     p.add_argument("--target-kl", type=float, default=0.0,
                    help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
+    p.add_argument("--kickstart-coef", type=float, default=0.0,
+                   help=">0: distill toward the Rust heuristic's action with this coefficient, "
+                        "annealed linearly to 0 over --kickstart-anneal-steps (E1 arm c)")
+    p.add_argument("--kickstart-anneal-steps", type=int, default=5_000_000)
     p.add_argument("--init", type=str, default=None, metavar="CKPT",
                    help="warm-start model weights from this checkpoint (fresh optimizer/league; "
                         "ignored when --resume finds a training_state)")

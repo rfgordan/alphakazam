@@ -130,8 +130,12 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             mb = torch.as_tensor(idx[start:start + cfg.minibatch_size], device=data["obs"].device)
             mb_ids = obs_ids[mb] if obs_ids is not None else None
 
+            teacher = data.get("teacher_action")
+            kick_coef = float(data.get("kick_coef", 0.0))
             _, new_log_prob, entropy, new_value, *rest = model.act(
-                data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids, return_aux=use_aux
+                data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids,
+                return_aux=use_aux,
+                teacher_action=teacher[mb] if (teacher is not None and kick_coef > 0) else None,
             )
 
             # "The learner actually chose here" (decision-point env: single-sided replacement /
@@ -157,6 +161,18 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
 
             entropy_loss = (entropy * m).sum() / denom
             loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss
+
+            # Kickstart distillation: -log pi(teacher_action) on steps where the teacher had an
+            # opinion AND the learner was acting; the coefficient anneals to 0 (train_flow owns
+            # the schedule). Weak supervision that shapes early exploration, then gets out of
+            # the way.
+            kick_v = 0.0
+            if teacher is not None and kick_coef > 0 and model.teacher_log_prob is not None:
+                km = m * (teacher[mb] >= 0).float()
+                kdenom = km.sum().clamp(min=1.0)
+                kick_loss = -(model.teacher_log_prob * km).sum() / kdenom
+                loss = loss + kick_coef * kick_loss
+                kick_v = kick_loss.item()
 
             # Auxiliary prediction losses — gradient flows to the trunk, NOT the policy head.
             aux_loss = torch.zeros((), device=loss.device)
@@ -191,6 +207,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 aux_opp=aux_opp_v,        # opponent-move cross-entropy
                 aux_delta=aux_delta_v,    # world-model HP-Δ MSE (watch vs its irreducible floor)
                 aux_ko=aux_ko_v,          # world-model KO BCE
+                kick_loss=kick_v,         # kickstart distillation CE (0 when off/annealed out)
             )
     return last
 

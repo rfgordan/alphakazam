@@ -92,8 +92,14 @@ class ActorCritic(nn.Module):
         value = self.value_head(h).squeeze(-1)
         return logits, value
 
-    def act(self, obs, action_mask=None, action=None, obs_ids=None, return_aux=False):
-        """Sample (or evaluate a given) action. Returns (action, log_prob, entropy, value[, aux])."""
+    def act(self, obs, action_mask=None, action=None, obs_ids=None, return_aux=False,
+            teacher_action=None):
+        """Sample (or evaluate a given) action. Returns (action, log_prob, entropy, value[, aux]).
+
+        `teacher_action` (long, -1 = no teacher): also compute the policy's log-prob of the
+        teacher's action — the kickstart distillation term. Invalid rows evaluate at index 0 and
+        must be masked out by the caller (they carry no gradient there anyway once masked).
+        """
         h = self._trunk_features(obs, obs_ids)
         logits = self.policy_head(h)
         if action_mask is not None:
@@ -102,6 +108,9 @@ class ActorCritic(nn.Module):
         dist = Categorical(logits=logits)
         if action is None:
             action = dist.sample()
+        self.teacher_log_prob = None
+        if teacher_action is not None:
+            self.teacher_log_prob = dist.log_prob(teacher_action.clamp(min=0))
         out = (action, dist.log_prob(action), dist.entropy(), value)
         if return_aux:
             # Return the trunk features so the dynamics head can be conditioned on the actions

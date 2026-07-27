@@ -36,15 +36,23 @@ class RolloutBuffer:
         # policy/entropy terms with this; value regression and GAE run over every step. Defaults
         # to all-ones so the whole-turn envs are unaffected.
         self.active = torch.ones(shape, device=device)
+        # Kickstart distillation target (long, -1 = no teacher opinion at this step). Allocated
+        # lazily on the first add() that supplies one.
+        self.teacher_actions = None
 
         # Filled by compute_gae().
         self.advantages = torch.zeros(shape, device=device)
         self.returns = torch.zeros(shape, device=device)
 
     def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None,
-            opp_action=None, dyn_target=None, active=None):
+            opp_action=None, dyn_target=None, active=None, teacher_action=None):
         self.obs[t] = obs
         self.active[t] = 1.0 if active is None else active
+        if teacher_action is not None:
+            if self.teacher_actions is None:
+                self.teacher_actions = torch.full((self.steps, self.num_envs), -1,
+                                                  dtype=torch.long, device=self.device)
+            self.teacher_actions[t] = teacher_action
         if self.obs_ids is not None and obs_ids is not None:
             self.obs_ids[t] = obs_ids
         if self.aux and opp_action is not None:
@@ -90,4 +98,6 @@ class RolloutBuffer:
         if self.aux:
             d["opp_action"] = self.opp_actions.reshape(-1)
             d["dyn_target"] = self.dyn_targets.reshape(-1, 4)
+        if self.teacher_actions is not None:
+            d["teacher_action"] = self.teacher_actions.reshape(-1)
         return d
