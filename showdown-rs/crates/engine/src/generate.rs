@@ -8799,6 +8799,17 @@ fn mark_stats_lowered(b: &mut Branch, side: SideId) {
     }
 }
 
+/// PS `side.foePokemonLeft()` (`sim/side.ts:364`) for the side that is about to be BOOSTED:
+/// does the boosted mon's opponent still have an unfainted Pokémon? `Battle.boost()` returns
+/// false without applying anything when it is zero in gen > 5 (`sim/battle.ts:2028`).
+///
+/// PS counts `side.pokemonLeft`, which `faintMessages` decrements — so this predicate is only
+/// interchangeable with "hp > 0" at a site the engine reaches after PS's faint processing.
+/// Call it only from such a site.
+fn foe_pokemon_left(state: &State, boosted: SideId) -> bool {
+    state.side(boosted.other()).pokemon.iter().any(|p| p.is_alive())
+}
+
 /// Apply a *self*-boost (Swords Dance, Leaf Storm's −2 SpA, ...). Self-boosts ignore Clear
 /// Body but are inverted by Contrary. Returns nothing; clamps to ±6.
 fn apply_self_boost(b: &mut Branch, side: SideId, stat: BoostIndex, delta: i8) {
@@ -9626,9 +9637,20 @@ fn apply_damage_secondaries(b: &mut Branch, side: SideId, md: &crate::data::Move
     // (`if (move.selfBoost && moveResult) this.moveHit(pokemon, pokemon, move, move.selfBoost, …)`)
     // with NO `random(100)` roll — distinct from `move.self.boosts`, which rolls in `selfDrops`.
     // Emitted here (no draw) once the move connected.
-    for (i, &delta) in md.self_boost_only.iter().enumerate() {
-        if delta != 0 {
-            apply_self_boost(b, side, BOOST_ORDER[i], delta);
+    //
+    // `Battle.boost()` REFUSES outright when the boosted mon's side has no living foes left:
+    // `if (this.gen > 5 && !target.side.foePokemonLeft()) return false` (`sim/battle.ts:2028`).
+    // `selfBoost` is the one boost site the engine reaches AFTER PS has already run
+    // `faintMessages` (`battle-actions.ts:979`, at the end of `hitStepMoveHitLoop`, which is what
+    // decrements `side.pokemonLeft`) — so a move that KOs the LAST foe takes no self-drop.
+    // rb1233 d39: Kommo-o's second Clanging Scales KOs the last Farigiraf and PS leaves it at
+    // Def −1, not −2. Everything else the engine boosts on a hit (`move.self.boosts`, the
+    // secondaries below) runs INSIDE the hit loop, before that decrement, and is unaffected.
+    if md.self_boost_only.iter().any(|&d| d != 0) && foe_pokemon_left(&b.state, side) {
+        for (i, &delta) in md.self_boost_only.iter().enumerate() {
+            if delta != 0 {
+                apply_self_boost(b, side, BOOST_ORDER[i], delta);
+            }
         }
     }
     // Secondary self-boosts (Trailblaze +Spe, Power-Up Punch +Atk) are SECONDARIES, so Sheer
