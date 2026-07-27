@@ -34,6 +34,9 @@ class PPOConfig:
     update_epochs: int = 4
     minibatch_size: int = 256
     norm_advantages: bool = True
+    target_kl: float = 0.0      # >0: stop the epoch loop once approx_kl exceeds this (0 = off).
+                                # Makes extra epochs safe on an env-bound loop: cheap when the
+                                # policy is stable, cut short when it starts to run away.
 
     # --- auxiliary prediction losses (representation-shaping; never touch the policy head) ---
     aux: bool = True            # opponent-move + world-model (damage/KO) prediction heads

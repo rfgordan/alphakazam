@@ -115,11 +115,38 @@ pub enum RealizedSource {
     /// Differ: the unit's recorded draw RESULTS in order (sample → chosen index). The executor
     /// indexes by the branch's draws-so-far length, which equals PS's draw position when aligned.
     Recorded(std::rc::Rc<Vec<i64>>),
+    /// `Exec::Sample` (training): draw outcomes from a splitmix64 stream held in [`SPLITMIX`].
+    ///
+    /// Sample mode follows ONE path, so it has no use for the branch set a multi-hit move's
+    /// per-hit product generates — but it was still paying for it, because pruning happens at
+    /// stage seams and the product is built *inside* a stage. Triple Axel is the extreme case:
+    /// (16 damage rolls x 2 crit)^k for k=1..3 = 33,825 branches, each cloning a `State`, all
+    /// but one discarded. Installing this source routes the same moves down the realized
+    /// executor the seed gate already uses, which draws per hit and emits a single branch.
+    ///
+    /// Unlike the other two this carries no state of its own: the stream lives in a separate
+    /// cell so `realized_cursor` (which only has `&`) can advance it.
+    Splitmix,
 }
 
 thread_local! {
     static REALIZED_SOURCE: std::cell::RefCell<Option<RealizedSource>> =
         const { std::cell::RefCell::new(None) };
+    /// The `RealizedSource::Splitmix` stream. Seeded per call from the sampled executor's own RNG
+    /// (see `generate_instructions_sampled`) so a run stays reproducible from its seed.
+    static SPLITMIX: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One splitmix64 step of the [`SPLITMIX`] stream.
+fn splitmix_next() -> u64 {
+    SPLITMIX.with(|c| {
+        let s = c.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        c.set(s);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
 }
 
 /// Install (or clear) the realized multi-hit source for the current thread. See [`RealizedSource`].
@@ -172,6 +199,10 @@ fn consume_shape(p: &mut crate::psprng::PsPrng, kind: &str, args: &[i32]) {
 enum RealizedCursor {
     Prng(crate::psprng::PsPrng),
     Recorded { results: std::rc::Rc<Vec<i64>>, idx: usize },
+    /// Sample mode. Stateless here — each `peek` advances the thread-local [`SPLITMIX`] stream,
+    /// so several cursors taken within one decision continue the same stream instead of
+    /// replaying it (two multi-hit moves in the same turn must not roll identically).
+    Splitmix,
 }
 
 impl RealizedCursor {
@@ -189,6 +220,21 @@ impl RealizedCursor {
                 *idx += 1;
                 r
             }
+            // Same call forms as the `Prng` arm and the same interpretation of each, so the
+            // realized executor cannot tell them apart; only the bit source differs.
+            RealizedCursor::Splitmix => {
+                let r = splitmix_next();
+                match kind {
+                    "randomChance" => ((r % args[1].max(1) as u64) < args[0] as u64) as i64,
+                    "random" if args.len() == 2 => {
+                        let (from, to) = (args[0] as u64, args[1].max(args[0] + 1) as u64);
+                        (from + r % (to - from)) as i64
+                    }
+                    "random" => (r % args[0].max(1) as u64) as i64,
+                    "sample" => (r % args[0].max(1) as u64) as i64,
+                    _ => 0,
+                }
+            }
         }
     }
     /// Consume the inter-hit `ModifyDamage` screen-tie `shuffle[k,0,k]` that `apply_damage_hit`
@@ -205,6 +251,10 @@ impl RealizedCursor {
         match self {
             RealizedCursor::Prng(p) => consume_shape(p, "shuffle", &[k, 0, k]),
             RealizedCursor::Recorded { idx, .. } => *idx += 1,
+            // Nothing to stay in step with: the splitmix stream exists only to pick outcomes, and
+            // a speed-tie shuffle does not decide one. Skipping it keeps the stream shorter; it
+            // cannot desync anything because no other reader shares this stream.
+            RealizedCursor::Splitmix => {}
         }
     }
 }
@@ -236,7 +286,30 @@ fn realized_cursor(b: &Branch) -> Option<RealizedCursor> {
         Some(RealizedSource::Recorded(results)) => {
             Some(RealizedCursor::Recorded { results: std::rc::Rc::clone(results), idx: b.draws.len() })
         }
+        // Sample mode deliberately does NOT realize here — see `realized_cursor_per_hit`.
+        Some(RealizedSource::Splitmix) => None,
     })
+}
+
+/// Like [`realized_cursor`], but also hands `Exec::Sample` a cursor.
+///
+/// Only valid for moves whose ENUMERATE path also emits one `Damage` per hit. The variable
+/// [2,5] moves, Population Bomb and Beat Up are compressed by the sumset DP in Enumerate: that
+/// path emits a SINGLE aggregated `Damage { amount: total }`, while the realized executor emits
+/// `Damage` per hit. Final HP agrees, the transcript does not — and the transcript is what the
+/// protocol emitter, the narrator, the apply/reverse roundtrip and `sampled_distribution`'s
+/// support check all read. Letting Sample realize those moves silently desynchronised the
+/// sampled transcript from the enumerated one (caught by the multi-hit support check).
+///
+/// `tripleaxel`/`triplekick` enumerate via `HitCombos`, which already emits per-hit `Damage`, so
+/// realizing them in Sample is transcript-identical — and they are the moves that actually cost:
+/// (16 rolls x 2 crit)^k for k=1..3 = 33,825 branches, ~408 ms per decision, all but one thrown
+/// away.
+fn realized_cursor_per_hit(b: &Branch) -> Option<RealizedCursor> {
+    if REALIZED_SOURCE.with(|c| matches!(&*c.borrow(), Some(RealizedSource::Splitmix))) {
+        return Some(RealizedCursor::Splitmix);
+    }
+    realized_cursor(b)
 }
 
 /// True if `md` is a multi-hit move the realized executor handles (variable [2,5] or a fixed count
@@ -2025,11 +2098,22 @@ pub fn generate_instructions_sampled(
     tera: [bool; 2],
     rng: &mut u64,
 ) -> StateInstructions {
+    // Realize multi-hit moves instead of enumerating their per-hit product. Sample follows one
+    // path, so the product is pure waste — see `RealizedSource::Splitmix`. Seeded from `rng` so
+    // the run stays reproducible from its seed, and folded back below so the stream advances.
+    //
+    // Save/restore rather than clear: the seed gate installs a `Prng` source around its own
+    // generation, and must get it back if anything ever calls this from inside that scope.
+    let prev = REALIZED_SOURCE.with(|c| c.borrow_mut().take());
+    SPLITMIX.with(|c| c.set(rng.wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(17)));
+    set_realized_source(Some(RealizedSource::Splitmix));
+
     let mut exec = Exec::Sample(*rng);
     let mut out = generate_instructions_ctx(state, s1, s2, pivot, tera, &mut exec);
     if let Exec::Sample(s) = exec {
-        *rng = s;
+        *rng = s ^ SPLITMIX.with(|c| c.get());
     }
+    set_realized_source(prev);
     debug_assert_eq!(out.len(), 1);
     out.pop().unwrap_or(StateInstructions { percentage: 100.0, instructions: Vec::new() })
 }
@@ -6129,9 +6213,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             .map(|i| { let mut m = md; m.base_power = step * i; m })
             .collect();
         let calcs: Vec<DamageCalc> = mds.iter().map(|m| compute_damage(&b, side, m)).collect();
-        if let Some(cur) = realized_cursor(&b) {
-            // Realized single path (seed gate / differ): per-hit accuracy + crit + damage off the
-            // source, KO-truncated. The enumerated branch below serves Enumerate/Sample (no draws).
+        if let Some(cur) = realized_cursor_per_hit(&b) {
+            // Realized single path (seed gate / differ / SAMPLE): per-hit accuracy + crit + damage
+            // off the source, KO-truncated. The enumerated branch below serves Enumerate only.
             apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur)
         } else {
             let crit_p = crit_chance(&b, side, &md);

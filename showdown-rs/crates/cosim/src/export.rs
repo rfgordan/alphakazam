@@ -613,7 +613,11 @@ fn emit_order_side(side: &Side) -> Vec<usize> {
 }
 
 /// Array index (field position) of `roster_slot` on side `si` in the emitted active-first order.
-fn array_index_of(state: &State, si: usize, roster_slot: usize) -> usize {
+///
+/// Public because a PS *choice string* (`switch 3`) indexes this emitted array, not the engine's
+/// party order — anything handing PS a choice against an exported snapshot must translate through
+/// here or it will switch in the wrong Pokémon.
+pub fn array_index_of(state: &State, si: usize, roster_slot: usize) -> usize {
     emit_order(state, si).iter().position(|&s| s == roster_slot).unwrap_or(0)
 }
 

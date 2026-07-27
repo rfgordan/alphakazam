@@ -339,18 +339,34 @@ impl Flow {
     }
 
     fn resume_pivot(&mut self, side: SideId, second: Option<Action>, mut switched: [bool; 2], pass_sub: bool, choices: [Option<PlayerChoice>; 2]) {
-        let slot = match choices[side.index()] {
-            Some(PlayerChoice::Switch { slot }) => slot,
-            _ => alive_bench(&self.state, side).expect("PivotLanding issued with no bench"),
+        let picked = match choices[side.index()] {
+            Some(PlayerChoice::Switch { slot }) => Some(slot),
+            _ => alive_bench(&self.state, side),
         };
-        let slot = {
+        let slot = picked.and_then(|slot| {
             let s = self.state.side(side);
-            let p = &s.pokemon[slot as usize];
-            if slot != s.active_index && p.species != crate::ids::Species::None && p.is_alive() {
-                slot
-            } else {
-                alive_bench(&self.state, side).expect("PivotLanding issued with no bench")
+            let ok = (slot as usize) < 6 && slot != s.active_index && {
+                let p = &s.pokemon[slot as usize];
+                p.species != crate::ids::Species::None && p.is_alive()
+            };
+            if ok { Some(slot) } else { alive_bench(&self.state, side) }
+        });
+        let Some(slot) = slot else {
+            // A pivot pause whose bench emptied before the landing resolved. The path that
+            // produces this is still undiagnosed (rare — roughly 1 in 10^5 games; it killed the
+            // scale2 trainer on 2026-07-27), but PS's behavior with nowhere to go is "stay in",
+            // and skipping the switch is exactly that. Log loudly so the parity campaign can
+            // hunt it; do NOT kill a 4096-env training process over it.
+            eprintln!(
+                "[engine] PivotLanding with no live bench (side {:?}, turn {}) — staying in",
+                side, self.state.turn
+            );
+            let b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+            match second {
+                Some(a) => self.continue_after_first(b, a, switched),
+                None => self.finish_turn(b, switched),
             }
+            return;
         };
         let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
         // Shed Tail passes its Substitute to the lander; every other pivot clears it.
@@ -380,11 +396,19 @@ impl Flow {
                 && !s.pokemon[slot as usize].is_alive()
         };
         let slot = match wanted {
-            Some(slot) if valid(slot) => slot,
-            _ => fainted_bench(&self.state, side).expect("Revive issued with no fainted ally"),
+            Some(slot) if valid(slot) => Some(slot),
+            _ => fainted_bench(&self.state, side),
         };
         let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
-        crate::generate::apply_revive(&mut b, side, slot);
+        match slot {
+            Some(slot) => crate::generate::apply_revive(&mut b, side, slot),
+            // Same defensive stance as the pivot fallback above: a Revive request with no
+            // fainted ally is an engine-state bug to hunt, not a reason to kill the trainer.
+            None => eprintln!(
+                "[engine] Revive with no fainted ally (side {:?}, turn {}) — skipping",
+                side, self.state.turn
+            ),
+        }
         match second {
             Some(a) => self.continue_after_first(b, a, switched),
             None => self.finish_turn(b, switched),

@@ -17,6 +17,12 @@ use engine::state::{SideId, State};
 use engine::team;
 use pyo3::prelude::*;
 
+// Turn resolution allocates hard (a `Vec<Instruction>` per branch, grown per push), and that
+// traffic is what limits multi-core scaling far more than the arithmetic does.
+#[cfg(feature = "mimalloc-alloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const N_ACTIONS: usize = 9;
 const N_MOVES: usize = 4;
 
@@ -146,9 +152,13 @@ impl Battle {
     }
 
     /// Vocabulary size (number of embedding rows needed) for each table named in `id_columns()`.
-    fn vocab_sizes(&self) -> std::collections::HashMap<String, usize> {
+    /// `BTreeMap`, not `HashMap`: the caller builds one embedding table per entry **in iteration
+    /// order**, so a randomized order makes the model's parameter list differ run-to-run. State
+    /// dicts survive that (they are keyed by name) but Adam's state is keyed by parameter
+    /// *position*, so resuming a run crashed with a shape mismatch. Keep this deterministic.
+    fn vocab_sizes(&self) -> std::collections::BTreeMap<String, usize> {
         use engine::ids::{Ability, Item, Type};
-        let mut m = std::collections::HashMap::new();
+        let mut m = std::collections::BTreeMap::new();
         m.insert("species".to_string(), engine::gen::SPECIES_NAMES.len());
         m.insert("move".to_string(), engine::gen::MOVE_NAMES.len());
         m.insert("item".to_string(), Item::Unknown as usize + 1);
@@ -228,68 +238,7 @@ impl Battle {
     /// adapters that build a foreign engine's state (e.g. poke-engine for an MCTS baseline).
     /// All identifiers are PS `toID` strings; the caller maps them to the target engine's format.
     fn state_json(&self) -> String {
-        use serde_json::{json, Value};
-        let s = &self.state;
-        let ty = |t: engine::ids::Type| t.to_id();
-
-        let side_json = |side: SideId| -> Value {
-            let sd = s.side(side);
-            let mons: Vec<Value> = (0..6)
-                .map(|i| {
-                    let p = &sd.pokemon[i];
-                    let moves: Vec<Value> = (0..4)
-                        .map(|m| {
-                            let mv = p.moves[m];
-                            let md = engine::data::move_data(mv.id);
-                            json!({
-                                "id": mv.id.to_id(), "pp": mv.pp, "disabled": mv.disabled,
-                                "type": md.typ.to_id(), "base_power": md.base_power, "accuracy": md.accuracy,
-                                "category": cat_str(md.category),
-                                "self_boost_total": md.self_boosts.iter().map(|&x| x as i32).sum::<i32>(),
-                            })
-                        })
-                        .collect();
-                    json!({
-                        "species": p.species.to_id(),
-                        "level": p.level,
-                        "types": [ty(p.types[0]), ty(p.types[1])],
-                        "base_types": [ty(p.base_types[0]), ty(p.base_types[1])],
-                        "hp": p.hp, "maxhp": p.max_hp,
-                        "ability": p.ability.to_id(), "base_ability": p.base_ability.to_id(),
-                        "item": p.item.to_id(),
-                        "nature": nature_str(p.nature),
-                        "evs": p.evs,
-                        "stats": {"atk": p.stats[1], "def": p.stats[2], "spa": p.stats[3], "spd": p.stats[4], "spe": p.stats[5]},
-                        "status": p.status.to_id(), "status_counter": p.status_counter,
-                        "tera_type": ty(p.tera_type), "terastallized": p.terastallized,
-                        "weight_kg": engine::data::species_weight_hg(p.species) as f64 / 10.0,
-                        "moves": moves,
-                    })
-                })
-                .collect();
-            let sc = &sd.side_conditions;
-            json!({
-                "active_index": sd.active_index,
-                "last_used_move": sd.last_used_move.to_id(),
-                "boosts": {"atk": sd.boosts[0], "def": sd.boosts[1], "spa": sd.boosts[2],
-                           "spd": sd.boosts[3], "spe": sd.boosts[4], "accuracy": sd.boosts[5], "evasion": sd.boosts[6]},
-                "side_conditions": {
-                    "stealth_rock": sc.stealth_rock, "spikes": sc.spikes, "toxic_spikes": sc.toxic_spikes,
-                    "sticky_web": sc.sticky_web, "reflect": sc.reflect, "light_screen": sc.light_screen,
-                    "aurora_veil": sc.aurora_veil, "tailwind": sc.tailwind,
-                },
-                "pokemon": mons,
-            })
-        };
-
-        json!({
-            "weather": s.weather.to_id(), "weather_turns": s.weather_turns,
-            "terrain": s.terrain.to_id(), "terrain_turns": s.terrain_turns,
-            "trick_room": s.trick_room, "trick_room_turns": s.trick_room_turns,
-            "turn": s.turn,
-            "sides": [side_json(SideId::One), side_json(SideId::Two)],
-        })
-        .to_string()
+        state_json_of(&self.state)
     }
 
     /// Type effectiveness multiplier of `attacking` (a type id) against one or two `defending`
@@ -395,14 +344,91 @@ fn cap(id: &str) -> String {
     }
 }
 
+/// The full *true* battle state as JSON. Free function so both `Battle` and `FlowVec` expose
+/// it from the same source — the heuristic baseline needs it from the decision-point env, and
+/// a second copy of this mapping would rot out of sync with the first.
+pub fn state_json_of(state: &State) -> String {
+        use serde_json::{json, Value};
+        let s = state;
+        let ty = |t: engine::ids::Type| t.to_id();
+
+        let side_json = |side: SideId| -> Value {
+            let sd = s.side(side);
+            let mons: Vec<Value> = (0..6)
+                .map(|i| {
+                    let p = &sd.pokemon[i];
+                    let moves: Vec<Value> = (0..4)
+                        .map(|m| {
+                            let mv = p.moves[m];
+                            let md = engine::data::move_data(mv.id);
+                            json!({
+                                "id": mv.id.to_id(), "pp": mv.pp, "disabled": mv.disabled,
+                                "type": md.typ.to_id(), "base_power": md.base_power, "accuracy": md.accuracy,
+                                "category": cat_str(md.category),
+                                "self_boost_total": md.self_boosts.iter().map(|&x| x as i32).sum::<i32>(),
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "species": p.species.to_id(),
+                        "level": p.level,
+                        "types": [ty(p.types[0]), ty(p.types[1])],
+                        "base_types": [ty(p.base_types[0]), ty(p.base_types[1])],
+                        "hp": p.hp, "maxhp": p.max_hp,
+                        "ability": p.ability.to_id(), "base_ability": p.base_ability.to_id(),
+                        "item": p.item.to_id(),
+                        "nature": nature_str(p.nature),
+                        "evs": p.evs,
+                        "stats": {"atk": p.stats[1], "def": p.stats[2], "spa": p.stats[3], "spd": p.stats[4], "spe": p.stats[5]},
+                        "status": p.status.to_id(), "status_counter": p.status_counter,
+                        "tera_type": ty(p.tera_type), "terastallized": p.terastallized,
+                        "weight_kg": engine::data::species_weight_hg(p.species) as f64 / 10.0,
+                        "moves": moves,
+                    })
+                })
+                .collect();
+            let sc = &sd.side_conditions;
+            json!({
+                "active_index": sd.active_index,
+                "last_used_move": sd.last_used_move.to_id(),
+                "boosts": {"atk": sd.boosts[0], "def": sd.boosts[1], "spa": sd.boosts[2],
+                           "spd": sd.boosts[3], "spe": sd.boosts[4], "accuracy": sd.boosts[5], "evasion": sd.boosts[6]},
+                "side_conditions": {
+                    "stealth_rock": sc.stealth_rock, "spikes": sc.spikes, "toxic_spikes": sc.toxic_spikes,
+                    "sticky_web": sc.sticky_web, "reflect": sc.reflect, "light_screen": sc.light_screen,
+                    "aurora_veil": sc.aurora_veil, "tailwind": sc.tailwind,
+                },
+                "pokemon": mons,
+            })
+        };
+
+        json!({
+            "weather": s.weather.to_id(), "weather_turns": s.weather_turns,
+            "terrain": s.terrain.to_id(), "terrain_turns": s.terrain_turns,
+            "trick_room": s.trick_room, "trick_room_turns": s.trick_room_turns,
+            "turn": s.turn,
+            "sides": [side_json(SideId::One), side_json(SideId::Two)],
+        })
+        .to_string()
+}
+
 // ---- shared state-level helpers (used by both Battle and BattleVec) ------------------------
 
 /// The five non-active party slots in slot order (switch action 4+k -> k-th entry).
+///
+/// `k < 5` guard: a `Flow` always keeps a fainted mon as the active, so exactly one of the six
+/// slots is skipped and `k` tops out at 5. A state CONVERTED from a PS snapshot need not —
+/// at a forced-switch request PS has already taken the fainted mon off the field and `convert`
+/// records `active_index = u8::MAX`, so no slot is skipped, `k` reaches 5, and this wrote past
+/// the array. With no active there is no sixth switch action to name anyway.
 fn bench_slots(state: &State, side: SideId) -> [Option<u8>; 5] {
     let s = state.side(side);
     let mut out = [None; 5];
     let mut k = 0;
     for i in 0..6u8 {
+        if k >= out.len() {
+            break;
+        }
         if i != s.active_index {
             if s.pokemon[i as usize].species != engine::ids::Species::None {
                 out[k] = Some(i);
@@ -879,6 +905,168 @@ fn flow_choice(state: &State, side: SideId, action: u8) -> PlayerChoice {
 }
 
 /// Phase-aware (N=13) legal mask for `side` under the pending `req`.
+/// `_matchup` from `agents/ppo/baselines.py::HeuristicBaseline`, arithmetic-identical: f32
+/// type-chart values widened to f64 exactly where the Python side crosses `type_effectiveness`,
+/// same operation order, raw (unclamped) HP like the JSON path exposes.
+fn heuristic_matchup(mon: &engine::state::Pokemon, opp: &engine::state::Pokemon) -> f64 {
+    use engine::damage::type_multiplier;
+    const SPEED_COEF: f64 = 0.1;
+    const HP_COEF: f64 = 0.4;
+    let best = |att: &[engine::ids::Type], def: [engine::ids::Type; 2]| -> f64 {
+        att.iter()
+            .filter(|&&t| t != engine::ids::Type::None)
+            .map(|&t| type_multiplier(t, def) as f64)
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    let off = best(&mon.types, opp.types);
+    let off = if off.is_finite() { off } else { 1.0 };
+    let deff = best(&opp.types, mon.types);
+    let deff = if deff.is_finite() { deff } else { 1.0 };
+    let mut score = off - deff;
+    score += if mon.stats[5] > opp.stats[5] {
+        SPEED_COEF
+    } else if opp.stats[5] > mon.stats[5] {
+        -SPEED_COEF
+    } else {
+        0.0
+    };
+    score += HP_COEF * (mon.hp as f64 / mon.max_hp.max(1) as f64);
+    score -= HP_COEF * (opp.hp as f64 / opp.max_hp.max(1) as f64);
+    score
+}
+
+/// Faithful port of `agents/ppo/baselines.py::HeuristicBaseline._action_for` (itself a port of
+/// poke-env's SimpleHeuristicsPlayer), evaluated directly on engine state. The Python version
+/// costs ~400µs/env (a full `state_json` serialize + `json.loads` per env per step) and was
+/// measured at 83% of trainer wall time when league slots draw the heuristic; this one is
+/// rayon-parallel and three orders of magnitude cheaper. Action-exactness against the Python
+/// implementation is enforced by `agents/probes/heuristic_parity.py` — any change here must keep
+/// the two in lockstep, or the training opponent silently diverges from the eval opponent.
+///
+/// Returns -1 when the heuristic has no opinion (non-acting request, no legal action, or a state
+/// the Python port would have raised on) — the caller falls back to a random legal action and
+/// counts the event.
+fn heuristic_action_of(state: &State, req: Request, side: SideId) -> i64 {
+    use engine::damage::type_multiplier;
+    const SWITCH_THRESHOLD: f64 = -2.0;
+
+    let mask = flow_legal_mask(state, req, side);
+    if !mask.iter().any(|&b| b) {
+        return -1;
+    }
+    let sd = state.side(side);
+    let od = state.side(side.other());
+    let (ai, oi) = (sd.active_index as usize, od.active_index as usize);
+    if ai >= 6 || oi >= 6 {
+        return -1; // the Python port IndexErrors here and falls back; mirror that
+    }
+    let active = &sd.pokemon[ai];
+    let opp = &od.pokemon[oi];
+    let bench: Vec<usize> = (0..6).filter(|&s| s != ai).collect();
+    let legal_moves: Vec<usize> = (0..4).filter(|&i| mask[i]).collect();
+    let legal_switch: Vec<usize> = (0..5).filter(|&k| mask[4 + k]).collect();
+
+    // Should we switch out? (a good reserve exists AND we're in a bad spot). Boosts live on the
+    // SIDE in this engine; boosts[..5] = [atk, def, spa, spd, spe].
+    let mut should_switch = false;
+    if !legal_switch.is_empty()
+        && legal_switch
+            .iter()
+            .any(|&k| heuristic_matchup(&sd.pokemon[bench[k]], opp) > 0.0)
+    {
+        let b = &sd.boosts;
+        let phys = active.stats[1] >= active.stats[3];
+        should_switch = b[1] <= -3
+            || b[3] <= -3
+            || (b[0] <= -3 && phys)
+            || (b[2] <= -3 && !phys)
+            || heuristic_matchup(active, opp) < SWITCH_THRESHOLD;
+    }
+
+    if !legal_moves.is_empty() && !(should_switch && !legal_switch.is_empty()) {
+        let alive =
+            |p: &engine::state::Pokemon| p.species != engine::ids::Species::None && p.hp > 0;
+        let n_opp = od.pokemon.iter().filter(|p| alive(p)).count();
+        let n_self = sd.pokemon.iter().filter(|p| alive(p)).count();
+
+        // Hazards: set them up early; clear our own if any exist.
+        for &i in &legal_moves {
+            let id = active.moves[i].id.to_id();
+            let hazard_set = match id {
+                "spikes" => Some(od.side_conditions.spikes != 0),
+                "stealthrock" => Some(od.side_conditions.stealth_rock),
+                "stickyweb" => Some(od.side_conditions.sticky_web),
+                "toxicspikes" => Some(od.side_conditions.toxic_spikes != 0),
+                _ => None,
+            };
+            if let Some(already) = hazard_set {
+                if !already && n_opp >= 3 {
+                    return i as i64;
+                }
+            }
+            if (id == "rapidspin" || id == "defog")
+                && (sd.side_conditions.stealth_rock
+                    || sd.side_conditions.spikes != 0
+                    || sd.side_conditions.toxic_spikes != 0
+                    || sd.side_conditions.sticky_web)
+                && n_self >= 2
+            {
+                return i as i64;
+            }
+        }
+
+        // Setup: boost when at full HP in a favorable matchup and not maxed.
+        if active.hp >= active.max_hp
+            && heuristic_matchup(active, opp) > 0.0
+            && sd.boosts[..5].iter().copied().max().unwrap_or(0) < 6
+        {
+            for &i in &legal_moves {
+                let md = engine::data::move_data(active.moves[i].id);
+                let boost_total: i32 = md.self_boosts.iter().map(|&x| x as i32).sum();
+                if boost_total >= 2 && md.base_power == 0 {
+                    return i as i64;
+                }
+            }
+        }
+
+        // Best damaging move — strict `>` keeps Python `max()`'s first-of-ties semantics.
+        let mut best: Option<(usize, f64)> = None;
+        for &i in &legal_moves {
+            let md = engine::data::move_data(active.moves[i].id);
+            if md.base_power == 0 {
+                continue;
+            }
+            let stab = if active.types.contains(&md.typ) { 1.5 } else { 1.0 };
+            let acc = if md.accuracy > 0 { md.accuracy as f64 / 100.0 } else { 1.0 };
+            let sc = md.base_power as f64 * stab * type_multiplier(md.typ, opp.types) as f64 * acc;
+            if best.is_none_or(|(_, b)| sc > b) {
+                best = Some((i, sc));
+            }
+        }
+        if let Some((i, _)) = best {
+            return i as i64;
+        }
+    }
+
+    // Switch to the best-matchup reserve (again first-of-ties, ascending k).
+    if !legal_switch.is_empty() {
+        let mut best = (legal_switch[0], f64::NEG_INFINITY);
+        for &k in &legal_switch {
+            let m = heuristic_matchup(&sd.pokemon[bench[k]], opp);
+            if m > best.1 {
+                best = (k, m);
+            }
+        }
+        return 4 + best.0 as i64;
+    }
+    // Python's terminal fallback: the first legal action (e.g. a Struggle-fallback move slot, or
+    // only zero-power moves legal with an empty bench).
+    match mask.iter().position(|&b| b) {
+        Some(i) => i as i64,
+        None => -1,
+    }
+}
+
 fn flow_legal_mask(state: &State, req: Request, side: SideId) -> [bool; N_ACTIONS_FLOW] {
     let mut mask = [false; N_ACTIONS_FLOW];
     if !acting_for(req, side) {
@@ -1078,6 +1266,33 @@ impl FlowVec {
         Array2::from_shape_vec((n, N_ACTIONS_FLOW), flat).unwrap().into_pyarray_bound(py)
     }
 
+    /// (N,) scripted-heuristic action for every env, from `sides[i]`'s perspective (0/1).
+    /// -1 where the heuristic has no opinion (non-acting request, or a state the Python
+    /// implementation would raise on) — see [`heuristic_action_of`]. The Python-side wrapper
+    /// falls back to a random legal action there and counts the event.
+    fn heuristic_actions_all<'py>(
+        &self,
+        py: Python<'py>,
+        sides: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let sv = sides.as_slice()?.to_vec();
+        let n = self.flows.len();
+        if sv.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "sides must have length {n} (got {})",
+                sv.len()
+            )));
+        }
+        let acts: Vec<i64> = py.allow_threads(|| {
+            self.flows
+                .par_iter()
+                .zip(sv.par_iter())
+                .map(|(f, &s)| heuristic_action_of(&f.state, f.request(), sid(s as u8)))
+                .collect()
+        });
+        Ok(Array1::from_vec(acts).into_pyarray_bound(py))
+    }
+
     /// (N, OBS_DIM) f32 observations from `side`'s perspective.
     fn observe_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<f32>> {
         let n = self.flows.len();
@@ -1120,6 +1335,38 @@ impl FlowVec {
             })
             .collect();
         Array1::from_vec(v).into_pyarray_bound(py)
+    }
+
+    /// Env `i`'s full *true* state as JSON — the input the scripted heuristic baseline reads.
+    /// Same mapping `Battle.state_json` uses (see [`state_json_of`]).
+    fn state_json(&self, env: usize) -> PyResult<String> {
+        let f = self.flows.get(env).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={})", self.flows.len()))
+        })?;
+        Ok(state_json_of(&f.state))
+    }
+
+    /// The **PS choice string** env `i`'s `action` resolves to for `side`, against the snapshot
+    /// `export_state` would emit right now ("move 2", "move 1 terastallize", "switch 3").
+    ///
+    /// The on-policy cosim sidecar replays engine decisions inside real Showdown, and the two
+    /// sides index switches differently: the engine's action `4..=8` picks the k-th *bench party
+    /// slot*, while a PS `switch N` indexes the exported **active-first** array. Resolving here,
+    /// off the same state the exporter serializes, makes them agree by construction instead of
+    /// by two copies of the same off-by-ordering reasoning.
+    fn choice_str(&self, env: usize, side: u8, action: i64) -> PyResult<String> {
+        let f = self.flows.get(env).ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!("env {env} out of range (num_envs={})", self.flows.len()))
+        })?;
+        let sd = sid(side);
+        Ok(match flow_choice(&f.state, sd, action as u8) {
+            PlayerChoice::Move { slot, tera } => {
+                format!("move {}{}", slot + 1, if tera { " terastallize" } else { "" })
+            }
+            PlayerChoice::Switch { slot } => {
+                format!("switch {}", cosim::export::array_index_of(&f.state, sd.index(), slot as usize) + 1)
+            }
+        })
     }
 
     /// (N,) i64 fainted-mon count for `side` — the other Φ term.
@@ -1205,11 +1452,103 @@ impl FlowVec {
     }
 }
 
+/// Encode a **PS serialized battle state** the way the training env would see it.
+///
+/// This is the hinge of the deterministic on-policy sidecar. There, Showdown drives the battle
+/// from a seed and our policy supplies the choices, so the policy has to act on a *PS* state —
+/// but it was trained on `encode()` of an engine `State`. This runs the certified
+/// `convert_state` (the same converter every parity gate uses) and then the same encoder, so
+/// the policy sees byte-identical inputs to training.
+///
+/// `state_json` is one snapshot in the recorder's projection (`harness/cosim.mjs`'s `snapshot`).
+/// Returns `(obs, ids, legal_mask, roster_of_action)` for `side`, where `roster_of_action[a]` is
+/// the battle-start roster index a switch action targets (`-1` for move actions) — the caller
+/// translates that into PS's live array position, which is the only place the two orderings meet.
+#[pyfunction]
+fn encode_ps_state(
+    py: Python<'_>,
+    state_json: &str,
+    side: u8,
+    format: &str,
+    request_state: &str,
+) -> PyResult<(Vec<f32>, Vec<i64>, Vec<bool>, Vec<i64>)> {
+    let v: serde_json::Value = serde_json::from_str(state_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("state json: {e}")))?;
+    let canon = cosim::convert::Canonical::from_first_state(&v)
+        .map_err(|u| pyo3::exceptions::PyValueError::new_err(format!("canonical: {}", u.0)))?;
+    let mut state = cosim::convert::convert_state(&v, &canon)
+        .map_err(|u| pyo3::exceptions::PyValueError::new_err(format!("convert: {}", u.0)))?;
+    // Ruleset selection. "gen9randombattle" is AMBIGUOUS at this boundary: every recording and
+    // the whole training pipeline to date labels battles with the *team* format while actually
+    // running them as gen9customgame (pre-generated teams, no ruleset) — so that spelling keeps
+    // its historical meaning and maps to the customgame ruleset. The REAL ladder ruleset (sleep
+    // clause, 16-bit truncation arm, maybeTrapped, percent HP) is an explicit opt-in via
+    // "gen9randombattle-real", matching recordings whose trace `ruleset` field says
+    // gen9randombattle (harness/seed-fixtures-rb/). Migrating the default is a deliberate
+    // future step, to be taken together with the sidecar's recordings.
+    state.ruleset = match format {
+        f if f.contains("random") && !f.ends_with("-real") => {
+            engine::ruleset::Ruleset::GEN9_CUSTOM_GAME
+        }
+        f => engine::ruleset::Ruleset::from_format(f.trim_end_matches("-real"))
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown format: {f}")))?,
+    };
+
+    let sd = sid(side);
+    let _ = py;
+    // At a forced-switch request PS has already taken the fainted mon off the field, so `convert`
+    // records `active_index = u8::MAX` — a board the encoder cannot describe ("my active" has no
+    // referent) and `Side::active()` panics on. The engine's OWN replacement state keeps the
+    // fainted mon as the active until the replacement enters, so restore that shape: adopt the
+    // fainted party member as the active. This is the state the policy was trained on at a
+    // replacement decision, and the only thing it is used for here is choosing who comes in.
+    for s in [SideId::One, SideId::Two] {
+        let sref = state.side_mut(s);
+        if sref.active_index == u8::MAX {
+            let fainted = (0..6u8).find(|&i| {
+                let p = &sref.pokemon[i as usize];
+                p.species != engine::ids::Species::None && !p.is_alive()
+            });
+            // Nothing fainted and still no active means an empty side (battle already decided);
+            // slot 0 keeps the encoder total without claiming anything about the position.
+            sref.active_index = fainted.unwrap_or(0);
+        }
+    }
+    // A serialized PS state carries no pending-request marker (`requestState` is not part of
+    // serializeBattle's modeled output), so the caller passes PS's own request phase in. It
+    // matters beyond legality: at a forced switch the fainted mon is off the field, `convert`
+    // sets `active_index = u8::MAX`, and the `Turn` arm's `s.active()` indexes past the party
+    // (panic: "len is 6 but the index is 255").
+    let phase = match request_state {
+        "switch" => Request::Replace { sides: [true, true] },
+        _ => Request::Turn,
+    };
+    // Belt and braces: a turn-phase state whose active is genuinely absent is still unsafe to
+    // read as `Turn`, whatever PS called the request.
+    let phase = if state.side(sd).active_index == u8::MAX {
+        Request::Replace { sides: [true, true] }
+    } else {
+        phase
+    };
+    let mask = flow_legal_mask(&state, phase, sd);
+    let mut roster = vec![-1i64; N_ACTIONS_FLOW];
+    for k in 0..5usize {
+        roster[4 + k] = bench_party_slot(&state, sd, k) as i64;
+    }
+    Ok((
+        engine::encode::encode(&state, sd).to_vec(),
+        engine::encode::encode_ids(&state, sd).to_vec(),
+        mask.to_vec(),
+        roster,
+    ))
+}
+
 #[pymodule]
 fn showdown_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Battle>()?;
     m.add_class::<BattleVec>()?;
     m.add_class::<FlowVec>()?;
+    m.add_function(wrap_pyfunction!(encode_ps_state, m)?)?;
     Ok(())
 }
 

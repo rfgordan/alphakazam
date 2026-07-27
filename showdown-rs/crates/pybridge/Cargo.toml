@@ -27,8 +27,15 @@ serde_json = "1"
 numpy = "0.22"
 rayon = "1.10"
 flate2 = "1"
+# Turn resolution is allocation-heavy (a Vec<Instruction> and a cloned State per branch), and
+# glibc malloc measurably throttles it: swapping to mimalloc is +25% single-thread and +37% at
+# 8 threads on real random-battle teams, with no semantic change. Default-on; disable with
+# --no-default-features if you need to A/B it.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
+default = ["mimalloc-alloc"]
+mimalloc-alloc = ["dep:mimalloc"]
 # Opt-in extension-module linkage for anyone building the cdylib directly with cargo.
 extension-module = ["pyo3/extension-module"]
 
