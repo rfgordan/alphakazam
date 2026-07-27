@@ -3058,6 +3058,10 @@ fn run_move_action(mut b: Branch, action: Action) -> Vec<Branch> {
     }
     if annotating() {
         for nb in &mut out {
+            // `runMove` fires `runEvent('AfterMove')` (sim/battle-actions.ts:312) between `useMove`
+            // returning and the action's trailing 2882 — its handler list is speed-sorted, so two
+            // `onAnyAfterMove` holders at equal Speed consume one shuffle here.
+            emit_after_move_shuffles(nb);
             // Commit PS's `moveLastTurnResult` for the acting side: a move that failed to connect
             // (immune / miss / no-target / blocked) sets it `false` — the signal Stomping Tantrum's
             // base-power doubler reads next turn. The read (BP calc) already happened inside
@@ -11076,6 +11080,64 @@ fn emit_residual_shuffles(b: &mut Branch) {
         }
         if j - i >= 2 {
             draw(b, "shuffle", &[len, i as i32, j as i32], -1, "residual");
+        }
+        i = j;
+    }
+}
+
+/// Emit the `speedSort` shuffle draws PS makes over the **`AfterMove`** handler list.
+///
+/// `runMove` fires `this.battle.runEvent('AfterMove', pokemon, target, move)` right after
+/// `useMove` returns (sim/battle-actions.ts:312) — after the move's own internal 970/1024 Updates
+/// and before the move action's trailing runAction 2882. `runEvent` collects `onAnyAfterMove` from
+/// EVERY active on the field, so a handler is contributed per holder regardless of which side
+/// moved. Exactly four effects register one at pin `b9dc987d`:
+///   White Herb (data/items.ts:7694), Eject Pack (:1729), Mirror Herb (:4176) — Items, default
+///   subOrder 8 — and Opportunist (data/abilities.ts:3024) — Ability, default subOrder 7.
+/// None declares an order, so all sit at order `false`, and two holders at equal Speed tie.
+///
+/// Witness rb1345 d11: both Blastoise hold a White Herb at equal Speed. PS records the shuffle
+/// TWICE in the unit (once per move action) with `full` = exactly `[whiteherb/Item/false/8] x2`,
+/// which is also the whole census: across all 401 sidecars the ONLY `AfterMove` handler rows are
+/// those four `whiteherb` entries, so nothing else in the corpus lengthens this list.
+///
+/// (The mover's own `onAfterMove` handlers — `lockedmove` (data/conditions.ts:273, Condition
+/// subOrder 2) — and the MOVE's own `onAfterMove`, which `runEvent` unshifts as a `sourceEffect`
+/// at subOrder 0 (sim/battle.ts:783), would lengthen the list without joining the White Herb tie.
+/// The corpus contains no instance of either co-occurring with a tie, so they are deliberately not
+/// modelled here; add them with a witness.)
+fn emit_after_move_shuffles(b: &mut Branch) {
+    if !annotating() {
+        return;
+    }
+    let mut hs: Vec<ResHandler> = Vec::new();
+    for side in [SideId::One, SideId::Two] {
+        let p = b.state.side(side).active();
+        if !p.is_alive() {
+            continue;
+        }
+        let speed = effective_speed(&b.state, side) as i64;
+        if matches!(p.item, Item::WhiteHerb | Item::EjectPack | Item::MirrorHerb) {
+            hs.push(ResHandler { order: i64::MAX, speed, sub_order: 8 });
+        }
+        if p.ability == crate::ids::Ability::Opportunist {
+            hs.push(ResHandler { order: i64::MAX, speed, sub_order: 7 });
+        }
+    }
+    if hs.len() < 2 {
+        return;
+    }
+    let len = hs.len() as i32;
+    hs.sort_by(|a, c| a.order.cmp(&c.order).then(c.speed.cmp(&a.speed)).then(a.sub_order.cmp(&c.sub_order)));
+    let ties = |a: &ResHandler, c: &ResHandler| a.order == c.order && a.speed == c.speed && a.sub_order == c.sub_order;
+    let mut i = 0usize;
+    while i + 1 < hs.len() {
+        let mut j = i + 1;
+        while j < hs.len() && ties(&hs[i], &hs[j]) {
+            j += 1;
+        }
+        if j - i >= 2 {
+            draw(b, "shuffle", &[len, i as i32, j as i32], -1, "aftermove");
         }
         i = j;
     }
