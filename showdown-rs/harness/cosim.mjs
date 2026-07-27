@@ -1038,6 +1038,13 @@ function allowedFor(request, side, roster) {
 		if (!m.disabled && (m.pp === undefined || m.pp > 0)) out.allowedMoves.push(i);
 	}
 	out.canTera = !!act.canTerastallize;
+	// REVIEW NOTE (integration, 2026-07-27): treating `maybeTrapped` like hard `trapped` is
+	// OVER-restrictive. `maybeTrapped` means the foe's *possible* (unrevealed) abilities could
+	// trap — PS still offers the switches and rejects the choice live only if the foe's actual
+	// ability traps. A policy fed this mask never even attempts those switches, so it plays
+	// strictly more trapped than the ladder client would, and on-policy traces under-cover the
+	// attempt-switch-then-rejected flow. Fix belongs with the trainer (mask semantics are model
+	// API); until then, recorded `allowedRoster` is a subset of PS-legal at maybeTrapped states.
 	if (!act.trapped && !act.maybeTrapped) {
 		const mons = request.side.pokemon;
 		for (let i = 0; i < mons.length; i++) {
