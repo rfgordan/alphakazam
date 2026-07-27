@@ -3687,10 +3687,39 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     modified_priority(state, side, &md)
 }
 
+/// The move data an ACTION will actually resolve with — which is not always the chosen slot's.
+///
+/// `runMove` (`sim/battle-actions.ts:255-275`) replaces the chosen move with Struggle when the
+/// mon has nothing usable (`if (!moveSlot?.pp) { move = dex.moves.get('struggle') }`), and the
+/// queue's `getActionSpeed` reads `action.move.priority` — i.e. **Struggle's priority, 0** — not
+/// the empty slot's. A called/external move (Sleep Talk's pick, a Dancer copy) likewise resolves
+/// as itself.
+///
+/// The engine keyed priority off `active.moves[move_idx]`, so a mon Struggling because its
+/// Choice-locked slot ran out of PP inherited THAT slot's priority. rb5081 d49 t39: a
+/// choice-locked Ditto, transformed into Glaceon, is locked onto a 0-PP Protect and Struggles.
+/// The engine gave the Struggle Protect's **+4**, moved it before the foe's real Protect, and
+/// the recoil KO'd its last mon and ended the battle. PS runs the foe's Protect first, blocks
+/// the Struggle outright, and its only draw for the turn is the residual protect/stall shuffle.
+fn action_move_data(state: &State, act: &Action) -> crate::data::MoveData {
+    if let Some(ext) = act.external_move {
+        return move_data(ext);
+    }
+    let p = state.side(act.side).active();
+    let slot = p.moves[act.move_idx as usize];
+    if act.struggling || slot.pp == 0 {
+        if let Some(id) = crate::ids::MoveId::from_id("struggle") {
+            return move_data(id);
+        }
+    }
+    move_data(slot.id)
+}
+
 pub(crate) fn move_order(state: &State, a: &Action, b: &Action) -> Order {
     let (sa, sb) = (a.side, b.side);
-    let pa = effective_priority(state, sa, a.move_idx);
-    let pb = effective_priority(state, sb, b.move_idx);
+    let (mda, mdb) = (action_move_data(state, a), action_move_data(state, b));
+    let pa = modified_priority(state, sa, &mda);
+    let pb = modified_priority(state, sb, &mdb);
     if pa != pb {
         return Order::First(if pa > pb { sa } else { sb });
     }
@@ -3703,7 +3732,7 @@ pub(crate) fn move_order(state: &State, a: &Action, b: &Action) -> Order {
         }
         let p = state.side(act.side).active();
         if p.ability == crate::ids::Ability::MyceliumMight
-            && move_data(p.moves[act.move_idx as usize].id).category == MoveCategory::Status
+            && action_move_data(state, act).category == MoveCategory::Status
         {
             f -= 1;
         }
