@@ -1,5 +1,5 @@
 # Third-party reference clones — clone separately, see README (each has its own history)
-/engines/
+/engines
 
 # Rust build artifacts
 target/
