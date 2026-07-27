@@ -1507,6 +1507,14 @@ fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     } else if !foe_fe && my_fe {
         push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::FocusEnergy });
     }
+    // **The copied ability FIRES.** `transformInto` ends with `this.setAbility(pokemon.ability,
+    // this, true)` (`sim/pokemon.ts`), and `setAbility` runs `singleEvent('Start', ability, ...)`
+    // on the new ability for every gen > 3 — so an Imposter Ditto copying an Intimidate mon
+    // Intimidates. rb1502 d20: a Ditto Impostered into a +2/+1 Incineroar and PS dropped the real
+    // Incineroar's Attack to +1. The recursion terminates on its own: the copied ability can only
+    // be `Imposter` if the target was an untransformed Ditto, and the re-entry then fails
+    // `user_ok` because this mon is now `transformed`.
+    apply_switch_in_ability(b, side);
     true
 }
 
@@ -2778,6 +2786,13 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     if previous == target {
         return;
     }
+    // **The switch-out abilities read the LIVE ability, before any of this function's reverts.**
+    // PS fires them from `runEvent('BeforeSwitchOut')` (`sim/battle.ts:2919`), which happens before
+    // `switchIn` calls `clearVolatile()` — so a Ditto that Impostered into a Regenerator mon still
+    // has Regenerator when it leaves. The engine read the ability ~120 lines down, AFTER
+    // `revert_transform` had already put Imposter back. rb1502 d17: a Ditto-as-Klawf switches out
+    // at 19 HP; PS heals it to 94 (baseMaxhp 225 / 3), the engine healed nothing.
+    let switch_out_ability = s.active().ability;
     // The outgoing mon is the current opposing active from the foe's perspective, so its exit ends
     // any foe-sourced trap (partial trap / Mean Look / Octolock / Jaw Lock) it was holding the foe
     // in — PS clears the linked `trapped`/`partiallytrapped` when the trapper's `clearVolatile`
@@ -2901,7 +2916,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // Regenerator restores 1/3 of its max HP. Both act on the mon before it leaves.
     let (out_ability, out_status, out_hp, out_max) = {
         let o = b.state.side(side).active();
-        (o.ability, o.status, o.hp, o.max_hp)
+        (switch_out_ability, o.status, o.hp, o.max_hp)
     };
     if out_ability == crate::ids::Ability::NaturalCure && out_status != Status::None {
         push(b, Instruction::ChangeStatus { side, slot: previous, previous: out_status, new: Status::None });
