@@ -10432,6 +10432,23 @@ fn execute_status_move(
     let foe = side.other();
     let foe_moves_later = foe_pending.is_some();
 
+    // PS `hitStepTryImmunity` is moveStep **3**, before `hitStepAccuracy` (4) — a move refused
+    // there makes NO draw and applies nothing. It has to be checked before every move-specific
+    // branch below, because several of those branches emit their own accuracy draw and would
+    // otherwise emit it for a move PS never accuracy-rolled.
+    //
+    // This used to live 700 lines further down, after the whole `md.id` special-case chain, and
+    // Trick/Switcheroo — which is IN that chain and emits its own accuracy draw — carried a
+    // comment asserting the opposite ("Sticky Hold blocks the item swap later at `onTakeItem`,
+    // not before accuracy"). It does not: `trick.onTryImmunity(target) { return
+    // !target.hasAbility('stickyhold'); }` (`data/moves.ts:19886`) is exactly moveStep 3.
+    // rb5062 d6: a Choice-Scarf Hoopa Tricks a Sticky Hold Dipplin; PS's three draws for the turn
+    // are Giga Drain's accuracy/crit/roll and nothing else, the engine drew a fourth, and every
+    // draw after it read the wrong PRNG value. Two engine copies of one PS predicate, again.
+    if status_try_immunity_fails(&b, side, md) {
+        return vec![b];
+    }
+
     // Sleep Talk: `onTry` requires the user to be asleep (or Comatose) — used awake the move
     // simply fails, with no draw. `onHit` samples uniformly over the user's OTHER usable move
     // slots (PS `sleeptalk` excludes `nosleeptalk`/`charge`-flagged moves and empty slots; PP is
@@ -10938,9 +10955,11 @@ fn execute_status_move(
         let (mine, theirs) = (b.state.side(side).active().item, b.state.side(foe2).active().item);
         let sticky = b.state.side(foe2).active().ability == crate::ids::Ability::StickyHold;
         // Trick / Switcheroo are foe-targeting numeric-accuracy (100) status moves: PS
-        // `hitStepAccuracy` rolls `randomChance(accuracy,100)` (they reach it — Sticky Hold blocks
-        // the item swap later at `onTakeItem`, not before accuracy). Special-cased above the general
-        // status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits). The arg is
+        // `hitStepAccuracy` rolls `randomChance(accuracy,100)`. They reach it only when
+        // `onTryImmunity` let them through — Sticky Hold refuses at moveStep 3, which the hoisted
+        // `status_try_immunity_fails` at the top of this function now handles for every branch.
+        // Special-cased above the general status-accuracy branch, so emit the draw here
+        // (draw-and-discard, 100% hits). The arg is
         // post-`ModifyAccuracy`/stage: a +1-accuracy Trick user rolls `randomChance(133,100)`
         // (r10 t17). A fainted foe (no target) fails earlier and never rolls.
         if annotating() && b.state.side(foe2).active().is_alive() && !accuracy_forced_true(&b, side, md) {
@@ -11127,11 +11146,6 @@ fn execute_status_move(
             return vec![b];
         }
     }
-    // PS `hitStepTryImmunity` — before `hitStepAccuracy`, so no draw and no effect.
-    if status_try_immunity_fails(&b, side, md) {
-        return vec![b];
-    }
-
     let hit_prob = accuracy_of(&b, side, md);
     let miss_prob = 1.0 - hit_prob;
     // PS `hitStepAccuracy`: a foe-targeting status move with numeric accuracy rolls
