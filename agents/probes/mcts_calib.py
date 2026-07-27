@@ -28,8 +28,10 @@ def load_ckpt(path: str, device):
     meta = se.Battle(seed=0)
     embed = {"n_mons": meta.n_mons, "cols": meta.id_columns(), "vocab": meta.vocab_sizes(),
              "dim": ck.get("embed_dim", 32)}
+    # Checkpoints from --aux runs carry the prediction heads; build to match or strict load fails.
+    has_aux = any(k.startswith("aux_") for k in ck["model"])
     net = ActorCritic(ck["obs_dim"], ck["n_actions"], ck.get("hidden_dim", 256),
-                      ck.get("n_hidden_layers", 2), embed=embed, aux=False).to(device)
+                      ck.get("n_hidden_layers", 2), embed=embed, aux=has_aux).to(device)
     net.load_state_dict(ck["model"])
     net.eval()
     return net, ck.get("global_step", 0)
