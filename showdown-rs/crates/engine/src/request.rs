@@ -255,6 +255,7 @@ impl Flow {
                 foe_pending_move: None,
                 shell_phys: None,
                 custap: cu,
+                struggling: crate::generate::no_usable_move(&b.state, side),
                 external_move: None,
                 called: false,
             }),

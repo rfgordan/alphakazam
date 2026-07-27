@@ -262,7 +262,8 @@ pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
-        foe_pending_move: None, custap: cu, external_move: None, called: false,
+        foe_pending_move: None, custap: cu, struggling: no_usable_move(state, side),
+        external_move: None, called: false,
     };
     let a = mk(SideId::One, i1, custap[0]);
     let c = mk(SideId::Two, i2, custap[1]);
@@ -478,6 +479,7 @@ fn apply_dancer_copies(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                 shell_phys: None,
                 foe_pending_move: None,
                 custap: false,
+                struggling: false, // external (Dancer) copies never Struggle
                 external_move: Some(move_id),
                 called: false,
             })
@@ -1018,6 +1020,7 @@ fn emit_turn_start_bracket(b: &mut Branch, s1: MoveChoice, s2: MoveChoice, custa
         shell_phys: None,
         foe_pending_move: None,
         custap: cu,
+        struggling: no_usable_move(st, side),
         external_move: None,
         called: false,
     };
@@ -1900,6 +1903,7 @@ pub fn generate_move_action(
         pivot: pivot.map_or(Pivot::Stay, Pivot::Target),
         foe_pending_move,
         custap: false,
+        struggling: no_usable_move(state, side),
         external_move: None,
         called: false,
     })
@@ -2219,7 +2223,12 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
     let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0], custap[0]), (SideId::Two, s2, pivot[1], custap[1])]
         .into_iter()
         .filter_map(|(side, c, pv, cu)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu, external_move: None, called: false }),
+            MoveChoice::Move(idx) => Some(Action {
+                side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu,
+                // Evaluated on the TURN-START board, which is when PS builds the request.
+                struggling: no_usable_move(state, side),
+                external_move: None, called: false,
+            }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -3085,6 +3094,12 @@ pub(crate) struct Action {
     /// Custap Berry fired at queue time (+0.1 fractional priority for this action). The
     /// berry was already consumed at turn start, so the flag must ride on the action.
     pub(crate) custap: bool,
+    /// PS decided at REQUEST time that this side has no usable move and must Struggle
+    /// (`no_usable_move`). It rides on the action because the decision is made on the
+    /// turn-START board: an Encore or a Disable that the foe lands EARLIER IN THIS TURN
+    /// cannot retroactively force Struggle — PS's `onOverrideAction` just redirects the
+    /// already-chosen action and never re-consults `disabled`.
+    pub(crate) struggling: bool,
     /// A Dancer-invoked copy of `Some(move)` (PS `externalMove`): the move executes from
     /// this side without a move slot — no PP cost, no Encore/rampage override, no move-use
     /// bookkeeping, no rampage lock (the "Dancer Petal Dance hack"), and no re-trigger of
@@ -4161,11 +4176,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         return vec![b];
     }
     // A Dancer-invoked copy carries its move directly (it need not be on the user's set).
-    let move_id = external_move.unwrap_or(attacker.moves[move_idx as usize].id);
-    // Struggle: a mon forced to act with no usable moves (the chosen slot is out of PP) uses
-    // Struggle instead — a typeless 50-BP physical hit that connects on everything and recoils
-    // 1/4 of the user's max HP.
-    let struggling = !external && attacker.moves[move_idx as usize].pp == 0;
+    let mut move_id = external_move.unwrap_or(attacker.moves[move_idx as usize].id);
+    // Struggle: a mon forced to act with no usable moves uses Struggle instead — a typeless
+    // 50-BP physical hit that connects on everything and recoils 1/4 of the user's max HP.
+    // The chosen slot being out of PP is the common case; `no_usable_move` is PS's actual rule
+    // (`getMoves` returns `[]` when EVERY slot is disabled, which the request turns into
+    // Struggle) and covers the disabled-but-not-empty mons the pp test misses.
+    let struggling = !external && (attacker.moves[move_idx as usize].pp == 0 || action.struggling);
+    if struggling {
+        // The move USED is Struggle, not whatever slot the choice nominally pointed at — PS
+        // sets `lastMove` to the struggle Move object. It matters: rb1024 d82's Ursaluna
+        // Struggles on t72 while Encored into Blood Moon, and if the engine records Blood Moon
+        // as the last move then `cantusetwice` locks it out on t73 and the mon Struggles a
+        // SECOND time, where PS goes back to using Blood Moon.
+        move_id = crate::ids::MoveId::from_id("struggle").unwrap_or(crate::ids::MoveId::None);
+    }
+    let move_id = move_id;
     let mut md = if struggling {
         let mut m = crate::data::MoveData::none();
         m.typ = Type::None;
@@ -4522,7 +4548,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
 
     // PP is paid on the charge turn, not the strike turn. Pressure on the opposing active
     // costs one extra PP for any move that targets it (PS onDeductPP; cosim caught this).
-    if !executing_charge && !rampaging_now && !external {
+    // Struggle is not a move slot (PS `dex.moves.get('struggle')` with no `moveSlot`), so it
+    // deducts nothing — the guard used to be implicit because `struggling` meant "the chosen
+    // slot is at 0 PP", which is no longer the only way in (`no_usable_move`).
+    if !executing_charge && !rampaging_now && !external && !struggling {
         let pp = b.state.side(side).active().moves[move_idx as usize].pp;
         if pp > 0 {
             let foe_active = b.state.side(side.other()).active();
@@ -9891,6 +9920,7 @@ fn execute_status_move(
                         shell_phys: None,
                         foe_pending_move: foe_pending,
                         custap: false,
+                        struggling: false, // a called move (Sleep Talk) never Struggles
                         external_move: Some(called_id),
                         called: true,
                     },
@@ -10748,6 +10778,41 @@ pub fn is_cantusetwice_move(id: crate::ids::MoveId) -> bool {
 /// active because it was that mon's last executed move (PS's `DisableMove` for the flag).
 pub fn cantusetwice_locked(state: &State, side: SideId, move_id: crate::ids::MoveId) -> bool {
     is_cantusetwice_move(move_id) && state.side(side).last_used_move == move_id
+}
+
+/// PS `Pokemon.getMoves(null)` ends `return hasValidMove ? moves : []` (`sim/pokemon.ts:1042`),
+/// and `getMoveRequestData` turns an empty list into the single pseudo-move **Struggle**
+/// (`:1104-1107`). So a mon whose every slot is DISABLED — not merely out of PP — is forced to
+/// Struggle, with all of its PP intact.
+///
+/// The witness is rb1231 d15: a Tinkaton that used Gigaton Hammer (whose `cantusetwice` flag
+/// disables it the following turn) is then hit by **Encore**, whose gen-9 `onDisableMove`
+/// disables every slot EXCEPT the encored one — which is the already-disabled Gigaton Hammer.
+/// All four slots disabled, so PS's request offers only Struggle. The engine instead honoured
+/// the Encore override and re-used Gigaton Hammer, spending a PP PS never spent.
+///
+/// A HARD lock (rampage / charge / recharge) short-circuits `getMoves` before the `disabled`
+/// scan and returns the locked move, so such a mon never Struggles — hence the early return.
+pub fn no_usable_move(state: &State, side: SideId) -> bool {
+    let s = state.side(side);
+    if s.pending_move != crate::state::PendingMove::None {
+        return false;
+    }
+    let p = s.active();
+    let choice_locked = s.volatiles.contains(VolatileStatus::ChoiceLock);
+    !p.moves.iter().any(|m| {
+        m.id != crate::ids::MoveId::None
+            && m.pp > 0
+            && !m.disabled
+            // Gigaton Hammer / Blood Moon, the turn after use.
+            && !cantusetwice_locked(state, side, m.id)
+            // Encore disables every OTHER slot; Disable disables its own.
+            && (s.encore.1 == 0 || m.id == s.encore.0)
+            && (s.disable.1 == 0 || m.id != s.disable.0)
+            // Taunt disables every status move; a Choice lock every move but the locked one.
+            && !(s.taunt_turns > 0 && move_data(m.id).category == MoveCategory::Status)
+            && !(choice_locked && s.last_used_move != crate::ids::MoveId::None && m.id != s.last_used_move)
+    })
 }
 
 /// Two-turn moves whose user is untargetable during the charge turn.
