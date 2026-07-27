@@ -6601,16 +6601,67 @@ impl Iterator for HitCombos {
 /// Compute a move's damage rolls (non-crit and crit) and the defender-side fields needed
 /// after application. Pure with respect to `b` (reads state, mutates nothing) so both the
 /// exact per-hit path and the sumset-DP path can call it once and share the result.
+/// Does Mold Breaker / Teravolt / Turboblaze (and `move.ignoreAbility`) suppress this ability?
+///
+/// **`flags: { breakable: 1 }` in `data/abilities.ts` is the whole rule.** PS `sim/battle.ts:836`:
+/// `if (effect.effectType === 'Ability' && effect.flags['breakable'] &&
+/// this.suppressingAbility(effectHolder)) continue;`, and `suppressingAbility` (`:365`) is just
+/// "there is an active move and it has `ignoreAbility`". Everything else is untouched — the engine
+/// used to blank the defender's ability wholesale, which silently deleted the abilities PS
+/// deliberately left OUT of the flag:
+///
+/// * **Shadow Shield** (`flags: {}`) is not Multiscale (`breakable: 1`) — rb1612, a Mold Breaker
+///   Haxorus's Iron Head into a full-HP Lunala, where PS still halved the damage.
+/// * **the four Ruin abilities** (`flags: {}`) — rb1588, a Mold Breaker Excadrill's Iron Head into
+///   Wo-Chien, where PS still applied Tablets of Ruin's ×0.75 to Excadrill's Attack.
+/// * **Prism Armor** (`flags: {}`) is not Filter / Solid Rock (`breakable: 1`); no corpus witness
+///   yet, same class.
+///
+/// The list is the 83 `breakable: 1` abilities of the pinned dex, minus `mountaineer` and
+/// `rebound` (CAP-only, absent from the engine's `Ability` enum).
+fn ability_breakable(a: crate::ids::Ability) -> bool {
+    use crate::ids::Ability as Ab;
+    matches!(
+        a,
+        Ab::ArmorTail | Ab::AromaVeil | Ab::AuraBreak | Ab::BattleArmor | Ab::BigPecks |
+        Ab::Bulletproof | Ab::ClearBody | Ab::Contrary | Ab::Damp | Ab::Dazzling | Ab::Disguise |
+        Ab::DrySkin | Ab::EarthEater | Ab::Filter | Ab::FlashFire | Ab::FlowerGift | Ab::FlowerVeil |
+        Ab::Fluffy | Ab::FriendGuard | Ab::FurCoat | Ab::GoodAsGold | Ab::GrassPelt | Ab::GuardDog |
+        Ab::Heatproof | Ab::HeavyMetal | Ab::HyperCutter | Ab::IceFace | Ab::IceScales |
+        Ab::Illuminate | Ab::Immunity | Ab::InnerFocus | Ab::Insomnia | Ab::KeenEye | Ab::LeafGuard |
+        Ab::Levitate | Ab::LightMetal | Ab::LightningRod | Ab::Limber | Ab::MagicBounce |
+        Ab::MagmaArmor | Ab::MarvelScale | Ab::MindsEye | Ab::MirrorArmor | Ab::MotorDrive |
+        Ab::Multiscale | Ab::Oblivious | Ab::Overcoat | Ab::OwnTempo | Ab::PastelVeil | Ab::PunkRock |
+        Ab::PurifyingSalt | Ab::QueenlyMajesty | Ab::SandVeil | Ab::SapSipper | Ab::ShellArmor |
+        Ab::ShieldDust | Ab::Simple | Ab::SnowCloak | Ab::SolidRock | Ab::Soundproof | Ab::StickyHold |
+        Ab::StormDrain | Ab::Sturdy | Ab::SuctionCups | Ab::SweetVeil | Ab::TangledFeet |
+        Ab::Telepathy | Ab::TeraShell | Ab::ThermalExchange | Ab::ThickFat | Ab::Unaware |
+        Ab::VitalSpirit | Ab::VoltAbsorb | Ab::WaterAbsorb | Ab::WaterBubble | Ab::WaterVeil |
+        Ab::WellBakedBody | Ab::WhiteSmoke | Ab::WindRider | Ab::WonderGuard | Ab::WonderSkin
+    )
+}
+
+/// Does `side`'s move set PS's `move.ignoreAbility` — i.e. does it suppress the TARGET's
+/// `breakable` abilities while it resolves? Mold Breaker / Teravolt / Turboblaze on the user, or a
+/// move with its own `ignoreAbility` (Sunsteel Strike / Moongeist Beam / Photon Geyser). Mycelium
+/// Might is deliberately absent: it sets the flag only for the user's STATUS moves, and the one
+/// status site that needs it already folds it into its own `status_breaker`.
+fn move_breaks_abilities(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    matches!(b.state.side(side).active().ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze)
+        || move_ignores_ability(md.id)
+}
+
 fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> DamageCalc {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let attacker = b.state.side(side).active();
     let defender = b.state.side(foe).active();
-    // Mold Breaker suppresses the defender's damage-affecting ability for this move; `def_ab`
-    // is the defender's ability as the damage calc should see it (None when suppressed).
+    // Mold Breaker suppresses the defender's damage-affecting ability for this move — but **only
+    // if it is `breakable`**. `def_ab` is the defender's ability as the damage calc should see it.
     let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze)
         || move_ignores_ability(md.id);
-    let def_ab = if mb { Ab::None } else { defender.ability };
+    let def_ab = if mb && ability_breakable(defender.ability) { Ab::None } else { defender.ability };
 
     // Foul Play uses the defender's Attack stat and Attack boost (attacker's burn still
     // applies; Unaware on the defender ignores... the defender's own boost is used as-is).
@@ -9692,19 +9743,34 @@ fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
     }
 }
 
+/// The no-Mold-Breaker case (switch-in abilities, hazards, residuals, contact abilities).
+fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+    apply_boost_clamped_ex(b, target, stat, delta, false)
+}
+
 /// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
 /// the ±6 clamp. Returns the effective change actually applied (0 if blocked/clamped out).
-fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+///
+/// `breaker` is "this change comes from a move whose user has Mold Breaker / Teravolt /
+/// Turboblaze (or `move.ignoreAbility`)". It suppresses the target's `breakable` abilities for
+/// exactly this change, which is what PS's `suppressingAbility` (`sim/battle.ts:365`) does — and
+/// it is only true while such a MOVE is resolving, so Intimidate / Sticky Web / Octolock / a
+/// contact ability's own drop pass `false`. **`Contrary` is `breakable: 1`**: rb1430 d26, a Mold
+/// Breaker Tinkaton's Play Rough into a Malamar, where PS applied the −1 Attack as a DROP
+/// (2 → 1) and the engine inverted it into a raise (2 → 3). `Full Metal Body` is NOT breakable
+/// (`cantsuppress`), which is why the blocker set has to be filtered per-ability.
+fn apply_boost_clamped_ex(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8, breaker: bool) -> i8 {
     use crate::ids::Ability as Ab;
+    let seen = |a: Ab| if breaker && ability_breakable(a) { Ab::None } else { a };
     // Contrary inverts the change before anything else (so a "drop" becomes a raise and is no
     // longer blocked by Clear Body / counted as a drop by Defiant).
-    let delta = if b.state.side(target).active().ability == Ab::Contrary { -delta } else { delta };
+    let delta = if seen(b.state.side(target).active().ability) == Ab::Contrary { -delta } else { delta };
     // Every apply_boost_clamped call is an OPPONENT-inflicted change on `target` (self-drops go
     // through apply_self_boost), so the "source && target === source" self-skip in PS's onTryBoost
     // handlers never fires here. Protective abilities block foe-inflicted stat *drops*.
     if delta < 0 {
         let tgt = b.state.side(target).active();
-        let ab = tgt.ability;
+        let ab = seen(tgt.ability);
         // Clear Body / Full Metal Body / White Smoke block every stat drop; Flower Veil does so
         // for a Grass-type holder; Big Pecks only Defense; Keen Eye / Mind's Eye only Accuracy.
         let block_all = matches!(ab, Ab::ClearBody | Ab::FullMetalBody | Ab::WhiteSmoke)
@@ -10356,6 +10422,9 @@ fn apply_alluringvoice_confusion(b: Branch, side: SideId, md: &crate::data::Move
 
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let mut b = b;
+    // The attacker's Mold Breaker suppresses the target's `breakable` abilities for this move's
+    // secondary boosts too — Contrary among them (rb1430 d26).
+    let mb_move = move_breaks_abilities(&b, side, md);
     // 100%-secondary moves the engine applies through `target_volatile`/a dedicated handler
     // (secondary_chance == 0) still cost PS one `random(100)` at the secondaries site.
     if extra_secondary_roll_move(md.id)
@@ -10427,7 +10496,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if target_eligible {
         for (i, &delta) in md.secondary_boosts.iter().enumerate() {
             // One `AfterEachBoost` per actually-changed stat (sim/battle.ts:2073).
-            if delta != 0 && apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0 {
+            if delta != 0 && apply_boost_clamped_ex(&mut proc, foe, BOOST_ORDER[i], delta, mb_move) < 0 {
                 react_to_stat_drop(&mut proc, foe);
                 apply_white_herb(&mut proc, foe);
             }
@@ -11272,7 +11341,8 @@ fn execute_status_move(
         let sub_blocks = b.state.side(foe2).volatiles.contains(VolatileStatus::Substitute)
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator;
         if b.state.side(foe2).active().is_alive() && !sub_blocks {
-            if apply_boost_clamped(&mut b, foe2, BoostIndex::Evasion, -1) < 0 {
+            let mb_move = move_breaks_abilities(&b, side, &md);
+            if apply_boost_clamped_ex(&mut b, foe2, BoostIndex::Evasion, -1, mb_move) < 0 {
                 react_to_stat_drop(&mut b, foe2);
             }
         }
@@ -11592,7 +11662,8 @@ fn execute_status_move(
                     push(&mut b, Instruction::Heal { side, slot, amount });
                 }
             }
-            if apply_boost_clamped(&mut b, foe, BoostIndex::Attack, -1) < 0 {
+            let mb_move = move_breaks_abilities(&b, side, &md);
+            if apply_boost_clamped_ex(&mut b, foe, BoostIndex::Attack, -1, mb_move) < 0 {
                 react_to_stat_drop(&mut b, foe);
             }
         }
@@ -11717,7 +11788,7 @@ fn execute_status_move(
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
     if hit.state.side(foe).active().is_alive() && !foe_immune {
         for (i, &delta) in md.target_boosts.iter().enumerate() {
-            if delta != 0 && apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta) < 0 {
+            if delta != 0 && apply_boost_clamped_ex(&mut hit, foe, BOOST_ORDER[i], delta, status_breaker) < 0 {
                 // PS fires `AfterEachBoost` INSIDE `boost()`'s per-stat loop (sim/battle.ts:2073),
                 // once for every stat whose `boostBy` was non-zero — so a TWO-stat drop wakes
                 // Defiant / Competitive TWICE. Parting Shot (atk -1, spa -1) into Competitive is
