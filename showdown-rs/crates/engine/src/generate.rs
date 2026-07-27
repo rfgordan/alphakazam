@@ -5781,6 +5781,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_damaging_hit_step7(&mut hb, side, &md, true);
             vec![hb]
         } else {
+            apply_beak_blast_burn(&mut hb, side, &md, foe_pending_move);
             apply_burning_jealousy(&mut hb, side, &md);
             // A realized multi-hit branch already fired the `DamagingHit` ability rolls per hit
             // (PS runs the event inside `spreadMoveHit`, once per connecting hit) — don't fire them
@@ -9071,6 +9072,52 @@ fn react_to_stat_drop(b: &mut Branch, target: SideId) {
 /// Split a contact hit on a contact-triggered status ability (30%): the defender's Flame
 /// Body / Static / Poison Point statuses the attacker, or the attacker's Poison Touch
 /// poisons the target. Only one (the first applicable) is modeled; no-op off contact.
+/// Beak Blast burns anything that makes CONTACT with its user while the beak is heating.
+///
+/// `data/moves.ts` beakblast: `priorityChargeCallback(pokemon) { pokemon.addVolatile('beakblast') }`
+/// runs at `beforeTurn` (`sim/battle.ts:2764`, `case 'priorityChargeMove'`), so the volatile is up
+/// from the START of the turn — long before the move itself, which is priority **-3** and so
+/// effectively always moves last. The volatile's `onHit(target, source, move)` fires on the
+/// HOLDER as the target of an incoming move and does
+/// `if (checkMoveMakesContact(move, source, target)) source.trySetStatus('brn', target)`.
+/// `onAfterMove` removes it once Beak Blast resolves.
+///
+/// Modelled off `Action::foe_pending_move` — the queued, not-yet-executed move of the mon being
+/// hit — rather than a new volatile bit: PS's own volatile is `duration: 1` and is gone by every
+/// request boundary the gate digests, and "the target has a Beak Blast still queued" is exactly
+/// the window in which PS's handler exists. A mon dragged or switched off the field loses its
+/// queued action already (`sequence_two_moves`), which is the same lifetime.
+///
+/// It is `onHit` — step 3 of `spreadMoveHit` — so it lands ahead of the self-drops (4), the
+/// secondaries (5) and the `DamagingHit` contact abilities (7); a Flame Body / Static roll still
+/// happens, it just finds the attacker already statused. A Substitute hit does NOT burn: PS nulls
+/// the target entry (`targets[i] = null`, battle-actions.ts:1085) before `runMoveEffects` runs.
+///
+/// rb1108 d4 t5: p2's Blissey queues Beak Blast, p1's Ceruledge lands a contact Shadow Sneak
+/// (+1 priority) first. PS burns the Ceruledge and it takes the 16-HP residual chip that turn; the
+/// engine left it unburned at 89 where PS has 73.
+fn apply_beak_blast_burn(
+    b: &mut Branch, side: SideId, md: &crate::data::MoveData,
+    foe_pending_move: Option<crate::ids::MoveId>,
+) {
+    if !md.flag_contact {
+        return;
+    }
+    let charging = foe_pending_move.is_some_and(|m| m.to_id() == "beakblast");
+    if !charging {
+        return;
+    }
+    let atk = b.state.side(side).active();
+    if !atk.is_alive()
+        || !status_applies(atk, Status::Burn)
+        || status_blocked_by_field(&b.state, side, Status::Burn)
+    {
+        return;
+    }
+    let slot = b.state.side(side).active_index;
+    push(b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Burn });
+}
+
 fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     use crate::ids::Ability as Ab;
     let foe = side.other();
