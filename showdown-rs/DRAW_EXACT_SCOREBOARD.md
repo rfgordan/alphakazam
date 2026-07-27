@@ -6,6 +6,281 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 ---
 
+# ==== BURN-DOWN VIII — certification (2026-07-27) ====
+
+**HEADLINE: 466 / 512 full games byte-exact from seed (91.0%), up from 457; init-aligned
+512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
+
+Six parity commits, every one PS-source-grounded. Judged by the exact-SET diff on BOTH corpora at
+every step: **the newly-non-exact set was EMPTY at all six.** 9 games / 6 commits = **1.5
+games/commit**, so the early-stop line (<1 game/commit across 3 consecutive commits) was never
+reached and no asymptote assessment is due. The tranche stopped on its session budget, not on a
+kill criterion.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
+| Seed gate, 512 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz` | **466 / 512 = 91.0%**; init-aligned **512 / 512** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3812 / 3831 = 99.50%**; **zero `rust extra`** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, **0 unsupported** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+
+`convert.rs` was NOT touched, so the seed fixtures' baked digests did not move and **no fixture
+regeneration was needed**. `gen.rs` was NOT regenerated (no new `MoveData` fields). Five of the six
+commits are `crates/engine/src/generate.rs`-only; `d62ee20` also touches `crates/cosim/src/seedgate.rs`
+and `04717e6` touches `crates/engine/src/request.rs` (one `Branch` field constructor).
+
+## THE LEVER: `spreadMoveHit`'s per-hit step table, as landed
+
+Written from the pin FIRST, then used to place every call site. `sim/battle-actions.ts:1044-1155`;
+`hitStepMoveHitLoop` calls the WHOLE of this once per hit.
+
+| step | PS | engine counterpart | was it in the right place? |
+|------|----|--------------------|-----------------------------|
+| 0 | `tryPrimaryHitEvent` (Substitute) | sub routing inside the three hit loops | ✓ |
+| 1 | `getSpreadDamage` → `getDamage` | per-hit crit `randomChance(1,den)` + `random(16)` + the `ModifyDamage` screen shuffle | ✓ |
+| 2 | `spreadDamage` | `Instruction::Damage`, Sturdy / Focus Sash | ✓ |
+| 3 | `runMoveEffects` (`onHit`) | `apply_bug_bite`, `apply_thaw_on_hit`, `apply_spirit_shackle`, `apply_sparkling_aria`, `apply_relic_song_forme` | ~ (they sit after step 4/5; no witness) |
+| 4 | `selfDrops` | `apply_self_drop`, `start_rampage_lock` | ✓ |
+| 5 | `secondaries()` | `apply_damage_secondaries`, `apply_burning_jealousy`, `apply_target_secondary`, `apply_alluringvoice_confusion`, `apply_triattack_secondary`, `apply_direclaw_secondary`, `apply_partial_trap`, `apply_flinch_split` | ✓ |
+| 6 | `forceSwitch` | `apply_drag` | ✓ |
+| 7 | `runEvent('DamagingHit')` | **`apply_damaging_hit_step7`** = `apply_damaging_hit_reactions` (Rough Skin / Iron Barbs / Rocky Helmet / Gulp Missile / Electromorphosis / Stamina / Water Compaction / Seed Sower / Toxic Debris / Gooey) + Justified / Rattled / Thermal Exchange / Weak Armor, then the DRAWING handlers `apply_contact_secondaries` / `apply_cursed_body`, then `apply_weakness_policy` | **✗ — was BEFORE step 5. Fixed.** |
+| 8 | `onAfterHit` | Stone Axe / Ceaseless Edge hazards, `apply_spin_clear` | ~ |
+| 9 | `eachEvent('Update')` | `apply_pinch_berry`, `consume_lum_if_statused`, `emit_update_hit` | ✓ |
+
+The reorder mechanism: the three realized/enumerated hit loops (`apply_damage_hit_rolls`,
+`apply_damage_hit_indexed`, `apply_multihit_realized_ma`) now DEFER the event onto
+`Branch::pending_damaging_hit` instead of firing it inline. `apply_damaging_hit_step7` flushes it
+**(a)** at the top of the next iteration — PS finishes hit n, step 7 included, before starting hit
+n+1, and whatever the event moved is an input to hit n+1's `getDamage`, so the `restat_dirty` /
+`calc` re-derivation moved with it; **(b)** for the LAST hit, after the caller's step-5 secondary
+split and ahead of the drawing step-7 handlers, because PS orders Rough Skin / Iron Barbs
+(`onDamagingHitOrder: 1`) and Rocky Helmet (2) before the unordered contact-status set — a chip
+that faints the attacker must suppress its paralysis/burn.
+
+Two deliberate consequences: Justified / Rattled / Thermal Exchange / Weak Armor now fire ONCE PER
+HIT (they are `onDamagingHit`, like Stamina already was), and Weak Armor is now gated on `hit_sub`
+(`runEvent('DamagingHit')` is gated on `damagedDamage.length`, and a Substitute hit records
+`damage[i] === true`, not a number).
+
+Two places deliberately NOT deferred, both because the reorder is provably a no-op there:
+`realized_per_hit_damaging_hit` (the drawing half) stays inline — the realized multi-hit family
+([2,5] + Population Bomb + Beat Up) has no `secondary`, so nothing separates it from step 5 — and
+`apply_post_damage`'s once-per-move fallback (`!per_hit_done`: fixed-damage moves and the
+enumeration DP paths), which has no `secondary` either and whose current position keeps the event
+ahead of the Moxie / `onSourceAfterFaint` block that follows it.
+
+**The one regression this tranche produced, and the lesson.** The first cut of the reorder dropped
+rb1198 / rb1302 / rb1395 — exactly the three games burn-down VI's commit 4 had won. Deferring the
+event moved the `pre_inputs` snapshot past `realized_per_hit_damaging_hit`, so a Flame Body burn
+inflicted by the DRAWING half stopped invalidating the cached `DamageCalc`. The fix was to snapshot
+before the drawing handlers and again around the flush. **Any change to a hit loop must keep a
+`damage_inputs` snapshot straddling EVERY step-7 handler, drawing or not.**
+
+## The roots landed (in commit order)
+
+| # | commit | class | games | PS reference |
+|---|--------|-------|-------|--------------|
+| 1 | `04717e6` | **`spreadMoveHit` steps 5 and 7 were swapped** — the move's SECONDARIES run BEFORE `runEvent('DamagingHit')`. rb1122 d5: Palossand at Def +5, Azumarill's Liquidation lands and its 20% Def drop procs — PS takes 5 → 4 (secondary) → 6 (Water Compaction +2), the engine took 5 → 6 (clamped at the cap) → 5 | 457 → 458 | `sim/battle-actions.ts:1044-1155` (`:1116` secondaries, `:1142` DamagingHit) |
+| 2 | `d62ee20` | **A double-switch Speed TIE is NOT state-neutral.** Two `switch` actions at order 103 are speed-sorted on the OUTGOING active's Speed; on a tie `commitChoices`' `queue.sort()` breaks it with one `shuffle[2,0,2]`, and the winner's `runSwitch` (order 101) preempts the loser's still-pending `switch` (103) — so the winner's switch-in ability fires while the LOSER'S OLD mon is still on the field. There is no second queue sort to compose with (the gen8 dynamic re-sort is gated on `queue.peek()?.choice === 'move'`), so side One goes first iff that single bit is 0 | 458 → 459 | `sim/battle.ts:3038`, `:2940` |
+| 3 | `39bcf16` | **Queenly Majesty and Psychic Terrain only guarded DAMAGING moves.** Both engine blocks sat BELOW the `md.category == Status` dispatch, which returns first — and a status move is exactly what they block, because Prankster is what gives it priority. rb1061 d34: Klefki's Prankster Thunder Wave into a Queenly Majesty Tsareena; PS's whole unit is Tsareena's own move (the block makes NO draw), the engine rolled `randomChance(90,100)` and paralysed her. Psychic Terrain also picked up `effect.target === 'self'` exemption and the EFFECTIVE priority (`getActionSpeed` writes `action.move.priority` after `ModifyPriority`) | 459 → 463 | `sim/battle-actions.ts:485-492`; `data/abilities.ts:3671`; `data/moves.ts:14120-14123` |
+| 4 | `6ce4a13` | **Four residual handlers PS collects and the engine never listed** — `whiteherb` (Item, 29/8), `shieldsdown` (Ability, 29/7), the `flinch` volatile (Condition, false/2 — duration-only) and `twoturnmove` (Condition, false/2 — duration-only, plus a SECOND handler for the semi-invulnerable moves' own condition). A missing handler both shortens `shuffle[len,i,j]` and can delete a tie group | 463 → 465 | `sim/battle.ts:486` (`getKey = 'duration'`), `:1102/:1111/:1119/:1126`, `:955-991` (subOrder table); `data/items.ts:7697`; `data/conditions.ts:198`, `:287` |
+| 5 | `12e5770` | **Trick / Switcheroo never consulted `onTakeItem`.** `trick.onHit` bails the moment either transfer is refused, and then re-runs `singleEvent('TakeItem')` with the holders CROSSED, so an item that cannot be HELD by the other end blocks the swap too. rb1099 d57: a Choice Scarf Chandelure Tricks an Arceus-Dark holding a Dread Plate — PS fails outright, the engine swapped and handed the Choice lock to the Arceus. `item_removable_from` already existed for Knock Off / Magician / Pickpocket / Thief | 465 → 466 | `data/moves.ts:19889-19904`; `data/items.ts:1581-1586` |
+
+(Commit 1's first cut also carried the `restat_dirty` regression fix described above; it is part of
+`04717e6`, which is why the table has five roots across six commits — the sixth commit is the
+docs/certification commit this section belongs to.)
+
+Games flipped, by commit: 1 → rb1122; 2 → rb1250; 3 → rb1061 rb1245 rb1252 rb1370;
+4 → rb1034 rb1378; 5 → rb1099.
+
+Three named opens CLOSED outright: **the step-5/7 lever itself** (which also subsumes the Phase-7
+"`apply_rattled` / `apply_thermal_exchange` / `apply_weak_armor` still run before the secondaries"
+open), **the double-switch Speed tie** (rb1250, the only game in its class), and the
+`args randomChance@hypervoice` / `@powerwhip` pair (rb1245 / rb1252 / rb1370, all taken by commit 3
+without being touched — they were Queenly Majesty games mislabelled by their draw class).
+
+## What the re-triage method produced this tranche — the new cheap step
+
+Burn-down VII's `|Δhp| == 0` sweep still works and produced the Trick root (rb1099's item pair).
+The NEW step, worth repeating first thing next time, is a **handler-list census off the sidecars**:
+
+> Every recorded `shuffle` draw carries `group` (the tied handlers) AND `full` (PS's entire sorted
+> handler list) with each entry's `effect` / `effectType` / `order` / `subOrder` / `speed`. Group
+> the whole 401-game corpus by `(eventid, effect, effectType, order, subOrder, cb)` and diff the
+> result against the engine's model. It is PS's own answer to "what is in this list", measured, not
+> guessed.
+
+That census produced commit 4 in one pass: of the 37 distinct residual triples the corpus contains,
+`residual_handlers` was missing exactly four, and each came with its own witness decision. It also
+produced the *shape* census below, which is the standing worklist for the next tranche.
+
+**Shuffle-signature census (401 sidecars), `(eventid | tied-handler group)` → count / games.**
+Everything not listed under "modelled" is a shuffle the engine does not emit at all:
+
+```
+   792  48  Update      | MON~MON              modelled (eachEvent Update)
+   267  64  -           | MON~MON              modelled (commitChoices queue.sort)
+   263 102  Residual    | stall~protect        modelled
+   112  42  BeforeTurn  | MON~MON              modelled
+    99  53  Residual    | protect~stall        modelled
+    31   4  ModifyDamage| lightscreen~reflect  modelled
+    12   2  Residual    | slowstart~slowstart   modelled   rb1310 rb1369
+     8   5  DisableMove | choicelock~encore    modelled
+     5   1  Residual    | grassyterrain~…      modelled   rb1360
+     4   2  Residual    | leftovers~leftovers  modelled   rb1021 rb1141
+     4   4  DisableMove | choicelock~healblock modelled
+     4   3  Weather     | MON~MON              modelled
+     3   3  WeatherChange | MON~MON            modelled   rb1195 rb1250 rb1362
+     2   2  Residual    | flinch~stall         FIXED this tranche (commit 4)
+     2   1  AfterMove   | whiteherb~whiteherb  ** NOT MODELLED **  rb1345
+     1   1  Residual    | whiteherb~whiteherb  FIXED this tranche (commit 4)
+     1   1  TerrainChange | MON~MON            modelled   rb1099
+```
+
+## The 46 still-open games, re-triaged at the certifying commit
+
+First-divergence CLASS split (from the 512 gate):
+
+| n | class |
+|---|-------|
+| 22 | `draws-match/state-diff` |
+| 8 | `result random[16]@…` — a draw miscount in an EARLIER unit |
+| 2 each | `PS shuffle@generic`, `args randomChance@struggle` |
+| 1 each | `PS random@confusion`, `PS randomChance@heavyslam`, `PS randomChance@struggle`, `PS shuffle@thunderbolt`, `PS-unconsumed random@icehammer` / `randomChance@freezedry` / `randomChance@icebeam` / `sample@trace`, `args randomChance@par`, `args shuffle@generic`, `rust-extra randomChance@accuracy`, `rust-extra randomChance@crit` |
+
+The 8 `result random[16]` games (rb1369's `@knockoff` survives; the set is otherwise unchanged):
+rb1021 d59(thunderbolt, rust=13), rb1057 d26(sludgewave, 9), rb1271 d11(hydropump, 9),
+rb1277 d12(gigadrain, 14), rb1310 d18(outrage, 1), rb1329 d24(heatcrash, 1),
+rb1343 d36(voltswitch, 8), rb1369 d46(knockoff, 14).
+
+Every open game, its first divergent unit, the move pair, and the first divergent field:
+
+```
+  rb1011 d43 t33 [closecombat switch]          s0#3.hp: engine=140 ps=77
+  rb1012 d60 t52 [gigadrain scald]             s0#2.hp: engine=138 ps=185
+  rb1021 d59 t50 [thunderbolt wish]            s1#3.hp: engine=145 ps=214
+  rb1024 d81 t73 [struggle switch]             s0#3.hp: engine=308 ps=250
+  rb1029 d22 t18 [gunkshot swordsdance]        s0#3.hp: engine=222 ps=246
+  rb1030 d53 t46 [toxic hypervoice]            s1#5.hp: engine=61 ps=78
+  rb1033 d44 t33 [substitute discharge]        s0.volatiles: engine=3 ps=1  (bit 1 Substitute EXTRA)
+  rb1040 d2 t3   [stealthrock earthpower]      s0#0.hp: engine=230 ps=217
+  rb1057 d26 t25 [sludgewave psychicnoise]     s0#5.hp: engine=88 ps=76
+  rb1093 d22 t17 [icehammer switch]            s0.boost.spe: engine=-2 ps=-3
+  rb1103 d37 t32 [strengthsap struggle]        s0#0.hp: engine=222 ps=136
+  rb1108 d4 t5   [shadowsneak beakblast]       s0#2.hp: engine=89 ps=73
+  rb1116 d7 t6   [knockoff closecombat]        s0#4.hp: engine=268 ps=251
+  rb1119 d8 t7   [moonblast sludgewave]        s1#4.types: engine=[Fire,None] ps=[Fairy,None]
+  rb1121 d18 t15 [hurricane uturn]             s1.volatiles: engine=1 ps=0  (bit 0 Confusion EXTRA)
+  rb1125 d2 t3   [icebeam flowertrick]         s0#0.hp: engine=0 ps=27
+  rb1126 d7 t5   [sludgebomb strengthsap]      s1.volatiles: engine=0 ps=2^28  (Unburden MISSING)
+  rb1184 d5 t6   [terastarstorm tachyoncutter] s1#4.hp: engine=196 ps=142
+  rb1191 d17 t14 [thunderbolt playrough]       s0#1.hp: engine=25 ps=33
+  rb1231 d15 t12 [struggle uturn]              s0#3.hp: engine=274 ps=208
+  rb1233 d39 t32 [clangingscales wish]         s0.boost.def: engine=-2 ps=-1
+  rb1236 d37 t29 [dracometeor voltswitch]      s0#4.hp: engine=51 ps=18
+  rb1239 d64 t51 [hurricane dazzlinggleam]     s1.stall_counter: engine=0 ps=1
+  rb1243 d11 t10 [stompingtantrum knockoff]    s1#1.hp: engine=94 ps=156
+  rb1244 d10 t7  [voltswitch switch]           s1#4.ability: engine=Trace ps=WaterAbsorb
+  rb1253 d12 t10 [snowscape bellydrum]         s1#2.species: engine=222 ps=221  (Ice Face restore)
+  rb1271 d11 t9  [switch hydropump]            s0#3.hp: engine=225 ps=221
+  rb1277 d12 t9  [sludgebomb gigadrain]        s0#5.hp: engine=293 ps=290
+  rb1283 d17 t13 [knockoff switch]             s1#2.hp: engine=114 ps=99
+  rb1300 d52 t48 [sleeptalk focusblast]        s0#1.hp: engine=152 ps=174
+  rb1310 d18 t14 [dragondance outrage]         s1.pending_move: Rampaging(589,2) vs (589,1)
+  rb1314 d45 t38 [stickyweb revivalblessing]   s1#0.item: engine=LightClay ps=None
+  rb1315 d28 t26 [earthquake knockoff]         s0#2.hp: engine=189 ps=205
+  rb1326 d50 t40 [superfang protect]           s1.substitute_hp: engine=66 ps=48
+  rb1329 d24 t17 [heatcrash earthquake]        s0#5.hp: engine=112 ps=120
+  rb1343 d36 t27 [voltswitch kowtowcleave]     s0#4.hp: engine=60 ps=52
+  rb1345 d11 t9  [icebeam icebeam]             s1#4.hp: engine=233 ps=231
+  rb1347 d61 t56 [trick rest]                  s1#1.last_berry: engine=None ps=ChestoBerry
+  rb1348 d12 t11 [drainingkiss outrage]        s0#1.hp: engine=159 ps=107
+  rb1359 d7 t7   [switch calmmind]             s0#0.types: engine=[Normal,Fire] ps=[Ghost,None]
+  rb1360 d6 t6   [dragontail dragontail]       s1#2.move3.pp: engine=7 ps=8
+  rb1362 d24 t20 [icebeam thunderbolt]         s0#1.hp: engine=138 ps=120
+  rb1369 d46 t42 [knockoff bodyslam]           s1#0.hp: engine=162 ps=70
+  rb1380 d15 t15 [scaleshot toxic]             s0#1.hp: engine=157 ps=173
+  rb1387 d36 t32 [encore freezedry]            s0#3.hp: engine=337 ps=218
+  rb1391 d20 t15 [switch heavyslam]            s0#3.hp: engine=207 ps=204
+```
+
+Recurrences to re-scan after every landing: **`knockoff` 5x** (rb1116 rb1243 rb1283 rb1315 rb1369 —
+still the largest move cluster), `icebeam` 3x (rb1125 rb1345 rb1362), `struggle` 3x (rb1024 rb1103
+rb1231), `thunderbolt` 3x (rb1021 rb1191 rb1362), `voltswitch` 3x (rb1236 rb1244 rb1343),
+`switch` as one half 6x.
+
+## Named opens carried forward — newly located first
+
+- **NEW, fully diagnosed, 1 game: the `runEvent('AfterMove')` tie shuffle is not modelled.**
+  White Herb / Eject Pack / Mirror Herb (items) and Opportunist (ability) all register
+  `onAnyAfterMove`, so EVERY move action collects one handler per holder on the field; two holders
+  at equal Speed tie and consume a `shuffle[2,0,2]`. rb1345 d11 records it twice, with `full` =
+  exactly `[whiteherb/false/8/171 ×2]`, positioned between the move's internal 970/1024 Updates and
+  the trailing runAction 2882. Sizing it correctly also needs the mover's own volatile handlers
+  (`lockedmove`, `charge`, `beakblast` conditions) and the MOVE's own `onAfterMove` (Mind Blown,
+  Steel Beam, Sparkling Aria, Ice Ball, Rollout, Spit Up — `runEvent` unshifts a `sourceEffect`
+  handler at `sim/battle.ts:783`, subOrder 0, so it lengthens the list without joining the tie).
+  rb1345 is the only game in the corpus that needs it.
+- **NEW: `lockedmove` is a residual handler PS collects and the engine still does not.** It has
+  `duration: 2` AND an `onResidual` (`data/conditions.ts:255-262`), order `false`, Condition
+  subOrder 2 — so a rampaging mon must contribute one. It was left OUT of commit 4 because no
+  recorded residual `shuffle` in the corpus fired while a rampage was live, so there is no witness
+  to size it against. Adding it blind changes `shuffle[len,…]` for every rampage turn; do it with a
+  witness or with a directed trace.
+- **NEW: rb1362 d24 is a `random(100)` branch-SELECTION failure, not a mechanics bug.** PS's
+  Thunderbolt rolls `random(100) = 2` against a 10% paralysis and procs; the engine's chosen branch
+  carries the no-proc placeholder (`random[100]=10`) and then never rolls the victim's
+  `randomChance(1,4)@par`, so the streams desync by one draw and the second mover's Ice Beam freeze
+  is selected off the wrong slot. `replicate_select`'s threshold decode
+  (`seedgate.rs:255-273`) needs `distinct[0] == 0`; work out which earlier position eliminated the
+  proc branch. One game, but the mechanism is shared with every secondary split.
+- **NEW: rb1391 d20's pre-swap Speed tie is evaluated differently by the two.** PS's unit opens
+  with the move's accuracy — no turn-start or switch-out shuffle at all — while the engine emits
+  three `shuffle[2,0,2]` before it. The engine believes the PRE-switch board is Speed-tied and PS
+  does not; the POST-switch board is tied in both (PS's four trailing shuffles match).
+- **Roost typing is an ENCODING artifact, not PS state** — unchanged from burn-down VII, and
+  DELIBERATELY not fixed this tranche: no open game's first divergence is a Roost window
+  (`rb1119` and `rb1359` are both real type CHANGES, not a stripped Flying), so the principled
+  `convert.rs`/`digest.rs` fix would cost a full fixture regeneration — every baked digest moves —
+  for zero measured gain. Fix it when a witness appears, or fold it into the next tranche that has
+  to regenerate fixtures anyway.
+- **The `struggle` cluster (rb1024, rb1103, rb1231) is REQUEST LEGALITY**, unchanged. rb1024 is
+  still the largest single gap in the corpus (121 HP at t73).
+- **Shed Skin is residual order 5/3** and still runs in the branching tail after Harvest (28/2);
+  fixing it moves a DRAW, so the residual's deterministic tail must become branch-based first.
+  Witnesses rb1315, rb1380.
+- **Clanging Scales' self Def −1** (rb1233 d39), **Ice Face's RESTORE** (rb1253, still the only
+  `species` first-divergence), **Rampage BeforeMove-cancel at `n == 1` with a NON-confused user**,
+  **Terapagos-Stellar's FAINT regression**, **Battle Bond's once-per-stint guard**, **Magnet
+  Rise's `onTry` failure** — all unchanged.
+- **The BeforeMove ladder's other half is still OPEN and is now correctly scoped.** confusion (3),
+  Attract (2) and paralysis (1) are still resolved in `execute_move`'s outer chain, i.e. ahead of
+  the order-5..7 cancels (Disable 7, Throat Chop / Heal Block / Gravity 6, Taunt 5) that live in
+  `execute_move_inner`. Flinch (8) is already correct — `flinch_cancel_chain` never reaches the
+  low ladder. **The four `eff=par ev=BeforeMove` games are NOT this bug** (rb1034 and rb1061 were
+  taken by commits 4 and 3; rb1243 and rb1362 are a knock-off HP gap and the `replicate_select`
+  bug above), so the ladder currently has NO witness in the corpus. The combination it needs is a
+  lock applied THIS TURN by a faster foe (Taunt / Heal Block are `onDisableMove` too, so the
+  request already excludes them otherwise) landing on a confused / attracted / paralysed mover.
+  Either find one with a directed trace or leave it; it is not worth a blind refactor.
+- **`apply_end_of_turn`'s `switched` parameter is still vestigial** — delete its `request.rs`
+  plumbing next time that file is touched.
+- **Kill criterion: NOT triggered.** 1.5 games/commit across five parity commits; the worst single
+  commit still flipped one game, and the best flipped four.
+
+## Extended CI gate
+
+8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
+   — **must stay >= 466 / 512**, and the non-exact SET must be a subset of the previous one.
+9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
+
+---
+
 # ==== BURN-DOWN VII — certification (2026-07-26) ====
 
 **HEADLINE: 457 / 512 full games byte-exact from seed (89.3%), up from 444; init-aligned

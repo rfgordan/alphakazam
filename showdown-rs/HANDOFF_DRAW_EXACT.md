@@ -1,5 +1,113 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN VIII (2026-07-27): 466/512 full games byte-exact from seed (91.0%), up from 457;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
+engine tests 12 suites green. Kill criteria NEVER triggered (1.5 games/commit over 5 parity
+commits). `convert.rs` untouched — no fixture regeneration.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN VIII" — before anything else.**
+It carries the five roots (PS file:line each), the **full `spreadMoveHit` step table as landed**,
+the re-triaged 46 open games, and the named opens.
+
+**The single most valuable thing this tranche produced is a METHOD, not a fix — use it first:**
+
+> **Handler-list census off the sidecars.** Every recorded `shuffle` draw carries `group` (the tied
+> handlers) AND `full` (PS's ENTIRE sorted handler list) with each entry's `effect` / `effectType` /
+> `order` / `subOrder` / `speed` / `cb`. Group the whole 401-game corpus by
+> `(eventid, effect, effectType, order, subOrder, cb)` and diff it against the engine's model. It is
+> PS's own answer to "what is in this list", measured rather than guessed.
+
+It produced a whole commit in one pass (four missing residual handlers, each with its own witness
+decision), and its output is the standing worklist: the census table in the scoreboard marks every
+shuffle signature as modelled or not. The one still marked **NOT MODELLED** is
+`AfterMove | whiteherb~whiteherb` (rb1345, the only game that needs it).
+
+The three biggest remaining levers, in order:
+
+1. **The 22 `draws-match/state-diff` games.** Wrong MECHANICS with an aligned stream — the class
+   the census cannot see. `knockoff` recurs 5x (rb1116 rb1243 rb1283 rb1315 rb1369). Start from the
+   `|Δhp| == 0` half (rb1093 boost.spe, rb1233 boost.def, rb1239 stall_counter, rb1253 species,
+   rb1314 item, rb1347 last_berry, rb1360 pp, rb1119/rb1359 types) — single-mechanic bugs with no
+   downstream noise.
+2. **`replicate_select`'s `random(100)` threshold decode (`seedgate.rs:255-273`).** rb1362 d24 is a
+   clean, fully-diagnosed failure of it: PS rolls 2 against a 10% paralysis and procs, the engine's
+   chosen branch carries the no-proc placeholder, the victim's `randomChance(1,4)@par` is then never
+   rolled, and the two streams desync by one draw for the rest of the unit. One game, but the
+   mechanism is shared with EVERY secondary split, so a bug here can be silently costing others.
+3. **The 8 `result random[16]@…` games.** Each has a draw miscount in an EARLIER unit; the compared
+   damage roll differs while the shape matches, which localizes the OFFSET, not the root.
+
+**Two triage moves that keep paying**, in the order to run them:
+1. The census above.
+2. Burn-down VII's `|Δhp| == 0` sweep: take every open game whose first divergence is a boost, a
+   volatile bit or a counter, decode the volatile bitmask against `crates/engine/src/volatile.rs`
+   (discriminant = bit index), and read the DIRECTION (engine EXTRA vs engine MISSING). This
+   tranche's Trick root came straight out of it (rb1099's mirrored item pair).
+
+Traps that keep costing cycles:
+1. **A hit-loop change must keep a `damage_inputs` snapshot straddling EVERY step-7 handler,
+   drawing or not.** The first cut of the step-5/7 reorder moved `pre_inputs` past
+   `realized_per_hit_damaging_hit` and dropped rb1198 / rb1302 / rb1395 — exactly the three games
+   burn-down VI's commit 4 had won, because a Flame Body burn inflicted by the DRAWING half stopped
+   invalidating the cached `DamageCalc`.
+2. **A cancel/immunity check placed below the `md.category == MoveCategory::Status` dispatch in
+   `execute_move_inner` is DEAD for status moves** — that branch returns first. Queenly Majesty and
+   Psychic Terrain both sat there for the whole campaign.
+3. **`DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]`" at a forced-replacement unit is a FALSE
+   POSITIVE.** The replacement bracket is consumed straight off `prng` in `step_unit` and never
+   enters `chosen_draws`.
+4. **A `pending_move` / counter divergence can be a prng-offset symptom** (rb1310).
+5. **A speed-tie `shuffle` is NOT always state-neutral.** Two `switch` actions (rb1250) and the
+   `commitChoices` sort decide which side's switch-in ability sees which mon.
+6. **An indented block in a `///` doc comment is compiled as a Rust DOCTEST.** Pasted PS source
+   must be ```` ```text ````-fenced or `cargo test -p engine` fails on it.
+7. **A draw-CLASS label is not a root label.** rb1245 / rb1252 / rb1370 sat under
+   `args randomChance@hypervoice` / `@powerwhip` and were all Queenly Majesty games.
+
+Frames that paid off and are worth keeping:
+- **`spreadMoveHit`'s numbered steps are the draw order, and step 5 precedes step 7.** The full
+  table with every engine counterpart is in the scoreboard; `apply_damaging_hit_step7` carries it
+  as a doc comment. The hit loops DEFER step 7 onto `Branch::pending_damaging_hit`.
+- **`runEvent('TryMove')` (`sim/battle-actions.ts:485-492`) is one event for status and damaging
+  moves alike**, sits right after the Pressure PP deduction, and precedes the WHOLE hit-step chain
+  (invulnerability, TryHit, type immunity, Prankster-vs-Dark, accuracy).
+- **`fieldEvent('Residual')` collects a handler for every effect with an `onResidual` OR a live
+  `duration`** (`getKey = 'duration'`, `sim/battle.ts:486`). Default subOrders (`:955-991`):
+  Condition 2, side-condition 4, field 5, Weather 5, Ability 7, Item 8. It is ONE globally ordered
+  queue and it RETURNS the moment the battle ends.
+- **PS's `BeforeMove` ladder** (`runEvent` short-circuits on the first `false`): 100 glaiverush /
+  grudge / rage / chillyreception, 11 mustrecharge, 10 slp + frz, 9 Truant, 8 flinch, 7 disable,
+  6 gravity / healblock / throatchop, 5 taunt, 3 confusion, 2 attract, 1 par, -1 destinybond. The
+  engine still runs 3/2/1 ahead of 7/6/5 — but **that bug has no witness in the corpus**; see the
+  scoreboard's named open before refactoring for it.
+- **PS's `TryHit` is one event**: Psychic Terrain `onTryHitPriority: 4` > protect-family 3 >
+  redirect/absorb 1 or 0.
+- **`first_draw_mismatch` compares the DAMAGE ROLL's RESULT**, not just kind+args — a matching shape
+  with a differing `random(16)` proves a prng OFFSET, i.e. a miscount in an earlier unit.
+- **`DBG_INSTR=1`** (with `DBG_GAME`/`DBG_I`) prints the chosen branch's instruction stream — the
+  only thing that localizes a `draws-match/state-diff` unit.
+
+Practical notes (unchanged from VII, still accurate):
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim
+  harness/seed-sidecars/*.json.gz 2> dbg.txt` dumps every game's first divergent block in ONE pass
+  (serial, so the blocks are not interleaved). **The DIFF lines only appear on SIDECARS.**
+  `VERBOSE=1` on the gate lifts the row cap.
+- The sidecar's `decisions[i]` is indexed by the gate's `dN` DIRECTLY, and carries `choices`,
+  `draws` with `{kind,args,result,move,effect,event,pokemon}` — and, on a `shuffle`,
+  `group`/`full`/`start`/`end` (see the census method above).
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.**
+- The full 512 gate takes ~4 min; `cargo build --release -p cosim -j 2` plus both gates plus the
+  differ exceeds a 600 s tool timeout — run them as separate commands.
+
+--- historical (pre-burn-down-VIII) below ---
+
 **BURN-DOWN VII (2026-07-26): 457/512 full games byte-exact from seed (89.3%), up from 444;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
