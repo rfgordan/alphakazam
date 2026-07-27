@@ -544,10 +544,19 @@ pub fn boosted_stat(stat: i64, stage: i8) -> i64 {
 /// Effective speed including boost, paralysis, Choice Scarf, Tailwind and a Speed-based
 /// Protosynthesis / Quark Drive boost.
 pub fn effective_speed(state: &State, side: SideId) -> i32 {
+    effective_speed_opts(state, side, false)
+}
+
+/// `effective_speed`, optionally evaluated as PS caches it at SWITCH-IN — see
+/// `switch_entry_speed`. `at_entry` drops every effect whose PS handler runs strictly after
+/// `queue.insertChoice({choice:'runSwitch'})`: the Speed boosts entry hazards apply, Slow Start's
+/// halving and the Protosynthesis / Quark Drive boost (all three are `onStart`, fired by
+/// `runSwitch`'s `fieldEvent('SwitchIn')`).
+fn effective_speed_opts(state: &State, side: SideId, at_entry: bool) -> i32 {
     let s = state.side(side);
     let p = s.active();
     let mut spe = p.stat(crate::ids::StatIndex::Speed) as f32;
-    spe *= boost_multiplier(s.boost(BoostIndex::Speed));
+    spe *= boost_multiplier(if at_entry { 0 } else { s.boost(BoostIndex::Speed) });
     if p.status == Status::Paralysis {
         spe *= 0.5;
     }
@@ -560,7 +569,7 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
     if s.volatiles.contains(VolatileStatus::Unburden) {
         spe *= 2.0;
     }
-    if has_proto(s) && proto_stat(p) == crate::ids::StatIndex::Speed {
+    if !at_entry && has_proto(s) && proto_stat(p) == crate::ids::StatIndex::Speed {
         spe *= 1.5;
     }
     // Speed abilities (affect turn order).
@@ -583,10 +592,43 @@ pub fn effective_speed(state: &State, side: SideId) -> i32 {
         spe *= 2.0;
     }
     // Slow Start halves Speed for the first five active turns after each switch-in.
-    if p.ability == SlowStart && s.active_turns <= 5 {
+    if !at_entry && p.ability == SlowStart && s.active_turns <= 5 {
         spe *= 0.5;
     }
     spe as i32
+}
+
+/// The Speed PS caches for a mon that JUST switched in, which every shuffle of the switch bracket
+/// sorts on.
+///
+/// `switchIn` (sim/battle-actions.ts:135-155) does, in this order: swap the slot, reset
+/// `abilityState`/`itemState` with `initEffectState`, `runEvent('BeforeSwitchIn')`, then
+/// `queue.insertChoice({choice: 'runSwitch', pokemon})` — and `insertChoice` calls
+/// `choice.pokemon.updateSpeed()` (sim/battle-queue.ts:373-375). That is the LAST `updateSpeed`
+/// before the bracket runs, and it happens BEFORE `runSwitch`, i.e. before entry hazards and before
+/// every switch-in ability's `onStart`. So the cache excludes:
+///   * the Speed −1 Sticky Web applies (c3c2s82 d49: Iron Crown enters a webbed side, cached 324 vs
+///     live 216; rb1021 d58: Magnezone cached **151**, live 100 — the sidecar records PS's
+///     `pokemon.speed` verbatim, and 151 ties the foe Sylveon exactly),
+///   * Slow Start's ×0.5 (`onStart` sets `effectState.counter`, which `onModifySpe` reads, and
+///     `switchIn` has just cleared `abilityState` — rb1369 d44, two Regigigas),
+///   * the Protosynthesis / Quark Drive Speed boost (both `onStart`).
+/// A weather/terrain Speed ability (Chlorophyll, Swift Swim, Surge Surfer) has no such gate and
+/// DOES apply, as do paralysis, Choice Scarf and Tailwind.
+fn switch_entry_speed(state: &State, side: SideId) -> i32 {
+    effective_speed_opts(state, side, true)
+}
+
+/// Run `f` with the switch bracket's cached Speeds installed as the Update tie speeds: the mon that
+/// just entered on `entered` uses `switch_entry_speed`, the other side its live (already-cached)
+/// Speed. See `switch_entry_speed` for why the two differ.
+fn with_switch_bracket_speeds(b: &mut Branch, entered: SideId, f: impl FnOnce(&mut Branch)) {
+    let prev = MOVE_TIE_SPEEDS.with(|c| c.get());
+    let mut sp = [effective_speed(&b.state, SideId::One), effective_speed(&b.state, SideId::Two)];
+    sp[entered as usize] = switch_entry_speed(&b.state, entered);
+    MOVE_TIE_SPEEDS.with(|c| c.set(Some(sp)));
+    f(b);
+    MOVE_TIE_SPEEDS.with(|c| c.set(prev));
 }
 
 /// PS `eachEvent('Update')` / `runAction` post-action Update speed-sorts `getAllActive()` with
@@ -627,23 +669,21 @@ fn actives_speed_tied(state: &State) -> bool {
 /// applies replacements via `switch_into` (state only), so it consumes this bracket separately —
 /// gated on exactly this predicate (both actives alive and equal `effective_speed`).
 ///
-/// `replaced[i]` marks a side whose active JUST entered via this replacement. PS's Update speedSort
-/// reads the CACHED `pokemon.speed`, refreshed only by `updateSpeed()` — which runs in
-/// `commitChoices` (battle.ts:3020) over `getAllActive()`, i.e. BEFORE the replacement switches in,
-/// and skips the fainted slot entirely. So the incoming mon's cached speed predates its switch-in,
-/// and any Speed change applied ON ENTRY (Sticky Web's −1) is invisible to this bracket's tie.
-/// Ground-truthed on c3c2s82 d49: Iron Crown replaces a fainted Grimmsnarl into Sticky Web
-/// (stored Spe 324, boosted to 216 — exactly the foe Deoxys-Defense's 216), yet PS consumes ZERO
-/// draws — its cached speed is still 324. (Other stale-cache deltas — a mon last active under a
-/// weather Speed ability, Slow Start's active-turn window — are not modeled; no corpus instance.)
+/// `replaced[i]` marks a side whose active JUST entered via this replacement, and therefore sorts on
+/// `switch_entry_speed` — the Speed PS cached at `queue.insertChoice({choice:'runSwitch'})`, before
+/// entry hazards and before any switch-in ability's `onStart`. Ground-truthed on c3c2s82 d49
+/// (Iron Crown replaces a fainted Grimmsnarl into Sticky Web: stored Spe 324, live 216 — exactly the
+/// foe Deoxys-Defense's 216 — yet PS consumes ZERO draws, because its cache still reads 324) and on
+/// rb1369 d44 / rb1310 d11, which are the Slow Start half of the same rule.
 pub fn replacement_bracket_tied(state: &State, replaced: [bool; 2]) -> bool {
-    let mut st = *state;
-    for i in 0..2 {
-        if replaced[i] {
-            st.sides[i].boosts[BoostIndex::Speed as usize] = 0;
-        }
-    }
-    actives_update_tie(&st, false)
+    let sp: Vec<i32> = (0..2)
+        .map(|i| {
+            let side = if i == 0 { SideId::One } else { SideId::Two };
+            if replaced[i] { switch_entry_speed(state, side) } else { effective_speed(state, side) }
+        })
+        .collect();
+    let alive = state.side(SideId::One).active().is_alive() && state.side(SideId::Two).active().is_alive();
+    alive && sp[0] == sp[1]
 }
 
 /// Whether `ability` can be copied by Trace (PS `onUpdate` skips a `notrace`/self-referential
@@ -2043,9 +2083,13 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
             for &(side, target) in &order {
                 emit_switch_pre_update(b); // switch-out :83 (pre-swap board)
                 apply_switch(b, side, target);
-                emit_update(b); // switch runAction Update (2882)
-                emit_update(b); // runSwitch getAllActive speedSort
-                emit_update(b); // runSwitch runAction Update (2882)
+                // All three sort on the Speed cached at `insertChoice({runSwitch})`, i.e. before
+                // this switch's hazards and switch-in ability — see `switch_entry_speed`.
+                with_switch_bracket_speeds(b, side, |b| {
+                    emit_update(b); // switch runAction Update (2882)
+                    emit_update(b); // runSwitch getAllActive speedSort
+                    emit_update(b); // runSwitch runAction Update (2882)
+                });
             }
         }
     } else {
@@ -2063,9 +2107,15 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 // Iron Valiant is untied so switch-out is skipped, post-swap Garganacl==Toxapex==106
                 // ties → [Update, null, Update]. A pre-tied/post-untied switch gives the mirror
                 // [BeforeTurn, Update, Update] from the turn-start bracket + switch-out Update.)
-                emit_update(b); // switch action runAction Update
-                emit_update(b); // runSwitch getAllActive speedSort
-                emit_update(b); // runSwitch runAction Update
+                // All three sort on the Speed cached at `insertChoice({runSwitch})`, i.e. before
+                // this switch's hazards and switch-in ability — see `switch_entry_speed`.
+                // (rb1021 d58: Magnezone switches into Sticky Web on a 151==151 tie; PS's cached
+                // 151 ties and fires all three, the post-hazard live 100 does not.)
+                with_switch_bracket_speeds(b, side, |b| {
+                    emit_update(b); // switch action runAction Update
+                    emit_update(b); // runSwitch getAllActive speedSort
+                    emit_update(b); // runSwitch runAction Update
+                });
             }
         }
     }
