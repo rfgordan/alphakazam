@@ -290,7 +290,20 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
     for (ti, t) in p["types"].as_array().into_iter().flatten().take(2).enumerate() {
         types[ti] = parse_type(t)?;
     }
-    let mut base_types = types;
+    // `base_types` is what PS's `clearVolatile()` restores the array to — `setSpecies(baseSpecies)`
+    // -> `setType(species.types, true)`. That is NOT simply the serialized `baseTypes` field:
+    // `baseTypes` is frozen at CONSTRUCTION from `baseSpecies.types` (`sim/pokemon.ts:446-447`),
+    // before `setSpecies`' `runEvent('ModifySpecies')` resolves an item-driven forme. A Rusted
+    // Shield Zamazenta serializes `types` ["Fighting","Steel"] with `baseTypes` ["Fighting"], and
+    // `setSpecies(baseSpecies)` re-runs ModifySpecies, so its restore target is the two-type array
+    // (rb1114 / rb1123 / rb1137 / rb1318 / rb1320 / rb1356 / rb1366 all carry a Crowned Zamazenta).
+    // So the live array supplies the LENGTH and `baseTypes` corrects the prefix.
+    //
+    // A TRANSFORMED mon is the one case where the live array carries no information about the base:
+    // it is the COPY. There the field must be taken verbatim — a Ditto with `types`
+    // ["Ghost","Fire"] and `baseTypes` ["Normal"] reverted to [Normal, Fire] on switch-out
+    // (rb1359 d7) under the element-wise patch.
+    let mut base_types = if b(p, "transformed") { [Type::None; 2] } else { types };
     for (ti, t) in p["baseTypes"].as_array().into_iter().flatten().take(2).enumerate() {
         base_types[ti] = parse_type(t)?;
     }

@@ -66,6 +66,9 @@ pub(crate) struct GateInput<'a> {
     pub seed: Option<[u16; 4]>,
     /// PS's full serialized state after the FIRST (teampreview) decision.
     pub init_state: &'a Value,
+    /// The PS packed team strings the recorder handed `new Battle` (p1, p2). Used only by
+    /// `restore_transformed_base_moves`; empty when a corpus predates the field.
+    pub packed_teams: &'a [String],
     pub decisions: Vec<GateDecision<'a>>,
 }
 
@@ -114,6 +117,7 @@ impl<'a> GateInput<'a> {
             format: &t.format,
             seed: t.seed,
             init_state: &first.state_after,
+            packed_teams: &t.packed_teams,
             decisions,
         })
     }
@@ -139,6 +143,7 @@ impl<'a> GateInput<'a> {
             format: &f.format,
             seed: f.seed,
             init_state: &f.init_state,
+            packed_teams: &f.packed_teams,
             decisions,
         })
     }
@@ -151,6 +156,51 @@ static FIXED_GENDER_IDS: &str = include_str!("fixed_gender.txt");
 
 fn fixed_gender_set() -> std::collections::HashSet<&'static str> {
     FIXED_GENDER_IDS.lines().map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// Recover `base_moves` for a mon that is ALREADY TRANSFORMED in the battle-start state.
+///
+/// PS does not serialize `baseMoveSlots`, so `convert_state` has to leave a transformed mon's
+/// `base_moves` empty — the snapshot's `moveSlots` are the COPY. That is harmless for a mid-battle
+/// comparison state (the field is not diffed) but not for the seed gate, which simulates FORWARD
+/// from the start state: when the transform later reverts (`clearVolatile`'s
+/// `moveSlots = baseMoveSlots.slice()`), the engine restores an empty move list.
+///
+/// The one mon this can happen to is an Imposter holder in the LEAD slot — Imposter fires during
+/// `battle.start()`, before the first recorded state. rb1359: p1 leads a Ditto, and at d7 t7 the
+/// switch-out left the engine's Ditto with no moves where PS has `transform`.
+///
+/// The packed team strings the recorder handed `new Battle` are carried on the fixture/trace, and
+/// they hold the ORIGINAL sets. Match on base species (unique under Species Clause in randbats)
+/// and rebuild the slots at full PP, which is what `baseMoveSlots` holds at battle start.
+fn restore_transformed_base_moves(state: &mut engine::state::State, packed: &[String]) {
+    use engine::state::MoveSlot;
+    for (si, side) in [engine::state::SideId::One, engine::state::SideId::Two].into_iter().enumerate() {
+        let Some(team) = packed.get(si) else { continue };
+        for slot in 0..6usize {
+            let p = &state.side(side).pokemon[slot];
+            if !p.transformed || p.base_moves.iter().any(|m| m.id != engine::ids::MoveId::None) {
+                continue;
+            }
+            let want = p.base_species.to_id();
+            let Some(set) = team.split(']').find(|s| {
+                let f: Vec<&str> = s.split('|').collect();
+                let sp = f.get(1).copied().filter(|x| !x.is_empty()).or_else(|| f.first().copied());
+                sp.map(crate::convert::to_id).is_some_and(|id| id == want)
+            }) else { continue };
+            let mut moves = [MoveSlot::EMPTY; 4];
+            for (mi, m) in set.split('|').nth(4).unwrap_or("").split(',').filter(|m| !m.is_empty()).take(4).enumerate() {
+                if let Some(id) = engine::ids::MoveId::from_id(&crate::convert::to_id(m)) {
+                    if id != engine::ids::MoveId::None {
+                        // PS's default random-battle sets carry max PP Ups: max PP = base * 8/5.
+                        let pp = (engine::data::move_data(id).pp as u16 * 8 / 5) as u8;
+                        moves[mi] = MoveSlot { id, pp, max_pp: pp, disabled: false };
+                    }
+                }
+            }
+            state.side_mut(side).pokemon[slot].base_moves = moves;
+        }
+    }
 }
 
 /// The number of unlogged battle-construction PRNG draws to burn to align the stream to turn 1.
@@ -375,6 +425,7 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
         Ok(mut s) => { s.sleep_clause = sleep_clause; s }
         Err(u) => return mk_fail(Some(format!("convert0:{}", u.0)), 0, 0, aligned),
     };
+    restore_transformed_base_moves(&mut state, g.packed_teams);
 
     let mut i = 1usize;
     let mut decisions_ok = 0u32;
