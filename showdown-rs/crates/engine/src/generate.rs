@@ -2864,6 +2864,25 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
 }
 
+/// The crit + damage rolls PS makes and then throws away, for the `onDamage`-returns-0 abilities
+/// (Ice Face, Disguise): `getDamage` still rolls `randomChance(1, critMult)` and `random(16)`
+/// before `onDamage` zeroes the result, so the stream has to advance by exactly those two draws
+/// plus the ModifyDamage screen-tie shuffle.
+///
+/// The RESULTS are recorded from the realized source when there is one. They change nothing about
+/// the branch, but the seed gate's branch selector filters on recorded-result equality with the
+/// live PRNG, so a hardcoded value desyncs the unit.
+fn emit_discarded_damage_rolls(hb: &mut Branch, crit_den: i32) {
+    let mut cur = realized_cursor(hb);
+    if crit_den > 0 {
+        let v = cur.as_mut().map_or(0, |c| c.peek("randomChance", &[1, crit_den]));
+        draw(hb, "randomChance", &[1, crit_den], v, "crit");
+    }
+    let v = cur.as_mut().map_or(0, |c| c.peek("random", &[16]));
+    draw(hb, "random", &[16], v, "damage-roll");
+    emit_modifydamage_shuffle(hb);
+}
+
 /// Illusion `onBeforeSwitchIn` (`data/abilities.ts:2011-2023`): the entering mon's disguise is
 /// nulled and then re-chosen as the LAST able entry of PS's live `side.pokemon` array behind it.
 ///
@@ -5899,11 +5918,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // forces no-crit, onEffectiveness forces typeMod 0), then onDamage zeroes the result. Emit
         // those two draw-and-discards so the from-seed stream advances exactly as PS's does.
         let crit_den = ps_crit_den(&b, side, &md);
-        if crit_den > 0 {
-            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
-        }
-        draw(&mut hb, "random", &[16], 0, "damage-roll");
-        emit_modifydamage_shuffle(&mut hb);
+        // **A draw-and-discard still has to record the REAL value.** The result is irrelevant to
+        // the outcome — `onDamage` zeroes the damage whatever the crit and roll were — but the seed
+        // gate does not "pick the closest branch": it draws from the real PRNG and keeps only the
+        // branches whose RECORDED result equals what it drew (`seedgate.rs:330-352`). A hardcoded
+        // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
+        // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
+        // claimed 0, and the unit desynced on a draw whose value cannot matter.
+        emit_discarded_damage_rolls(&mut hb, crit_den);
         break_ice_face(&mut hb, foe);
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
@@ -5917,13 +5939,30 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             .flat_map(|x| if external { vec![x] } else { start_rampage_lock(x, side, move_id) })
         {
             apply_damage_secondaries(&mut hb, side, &md, false);
-            out.extend(
-                apply_target_secondary(hb, side, &md)
-                    .into_iter()
-                    .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                    .flat_map(|sb| apply_cursed_body(sb, side, &md))
-                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md)),
-            );
+            for mut sb in apply_target_secondary(hb, side, &md)
+                .into_iter()
+                .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+            {
+                // **A nullified hit still CONNECTED, so a pivot user still leaves.** `selfSwitch`
+                // is set in `hitStepMoveHitLoop` on `move.totalDamage !== false`, and Ice Face's
+                // `onDamage` returns the NUMBER 0 — the target stays in `targets` and the move
+                // counts as a hit. The Disguise arm below already did this; the Ice Face arm
+                // returned without ever looking at `pivot`, so a U-turn into an intact Eiscue
+                // simply stayed in. rb1710 d18 / rb1410 d33 / rb1629 d31.
+                match pivot {
+                    Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(&mut sb);
+                        let pre = sb.state;
+                        apply_switch(&mut sb, side, t);
+                        emit_switch_bracket(&mut sb, &pre, side, t);
+                    },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Stay => {}
+                }
+                out.push(sb);
+            }
         }
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
@@ -5946,11 +5985,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // stream advances exactly as PS's does (a bare bust under-emitted 2 draws — e.g. U-turn into
         // an intact Mimikyu — desyncing every later damage roll).
         let crit_den = ps_crit_den(&b, side, &md);
-        if crit_den > 0 {
-            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
-        }
-        draw(&mut hb, "random", &[16], 0, "damage-roll");
-        emit_modifydamage_shuffle(&mut hb);
+        // **A draw-and-discard still has to record the REAL value.** The result is irrelevant to
+        // the outcome — `onDamage` zeroes the damage whatever the crit and roll were — but the seed
+        // gate does not "pick the closest branch": it draws from the real PRNG and keeps only the
+        // branches whose RECORDED result equals what it drew (`seedgate.rs:330-352`). A hardcoded
+        // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
+        // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
+        // claimed 0, and the unit desynced on a draw whose value cannot matter.
+        emit_discarded_damage_rolls(&mut hb, crit_den);
         bust_disguise(&mut hb, foe);
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
