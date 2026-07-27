@@ -7635,6 +7635,21 @@ fn apply_post_damage(
     // etc.) — unless the item is species-locked to the holder (PS onTakeItem false) or the
     // holder has Sticky Hold (suppressed by Mold Breaker, but def_ability reflects that).
     if md.id.to_id() == "knockoff" && !hit_sub {
+        // Knock Off's removal is `onAfterHit` — step 8 — and `runEvent('DamagingHit')` is step 7,
+        // so an `onDamagingHit` ITEM consumes itself before Knock Off can take it. The engine runs
+        // `apply_post_damage` ahead of the deferred `apply_damaging_hit_step7` (see the Gulp
+        // Missile note below for the same hazard), so the removal would erase the item first.
+        // Fire the policy here, ahead of the take; the caller's later call re-reads the item and
+        // finds nothing, exactly like the Gulp Missile precedent.
+        //
+        // Safe to hoist it above step 5 for THIS move only: Knock Off has no `secondaries`, so the
+        // reason the caller defers the policy — keeping the +2/+2 invisible to a secondary that
+        // reads `statsRaisedThisTurn` (rb1178: Alluring Voice) — has nothing to act on here.
+        //
+        // rb1544 t14 (Knock Off into a Weakness Policy Solgaleo) and rb1447 t25 (into a Necrozma-
+        // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
+        // policy consumed, the engine at +0 / +0 with it merely knocked away.
+        apply_weakness_policy(b, foe, &md);
         let f = b.state.side(foe).active();
         if f.is_alive()
             && f.item != Item::None
