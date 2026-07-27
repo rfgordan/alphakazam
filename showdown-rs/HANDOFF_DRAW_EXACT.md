@@ -1,10 +1,10 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**BURN-DOWN X (2026-07-27): 483/512 full games byte-exact from seed (94.3%), up from 476;
+**BURN-DOWN X (2026-07-27): 484/512 full games byte-exact from seed (94.5%), up from 476;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
 Differ 99.53% (3813/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
-engine tests 12 suites green. Kill criteria NOT triggered (1.17 games/commit over 6 commits;
+engine tests 12 suites green. Kill criteria NOT triggered (1.33 games/commit over 6 parity commits;
 longest sub-line run is ZERO). `convert.rs` untouched — no fixture regeneration.
 
 **THE HEADLINE IS NOT THE COUNT — IT IS THAT THE PRNG-OFFSET CLASS IS EMPTY.** All six of
@@ -67,21 +67,24 @@ reasoning about any tie.
 
 The three biggest remaining levers, in order:
 
-1. **The two multi-game clusters in the 29-game evidenced table** (scoreboard, "Clusters worth
-   naming"). (a) `status_counter` 2 vs 1 — rb1030 and rb1300, both exactly one extra toxic stage on
-   the FIRST residual after application, reached through two DIFFERENT application paths (the move
-   Toxic; Toxic Chain's `DamagingHit` secondary), which points at a stale counter a previous cure
-   left behind. Principled fix to try: zero `status_counter` on EVERY None->X `ChangeStatus`, since
-   PS's `onStart` always re-initialises `effectState`. (b) `times_hit` one lower in the engine plus a
-   `PS-unconsumed` accuracy roll — rb1125 and rb1387; rb1387 also holds a spurious **Encore**
-   (volatile bit 4) PS does not, i.e. the engine's mover is locked out of the move PS used, so check
-   the Encore duration tick first.
-2. **The rest of the 29, one at a time, off the evidenced table.** They are all stream-clean, so the
+1. **rb1387's spurious Encore.** The engine still holds an Encore (volatile bit 4) PS does not, so
+   its mover is locked out of the move PS used and PS's accuracy roll goes unconsumed. Check the
+   Encore duration tick. (Its former partner rb1125 turned out to be a different root — see 2.)
+2. **The STAB / Tera root (rb1125), fully diagnosed but NOT free.** PS's `isSTAB` is
+   `hasType(type) || getTypes(false, true).includes(type)` (`sim/battle-actions.ts:1768`), and
+   `getTypes(false, true)` returns `this.types` — the LIVE type list a Soak / Burn Up / Reflect Type
+   already rewrote — NOT `baseTypes`. The engine feeds the SPECIES table
+   (`generate.rs:6328`). Fixing it needs a new `Pokemon` field for the pre-tera live types (the
+   engine overwrites `p.types` on Tera and keeps only PS's `baseTypes`), so `convert.rs` moves and
+   **the fixtures must be regenerated** — budget for that before starting. `export.rs:317-325`
+   already assumes the field exists and is a latent bug on the same state; fix both together. Full
+   write-up in the scoreboard.
+3. **The rest of the 29, one at a time, off the evidenced table.** They are all stream-clean, so the
    only tool that localizes them is `DBG_INSTR`. The `|delta hp| == 0` ones are still the cheapest —
    rb1093 boost.spe, rb1233 boost.def (Clanging Scales' self Def -1: engine -2, PS -1), rb1239
    stall_counter, rb1253 species, rb1314 item, rb1345 pending_move, rb1347 last_berry, rb1360 pp,
    rb1126 volatiles (Unburden missing) — single-mechanic bugs with no downstream noise.
-3. **STRUGGLE / request legality — rb1024, rb1103, rb1231.** Now with direct evidence: in all three
+4. **STRUGGLE / request legality — rb1024, rb1103, rb1231.** Now with direct evidence: in all three
    the engine's PP is exactly one LOWER than PS's while PS's draw is a Struggle crit roll, i.e. the
    engine let the mon use a real move where PS forced Struggle. rb1024 is still the largest single
    gap in the corpus (58 HP at t73). One root, three games — the best remaining games/commit if the

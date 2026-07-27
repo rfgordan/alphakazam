@@ -8,7 +8,7 @@ PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 fresh
 
 # ==== BURN-DOWN X — certification (2026-07-27) ====
 
-**HEADLINE: 483 / 512 full games byte-exact from seed (94.3%), up from 476; init-aligned
+**HEADLINE: 484 / 512 full games byte-exact from seed (94.5%), up from 476; init-aligned
 512 / 512. The audited 111-trace corpus stayed 111 / 111 at EVERY step.**
 
 **THE RESULT THAT MATTERS MORE THAN THE COUNT: the PRNG-OFFSET class is EMPTY.** All six of
@@ -22,16 +22,16 @@ are same-step-count disagreements, not miscounts. **Trap #8 ("a draw-CLASS label
 label") is now the ONLY way to read the remaining labels.**
 
 Six parity commits, every one PS-source-grounded, judged by the exact-SET diff on BOTH corpora at
-every step: **the newly-non-exact set was EMPTY at all six.** 7 games / 6 commits = **1.17
+every step: **the newly-non-exact set was EMPTY at all six.** 8 games / 6 parity commits = **1.33
 games/commit**. Kill criterion NOT triggered — the longest run below 1 game/commit is ZERO
-(per-commit yield 1, 2, 1, 1, 2, 0-docs). `convert.rs` untouched, so **no fixture regeneration**.
+(per-commit yield 1, 2, 1, 1, 2, 1). `convert.rs` untouched, so **no fixture regeneration**.
 
 ## Final gate numbers (re-run at the certifying commit)
 
 | gate | command | result |
 |------|---------|--------|
 | Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 exact (100%)** |
-| Seed gate, 512 | `SEED_GATE=1 cosim … seed-fixtures/*.fx.json.gz` | **483 / 512 = 94.3%**; init-aligned **512 / 512** |
+| Seed gate, 512 | `SEED_GATE=1 cosim … seed-fixtures/*.fx.json.gz` | **484 / 512 = 94.5%**; init-aligned **512 / 512** |
 | Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; **zero `rust extra`** |
 | State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, 0 unsupported |
 | Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
@@ -46,7 +46,8 @@ games/commit**. Kill criterion NOT triggered — the longest run below 1 game/co
 | 3 | `4147434` | **Good as Gold blocks a status move BEFORE the accuracy roll.** `onTryHit` fires in `hitStepTryHitEvent` (step 1) and `hitStepAccuracy` is step 4 (`sim/battle-actions.ts:551-563`), so the holder's target makes NO accuracy draw; the engine rolled one and blocked only the move's PAYLOAD. It returns `null`, not `false`, so `moveThisTurnResult` is null and `move_failed` must stay clear | 479 → 480 (rb1277) |
 | 4 | `aba469e` | **A mon that faints mid-turn sorts its residual handlers on its UNBOOSTED Speed.** `faintMessages` runs `clearVolatile(false)` (`sim/battle.ts:2576`), zeroing boosts and volatiles, and the residual action's own `updateSpeed()` then recomputes the cache from that cleared board. rb1021: a Sticky-Webbed Magnezone is KO'd and its Leftovers handler ties the foe's at 151/151, not 100/151 | 480 → 481 (rb1021) |
 | 5 | `60a1be2` | **A simultaneous both-sides replacement makes TWO draws the gate never consumed**, on two DIFFERENT Speed pairs. See "The new PRNG call site" below | 481 → 483 (rb1271, rb1329) |
-| 6 | this commit | docs | — |
+| 6 | `ac6c9ff` | **Curing a status DISCARDS its counter.** `cureStatus()` goes through `setStatus('')`, which replaces `pokemon.statusState` wholesale (`sim/pokemon.ts`). The engine cured `status` at eight sites and left `status_counter` standing: a mon woken by the slp BeforeMove cancel (at `counter == 1`) carried a phantom 1, so a Toxic applied later started at stage 1 and its FIRST residual dealt 2·maxhp/16 instead of 1·maxhp/16. New `clear_status_counter` at all eight sites — a no-op for every status but `slp` and `tox`. THE two-game cluster below, landed | 483 → 484 (rb1300; rb1030 advances d53 → d67, 57/58 decisions) |
+| 7 | this commit | docs | — |
 
 ## The structural change: Shed Skin's 33% split inside a single-`&mut Branch` residual core
 
@@ -112,22 +113,23 @@ A second recurring shape, now three tranches deep:
 > Queenly Majesty / Psychic Terrain (burn-down VIII), Shield Dust / Covert Cloak (IX), Good as Gold
 > (this one). The tell is always the same: the engine rolls a draw PS never makes.
 
-## The 29 still-open games — the evidenced table, all stream-clean
+## The 28 still-open games — the evidenced table, all stream-clean
 
 Every one of these has an ALIGNED PRNG stream at its first divergence (verified by `PRNG_TRACE`
-this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
+this tranche, over the 29 open at the time; commit 6 then closed rb1300). The field column is the
+FIRST divergent field from `DBG_DIFF`.
 
 ```
   rb1011 d43 t33  s0#3.hp 140/77
   rb1012 d60 t52  s0#2.hp 138/185
   rb1024 d81 t73  s0#3.hp 308/250 + move0.pp 3/4 + s1#1.hp 0/121    STRUGGLE / request legality
-  rb1030 d53 t46  s1#5.hp 61/78 + status_counter 2/1                TOXIC STAGE (pairs with rb1300)
+  rb1030 d67 t59  s0#0.item Sitrus/None + last_berry None/Sitrus   was d53; commit 6 advanced it 14
   rb1040 d2  t3   s0#0.hp 230/217
   rb1093 d22 t17  s0.boost.spe -2/-3
   rb1103 d37 t32  s0#0.hp 222/136 + times_hit 5/6                   STRUGGLE / request legality
   rb1108 d4  t5   s0#2.hp 89/73 + status None/Burn
   rb1119 d8  t7   s1#4.types [Fire,None]/[Fairy,None]               Roost ENCODING artifact
-  rb1125 d2  t3   s0#0.hp 0/27 + s1#0.times_hit 1/2
+  rb1125 d2  t3   s0#0.hp 0/27 + s1#0.times_hit 1/2                STAB / Tera — see the named open
   rb1126 d7  t5   s1.volatiles bit28 UNBURDEN missing + s1#5.hp 396/275
   rb1184 d5  t6   s1#4.hp 196/142
   rb1191 d17 t14  s0#1.hp 25/33
@@ -137,7 +139,6 @@ this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
   rb1239 d64 t51  s1.stall_counter 0/1
   rb1244 d10 t7   s1#4.ability Trace/WaterAbsorb
   rb1253 d12 t10  s1#2.species 222/221                              Ice Face RESTORE
-  rb1300 d52 t48  s0#1.hp 152/174 + status_counter 2/1              pairs with rb1030
   rb1310 d46 t37  s1.boost.def -1/0, spe 1/0 + bits38,39 extra      engine's mon did not leave
   rb1314 d45 t38  s1#0.item LightClay/None
   rb1326 d50 t40  s1.substitute_hp 66/48 + s1#2.times_hit 2/1
@@ -146,7 +147,7 @@ this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
   rb1348 d12 t11  s0#1.hp 159/107 + s1.boost.def 1/0
   rb1359 d7  t7   s0#0.types [Normal,Fire]/[Ghost,None] + move0 None/transform
   rb1360 d6  t6   s1#2.move3.pp 7/8
-  rb1387 d36 t32  s0#3.hp 337/218 + times_hit 2/3 + bit4 ENCORE extra
+  rb1387 d36 t32  s0#3.hp 337/218 + times_hit 2/3 + bit4 ENCORE extra   spurious Encore
 ```
 
 **Volatile bit key** (discriminant = bit index, `volatile.rs`): 4 Encore, 28 Unburden,
@@ -154,25 +155,68 @@ this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
 
 ### Clusters worth naming (by DIVERGENT FIELD, per trap #1 — never by move name)
 
-- **`status_counter` 2 vs 1 — rb1030, rb1300.** In both, the engine's chip is exactly one extra
-  toxic stage (rb1030 −17 with maxhp/16 = 17; rb1300 −22 with maxhp/16 = 22). PS's `tox` condition
-  starts `effectState.stage = 0` in `onStart` and increments in `onResidual`, so the FIRST residual
-  after application is stage 1. **The two-game shared root is that the engine reaches that first
-  residual with the counter already at 1.** rb1030's toxic is applied by the move Toxic, rb1300's by
-  Toxic Chain's `DamagingHit` secondary — two different application paths, same result, which points
-  at a stale counter that a previous cure left behind rather than at either application site.
-  Principled fix to try: zero `status_counter` on EVERY None→X `ChangeStatus` (PS's `onStart` always
-  re-initialises `effectState`), rather than hunting the cure path that leaks it.
+- **`status_counter` 2 vs 1 — rb1030, rb1300 — LANDED this tranche (commit 6).** The reasoning is
+  worth keeping because it is the method: the engine's chip was exactly one extra toxic stage in
+  both (rb1030 −17 with maxhp/16 = 17; rb1300 −22 with maxhp/16 = 22), and the two toxics arrived by
+  two DIFFERENT application paths (the move Toxic; Toxic Chain's `DamagingHit` secondary). Two paths
+  with one symptom points at neither path — it points at the shared state they both read. It was a
+  stale counter a previous CURE had left behind (rb1030's Indeedee slept at t30 and woke at t36),
+  and the fix went at the cure sites, not the application sites.
 - **STRUGGLE / request legality — rb1024, rb1103, rb1231** (unchanged, and now with direct
   evidence): in all three the engine's PP is exactly one LOWER than PS's while PS's draw is a
   Struggle crit roll. The engine let the mon use a real move where PS forced Struggle. rb1024 is
   still the largest single gap in the corpus (58 HP at t73).
 - **`times_hit` one lower in the engine + a `PS-unconsumed` accuracy roll — rb1125, rb1387.** PS
-  makes an accuracy roll for a move the engine never runs. rb1387 comes with a spurious **Encore**
-  the engine still holds (bit 4) and PS does not — i.e. the engine's mover is locked out of the move
-  PS used. Check the Encore duration tick before anything else.
+  makes an accuracy roll for a move the engine never runs. **These turned out to be TWO different
+  roots, not one** (trap #1 again, in a new costume — a shared draw-CLASS shape is no more a root
+  than a shared move name). rb1125 is the STAB bug below, fully diagnosed. rb1387 comes with a
+  spurious **Encore** the engine still holds (bit 4) and PS does not — i.e. the engine's mover is
+  locked out of the move PS used; check the Encore duration tick before anything else.
 - **Roost typing (rb1119, rb1359) is still an ENCODING artifact** and still deliberately not fixed
   — the `convert.rs` change would cost a full fixture regeneration for zero measured gain.
+
+## NEW named open, fully diagnosed: STAB reads the SPECIES types, PS reads the LIVE pre-tera types
+
+**This one is diagnosed to the line on both sides and deliberately NOT fixed — it needs a new state
+field and a `convert.rs` change, i.e. a full fixture regeneration.** Do not start it without that
+budget.
+
+PS (`sim/battle-actions.ts:1768`):
+
+```text
+const isSTAB = move.forceSTAB || pokemon.hasType(type) || pokemon.getTypes(false, true).includes(type);
+```
+
+`getTypes(false, true)` is `preterastallized = true`, and it returns **`this.types`** — the mon's
+LIVE type list, which a Soak / Forest's Curse / Burn Up / Reflect Type / Conversion has already
+rewritten. It is **not** `this.baseTypes` (the species types). So a mon whose typing was changed and
+which then Terastallizes gets STAB on its CHANGED types, never on its species' original ones.
+
+The engine feeds `attacker_base_types: crate::data::species_types(attacker.species)`
+(`generate.rs:6328`) — the species table. `damage.rs:206` then reads it for exactly PS's
+`getTypes(false, true)` branch. (Note `generate.rs:10893` already passes `caster.base_types` for the
+same field — the two call sites disagree, which is how the outlier was spotted.)
+
+**Witness rb1125 d2 t3.** p2's Meowscarada is `types: ['Poison']` / `baseTypes: ['Grass','Dark']` in
+the sidecar at the end of turn 1, then Terastallizes into **Dark** and uses **Flower Trick** (Grass,
+`accuracy: true`, always-crit — PS's only draw for it is `random[16]`). PS: `hasType('Grass')` is
+false (post-tera `getTypes()` is `['Dark']`) and `getTypes(false, true)` is `['Poison']`, which does
+not include Grass → **isSTAB false, stab 1.0** → 304 damage, Gastrodon survives at 27/331. The
+engine read the species types `[Grass, Dark]`, found Grass, applied **1.5x**, and killed it (damage
+clamped to 331). p1's Gastrodon is then dead and never uses Ice Beam — which is the whole visible
+symptom, `PS-unconsumed randomChance[100,100]@icebeam`.
+
+**Why it is not a one-liner.** Swapping `species_types(attacker.species)` for
+`attacker.base_types` changes nothing: both are the species types. The engine models Tera by
+REWRITING `p.types` to `[tera_type, None]` and keeps `p.base_types` from PS's `baseTypes`
+(`convert.rs:279-282`), so the pre-tera LIVE types are simply not retained anywhere. The fix is a
+new `Pokemon` field (pre-tera live types), written at the Tera rewrite, read by `damage.rs`, plus
+`convert.rs` / `export.rs` support.
+
+**`export.rs:317-325` already assumes the field exists** — it recovers PS's raw `types` from
+`p.base_types` for a terastallized mon, which is correct only when the mon's typing was never
+changed. That is a latent exporter bug on the same state; the round-trip gate passes because no
+audited corpus state hits it. Fix both together.
 
 ## Named opens carried forward (unchanged unless noted)
 
@@ -190,8 +234,10 @@ this tranche). The field column is the FIRST divergent field from `DBG_DIFF`.
 The corpus is NOT mined out, but its character has changed. There are no stream bugs left, so
 `PRNG_TRACE` has done its job and the next tranche's primary tool is **`DBG_INSTR`** (with
 `DBG_GAME`/`DBG_I`) — the only thing that localizes a `draws-match/state-diff` unit — plus the
-`DBG_DIFF` field table above. Start with the two-game `status_counter` cluster and the
-`times_hit`/Encore pair; those are the only remaining multi-game roots the evidence supports.
+`DBG_DIFF` field table above. The two-game `status_counter` cluster was the last multi-game root the
+evidence supported and commit 6 closed it; **every one of the 28 is now, as far as the evidence
+goes, a SINGLETON.** Expect ~1 game/commit from here, and re-check that estimate against the kill
+criterion after three landings.
 
 ---
 
@@ -482,7 +528,7 @@ stream offsets, i.e. the existing corpus has not been mined out.
 ## Extended CI gate
 
 8. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz harness/seed-fixtures/*.fx.json.gz`
-   — **must stay >= 483 / 512** (raised from 476 at burn-down X), and the non-exact SET must be a
+   — **must stay >= 484 / 512** (raised from 476 at burn-down X), and the non-exact SET must be a
    subset of the previous one.
 9. `SEED_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz` — **must stay 111 / 111.**
 
