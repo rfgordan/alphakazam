@@ -604,7 +604,40 @@ fn effective_speed_opts(state: &State, side: SideId, at_entry: bool) -> i32 {
     if !at_entry && p.ability == SlowStart && s.active_turns <= 5 {
         spe *= 0.5;
     }
-    spe as i32
+    action_speed_trunc(state, spe as i32)
+}
+
+/// The tail of PS's `getStat('spe')` + `getActionSpeed()` — the two steps our whole corpus never
+/// saw, because `[Gen 9] Custom Game` sets `battle: { trunc: Math.trunc }` and both are gated on
+/// the format NOT doing that.
+///
+/// 1. `sim/pokemon.ts:638` — `if (statName === 'spe' && stat > 10000 && !this.battle.format.battle?.trunc)
+///    stat = 10000;` The Speed cap is SKIPPED in customgame (its `format.battle.trunc` is truthy)
+///    and applied everywhere else.
+/// 2. `sim/pokemon.ts:649` — `return this.battle.trunc(speed, 13);` With the real `Dex#trunc`
+///    (`sim/dex.ts:363`) that is `(speed >>> 0) % 8192`; with `Math.trunc` the `bits` argument is
+///    ignored outright and nothing happens.
+///
+/// This is the ONE place either step belongs: every engine read of "the Speed an action sorts on"
+/// goes through `effective_speed`, which models `pokemon.speed` = `updateSpeed()` =
+/// `getActionSpeed()` (`sim/pokemon.ts:557`).
+///
+/// **Known residual — Trick Room.** PS interposes `speed = 10000 - speed` BETWEEN the cap and the
+/// truncation, so under Trick Room it truncates `10000 - s`, while the engine models Trick Room by
+/// inverting the comparison instead. The two agree exactly wherever `s <= 1808`: there
+/// `trunc(10000 - s, 13) == 1808 - s`, which is strictly decreasing in `s`, so "descending
+/// truncated 10000-s" and "ascending s" induce the same order AND the same tie set (both are
+/// `s1 == s2`). 1808 is far above any Speed reachable without a +6/Scarf/Tailwind stack, so the
+/// disagreement needs Trick Room AND a >1808 effective Speed simultaneously. Flagged, not fixed:
+/// fixing it means making the ~20 comparison sites read a signed action speed rather than
+/// flipping, which is not worth the regression surface here.
+#[inline]
+fn action_speed_trunc(state: &State, spe: i32) -> i32 {
+    if !state.ruleset.bit_truncation {
+        return spe; // format.battle.trunc = Math.trunc: no cap, no wrap.
+    }
+    let capped = spe.min(10000).max(0) as i64;
+    state.ruleset.trunc(capped, 13) as i32
 }
 
 /// The Speed PS caches for a mon that JUST switched in, which every shuffle of the switch bracket
@@ -1415,7 +1448,7 @@ fn targets_foe_status(md: &crate::data::MoveData) -> bool {
 /// Sleep Clause Mod: an induced (non-Rest) sleep fails while any other Pokémon on the
 /// target's side is already asleep.
 fn sleep_clause_blocks(state: &State, side: SideId) -> bool {
-    if !state.sleep_clause {
+    if !state.ruleset.sleep_clause {
         return false;
     }
     let s = state.side(side);
@@ -1662,6 +1695,83 @@ pub fn is_trapped(state: &State, side: SideId) -> bool {
         }
     }
     false
+}
+
+/// PS `pokemon.maybeTrapped` — the request-JSON flag that says "a switch here MIGHT be refused,
+/// so the client must not let you take it back".
+///
+/// `nextTurn` (`sim/battle.ts:1723-1755`) resets `trapped = maybeTrapped = false`, runs
+/// `TrapPokemon` and `MaybeTrapPokemon` (which pick up the foe's REAL ability through
+/// `onFoeTrapPokemon` / `onFoeMaybeTrapPokemon`), and then sweeps **every ability the foe's
+/// apparent species could legally have** with `singleEvent('FoeMaybeTrapPokemon', ability, …)`.
+/// That sweep is skipped entirely by:
+///
+/// ```ts
+/// if ((ruleTable.has('+hackmons') || !ruleTable.has('obtainableabilities')) && !this.format.team) continue;
+/// ```
+///
+/// `[Gen 9] Custom Game` satisfies BOTH halves — no `obtainableabilities`, no `format.team` — so
+/// our entire recorded corpus has never seen it. `[Gen 9] Random Battle` fails both (Obtainable
+/// is in its ruleset and `team: 'random'`), so it runs. This is a genuine customgame->randbats
+/// delta in the request layer, hence `Ruleset::infer_foe_trapping_abilities`.
+///
+/// No PRNG (`singleEvent` has no handler list and never speed-sorts) — request shape only. And
+/// `maybeTrapped` does NOT reject a switch; only `trapped` does. Conflating the two is wrong the
+/// moment this flag can be set by an ability the foe does not actually have.
+///
+/// The three `onFoeMaybeTrapPokemon` handlers (`data/abilities.ts:203, 2477, 4117`) each add
+/// `isAdjacent` (always true in singles) to the same condition their real trap uses, with
+/// `!pokemon.knownType` disjuncts that are dead here — types are public in our model.
+pub fn maybe_trapped(state: &State, side: SideId) -> bool {
+    use crate::ids::Ability as Ab;
+    if is_trapped(state, side) {
+        return true;
+    }
+    if !state.ruleset.infer_foe_trapping_abilities {
+        return false;
+    }
+    let me = state.side(side).active();
+    if !me.is_alive() || me.types.contains(&Type::Ghost) || me.item == Item::ShedShell {
+        return false;
+    }
+    let foe = state.side(side.other()).active();
+    if !foe.is_alive() {
+        return false;
+    }
+    // PS skips the ability the foe ACTUALLY has ("pokemon event was already run above"), which is
+    // exactly the `is_trapped` case handled at the top.
+    species_possible_trap_abilities(foe.species)
+        .iter()
+        .filter(|&&ab| ab != foe.ability)
+        .any(|&ab| match ab {
+            Ab::ArenaTrap => is_grounded(state, side),
+            Ab::MagnetPull => me.types.contains(&Type::Steel),
+            Ab::ShadowTag => me.ability != Ab::ShadowTag,
+            _ => false,
+        })
+}
+
+/// Every gen-9 species carrying Arena Trap / Shadow Tag / Magnet Pull in ANY ability slot,
+/// enumerated from the pinned dex (`b9dc987d`) with PS's own two skips applied:
+/// `abilitySlot === 'H' && species.unreleasedHidden` (none of these), and
+/// `ruleTable.has('-ability:…')` (randbats bans no abilities).
+///
+/// Hardcoded rather than generated because the whole table is 17 species and the alternative is
+/// widening the 9k-line generated `gen.rs` for three abilities. The `*Past` entries
+/// (Gengar-Mega, Wobbuffet, Wynaut, Meltan) cannot be produced by the gen-9 randbats generator;
+/// they are listed so the function is a property of the DEX, not of one generator's pool.
+fn species_possible_trap_abilities(sp: crate::ids::Species) -> &'static [crate::ids::Ability] {
+    use crate::ids::Ability as Ab;
+    const ARENA: &[Ab] = &[Ab::ArenaTrap];
+    const SHADOW: &[Ab] = &[Ab::ShadowTag];
+    const MAGNET: &[Ab] = &[Ab::MagnetPull];
+    match sp.to_id() {
+        "diglett" | "dugtrio" | "trapinch" => ARENA,
+        "gothita" | "gothorita" | "gothitelle" | "wobbuffet" | "wynaut" | "gengarmega" => SHADOW,
+        "geodudealola" | "graveleralola" | "golemalola" | "magnemite" | "magneton" | "nosepass"
+        | "magnezone" | "probopass" | "meltan" => MAGNET,
+        _ => &[],
+    }
 }
 
 /// Clear the foe-sourced traps (partial trap / Mean Look-family / Octolock) on `victim`'s active
@@ -3577,10 +3687,39 @@ fn effective_priority(state: &State, side: SideId, move_idx: u8) -> i8 {
     modified_priority(state, side, &md)
 }
 
+/// The move data an ACTION will actually resolve with — which is not always the chosen slot's.
+///
+/// `runMove` (`sim/battle-actions.ts:255-275`) replaces the chosen move with Struggle when the
+/// mon has nothing usable (`if (!moveSlot?.pp) { move = dex.moves.get('struggle') }`), and the
+/// queue's `getActionSpeed` reads `action.move.priority` — i.e. **Struggle's priority, 0** — not
+/// the empty slot's. A called/external move (Sleep Talk's pick, a Dancer copy) likewise resolves
+/// as itself.
+///
+/// The engine keyed priority off `active.moves[move_idx]`, so a mon Struggling because its
+/// Choice-locked slot ran out of PP inherited THAT slot's priority. rb5081 d49 t39: a
+/// choice-locked Ditto, transformed into Glaceon, is locked onto a 0-PP Protect and Struggles.
+/// The engine gave the Struggle Protect's **+4**, moved it before the foe's real Protect, and
+/// the recoil KO'd its last mon and ended the battle. PS runs the foe's Protect first, blocks
+/// the Struggle outright, and its only draw for the turn is the residual protect/stall shuffle.
+fn action_move_data(state: &State, act: &Action) -> crate::data::MoveData {
+    if let Some(ext) = act.external_move {
+        return move_data(ext);
+    }
+    let p = state.side(act.side).active();
+    let slot = p.moves[act.move_idx as usize];
+    if act.struggling || slot.pp == 0 {
+        if let Some(id) = crate::ids::MoveId::from_id("struggle") {
+            return move_data(id);
+        }
+    }
+    move_data(slot.id)
+}
+
 pub(crate) fn move_order(state: &State, a: &Action, b: &Action) -> Order {
     let (sa, sb) = (a.side, b.side);
-    let pa = effective_priority(state, sa, a.move_idx);
-    let pb = effective_priority(state, sb, b.move_idx);
+    let (mda, mdb) = (action_move_data(state, a), action_move_data(state, b));
+    let pa = modified_priority(state, sa, &mda);
+    let pb = modified_priority(state, sb, &mdb);
     if pa != pb {
         return Order::First(if pa > pb { sa } else { sb });
     }
@@ -3593,7 +3732,7 @@ pub(crate) fn move_order(state: &State, a: &Action, b: &Action) -> Order {
         }
         let p = state.side(act.side).active();
         if p.ability == crate::ids::Ability::MyceliumMight
-            && move_data(p.moves[act.move_idx as usize].id).category == MoveCategory::Status
+            && action_move_data(state, act).category == MoveCategory::Status
         {
             f -= 1;
         }
@@ -3800,7 +3939,7 @@ fn before_move_blocked_7_6_5(state: &State, side: SideId, md: &crate::data::Move
 pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     let side = action.side;
     let mut b = b;
-    let (alive, status, confused) = {
+    let (alive, status, _confused) = {
         let p = b.state.side(side).active();
         (p.is_alive(), p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
     };
@@ -3814,10 +3953,29 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
     // confusion self-hit (1/3) and full paralysis (1/4 of the remainder) — both branches where
     // the move doesn't execute. The remaining "acts normally" branch equals prior behavior, so
     // these only *add* outcomes (no regression on the common path).
-    if !alive || status == Status::Sleep {
-        // The sleep-wake attempt toggles Truant inside `execute_move_inner` (slp's
-        // BeforeMove handler at priority 10 runs before Truant's 9).
+    if !alive {
         return dispatch_move_inner(b, action);
+    }
+    if status == Status::Sleep {
+        // slp's `onBeforeMove` (priority 10) ticks the counter and returns `false` — cancelling
+        // the attempt and short-circuiting `runEvent` — ONLY while the mon stays asleep. Gen-9
+        // sleep is a deterministic countdown, so whether this attempt wakes it is decidable here.
+        let (counter, early) = {
+            let p = b.state.side(side).active();
+            (p.status_counter, p.ability == crate::ids::Ability::EarlyBird)
+        };
+        let tick = if early { 2 } else { 1 };
+        if counter > tick {
+            // Still asleep: `execute_move_inner` owns the tick and the `sleepUsable`
+            // (Sleep Talk / Snore) exception, and nothing below slp runs.
+            return dispatch_move_inner(b, action);
+        }
+        // WAKES. The handler returns `undefined`, so the ladder CONTINUES — Truant (9),
+        // Disable/Taunt (7/6/5), confusion (3), Attract (2). `execute_move_inner`'s own wake
+        // block is a no-op after this (it re-reads the status, which is now None).
+        let slot = b.state.side(side).active_index;
+        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+        clear_status_counter(&mut b, side, slot);
     }
     // Freeze: 20% chance to thaw and act this turn, otherwise stay frozen (no move).
     // PS frz `onBeforeMove` (priority 10) rolls `randomChance(1, 5)` to thaw.
@@ -3831,10 +3989,9 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
             let slot = b.state.side(side).active_index;
             push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
             clear_status_counter(&mut b, side, slot);
-            if truant_gate(&mut b, side) {
-                return vec![b];
-            }
-            return dispatch_move_inner(b, action);
+            // Thawed: frz's handler returned `undefined`, so the rest of the ladder runs
+            // (Truant included — `before_move_lower_ladder` owns the gate now).
+            return before_move_lower_ladder(b, action);
         }
         let mut frozen = scaled(&b, 0.80);
         draw(&mut frozen, "randomChance", &[1, 5], 0, "frz");
@@ -3844,14 +4001,37 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         let slot = thawed.state.side(side).active_index;
         push(&mut thawed, Instruction::ChangeStatus { side, slot, previous: Status::Freeze, new: Status::None });
         clear_status_counter(&mut thawed, side, slot);
-        // frz (priority 10) ran; Truant (9) is next — a thawed loafer stays put this turn.
-        if truant_gate(&mut thawed, side) {
-            out.push(thawed);
-        } else {
-            out.extend(dispatch_move_inner(thawed, action));
-        }
+        // frz (priority 10) returned `undefined` on the thaw; Truant (9) and everything below
+        // it still run.
+        out.extend(before_move_lower_ladder(thawed, action));
         return out;
     }
+    before_move_lower_ladder(b, action)
+}
+
+/// The tail of PS's `BeforeMove` ladder, everything BELOW slp / frz (priority 10): Truant (9),
+/// Disable (7) / Throat Chop / Heal Block / Gravity (6) / Taunt (5), confusion (3), Attract (2),
+/// paralysis (1).
+///
+/// Three callers, and that is the point. `runEvent` short-circuits only on a handler that returns
+/// `false`, and **slp's and frz's handlers return `undefined` when the mon WAKES or THAWS** —
+/// they return `false` only when it stays asleep/frozen. So a mon that woke this turn, or thawed
+/// this turn, still runs every handler below, exactly like an awake one.
+///
+/// rb5043 d45 t37 is the witness for the sleep half: a confused, sleeping Staraptor is hit by
+/// Hurricane, wakes on the expiry turn, and PS immediately rolls its confusion
+/// `randomChance(33, 100)` — it hits itself, `random(16)` for the damage, and faints. The engine
+/// returned straight into the move machinery on `status == Sleep`, skipped the confusion / Attract
+/// / paralysis handlers entirely, and let the Roost through with 183 HP where PS has 0.
+///
+/// Status is re-read from the CURRENT board rather than captured before the wake, so the
+/// paralysis branch is skipped for a just-woken mon without a special case.
+fn before_move_lower_ladder(b: Branch, action: Action) -> Vec<Branch> {
+    let side = action.side;
+    let (status, confused) = {
+        let p = b.state.side(side).active();
+        (p.status, b.state.side(side).volatiles.contains(VolatileStatus::Confusion))
+    };
     // Truant: PS onBeforeMove priority 9 — below mustrecharge (11) and slp/frz (10), above
     // flinch (8), Disable, confusion (3) and paralysis (1). The volatile marks "loaf on this
     // attempt"; the toggle fires on every attempt that reaches this point, including ones a
@@ -4827,7 +5007,20 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             let mb = matches!(atk.ability, crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze);
             let pri = modified_priority(&b.state, side, &md);
             let side_targeting = md.side_condition.is_some() && md.target != crate::data::MoveTarget::User;
-            if pri > 0 && !mb && !side_targeting {
+            // PS's test is `source.isAlly(dazzlingHolder) || move.target === 'all'`
+            // (`data/abilities.ts:3679`), and in `onFoeTryMove(target, source, move)` the args are
+            // (move USER, move TARGET, move) — `runEvent('TryMove', pokemon, target, move)`. So it
+            // reads "the move's resolved TARGET is the ability holder (or its ally)". **A
+            // SELF-TARGETING priority move is therefore never blocked**: its target is its own
+            // user, which is the holder's foe.
+            //
+            // The engine blocked on priority alone. rb5051 d35 t31: a Regigigas Protects (+4,
+            // target `self`) across from a Queenly Majesty holder; the engine failed the Protect,
+            // let a High Jump Kick through for 196, and PS's only draw for the whole turn is the
+            // residual protect/stall shuffle. Psychic Terrain — the same predicate, 15 lines
+            // below — already carried the `target != User` exemption. Two copies, one right.
+            let self_targeting = md.target == crate::data::MoveTarget::User;
+            if pri > 0 && !mb && !side_targeting && !self_targeting {
                 b.move_failed = true; // blocked → moveThisTurnResult false
                 return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
             }
@@ -6740,6 +6933,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
         adaptability,
         tera_shell,
         freeze_dry: is_freeze_dry(md),
+        trunc_16: b.state.ruleset.bit_truncation,
         final_num: fmod,
         final_den: 4096,
     };
@@ -9333,11 +9527,18 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
         // band 11). The status result value is a draw-and-discard for the DP path; the band is
         // what the seed-gate/differ realized selection reads.
         for (p, status, res) in [(0.11, Status::Sleep, 0i64), (0.10, Status::Paralysis, 11), (0.09, Status::Poison, 21)] {
-            let applies = status_applies(b.state.side(side).active(), status)
-                && !status_blocked_by_field(&b.state, side, status)
-                && !(status == Status::Sleep && sleep_clause_blocks(&b.state, side));
+            // PS order at `SetStatus`: ability immunities -> terrains (subOrder 2) ->
+            // Safeguard (4) -> Sleep Clause Mod (5, LAST). So the clause is only ever REACHED
+            // when every earlier gate passed, and only then does it speak.
+            let pre_clause = status_applies(b.state.side(side).active(), status)
+                && !status_blocked_by_field(&b.state, side, status);
+            let clause = pre_clause && status == Status::Sleep && sleep_clause_blocks(&b.state, side);
+            let applies = pre_clause && !clause;
             let mut proc = scaled(&b, p);
             draw(&mut proc, "random", &[100], res, "effectspore");
+            if clause {
+                push(&mut proc, Instruction::SleepClauseBlocked { side });
+            }
             if !applies {
                 // The roll lands in this band but the status fails: no state change, but the band
                 // is retained so realized selection reads the correct threshold.
@@ -9856,15 +10057,20 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     }
     let mut applied_sleep = false;
     let mut applied_status_now = false;
-    if target_eligible
+    let pre_clause = target_eligible
         && md.secondary_status != Status::None
         && status_applies_src(proc.state.side(foe).active(), md.secondary_status,
             proc.state.side(side).active().ability == crate::ids::Ability::Corrosion,
             matches!(proc.state.side(side).active().ability,
                 crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt | crate::ids::Ability::Turboblaze))
-        && !status_blocked_by_field(&proc.state, foe, md.secondary_status)
-        && !(md.secondary_status == Status::Sleep && sleep_clause_blocks(&proc.state, foe))
-    {
+        && !status_blocked_by_field(&proc.state, foe, md.secondary_status);
+    let clause = pre_clause
+        && md.secondary_status == Status::Sleep
+        && sleep_clause_blocks(&proc.state, foe);
+    if clause {
+        push(&mut proc, Instruction::SleepClauseBlocked { side: foe });
+    }
+    if pre_clause && !clause {
         let slot = proc.state.side(foe).active_index;
         push(&mut proc, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.secondary_status });
         applied_status_now = true;
@@ -10031,10 +10237,14 @@ fn apply_direclaw_secondary(b: Branch, side: SideId, md: &crate::data::MoveData)
         let mut pb = scaled(&b, chance / 3.0);
         draw(&mut pb, "random", &[100], 0, "secondary");
         draw(&mut pb, "sample", &[3], idx as i64, "secondary");
-        let can_apply = alive
+        let pre_clause = alive
             && status_applies_src(pb.state.side(foe).active(), status, corrosion, breaker)
-            && !status_blocked_by_field(&pb.state, foe, status)
-            && !(status == Status::Sleep && sleep_clause_blocks(&pb.state, foe));
+            && !status_blocked_by_field(&pb.state, foe, status);
+        let clause = pre_clause && status == Status::Sleep && sleep_clause_blocks(&pb.state, foe);
+        let can_apply = pre_clause && !clause;
+        if clause {
+            push(&mut pb, Instruction::SleepClauseBlocked { side: foe });
+        }
         if can_apply {
             let slot = pb.state.side(foe).active_index;
             push(&mut pb, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: status });
@@ -10305,6 +10515,23 @@ fn execute_status_move(
     let foe = side.other();
     let foe_moves_later = foe_pending.is_some();
 
+    // PS `hitStepTryImmunity` is moveStep **3**, before `hitStepAccuracy` (4) — a move refused
+    // there makes NO draw and applies nothing. It has to be checked before every move-specific
+    // branch below, because several of those branches emit their own accuracy draw and would
+    // otherwise emit it for a move PS never accuracy-rolled.
+    //
+    // This used to live 700 lines further down, after the whole `md.id` special-case chain, and
+    // Trick/Switcheroo — which is IN that chain and emits its own accuracy draw — carried a
+    // comment asserting the opposite ("Sticky Hold blocks the item swap later at `onTakeItem`,
+    // not before accuracy"). It does not: `trick.onTryImmunity(target) { return
+    // !target.hasAbility('stickyhold'); }` (`data/moves.ts:19886`) is exactly moveStep 3.
+    // rb5062 d6: a Choice-Scarf Hoopa Tricks a Sticky Hold Dipplin; PS's three draws for the turn
+    // are Giga Drain's accuracy/crit/roll and nothing else, the engine drew a fourth, and every
+    // draw after it read the wrong PRNG value. Two engine copies of one PS predicate, again.
+    if status_try_immunity_fails(&b, side, md) {
+        return vec![b];
+    }
+
     // Sleep Talk: `onTry` requires the user to be asleep (or Comatose) — used awake the move
     // simply fails, with no draw. `onHit` samples uniformly over the user's OTHER usable move
     // slots (PS `sleeptalk` excludes `nosleeptalk`/`charge`-flagged moves and empty slots; PP is
@@ -10340,6 +10567,39 @@ fn execute_status_move(
             .flat_map(|(idx, called_id)| {
                 let mut nb = scaled(&b, p);
                 draw(&mut nb, "sample", &[n], idx as i64, "sleeptalk");
+                // **Pressure taxes the CALLER, for the CALLED move's targets.**
+                // `useMoveInner` (`sim/battle-actions.ts:472-483`):
+                //   const callerMoveForPressure = sourceEffect && sourceEffect.pp ? sourceEffect : null;
+                //   if (!sourceEffect || callerMoveForPressure || sourceEffect.id === 'pursuit') {
+                //       let extraPP = 0;
+                //       for (const source of pressureTargets) { extraPP += runEvent('DeductPP', …) }
+                //       if (extraPP > 0) pokemon.deductPP(callerMoveForPressure || moveOrMoveName, extraPP);
+                //   }
+                // Sleep Talk has `pp: 10`, so it IS a `callerMoveForPressure`: the loop runs over
+                // the CALLED move's pressure targets and the extra PP comes off **Sleep Talk's own
+                // slot**. So a Sleep Talk that calls a foe-targeting move into a Pressure holder
+                // costs 2 PP of Sleep Talk and 0 of the called move.
+                // rb5098 d28 t24: a Guts mon Sleep Talks into a Pressure Slowbro; PS leaves Sleep
+                // Talk at 13 PP, the engine at 14.
+                let called_md = move_data(called_id);
+                let user_is_ghost = nb.state.side(side).active().types.contains(&Type::Ghost);
+                let foe_active = nb.state.side(side.other()).active();
+                if foe_active.is_alive()
+                    && foe_active.ability == crate::ids::Ability::Pressure
+                    && pressure_affected(&called_md, user_is_ghost)
+                {
+                    // `deductPP` resolves the slot by move id and bails at 0 PP.
+                    let slot = nb.state.side(side).active_index;
+                    let caller_idx = nb.state.side(side).active().moves.iter()
+                        .position(|m| m.id == md.id);
+                    if let Some(mi) = caller_idx {
+                        if nb.state.side(side).active().moves[mi].pp > 0 {
+                            push(&mut nb, Instruction::DecrementPp {
+                                side, slot, move_index: mi as u8, amount: 1,
+                            });
+                        }
+                    }
+                }
                 // `dispatch_move_inner`, not `execute_move`: PS's `useMove` skips the whole
                 // BeforeMove gauntlet (and the Glaive Rush drop that sits above it).
                 dispatch_move_inner(
@@ -10811,9 +11071,11 @@ fn execute_status_move(
         let (mine, theirs) = (b.state.side(side).active().item, b.state.side(foe2).active().item);
         let sticky = b.state.side(foe2).active().ability == crate::ids::Ability::StickyHold;
         // Trick / Switcheroo are foe-targeting numeric-accuracy (100) status moves: PS
-        // `hitStepAccuracy` rolls `randomChance(accuracy,100)` (they reach it — Sticky Hold blocks
-        // the item swap later at `onTakeItem`, not before accuracy). Special-cased above the general
-        // status-accuracy branch, so emit the draw here (draw-and-discard, 100% hits). The arg is
+        // `hitStepAccuracy` rolls `randomChance(accuracy,100)`. They reach it only when
+        // `onTryImmunity` let them through — Sticky Hold refuses at moveStep 3, which the hoisted
+        // `status_try_immunity_fails` at the top of this function now handles for every branch.
+        // Special-cased above the general status-accuracy branch, so emit the draw here
+        // (draw-and-discard, 100% hits). The arg is
         // post-`ModifyAccuracy`/stage: a +1-accuracy Trick user rolls `randomChance(133,100)`
         // (r10 t17). A fainted foe (no target) fails earlier and never rolls.
         if annotating() && b.state.side(foe2).active().is_alive() && !accuracy_forced_true(&b, side, md) {
@@ -11000,11 +11262,6 @@ fn execute_status_move(
             return vec![b];
         }
     }
-    // PS `hitStepTryImmunity` — before `hitStepAccuracy`, so no draw and no effect.
-    if status_try_immunity_fails(&b, side, md) {
-        return vec![b];
-    }
-
     let hit_prob = accuracy_of(&b, side, md);
     let miss_prob = 1.0 - hit_prob;
     // PS `hitStepAccuracy`: a foe-targeting status move with numeric accuracy rolls
@@ -11109,14 +11366,17 @@ fn execute_status_move(
         set_weather(&mut hit, md.weather, turns);
     }
     let mut applied_sleep = false;
-    if md.status != Status::None
+    let pre_clause = md.status != Status::None
         && !foe_immune
         && status_applies_src(hit.state.side(foe).active(), md.status,
             hit.state.side(side).active().ability == crate::ids::Ability::Corrosion,
             status_breaker)
-        && !status_blocked_by_field(&hit.state, foe, md.status)
-        && !(md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe))
-    {
+        && !status_blocked_by_field(&hit.state, foe, md.status);
+    let clause = pre_clause && md.status == Status::Sleep && sleep_clause_blocks(&hit.state, foe);
+    if clause {
+        push(&mut hit, Instruction::SleepClauseBlocked { side: foe });
+    }
+    if pre_clause && !clause {
         let slot = hit.state.side(foe).active_index;
         push(&mut hit, Instruction::ChangeStatus { side: foe, slot, previous: Status::None, new: md.status });
         applied_sleep = md.status == Status::Sleep;
@@ -11567,6 +11827,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         adaptability: false,
         tera_shell: false,
         freeze_dry: false,
+        trunc_16: state.ruleset.bit_truncation,
         final_num: 1,
         final_den: if screened { 2 } else { 1 },
     };
@@ -12850,12 +13111,15 @@ fn apply_end_of_turn_inner(
             .into_iter()
             .flat_map(|mut x| {
                 let p = x.state.side(side).active();
-                if p.is_alive()
+                let pre_clause = p.is_alive()
                     && p.status == Status::None
                     && status_applies(p, Status::Sleep)
-                    && !status_blocked_by_field(&x.state, side, Status::Sleep)
-                    && !sleep_clause_blocks(&x.state, side)
-                {
+                    && !status_blocked_by_field(&x.state, side, Status::Sleep);
+                if pre_clause && sleep_clause_blocks(&x.state, side) {
+                    push(&mut x, Instruction::SleepClauseBlocked { side });
+                    return vec![x];
+                }
+                if pre_clause {
                     let slot = x.state.side(side).active_index;
                     push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
                     mark_slept_by_foe(&mut x, side);

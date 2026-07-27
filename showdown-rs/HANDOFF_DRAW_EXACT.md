@@ -1,5 +1,77 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**RULESET TRANCHE (2026-07-27): format rules are CONFIGURABLE and `[Gen 9] Random Battle` is a
+gated corpus for the first time — 93 / 101 byte-exact from seed (92.1%), init-aligned 101/101.**
+The customgame rail moved 868 → 870 / 912 as a side effect. Ten commits, newly-non-exact EMPTY on
+BOTH rails at every one. Differ 99.53% audited / 99.35% randbats; sweeps 100.00% / 99.62%; smoke
+18/18; round-trip PASS; 17 test suites / 102 tests green.
+
+**Run the two rails: `bash harness/gate-912.sh /tmp/a.txt` and `bash harness/gate-rb.sh
+/tmp/b.txt`.** Judge on the SET (`comm -13 before after` MUST be empty), never the count. Both
+scripts pass `VERBOSE=1` deliberately — without it the per-game listing truncates at 45 rows.
+
+## Read this before touching a trace's `format` field
+
+**All 912 customgame games STAMP `format: gen9randombattle` and were PLAYED as `gen9customgame`.**
+`cosim.mjs` used to rewrite the formatid. `cosim::trace::ruleset_for` therefore keys off a
+separate, explicit **`ruleset`** field — the formatid actually handed to `new Battle` — and treats
+its ABSENCE as `gen9customgame`. Never re-derive rules from `format`.
+
+## The Ruleset
+
+`engine::ruleset::Ruleset`: one `Copy` struct on `State` (it replaced the bare `sleep_clause`),
+built once at init, never mutated, and deliberately NOT on the manifest `cosim::diff`/`digest`
+walk. Presets `GEN9_CUSTOM_GAME` (the pre-tranche behaviour, and the default everywhere including
+`State::EMPTY`) and `GEN9_RANDOM_BATTLE`. Only two flags touch the PRNG: `sleep_clause`
+(suppresses the `random(2,5)`) and `bit_truncation` (Speed wrap → turn order → tie shuffles).
+
+Entry contract: `trace::first_decision_state(&ruleset)` — `"teampreview"` with Team Preview,
+`"start"` without. A no-preview recording carries a SYNTHETIC decision 0 holding `battle.start()`'s
+draws and the board at the first move request, so decision 1 onward is shape-identical.
+
+## Six things this tranche cost a landing each to learn
+
+1. **`RULESET_SPEC.md` §9's Speed example is wrong.** `getStat` caps Speed at 10000
+   (`sim/pokemon.ts:638`) BEFORE `getActionSpeed` truncates to 13 bits (`:649`), under the SAME
+   `!format.battle?.trunc` guard. 12096 → 10000 → **1808**, not 3904. The wrap window is raw Speed
+   8192..10000 and `(1808, 8191]` is unreachable by wrapping. **No wrap fired in 101 real games** —
+   it is implemented and unit-tested, and inert until someone stacks +6 / Scarf / Tailwind /
+   weather on a fast mon.
+2. **`hitStepTryImmunity` is moveStep 3, above accuracy (4)** — and the engine's correct copy sat
+   700 lines BELOW the `md.id` special-case chain that Trick/Switcheroo lives in.
+3. **`slp`/`frz` `onBeforeMove` return `undefined` when the mon WAKES or THAWS.** Only a mon that
+   STAYS asleep short-circuits `runEvent`. A woken mon still runs confusion (3) and Attract (2).
+4. **Pressure taxes the CALLER's PP for the CALLED move's targets** — Sleep Talk has `pp`, so it
+   is a `callerMoveForPressure` and eats 2 PP when what it calls hits a Pressure holder.
+5. **A Struggling action has Struggle's priority**, not the empty slot's — `runMove` swaps the move
+   before `getActionSpeed` reads `action.move.priority`.
+6. **Queenly Majesty / Dazzling / Armor Tail read the move's TARGET.** `source.isAlly(holder)` in
+   `onFoeTryMove(target, source, move)` means "the move's target is the holder", so a SELF-targeting
+   priority move is never blocked.
+
+> **Four of those six are "two engine copies of one PS computation drifted", and in three the
+> other copy was already right.** Burn-downs XII and XIII said this about lists and computations;
+> it is now the highest-yield thing to grep for. When you find a PS predicate in the engine, look
+> for the second implementation BEFORE anything else.
+
+## Where to go next
+
+**The 8 remaining randbats opens are all one class: the damage/HP asymptote** (five bare `hp`, two
+`result random[16]`, and rb5021's ONE-HP Giga Drain with the draws matching exactly). There is
+nothing format-shaped left in that corpus. Two named leads from the randbats differ:
+`rust extra randomChance[3, 10]@contact-status` (1 unit) and
+`ps unconsumed shuffle[2, 0, 2]@generic` (7 units).
+
+**Sleep is rare: 5 of 100 randbats games inflict ANY sleep**, and a 100-seed scan found exactly
+one more clause game. If you want more Sleep Clause coverage, record a DIRECTED tranche (two
+sleep-inducers + a Rest user), not a bigger blind range.
+
+**Illusion Level Mod is a flag with no implementation** — the engine does not model Illusion.
+
+**Repo hazard, unchanged:** `engines` is a symlink; never `git add` it.
+
+---
+
 **BURN-DOWN XIII (2026-07-27): the corpus is 912 games and 868 of them are byte-exact from seed
 (95.2%), up from 851.** The fresh 400 (seeds 1401-1800) are now COMMITTED fixtures in
 `harness/seed-fixtures-fresh/`, not a one-off reading. Per corpus: audited **111/111** (the

@@ -21,6 +21,7 @@ pub mod narrate;
 pub mod protocol;
 pub mod psprng;
 pub mod request;
+pub mod ruleset;
 pub mod state;
 pub mod team;
 pub mod volatile;

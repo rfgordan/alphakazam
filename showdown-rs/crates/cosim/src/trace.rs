@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use engine::ruleset::Ruleset;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,7 +16,13 @@ pub struct Trace {
     pub version: u32,
     #[serde(rename = "psCommit")]
     pub ps_commit: String,
+    /// The `--format` the RECORDER was invoked with. Not the rules the battle was played under —
+    /// see [`ruleset_for`].
     pub format: String,
+    /// The formatid actually handed to `new Battle`. Absent on every legacy recording (which were
+    /// all played as `gen9customgame`, whatever `format` says).
+    #[serde(default)]
+    pub ruleset: Option<String>,
     /// The battle seed the recorder built the game with (`[hi,..,lo]` u16 limbs). Present in v2
     /// traces; drives the seed-replay gate (seed a `PsPrng`, drive Replicate, byte-compare).
     #[serde(default)]
@@ -145,21 +152,49 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
     Ok(t)
 }
 
-/// Is PS's **Sleep Clause Mod** active for a trace recorded under `format`?
+/// The [`Ruleset`] a recording was actually PLAYED under.
 ///
-/// It never is. `harness/cosim.mjs` constructs every battle with
-/// `formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT` — random-battle TEAMS are
-/// pre-generated and the battle itself runs as a custom game so PS does not re-roll teams from the
-/// battle seed. `gen9customgame` carries no ruleset, and Sleep Clause Mod lives in the `standard`
-/// ruleset (data/rulesets.ts:1378, pulled in by gen9ou and friends, and listed explicitly on
-/// "[Gen 9] Random Battle" — a format the harness never instantiates). The default `FORMAT` is
-/// `gen9customgame`, so the other arm never fires either.
+/// **This does not key off `trace.format`, and the reason is a landmine.** `trace.format` is the
+/// `--format` the recorder was *invoked* with, which for the whole seed corpus is
+/// `gen9randombattle` — but until the ruleset work, `harness/cosim.mjs` then constructed the
+/// battle with `formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT`. Random-battle
+/// TEAMS were pre-generated and the BATTLE ran as a custom game, so PS would not re-roll teams
+/// from the battle seed. So all 912 committed games say `gen9randombattle` and were played with
+/// **no** Sleep Clause Mod, `Math.trunc`, exact HP and a team-preview first decision.
+///
+/// Recordings made after that rewrite was deleted carry an explicit `ruleset` field naming the
+/// formatid handed to `new Battle`. That field — and nothing else — decides:
+///
+/// * present   → [`Ruleset::from_format`], erroring loudly on an unknown id;
+/// * absent    → `gen9customgame`, which is what every legacy recording was played under
+///   regardless of what its `format` field claims.
 ///
 /// The old inference (`format.contains("randombattle")`) had it exactly backwards and made the
 /// engine refuse a second foe-inflicted sleep that the pinned PS happily applies — rb1312 t13 has
 /// Regice slept while the benched Iron Jugulis is still asleep from the same attacker, and PS rolls
 /// the `random(2,5)` duration for it.
-pub fn sleep_clause_for_format(format: &str) -> bool {
-    let effective = if format.contains("random") { "gen9customgame" } else { format };
-    effective != "gen9customgame"
+pub fn ruleset_for(explicit: Option<&str>, _format: &str) -> Result<Ruleset, String> {
+    match explicit {
+        None => Ok(Ruleset::GEN9_CUSTOM_GAME),
+        Some(id) => Ruleset::from_format(id)
+            .ok_or_else(|| format!("unknown ruleset formatid {id:?} — add a preset to engine::ruleset")),
+    }
+}
+
+/// The ENTRY CONTRACT shared by `replay.rs`, `seedgate.rs`, `drawdiff.rs` and
+/// `protocol_emit.rs`: what `requestState` decision 0 of a recording must carry.
+///
+/// Decision 0 is never a battle transition — it is the setup that ends at the first `move`
+/// request, recorded so its PRNG draws can be consumed for stream shape and its `stateAfter`
+/// used as the gate's initial board. Under Team Preview that setup IS a decision (the team
+/// order choice, whose resolution runs the `'start'` queue action). Without Team Preview
+/// (`runPickTeam` is a complete no-op — `RULESET_SPEC.md` §5) there is no decision at all, so
+/// `cosim.mjs` records a SYNTHETIC decision 0 with `requestState: "start"`, no choices, and the
+/// draws `battle.start()` consumed. Everything downstream is then shape-identical.
+pub fn first_decision_state(rs: &Ruleset) -> &'static str {
+    if rs.team_preview {
+        "teampreview"
+    } else {
+        "start"
+    }
 }

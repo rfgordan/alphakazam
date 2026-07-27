@@ -146,6 +146,17 @@ fn convert_field(f: &Value, state: &mut State) -> Res<()> {
                     state.trick_room = true;
                     state.trick_room_turns = i(pv, "duration") as i8;
                 }
+                // The RULES are registered as field pseudo-weathers at construction time
+                // (`sim/battle.ts:295-308`, "timing is early enough to hook into ModifySpecies").
+                // `dex.conditions.getByID` short-circuits to the Format object for any id in
+                // `data.Rulesets`, so the pseudo-weather's condition IS the rule, with
+                // `effectType: 'Rule'`. For `gen9randombattle` exactly one rule qualifies —
+                // every other rule in its table defines only lifecycle hooks, which are called
+                // directly and never registered. It carries no duration and no state the engine
+                // models (`addPseudoWeather` passes no `target`, so `initEffectState` does not
+                // even bump `effectOrder`): it is pure handler discovery. The behaviour it
+                // discovers is `Ruleset::sleep_clause`, which comes from the format stamp.
+                "sleepclausemod" => {}
                 other => return Err(unsup(format!("pseudoweather:{other}"))),
             }
         }

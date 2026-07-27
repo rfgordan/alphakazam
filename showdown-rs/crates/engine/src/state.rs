@@ -397,8 +397,10 @@ impl SideId {
 /// The complete battle state. `Copy`: `let snapshot = *state;` is a flat memcpy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct State {
-    /// Format rule: Sleep Clause Mod (OU / random battles). Customgames don't have it.
-    pub sleep_clause: bool,
+    /// Format rules — see [`crate::ruleset::Ruleset`]. Set once at battle init, never mutated.
+    /// Battle CONFIGURATION, not battle state: it is deliberately absent from the field manifest
+    /// `cosim::diff` / `cosim::digest` walk.
+    pub ruleset: crate::ruleset::Ruleset,
     pub sides: [Side; 2],
 
     pub weather: Weather,
@@ -413,7 +415,11 @@ pub struct State {
 
 impl State {
     pub const EMPTY: State = State {
-        sleep_clause: true,
+        // The corpus default. Every committed trace/fixture and every engine unit test was
+        // recorded under `[Gen 9] Custom Game`; a state that never says otherwise gets it.
+        // (The old `sleep_clause: true` default was the OPPOSITE of what the corpus needed and
+        // was overwritten at every cosim entry point — see RULESET_SPEC.md H2.)
+        ruleset: crate::ruleset::Ruleset::GEN9_CUSTOM_GAME,
         sides: [Side::EMPTY; 2],
         weather: Weather::None,
         weather_turns: 0,

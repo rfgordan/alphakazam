@@ -1,6 +1,20 @@
 # Ruleset spec — making format rules configurable (target: TRUE `[Gen 9] Random Battle`)
 
-**Status:** research + proposed design. Nothing implemented. Do not commit without review.
+**Status:** IMPLEMENTED, 2026-07-27. See `DRAW_EXACT_SCOREBOARD.md`'s RULESET TRANCHE section
+for what landed and how it is gated. Two corrections to this document, both load-bearing:
+
+> **§9's worked example is WRONG.** "504 → +6 2016 → Scarf 3024 → Tailwind 6048 → Swift Swim
+> 12096 → wraps to 3904" skips the `stat > 10000` cap at `sim/pokemon.ts:638`, which carries the
+> SAME `!this.battle.format.battle?.trunc` guard as the truncation and therefore fires in exactly
+> the formats that truncate. 12096 caps to 10000, then truncs to **1808**. The reachable
+> action-speed range is `[0, 8191]` for raw ≤ 8191, `[0, 1808]` for raw in `[8192, 10000]`, and
+> the single value 1808 above that — **`(1808, 8191]` is unreachable by wrapping**, and the
+> practical wrap window is 1809 wide, not "everything past 8192".
+
+> **§11.5 step 3's re-stamping is NOT what was done.** Re-stamping 801 gzipped fixtures is a large
+> binary diff with a silent failure mode. Instead the trace and fixture gained an explicit,
+> optional `ruleset` field naming the formatid handed to `new Battle`, and `ruleset_for` treats
+> its ABSENCE as `gen9customgame`. Zero churn, and the two stamps cannot disagree.
 
 **Ground truth:** pinned PS commit `b9dc987d344635789116ae46c48f8e2480e0ddc2` (`showdown-rs/ps.lock`,
 date 2026-06-03). All `file:line` citations below are relative to the PS clone root and refer to the

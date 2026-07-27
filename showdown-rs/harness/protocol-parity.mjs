@@ -144,14 +144,24 @@ function psLog(name) {
 	} else {
 		return null;
 	}
+	// The formatid the recording was PLAYED under — `trace.ruleset`, NOT `trace.format`. Every
+	// legacy trace stamps `format: gen9randombattle` and was played as a custom game (the recorder
+	// used to rewrite the formatid); those carry no `ruleset` field, so they resolve to
+	// `gen9customgame` exactly as before. A recording made under the real format rebuilds under
+	// the real format, or the |rule| prefix, percent HP and the missing |debug| lines would all
+	// disagree for reasons that have nothing to do with the engine.
+	const formatid = trace.ruleset || 'gen9customgame';
+	// Without Team Preview, `setPlayer` runs the whole `'start'` action inline, and the trace's
+	// synthetic decision 0 (`requestState: "start"`) carries no choices — skip it below.
 	const battle = new Battle({
-		formatid: 'gen9customgame',
+		formatid,
 		seed: trace.seed,
 		p1: { name: 'Red', team: p1team },
 		p2: { name: 'Blue', team: p2team },
 	});
 	const roster = battle.sides.map(s => s.pokemon.map(p => p.set));
 	for (const d of trace.decisions) {
+		if (d.requestState === 'start') continue; // synthetic setup decision, no choices
 		if (battle.ended) break;
 		for (const [sid, c] of Object.entries(d.choices)) {
 			const n = sid === 'p1' ? 0 : 1;

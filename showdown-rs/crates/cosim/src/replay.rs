@@ -46,14 +46,13 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
         .ok_or_else(|| Unsupported("trace:empty".into()))?;
     let canon = Canonical::from_first_state(&first.state_after)?;
 
-    // Sleep Clause Mod exists in ranked formats (incl. random battles) but not customgame
-    // (the recorded-team corpora).
-    let sleep_clause = crate::trace::sleep_clause_for_format(&trace.format);
+    let ruleset = crate::trace::ruleset_for(trace.ruleset.as_deref(), &trace.format)
+        .map_err(Unsupported)?;
     let mut results = Vec::new();
     let mut i = 0;
     // The state each unit replays from: the previous decision boundary.
     let mut boundary: &Value = &first.state_after;
-    if first.request_state != "teampreview" {
+    if first.request_state != crate::trace::first_decision_state(&ruleset) {
         return Err(Unsupported(format!("trace:first-decision-{}", first.request_state)));
     }
     i += 1;
@@ -71,14 +70,14 @@ pub fn replay_trace(trace: &Trace) -> Result<Vec<UnitResult>, Unsupported> {
             j += 1;
         }
         let target = &unit.last().unwrap().state_after;
-        results.push(replay_unit(boundary, &unit, target, &canon, sleep_clause));
+        results.push(replay_unit(boundary, &unit, target, &canon, ruleset));
         boundary = target;
         i = j;
     }
     Ok(results)
 }
 
-fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical, sleep_clause: bool) -> UnitResult {
+fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canonical, ruleset: engine::ruleset::Ruleset) -> UnitResult {
     let dp = unit[0];
     let mut moves_used = Vec::new();
     for c in dp.choices.values() {
@@ -113,11 +112,11 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
 
     // Convert endpoint states; conversion failures are coverage findings.
     let state_before = match convert_state(before, canon) {
-        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
+        Ok(mut s) => { s.ruleset = ruleset; s }
         Err(u) => return mk(Verdict::Unsupported(u), vec![]),
     };
     let state_target = match convert_state(target, canon) {
-        Ok(mut s) => { s.sleep_clause = sleep_clause; s }
+        Ok(mut s) => { s.ruleset = ruleset; s }
         Err(u) => return mk(Verdict::Unsupported(u), vec![]),
     };
 
@@ -200,10 +199,10 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 Ok(s) => s,
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             };
-            input.sleep_clause = sleep_clause;
+            input.ruleset = ruleset;
             if input.side(side).active_index == u8::MAX {
                 let no_op = vec![engine::instruction::StateInstructions { percentage: 100.0, instructions: Vec::new() }];
-                match compare_distribution(&input, &no_op, &kernel.outcomes, canon, sleep_clause) {
+                match compare_distribution(&input, &no_op, &kernel.outcomes, canon, ruleset) {
                     Ok(None) => continue,
                     Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
                         detail: format!("action {side_key}:{move_id} (no active): {detail}"),
@@ -220,7 +219,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 input.side(side.other()).active().moves.iter().find(|m| m.id.to_id() == id).map(|m| m.id)
             });
             let action_branches = generate_move_action(&input, side, move_idx as u8, None, foe_pending);
-            match compare_distribution(&input, &action_branches, &kernel.outcomes, canon, sleep_clause) {
+            match compare_distribution(&input, &action_branches, &kernel.outcomes, canon, ruleset) {
                 Ok(None) => {}
                 Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
                     detail: format!("action {side_key}:{move_id}: {detail}"),
@@ -249,7 +248,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                     &move_kernels[0].outcomes,
                     &dist.outcomes,
                     canon,
-                    sleep_clause,
+                    ruleset,
                 ) {
                     Ok(None) => return mk(Verdict::Matched, legality),
                     Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
@@ -277,7 +276,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 &move_kernels[0].outcomes,
                 &dist.outcomes,
                 canon,
-                sleep_clause,
+                ruleset,
             ) {
                 Ok(None) => return mk(Verdict::Matched, legality),
                 Ok(Some(detail)) => return mk(Verdict::DistributionDiverged {
@@ -301,7 +300,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                     Ok(s) => s,
                     Err(u) => return mk(Verdict::Unsupported(u), legality),
                 };
-                state.sleep_clause = sleep_clause;
+                state.ruleset = ruleset;
                 if state.sides.iter().any(|side| side.active_index == u8::MAX) {
                     boundary_kernel_states.push(state);
                 }
@@ -313,7 +312,7 @@ fn replay_unit(before: &Value, unit: &[&Decision], target: &Value, canon: &Canon
                 Ok(s) => s,
                 Err(u) => return mk(Verdict::Unsupported(u), legality),
             };
-            state.sleep_clause = sleep_clause;
+            state.ruleset = ruleset;
             if outcome.request_state == "switch"
                 && state.sides.iter().all(|side| side.active_index != u8::MAX)
             {
@@ -437,17 +436,17 @@ fn compare_ps_distributions(
     left: &[crate::trace::DistributionOutcome],
     right: &[crate::trace::DistributionOutcome],
     canon: &Canonical,
-    sleep_clause: bool,
+    ruleset: engine::ruleset::Ruleset,
 ) -> Result<Option<String>, Unsupported> {
     fn clusters(
         outcomes: &[crate::trace::DistributionOutcome],
         canon: &Canonical,
-        sleep_clause: bool,
+        ruleset: engine::ruleset::Ruleset,
     ) -> Result<Vec<(State, f64)>, Unsupported> {
         let mut out: Vec<(State, f64)> = Vec::new();
         for outcome in outcomes {
             let mut state = convert_state(&outcome.state, canon)?;
-            state.sleep_clause = sleep_clause;
+            state.ruleset = ruleset;
             if let Some((_, mass)) = out.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
                 *mass += outcome.probability;
             } else {
@@ -457,8 +456,8 @@ fn compare_ps_distributions(
         Ok(out)
     }
 
-    let left = clusters(left, canon, sleep_clause)?;
-    let right = clusters(right, canon, sleep_clause)?;
+    let left = clusters(left, canon, ruleset)?;
+    let right = clusters(right, canon, ruleset)?;
     const TOL: f64 = 2e-5;
     let mut errors = Vec::new();
     for (i, (state, mass)) in left.iter().enumerate() {
@@ -484,12 +483,12 @@ fn compare_distribution(
     branches: &[engine::instruction::StateInstructions],
     outcomes: &[crate::trace::DistributionOutcome],
     canon: &Canonical,
-    sleep_clause: bool,
+    ruleset: engine::ruleset::Ruleset,
 ) -> Result<Option<String>, Unsupported> {
     let mut ps_clusters: Vec<(State, f64)> = Vec::new();
     for outcome in outcomes {
         let mut state = convert_state(&outcome.state, canon)?;
-        state.sleep_clause = sleep_clause;
+        state.ruleset = ruleset;
         if let Some((_, mass)) = ps_clusters.iter_mut().find(|(s, _)| diff_states(s, &state).is_empty()) {
             *mass += outcome.probability;
         } else {
@@ -652,22 +651,41 @@ fn check_legality(state: &State, requests: &BTreeMap<String, Value>) -> Vec<Stri
             out.push(format!("moves[{side_key}]: ps={ps_moves:?} engine={eng_moves:?}"));
         }
 
-        // Trapping legality is a CERTIFIED property: PS's request switch-lock must equal the
-        // engine's `is_trapped(...) || committed`. In singles PS reports volatile/locked traps as
+        // Trapping legality is a CERTIFIED property. PS reports volatile/locked traps as
         // `trapped: true` and ability traps (hidden `tryTrap(true)`: Arena Trap / Shadow Tag /
-        // Magnet Pull) as `maybeTrapped: true` — with types public both mean "switch rejected".
-        // PS omits both flags when the side has no one to switch to (`canSwitchIn == 0`), so the
-        // comparison is gated on a live bench. `committed` covers the rampage/charge/recharge
-        // lock (PendingMove), which PS also reports as trapped.
+        // Magnet Pull) as `maybeTrapped: true`; with types public and the foe's real ability
+        // known, both mean "switch rejected". PS omits both flags when the side has no one to
+        // switch to (`canSwitchIn == 0`), so the comparison is gated on a live bench.
+        // `committed` covers the rampage/charge/recharge lock (PendingMove), which PS also
+        // reports as trapped.
+        //
+        // UNDER RANDBATS THE TWO FLAGS COME APART and must be compared separately: `nextTurn`
+        // additionally sweeps every ability the foe's SPECIES could have
+        // (`sim/battle.ts:1741-1752`), so a mon facing a Dugtrio with Sand Veil gets
+        // `maybeTrapped: true` while the switch is perfectly legal. Conflating them was only
+        // sound because customgame skips that sweep entirely.
+        let sid = crate::convert::side_id(si);
         let committed = !matches!(side.pending_move, engine::state::PendingMove::None);
-        let ps_trapped = matches!(act.get("trapped"), Some(Value::Bool(true)))
-            || matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
-        let engine_trapped = committed || engine::generate::is_trapped(state, crate::convert::side_id(si));
         let has_bench = side.pokemon.iter().enumerate().any(|(i, p)| {
             i as u8 != side.active_index && p.species != engine::ids::Species::None && p.is_alive()
         });
-        if has_bench && ps_trapped != engine_trapped {
-            out.push(format!("trapped[{side_key}]: ps={ps_trapped} engine={engine_trapped}"));
+        let engine_trapped = committed || engine::generate::is_trapped(state, sid);
+        if state.ruleset.infer_foe_trapping_abilities {
+            let ps_hard = matches!(act.get("trapped"), Some(Value::Bool(true)));
+            let ps_maybe = matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
+            let eng_maybe = committed || engine::generate::maybe_trapped(state, sid);
+            if has_bench && ps_hard != engine_trapped {
+                out.push(format!("trapped[{side_key}]: ps={ps_hard} engine={engine_trapped}"));
+            }
+            if has_bench && ps_maybe != eng_maybe {
+                out.push(format!("maybeTrapped[{side_key}]: ps={ps_maybe} engine={eng_maybe}"));
+            }
+        } else {
+            let ps_trapped = matches!(act.get("trapped"), Some(Value::Bool(true)))
+                || matches!(act.get("maybeTrapped"), Some(Value::Bool(true)));
+            if has_bench && ps_trapped != engine_trapped {
+                out.push(format!("trapped[{side_key}]: ps={ps_trapped} engine={engine_trapped}"));
+            }
         }
 
         // Tera availability.

@@ -192,6 +192,22 @@ pub enum Instruction {
     SetAbilityUsed { side: SideId, slot: u8, previous: bool, new: bool },
     SetTimesHit { side: SideId, slot: u8, previous: u8, new: u8 },
 
+    // --- protocol-only markers (zero state effect; apply/reverse are no-ops) ---
+    /// Sleep Clause Mod refused a foe-inflicted `slp` on `side`'s active. PS emits, on EVERY
+    /// activation (`data/rulesets.ts:1386`):
+    /// ```text
+    /// |-message|Sleep Clause Mod activated.
+    /// |-hint|Sleep Clause Mod prevents players from putting more than one of their opponent's Pokemon to sleep at a time
+    /// ```
+    /// and NOTHING else — in particular no `|-fail|`, because `moveHit` sets `didAnything` to
+    /// `null` rather than `false` (`sim/battle-actions.ts:1244-1252`) and the tail block at
+    /// `:1323` only speaks when it is `false`. `hint()` is called WITHOUT its `once` argument
+    /// (`sim/battle.ts:3092`), so unlike Illusion Level Mod's hint it repeats every time.
+    ///
+    /// It carries no state, consumes no draws, and is skipped by `apply`/`reverse`; it exists so
+    /// the protocol layer can render what PS renders.
+    SleepClauseBlocked { side: SideId },
+
     // --- hidden-information layer (what the foe has learned; never read by the transition) ---
     /// OR the given *newly-set* bits into a Pokémon's reveal mask. `moves`/`flags` carry only the
     /// bits this instruction sets (delta vs. the current mask), so reversal clears exactly them.
@@ -260,6 +276,8 @@ impl State {
             SetSleptByFoe { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].slept_by_foe = new;
             }
+            // Protocol-only marker: no state, so apply and reverse are both nothing.
+            SleepClauseBlocked { .. } => {}
             SetLastBerry { side, slot, new, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].last_berry = new;
             }
@@ -447,6 +465,7 @@ impl State {
             SetSleptByFoe { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].slept_by_foe = previous;
             }
+            SleepClauseBlocked { .. } => {}
             SetLastBerry { side, slot, previous, .. } => {
                 self.sides[side.index()].pokemon[slot as usize].last_berry = previous;
             }

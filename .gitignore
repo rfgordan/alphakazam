@@ -14,6 +14,7 @@ target/
 # so a regenerated sidecar is byte-identical. Only needed to get a FIELD-LEVEL state diff on a
 # digest mismatch; the gate itself never reads them.
 /showdown-rs/harness/seed-sidecars/
+/showdown-rs/harness/seed-sidecars-rb/
 
 # OS / editor cruft
 .DS_Store
