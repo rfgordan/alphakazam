@@ -88,3 +88,38 @@ damage roll (0–15), crit, accuracy hit/miss, secondary proc, speed-tie winner.
 Until that patch lands, `outcomes` is empty and the Rust side infers the branch by
 matching the resulting HP (sufficient for deterministic moves; the patch makes it exact).
 ```
+
+---
+
+## v2 addendum — the `ruleset` stamp and the synthetic `start` decision (2026-07-27)
+
+Two fields matter for format-configurable recording, both written by `harness/cosim.mjs`:
+
+**`ruleset`** (top level, string). The formatid actually handed to `new Battle`. It exists
+because `format` does not answer that question: until this change the recorder rewrote
+`formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT`, so all 912 committed
+recordings say `format: "gen9randombattle"` and were **played as a custom game** — no Sleep
+Clause Mod, `Math.trunc` instead of the bit-honouring `Dex#trunc`, exact HP in the shared stream,
+and a team-preview first decision. `cosim::trace::ruleset_for` therefore reads `ruleset` and
+nothing else; **absent ⇒ `gen9customgame`**, which is what every legacy recording really was.
+An unknown id is an error, never a silent default.
+
+**Decision 0 without Team Preview.** `runPickTeam` is a complete no-op in a format that has no
+`Team Preview` rule (`RULESET_SPEC.md` §5), so `start()` runs the `'start'` queue action and turn
+1 setup inline and the first real decision is a `move` request. To keep every downstream consumer
+shape-identical, the recorder emits a **synthetic decision 0** with
+
+```jsonc
+{ "requestState": "start", "choices": {}, "requests": {},
+  "draws": [ /* everything battle.start() consumed */ ],
+  "stateAfter": /* the board at the first move request */ }
+```
+
+which is exactly the role a teampreview decision plays under a preview format. The Rust entry
+contract is one shared helper, `cosim::trace::first_decision_state(&ruleset)`.
+
+Consequence for the recorder: p2 is held back out of the `new Battle` options and added with
+`battle.setPlayer('p2', …)` **after** `instrumentPrng`, because `setPlayer` is what triggers
+`start()` (`sim/battle.ts:3279`) and those draws would otherwise be lost. Only the no-preview arm
+defers; the Team-Preview arm is byte-identical to how the 912 committed games were recorded, so
+their sidecars stay regenerable.

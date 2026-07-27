@@ -25,7 +25,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 const PS_COMMIT = assertPsPinned();
-const { Battle, Teams } = require(path.join(PS_DIR, 'dist/sim'));
+const { Battle, Teams, Dex } = require(path.join(PS_DIR, 'dist/sim'));
 const { State } = require(path.join(PS_DIR, 'dist/sim/state'));
 
 // ---- args -------------------------------------------------------------------
@@ -1003,21 +1003,57 @@ async function main() {
 		team1 = Teams.pack(Teams.import(t1));
 		team2 = Teams.pack(Teams.import(t2));
 	}
-	const battle = new Battle({
-		// Random-battle TEAMS are pre-generated above; the battle itself runs as a custom game
-		// so PS doesn't re-roll teams from the battle seed.
-		formatid: FORMAT.includes('random') ? 'gen9customgame' : FORMAT,
-		seed: [SEED_NUM, SEED_NUM + 7, SEED_NUM + 13, SEED_NUM + 29],
-		p1: { name: 'Red', team: team1 },
-		p2: { name: 'Blue', team: team2 },
-	});
+	// THE REAL FORMAT, verbatim. This used to be rewritten to `gen9customgame` for any
+	// `*random*` format ("so PS doesn't re-roll teams from the battle seed") — which was
+	// unnecessary, because `Battle#getTeam` (sim/battle.ts:3186) returns `options.team` verbatim
+	// when it is supplied and only builds a generator when it is absent, and the generator's PRNG
+	// is a SEPARATE one seeded from the player seed (sim/teams.ts:628). Pre-generated packed
+	// teams therefore work fine under the real formatid, and the battle stream is untouched.
+	// The rewrite was also the reason every committed recording claims `gen9randombattle` while
+	// having been played as a custom game (RULESET_SPEC.md §11.5 step 3).
+	const seed = [SEED_NUM, SEED_NUM + 7, SEED_NUM + 13, SEED_NUM + 29];
+	const hasTeamPreview = Dex.formats.getRuleTable(Dex.formats.get(FORMAT)).has('teampreview');
 
-	const roster = battle.sides.map(side => side.pokemon.map(p => p.set));
+	// `setPlayer` calls `start()` once every side is set (sim/battle.ts:3279). Under Team Preview
+	// `start()` stops at `runPickTeam`'s `makeRequest('teampreview')` having drawn nothing, so
+	// instrumenting after construction loses nothing. WITHOUT Team Preview `runPickTeam` is a
+	// complete no-op and `start()` runs the whole `'start'` action AND turn 1 setup inline — leads
+	// switched in, entry abilities fired, hazards, the lot. Those draws must be captured, so p2 is
+	// held back until the PRNG is instrumented.
+	//
+	// Only the no-preview arm defers: keeping the Team-Preview arm byte-identical to how the 912
+	// committed games were recorded is what makes their sidecars regenerable.
+	const battle = new Battle({
+		formatid: FORMAT,
+		seed,
+		p1: { name: 'Red', team: team1 },
+		...(hasTeamPreview ? { p2: { name: 'Blue', team: team2 } } : {}),
+	});
 	const draws = [];
 	instrumentPrng(battle, draws);
+	if (!hasTeamPreview) battle.setPlayer('p2', { name: 'Blue', team: team2 });
+
+	const roster = battle.sides.map(side => side.pokemon.map(p => p.set));
 	const rng = { p1: makeRng(SEED_NUM * 2 + 1), p2: makeRng(SEED_NUM * 2 + 2) };
 
 	const decisions = [];
+	if (!hasTeamPreview) {
+		// The SYNTHETIC decision 0 the Rust entry contract expects when there is no team-preview
+		// decision (`cosim::trace::first_decision_state`). Not a battle transition: it is the
+		// setup that ends at the first `move` request, carrying the draws `start()` consumed and
+		// the board they produced — exactly the role a teampreview decision plays under a preview
+		// format. Everything from decision 1 on is then shape-identical between the two.
+		decisions.push({
+			index: 0,
+			turn: battle.turn,
+			requestState: 'start',
+			midTurn: !!battle.midTurn,
+			requests: {},
+			choices: {},
+			draws: draws.splice(0, draws.length),
+			stateAfter: snapshot(battle, roster),
+		});
+	}
 	let guard = 0;
 	while (!battle.ended && guard++ < MAX_DECISIONS) {
 		const requestState = battle.requestState;
@@ -1071,7 +1107,10 @@ async function main() {
 		version: 2,
 		psCommit: PS_COMMIT,
 		format: FORMAT,
-		seed: [SEED_NUM, SEED_NUM + 7, SEED_NUM + 13, SEED_NUM + 29],
+		seed,
+		// The formatid actually handed to `new Battle` — the ONLY stamp `Ruleset::from_format`
+		// keys off. `format` above is merely what --format was set to.
+		ruleset: FORMAT,
 		teamset: TEAMSET,
 		// The exact packed sets handed to `new Battle` — species/level/ability/item/moves/EVs/IVs
 		// AND each set's declared gender. Recorded so a trace (or the slim seed fixture built from

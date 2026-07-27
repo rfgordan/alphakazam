@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# Record a range of full gen9randombattle games as seed-gate SIDECARS (full v2 traces).
+# Record a range of full games as seed-gate SIDECARS (full v2 traces).
+#
+# FORMAT is the REAL formatid now — it is passed to `new Battle` verbatim and stamped on the
+# trace as `ruleset`. `gen9randombattle` gets Sleep Clause Mod, the 13-bit Speed truncation, no
+# team preview and percent HP; `gen9customgame` gets what the 912 committed games were recorded
+# with. They are NOT interchangeable corpora: a game recorded under one is not a valid witness
+# for the other.
 #
 #   bash harness/record-seeds.sh <first-seed> <last-seed> [outdir]
 #
