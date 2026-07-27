@@ -1,5 +1,62 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN XIII (2026-07-27): the corpus is 912 games and 868 of them are byte-exact from seed
+(95.2%), up from 851.** The fresh 400 (seeds 1401-1800) are now COMMITTED fixtures in
+`harness/seed-fixtures-fresh/`, not a one-off reading. Per corpus: audited **111/111** (the
+absolute invariant, held at every commit), pinned-401 **393/401**, fresh-400 **364/400 = 91.0%**.
+Init-aligned 912/912. Ten parity commits, newly-non-exact EMPTY at all ten, per-commit yield
+1,2,2,2,3,1,1,1,3,1 — **no commit flipped zero**; the tranche stopped on its commit budget.
+Differ 99.53% zero `rust extra`; sweep 3831/3831 (EXACTNESS 100.00%); smoke 18/18; round-trip
+PASS; engine 12 suites + cosim green.
+
+**Run the rail with one command: `bash harness/gate-912.sh /tmp/after.txt`.** It gates all three
+corpora and writes the NON-EXACT game SET, because the regression judgment is
+`comm -13 before after` (MUST be empty) and never a count. **It passes `VERBOSE=1` deliberately** —
+without it `seedgate.rs:973` truncates the per-game listing at 45 rows and the set comes out
+silently short. That bug cost this tranche its first reading.
+
+**16 of the 17 games flipped were FRESH**, one was pinned (rb1126). Burn-down XII's "gate on 912"
+recommendation is confirmed by the yield, and the fresh half is still 7 points behind the pinned
+half (91.0% vs 98.4%) — which is the honest estimate of how much engine the pinned corpus never
+touches. **Record seeds 1801-2200 before starting the bare-`hp` grind.**
+
+**Six rules this tranche cost a landing each to learn:**
+
+1. **`go()` returns early on `this.ended` OR `this.requestState`, and both look identical in
+   state: a FAINTED MON IN AN ACTIVE SLOT.** `nextTurn`'s per-turn bookkeeping has not run on such
+   a board. Two engine copies of the `statsRaisedThisTurn` clear had two different, both wrong,
+   guards; they are one `next_turn_reached` now.
+2. **`runEvent` speed-sorts EXCEPT for `['Invulnerability','TryHit','DamagingHit','EntryHazard']`,
+   which use `compareLeftToRightOrder` (`sim/battle.ts:789`)** — `order` ascending with undefined
+   mapped to 4294967296, then `priority`, then `index` (0 for a single target) — i.e. a STABLE
+   sort over the collection order. So every TARGET handler precedes every SOURCE handler and Speed
+   never enters: Cursed Body rolls before Toxic Chain no matter who is faster.
+3. **A volatile is refused by `onTryAddVolatile`, a status by `onSetStatus`, and those are
+   different lists.** Electric Terrain blocks `yawn` and not `confusion`; Misty Terrain the
+   reverse. Do not reuse the status predicate for the volatile question.
+4. **The `BeforeMove` ladder is 100 / 11 / 10 / 9 / 8 / 7 / 6 / 5 / 3 / 2 / 1 / 0 / -1** — the full
+   table is in the scoreboard. `runEvent` short-circuits on the first `false`, so a cancel at 7/6/5
+   means no confusion countdown, no Attract roll, no paralysis roll and NO PP.
+5. **`getAllActive()` drops fainted mons; `getAllActive(true)` keeps them, and exactly ONE sort in
+   the switch bracket passes `true`** (`runSwitch`, `battle-actions.ts:181`). A pivot landing next
+   to a corpse therefore consumes one shuffle, not zero and not three — and the corpse sorts on
+   `storedStats.spe`, because `clearVolatile` ends in `this.speed = this.storedStats.spe`. Third
+   tranche running in which `pokemon.speed`-is-a-cache paid.
+6. **Two engine copies of one PS computation always drift.** Three pairs merged this tranche
+   (`next_turn_reached`, `before_move_blocked_7_6_5`, the absorb block shared by status and
+   damaging moves). XII said it about hand-copied LISTS; it is equally true of duplicated logic.
+
+**The 44 opens (8 pinned + 36 fresh) are triaged in the scoreboard's BURN-DOWN XIII section.**
+31 of them are a bare `hp` with no second field — still the asymptote. The 12 with a second field
+include three roots already NAMED with their PS source line: **Disguise is single-hit-gated in the
+engine and PS busts on hit 1 of a multi-hit move (rb1621); Encore's `onOverrideAction` never
+redirects an already-chosen action (rb1734); a Spikes / Toxic Spikes layer mismatch (rb1765,
+rb1591).** Take those first.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN XIII" — before anything else.**
+
+---
+
 **BURN-DOWN XII (2026-07-27): 503/512 pinned games byte-exact from seed (98.2%), up from 497;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step. AND — the fresh-seed question
 is settled: 400 NEW games (seeds 1401-1800) were recorded and gated, and they come in at

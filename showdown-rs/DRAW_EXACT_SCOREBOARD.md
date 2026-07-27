@@ -1,10 +1,210 @@
 # DRAW-EXACT — Phase 1 first scoreboard
 
-Reproduce: `cargo build --release -p cosim && DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz`
-PS pin: `b9dc987d`. Corpus: 111 audited traces / 3831 move units, plus 401 `gen9randombattle`
-seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) — 512 games total. A further 400 fresh
-games (seeds 1401-1800) were recorded in burn-down XII as sidecars only; rebuild their fixtures
-with `MAKE_FIXTURE=<dir> target/release/cosim harness/seed-sidecars/rb1[4-8]*.json.gz`.
+Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the whole rail in one command.
+PS pin: `b9dc987d`. **Corpus: 912 games.** 111 audited traces / 3831 move units
+(`harness/cosim-traces/`), 401 `gen9randombattle` seed fixtures (`harness/seed-fixtures/`,
+seeds 1000-1400) and 400 more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). All three are
+committed; the SIDECARS the fixtures were built from stay gitignored and are regenerable with
+`bash harness/record-seeds.sh <first> <last>` (deterministic, byte-identical).
+
+---
+
+# ==== BURN-DOWN XIII — certification (2026-07-27) ====
+
+**HEADLINE: 868 / 912 games byte-exact from seed (95.2%), up from 851.** Per corpus: audited
+**111 / 111**, pinned-401 **393 / 401** (so 504 / 512 = 98.4% on the old "512" reading), fresh-400
+**364 / 400 = 91.0%**. Init-aligned 912 / 912.
+
+Ten parity commits, each PS-source-grounded, judged by the exact-SET diff over all 912 at every
+step: **the newly-non-exact set was EMPTY at all ten.** Per-commit yield 1, 2, 2, 2, 3, 1, 1, 1,
+3, 1 — **no commit flipped zero**, so the kill criterion (three consecutive zero-yield parity
+commits) was never approached. 17 games / 10 commits = **1.7 games/commit**, up from XII's 1.0.
+The tranche stopped on its 12-commit budget.
+
+## The fresh corpus is now first-class
+
+`402a3ac` committed `harness/seed-fixtures-fresh/` (400 slim fixtures, 3.4 MB) and
+`harness/gate-912.sh`, which runs the seed gate over all three corpora and writes the NON-EXACT
+game SET to a file. **The regression judgment is a set diff, never a count diff:**
+
+```
+bash harness/gate-912.sh /tmp/before.txt     # at the parent commit
+...fix...
+bash harness/gate-912.sh /tmp/after.txt
+comm -13 /tmp/before.txt /tmp/after.txt      # newly-non-exact — MUST BE EMPTY
+comm -23 /tmp/before.txt /tmp/after.txt      # the yield
+```
+
+> **The script passes `VERBOSE=1` deliberately.** Without it `seedgate.rs:973` truncates the
+> per-game divergence listing at 45 rows and the set comes out silently SHORT — this cost the
+> first reading of the tranche (858/912 instead of 851/912). Any tool that scrapes that listing
+> must set it.
+
+**Burn-down XII's recommendation is confirmed by the yield.** Of the 17 games flipped, 16 are
+fresh and 1 is pinned (rb1126, one of the nine standing pinned opens, closed as a side effect of
+the Liquid Ooze commit). The marginal open game really is cheaper in the fresh half.
+
+## Final gate numbers (re-run at the certifying commit)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111 = 100%** (ABSOLUTE INVARIANT, held at every commit) |
+| Seed gate, pinned 401 | `SEED_GATE=1 cosim harness/seed-fixtures/*.fx.json.gz` | **393 / 401 = 98.0%** |
+| Seed gate, fresh 400 | `SEED_GATE=1 cosim harness/seed-fixtures-fresh/*.fx.json.gz` | **364 / 400 = 91.0%** |
+| **Seed gate, all 912** | `bash harness/gate-912.sh` | **868 / 912 = 95.2%**; init-aligned **912 / 912** |
+| Draw-consumption differ | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; zero `rust extra` |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831 matched**, 0 diverged, 0 unsupported; EXACTNESS 100.00% |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS**, every convertible state |
+| Engine tests | `cargo test --release -p engine -j 2` | 12 suites, all green |
+| Cosim tests | `cargo test --release -p cosim -j 2` | green |
+
+## The roots landed (in commit order)
+
+| # | commit | root | 912 |
+|---|--------|------|-----|
+| 0 | `402a3ac` | **corpus**: the fresh 400 become committed fixtures; `gate-912.sh` | baseline 851 |
+| 1 | `8ccc8c6` | **A faint replacement that ENDS the battle freezes `statsRaised/LoweredThisTurn`** — `go()` returns on `this.ended` before `nextTurn()` | 852 (rb1433) |
+| 2 | `2e4396b` | **PS reaches `nextTurn` only when BOTH active slots are filled.** `go()` also returns on `this.requestState`; both early exits look identical in state (a fainted mon in an active slot). One predicate `next_turn_reached` replaces two divergent guards | 854 (rb1529, rb1628) |
+| 3 | `647ce86` | **Well-Baked Body and Wind Rider block STATUS moves too**, at `hitStepTryHitEvent` (step 2) — so no accuracy draw. Soundproof/Bulletproof folded in | 856 (rb1432, rb1650) |
+| 4 | `85622a6` | **Knock Off (`onAfterHit`, step 8) cannot take an item that consumed itself at `DamagingHit` (step 7)** — Weakness Policy fires first | 858 (rb1447, rb1544) |
+| 5 | `05c947a` | **Disable (7) / Throat Chop, Heal Block, Gravity (6) / Taunt (5) outrank confusion (3), Attract (2) and paralysis (1)** in the `BeforeMove` ladder; a cancel there rolls nothing and pays no PP | 861 (rb1412, rb1493, rb1682) |
+| 6 | `606bc2d` | **`DamagingHit` is NOT speed-sorted** (`compareLeftToRightOrder`, `battle.ts:789`) — every TARGET handler rolls before every SOURCE handler, so Cursed Body precedes Toxic Chain regardless of Speed | 862 (rb1520) |
+| 7 | `374de81` | **Electric Terrain refuses the Yawn VOLATILE** on a grounded target (`onTryAddVolatile`) — a different, shorter list than "can be put to sleep", and Misty Terrain is NOT on it | 863 (rb1778) |
+| 8 | `acbf34b` | **An absorbing ability does not save an Exploding user from its own faint** — `useMoveInner:501` precedes `trySpreadMoveHit:519` | 864 (rb1774) |
+| 9 | `e928258` | **Liquid Ooze's `canOoze` list is `['drain','leechseed','strengthsap']`**, not `drain` alone; the ooze damage is uncapped by missing HP because `TryHeal` runs before `heal`'s full-HP bail | 867 (rb1126, rb1739, rb1745) |
+| 10 | `d029c37` | **`runSwitch` is the one bracket sort that passes `includeFainted`** (`battle-actions.ts:181`), and a fainted slot sorts on the `clearVolatile`-restored `storedStats.spe` | 868 (rb1706; also moved rb1710 from d7 to d18) |
+| 11 | this commit | docs | — |
+
+## Rules this tranche added, each of which cost a landing to learn
+
+> **`go()` returns early on `this.ended` OR `this.requestState`, and both look the same in state:
+> a FAINTED MON IN AN ACTIVE SLOT.** Everything `nextTurn` does — the per-turn marker resets — has
+> not happened yet on such a board. Two independent copies of the `statsRaisedThisTurn` clear had
+> two different, both incomplete, guards; they are now one `next_turn_reached`. Whenever you model
+> "end of turn", ask whether PS actually got there.
+
+> **`runEvent` speed-sorts its handlers EXCEPT for four event ids.**
+> `['Invulnerability', 'TryHit', 'DamagingHit', 'EntryHazard']` use
+> `Battle.compareLeftToRightOrder` (`sim/battle.ts:789-790`): `order` ascending with undefined
+> mapped to **4294967296** (so ordered handlers run FIRST and unordered last), then `priority`,
+> then `index` — which is 0 for a single target, leaving a STABLE sort over the collection order.
+> `findEventHandlers` collects the target's `on<Event>` first and the source's `onSource<Event>`
+> last. Speed is not consulted at all.
+
+> **A volatile is refused by `onTryAddVolatile`, a status by `onSetStatus`, and the two lists are
+> different.** Electric Terrain blocks `yawn` and not `confusion`; Misty Terrain blocks
+> `confusion` and not `yawn`. `status_blocked_by_field` answers the status question and is NOT a
+> drop-in for the volatile one.
+
+> **The `BeforeMove` ladder, enumerated from the pin** (`…filter(x => x.onBeforeMove)`, sorted by
+> `onBeforeMovePriority`): `100` glaiverush/grudge/rage/chillyreception, `11` mustrecharge,
+> `10` slp + frz, `9` truant, `8` flinch, `7` disable, `6` gravity + healblock + throatchop,
+> `5` taunt, `3` confusion, `2` attract, `1` par, `0` choicelock + gorillatactics,
+> `-1` destinybond. `runEvent` short-circuits on the first `false`, so everything below the
+> firing handler — including its DRAW — does not happen.
+
+> **`getAllActive()` excludes fainted mons; `getAllActive(true)` does not, and exactly one sort in
+> the switch bracket passes `true`.** That is why a pivot landing next to a corpse consumes ONE
+> shuffle rather than zero or three. And the corpse sorts on `storedStats.spe`, because
+> `clearVolatile` -> `setSpecies(baseSpecies)` -> `this.speed = this.storedStats.spe`. This is
+> burn-down XII's cache rule again, now for a fainted ACTIVE rather than a benched mon — the third
+> tranche in a row in which `pokemon.speed`-is-a-cache paid.
+
+> **Two engine copies of the same PS computation always drift.** This tranche merged three such
+> pairs: the two marker clears (`next_turn_reached`), the two `BeforeMove` 7/6/5 checks
+> (`before_move_blocked_7_6_5`), and the absorb list (status and damaging moves now share one
+> block). Burn-down XII said it about hand-copied LISTS; it is equally true of duplicated logic.
+
+## The 44 still-open games, evidenced (`DBG_DIFF` on the SIDECARS)
+
+**8 pinned + 36 fresh.** A slim fixture has no `stateAfter` and can only ever say `state-digest`,
+so every line below was taken against `harness/seed-sidecars/`.
+
+```
+PINNED (8)
+  rb1011 d43 t33  s0#3.hp 140/77
+  rb1012 d60 t52  s0#2.hp 138/185
+  rb1040 d2  t3   s0#0.hp 230/217
+  rb1184 d5  t6   s1#4.hp 196/142
+  rb1191 d17 t14  s0#1.hp 25/33     PS shuffle@thunderbolt vs rust randomChance@accuracy
+  rb1236 d37 t29  s0#4.hp 51/18
+  rb1314 d45 t38  s1#0.item LightClay/None   surfaces at a Revival Blessing
+  rb1347 d69 t64  s1#1.hp 245/259
+
+FRESH (36) — first divergent FIELD
+  bare .hp, no second field (24)
+    rb1448 rb1502 rb1525 rb1572 rb1581 rb1588 rb1612 rb1636 rb1642 rb1670 rb1683 rb1713
+    rb1751 rb1769 rb1781 rb1795 rb1416 rb1464 rb1555 rb1629 rb1734 rb1711 rb1421 rb1710
+  named / multi-field (12)
+    rb1418  s0.volatiles bit0 Confusion + confusion_turns 1/0   engine confuses, PS does not
+    rb1421  same bit0 + confusion_turns 5/0, plus species 496/495 (Mimikyu-Busted/Mimikyu)
+    rb1621  species 495/496 — the OPPOSITE direction; Triple Axel into an intact Mimikyu.
+            **Disguise is single-hit-gated in the engine (`md.hits_max == 1`); PS busts on
+            hit 1 and damages with hits 2-3.** rb1421 points the other way, so they are two
+            roots, not one.
+    rb1430  s0.boost.atk 3/1        engine over-boosts by two stages
+    rb1573  s0.boost.spa 3/2 + StatsRaisedThisTurn set where PS has none (downstream)
+    rb1649  s0.volatiles bit1 Substitute + substitute_hp 80/0 + two move PPs
+    rb1661  s0.substitute_hp 12/13  PS shuffle@scaleshot vs rust randomChance@crit
+    rb1680  field.terrain None/Electric
+    rb1681  s1.wish (1,214)/(2,214) — a Wish counter one turn out
+    rb1734  **Encore does not redirect an already-chosen action.** Sableye's Prankster Encore
+            lands on an Arceus-Electric that picked Recover; PS's `onOverrideAction` turns it
+            into Judgment and KOs Sableye. The engine let Recover run.
+    rb1760  s1.active_index 3/2     `rust-extra sample[5]@drag`
+    rb1765  s1.sc.spikes 0/1        a Spikes layer PS has and the engine does not
+    rb1591  s1.sc.toxic_spikes 1/0  the mirror case
+```
+
+**The bare-`hp` tail is 24 fresh + 7 pinned = 31 games and is still the campaign's asymptote.**
+Nothing localizes them but `DBG_INSTR` to the first diverging instruction plus PS source at the
+pin, one modifier at a time. Everything cheaper than that has now been taken twice over.
+
+## Asymptote assessment
+
+The kill criterion did not fire and the yield per commit went UP (1.0 -> 1.7), so this is not an
+exhausted seam — it is a seam whose remaining ore is unevenly distributed:
+
+* **12 of 44 opens still carry a second field**, and a second field is what makes a root findable
+  in one sitting. Every root this tranche landed came from one. Three of the twelve are already
+  named above with the PS source line that explains them (Disguise multi-hit, Encore's
+  `onOverrideAction`, the two hazard-layer mismatches); they are the next tranche's obvious start.
+* **The remaining 31 are a bare `hp`**, and their cost has not moved across three tranches. They
+  are damage-formula or damage-ordering bugs with no other symptom, and the only tool is
+  instruction-level bisection.
+* **The fresh half is still 7 points behind the pinned half** (91.0% vs 98.4%) after this tranche
+  moved it +4.0 and the pinned half +0.2. That gap is the honest estimate of how much of the
+  engine the pinned corpus never exercises, and it says a THIRD batch of seeds would again find
+  roots the first two cannot. Recording is cheap (400 games / 510 s / one node process); the
+  fixtures are 3.4 MB.
+* Nothing in the 44 is a PRNG-offset class any more except rb1191, rb1661 and rb1760 — the offset
+  class is three singletons with named draw-label mismatches, not a cluster.
+
+## Recommendation for the next tranche
+
+1. **Take the three named multi-field roots first** — Disguise on a multi-hit move (rb1621),
+   Encore's `onOverrideAction` redirect (rb1734), and the Spikes / Toxic Spikes layer pair
+   (rb1765, rb1591) — then the confusion pair (rb1418, rb1421).
+2. **Record seeds 1801-2200** before starting the bare-`hp` grind, and gate on 1312. The measured
+   pinned-vs-fresh gap says the marginal fresh game is still the cheaper one.
+3. `bash harness/gate-912.sh <out>` on every commit; `comm -13 before after` MUST be empty.
+4. `DBG_INSTR` is the triage tool, `DBG_DIFF` must be run against a SIDECAR to name a field, and
+   `PRNG_TRACE` is a one-command confirmation that localizes an offset to the unit that CREATED
+   it (it found both halves of commit 10).
+
+## Extended CI gate
+
+```
+cargo test --release -p engine -j 2            # 12 suites
+cargo test --release -p cosim  -j 2
+target/release/cosim harness/cosim-traces/*.json.gz          # 3831/3831, EXACTNESS 100.00%
+DRAW_DIFF=1 target/release/cosim harness/cosim-traces/*.json.gz   # >= 99.45%, zero `rust extra`
+ROUNDTRIP_GATE=1 target/release/cosim harness/cosim-traces/*.json.gz
+bash harness/run-distribution-smoke.sh         # 18/18
+bash harness/gate-912.sh /tmp/after.txt        # audited 111/111 (HARD), 912 total >= 868
+comm -13 /tmp/before.txt /tmp/after.txt        # MUST be empty
+```
 
 ---
 
