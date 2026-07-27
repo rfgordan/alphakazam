@@ -1901,6 +1901,11 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
         return 1.0;
     }
     let id = md.id.to_id();
+    // gen >= 8: Toxic used by a Poison-type NEVER misses (`accuracy = true`,
+    // battle-actions.ts:726) — a No Guard-shaped override, not a numeric 100.
+    if id == "toxic" && atk.types.contains(&Type::Poison) {
+        return 1.0;
+    }
     // Weather-perfect (forced-`true`) accuracy — always hits. (Sun-halved Thunder/Hurricane is a
     // NUMERIC 50 and flows through `accuracy_numerator` below.)
     match (id, effective_weather(&b.state)) {
@@ -1999,6 +2004,8 @@ fn counter_family_ontry_fails(b: &Branch, side: SideId, md: &crate::data::MoveDa
 /// damage roll still happens, so the engine must not emit an accuracy draw here. Cases:
 ///   * No Guard on either side (`onAnyAccuracy` returns true),
 ///   * a Glaive Rush target (its volatile's `onAccuracy` returns true),
+///   * **gen >= 8 Toxic used by a Poison-type** (`battle-actions.ts:726`, hard-coded into
+///     `hitStepAccuracy` alongside `move.alwaysHit`),
 ///   * weather-perfect accuracy: Blizzard in snow, and Thunder/Hurricane/Bleakwind Storm/
 ///     Wildbolt Storm/Sandsear Storm in rain (`onModifyMove` sets `move.accuracy = true`).
 /// The sun case for Thunder/Hurricane sets a NUMERIC 50 (still rolls) and is deliberately absent.
@@ -2012,6 +2019,9 @@ fn accuracy_forced_true(b: &Branch, side: SideId, md: &crate::data::MoveData) ->
         return true;
     }
     if b.state.side(side.other()).volatiles.contains(VolatileStatus::GlaiveRush) {
+        return true;
+    }
+    if md.id.to_id() == "toxic" && atk.types.contains(&Type::Poison) {
         return true;
     }
     matches!(
@@ -5659,23 +5669,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             && !md.flag_bypass_sub
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator
         {
-            // A status move whose ONLY landing effect is a major status (Toxic/Thunder Wave/
-            // Will-O-Wisp/Poison Powder/…) is failed by PS's `hitStepTryImmunity` BEFORE
-            // `hitStepAccuracy` when the target already carries a major status — `runStatusImmunity`
-            // rejects it, so no accuracy draw (d6 t58-62: Toxic on an already-paralyzed, subbed
-            // Garchomp → PS's only draw is Garchomp's own full-para check). A status move that also
-            // does something else (boost drop / volatile) still rolls behind the sub.
-            let status_only = md.status != Status::None
-                && md.target_boosts.iter().all(|&x| x == 0)
-                && md.target_volatile.is_none()
-                && !md.force_switch;
-            let target_already_statused = status_only
-                && b.state.side(foe).active().status != Status::None;
+            // An ALREADY-STATUSED target does NOT suppress the roll. `setStatus` fails inside
+            // `moveHit`, long after `hitStepAccuracy`, and `hitStepTryImmunity` (battle-actions.ts:
+            // 661-684) has no status check at all. This site used to carry a `target_already_statused`
+            // gate justified by d6 t58-62 ("Toxic on an already-paralyzed, subbed Garchomp draws
+            // nothing") — but d6's Toxic user is **Toxtricity, Electric/POISON**, so the real reason
+            // was the gen-8 Poison-type Toxic override, which now lives in `accuracy_forced_true`.
+            // rb5039 d46 (Toxic into an already-badly-poisoned, subbed Keldeo) and rb1642 d35
+            // (Will-O-Wisp into a statused, subbed Keldeo) are the counter-witnesses: PS rolls.
             if annotating()
                 && md.accuracy != 0
                 && !accuracy_forced_true(&b, side, &md)
                 && status_move_reaches_accuracy(&b, side, &md)
-                && !target_already_statused
             {
                 let acc = accuracy_arg(&b, side, &md);
                 let hp = accuracy_of(&b, side, &md);
@@ -11619,7 +11624,6 @@ fn execute_status_move(
     // Taunt roll `randomChance(110, 100)`).
     if md.accuracy != 0
         && md.target != crate::data::MoveTarget::User
-        && !(md.id.to_id() == "toxic" && b.state.side(side).active().types.contains(&Type::Poison))
         && !accuracy_forced_true(&b, side, md)
     {
         let acc = accuracy_arg(&b, side, md);
