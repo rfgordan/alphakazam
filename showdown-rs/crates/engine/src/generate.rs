@@ -6078,6 +6078,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|sb| apply_cursed_body(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
             {
+                // A nullified hit is still a connecting hit, so the per-hit `eachEvent('Update')`
+                // (970) and the post-hit-loop one (1024) both fire.
+                emit_update_hit(&mut sb);
+                emit_update(&mut sb);
                 // **A nullified hit still CONNECTED, so a pivot user still leaves.** `selfSwitch`
                 // is set in `hitStepMoveHitLoop` on `move.totalDamage !== false`, and Ice Face's
                 // `onDamage` returns the NUMBER 0 — the target stays in `targets` and the move
@@ -6097,6 +6101,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 out.push(sb);
             }
         }
+        // The accuracy split's MISS branch belongs to this arm's return too — a nullifying
+        // ability does not make the move stop rolling accuracy, and dropping the branch leaves the
+        // seed gate with nothing to select when PS's roll was a miss.
+        out.extend(miss_out);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -6145,6 +6153,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|x| apply_cursed_body(x, side, &md))
                 .flat_map(|x| apply_contact_secondaries(x, side, &md))
             {
+                // Same two Updates as the Ice Face arm: `onDamage` returned the NUMBER 0, so the
+                // target stayed in `targets` and PS ran the rest of `hitStepMoveHitLoop`.
+                // rb1191 d17: a Thunderbolt busts an intact Mimikyu on a Speed-TIED board and PS
+                // logs two `shuffle[2,0,2]@thunderbolt`; the engine logged one.
+                emit_update_hit(&mut sb);
+                emit_update(&mut sb);
                 match pivot {
                     Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
                         emit_pivot_trailing_update(&mut sb);
@@ -6158,6 +6172,11 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 out.push(sb);
             }
         }
+        // Same as the Ice Face arm above: keep the miss branch. rb1421 d26 — a 70-accuracy
+        // Hurricane into an intact Mimikyu, where PS MISSED and the engine had generated no miss
+        // outcome at all, so `replicate_select` fell through to the only branch there was and
+        // busted the Disguise.
+        out.extend(miss_out);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
