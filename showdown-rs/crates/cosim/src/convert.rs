@@ -184,6 +184,45 @@ fn convert_side(v: &Value, si: usize, canon: &Canonical, ended: bool, turn: u32)
         }
     }
 
+    // PS's LIVE `side.pokemon` order, as canonical slots — `Side::roster`. The array index IS
+    // `pokemon.position`, which is also what a `[Pokemon:pNx]` reference encodes, so this table is
+    // what resolves the `illusion` pointers below. Missing `rosterIndex` (a pre-stamp recording)
+    // leaves the identity order, which is what the engine assumes at battle start anyway.
+    let mut order: Vec<u8> = Vec::new();
+    for p in mons {
+        let id = species_id_of_details(s(p, "details"));
+        let slot = match p.get("rosterIndex").and_then(Value::as_i64) {
+            Some(ri) if (0..6).contains(&ri) => ri as u8,
+            _ => canon.slot(si, &id)?,
+        };
+        order.push(slot);
+    }
+    // Any party slot PS does not carry (a shorter team, or the terminal state where PS has dropped
+    // the loser's active) is appended ascending, so `roster` is always a permutation of 0..6 —
+    // `illusion_target` skips the empty ones by species.
+    let mut full = order.clone();
+    full.extend((0..6u8).filter(|s| !order.contains(s)));
+    side.roster.copy_from_slice(&full[..6]);
+
+    // `pokemon.illusion` serializes as `[Pokemon:pNx]` where `x` is the ARRAY index
+    // (`sim/state.ts:380`, `POSITIONS = 'abcdef…'`). Resolve through the order table above.
+    for p in mons {
+        let Some(r) = p.get("illusion").and_then(Value::as_str) else { continue };
+        let id = species_id_of_details(s(p, "details"));
+        let slot = match p.get("rosterIndex").and_then(Value::as_i64) {
+            Some(ri) if (0..6).contains(&ri) => ri as u8,
+            _ => canon.slot(si, &id)?,
+        };
+        let arr = r
+            .strip_prefix("[Pokemon:")
+            .and_then(|x| x.strip_suffix(']'))
+            .and_then(|x| x.chars().nth(2))
+            .and_then(|c| "abcdefghijklmnopqrstuvwx".find(c))
+            .ok_or_else(|| unsup(format!("illusion-ref:{r}")))?;
+        let shown = *order.get(arr).ok_or_else(|| unsup(format!("illusion-ref-oob:{r}")))?;
+        side.pokemon[slot as usize].illusion = Some(shown);
+    }
+
     // Side-level tera-used: synthesized by the recorder from live objects (the serializer
     // drops `terastallized` from fainted mons, so the snapshot alone can't recover it).
     side.tera_used = b(v, "teraUsed") || side.pokemon.iter().any(|p| p.terastallized);
@@ -392,9 +431,10 @@ fn convert_pokemon(p: &Value, species_id: &str) -> Res<Pokemon> {
         types = [tera_type, Type::None];
     }
 
-    if b(p, "illusion") {
-        return Err(unsup("pokemon:illusion"));
-    }
+    // `illusion` is a `[Pokemon:pNx]` STRING, resolved in `convert_side` where the array order is
+    // known. (The old guard here was `b(p, "illusion")` — `as_bool` on a string is always `None`,
+    // so the "unsupported" arm never fired and four Zoroark games were silently converted without
+    // their disguises.)
 
     // Transform: the snapshot's moveSlots/storedStats/types/ability are already the copied
     // values; `baseStoredStats` holds the originals. PS doesn't serialize baseMoveSlots, so

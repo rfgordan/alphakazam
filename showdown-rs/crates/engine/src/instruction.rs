@@ -21,7 +21,19 @@
 //! stores both `previous` and `new`.
 
 use crate::ids::{Ability, BoostIndex, Item, MoveId, Status, Terrain, Type, Weather};
-use crate::state::{PendingMove, SideId, State};
+use crate::state::{PendingMove, Side, SideId, State};
+
+/// PS's `switchIn` array rewrite: the outgoing mon takes the incoming one's array index and vice
+/// versa (`sim/battle-actions.ts:128-131`). An involution, so it serves apply AND reverse.
+fn swap_roster(s: &mut Side, previous: u8, next: u8) {
+    let (Some(i), Some(j)) = (
+        s.roster.iter().position(|&x| x == previous),
+        s.roster.iter().position(|&x| x == next),
+    ) else {
+        return;
+    };
+    s.roster.swap(i, j);
+}
 
 /// Selects which of the active Pokémon's simple turn-countdowns an instruction touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +127,19 @@ pub enum Instruction {
     // --- active Pokémon selection ---
     /// Change a side's active slot. Boost/volatile resets are emitted as their own
     /// instructions, so this is purely the index swap.
+    /// Also SWAPS the two mons' entries in `Side::roster` — PS's `switchIn` rewrites
+    /// `side.pokemon[…]` for both (`sim/battle-actions.ts:128-131`). The swap is an involution, so
+    /// apply and reverse are the same operation.
     Switch { side: SideId, previous: u8, next: u8 },
+
+    // --- Illusion ---
+    /// Set/clear `pokemon.illusion` SILENTLY: the `onBeforeSwitchIn` choice (which always begins
+    /// by nulling the old value) and the `onFaint` clear. Emits no protocol.
+    SetIllusion { side: SideId, slot: u8, previous: Option<u8>, new: Option<u8> },
+    /// The VISIBLE break — PS's `singleEvent('End', Illusion)` reaching `onEnd` with
+    /// `beingCalledBack` false, i.e. the `onDamagingHit` path. Clears the disguise and emits
+    /// `|replace|` + `|-end|…|Illusion|` (plus the Illusion Level Mod hint).
+    BreakIllusion { side: SideId, slot: u8, previous: u8 },
 
     // --- HP ---
     Damage { side: SideId, slot: u8, amount: i16 },
@@ -261,8 +285,16 @@ impl State {
     pub fn apply_one(&mut self, ins: Instruction) {
         use Instruction::*;
         match ins {
-            Switch { side, next, .. } => {
-                self.side_mut(side).active_index = next;
+            Switch { side, previous, next } => {
+                let s = self.side_mut(side);
+                s.active_index = next;
+                swap_roster(s, previous, next);
+            }
+            SetIllusion { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = new;
+            }
+            BreakIllusion { side, slot, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = None;
             }
             Damage { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp -= amount;
@@ -450,8 +482,16 @@ impl State {
     pub fn reverse_one(&mut self, ins: Instruction) {
         use Instruction::*;
         match ins {
-            Switch { side, previous, .. } => {
-                self.side_mut(side).active_index = previous;
+            Switch { side, previous, next } => {
+                let s = self.side_mut(side);
+                s.active_index = previous;
+                swap_roster(s, previous, next); // involution
+            }
+            SetIllusion { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = previous;
+            }
+            BreakIllusion { side, slot, previous } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = Some(previous);
             }
             Damage { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp += amount;

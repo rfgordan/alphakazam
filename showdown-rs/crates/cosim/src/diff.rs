@@ -74,6 +74,11 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
     // so there is no active slot to compare.
     if b.active_index != u8::MAX {
         cmp!(out, s("active_index"), a.active_index, b.active_index);
+        // PS's live `side.pokemon` ORDER (canonical slots). Beat Up reads it and Illusion picks its
+        // disguise from it, so a drifted permutation is a real bug even though no other field sees
+        // it. Skipped at the terminal sentinel, where PS has dropped the loser's active from the
+        // array entirely and the order is not a permutation of the party.
+        cmp!(out, s("roster"), a.roster, b.roster);
     }
 
     let active_alive = a.active_index != u8::MAX
@@ -140,6 +145,10 @@ fn diff_side(out: &mut Vec<Diff>, si: usize, a: &Side, b: &Side) {
         cmp!(out, p("times_hit"), pa.times_hit, pb.times_hit);
         cmp!(out, p("ability_used"), pa.ability_used, pb.ability_used);
         cmp!(out, p("transformed"), pa.transformed, pb.transformed);
+        // Illusion: the disguise target as a canonical party slot. PS serializes the pointer, so
+        // this is a real state comparison, not an inference. Deliberately NOT in `digest.rs` —
+        // see the note there; the full-state sweeps are what verify it.
+        cmp!(out, p("illusion"), pa.illusion, pb.illusion);
         cmp!(out, p("last_berry"), pa.last_berry, pb.last_berry);
         for mi in 0..4 {
             let (ma, mb) = (pa.moves[mi], pb.moves[mi]);

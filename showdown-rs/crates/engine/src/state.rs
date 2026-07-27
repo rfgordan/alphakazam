@@ -139,6 +139,15 @@ pub struct Pokemon {
     /// What the opponent has learned about this mon (hidden-information layer). Not read by the
     /// transition; consulted only by [`State::observe`]. See [`Reveal`].
     pub reveal: Reveal,
+
+    /// Illusion (`data/abilities.ts:2010`): the CANONICAL PARTY SLOT of the party member this mon
+    /// is currently disguised as, i.e. PS's `pokemon.illusion` pointer. `None` = not disguised.
+    ///
+    /// Chosen at `onBeforeSwitchIn` as the LAST able member of PS's live `side.pokemon` array
+    /// (see [`Side::roster`]) — so it is a function of the array ORDER, not of party slots. It is
+    /// per-MON state that survives a switch-out (PS's `onEnd` bails on `beingCalledBack`, which is
+    /// always true there) and is cleared by a faint, by re-entry, and by the visible break.
+    pub illusion: Option<u8>,
 }
 
 impl Pokemon {
@@ -172,6 +181,7 @@ impl Pokemon {
         ability_used: false,
         times_hit: 0,
         reveal: Reveal { moves: 0, flags: 0 },
+        illusion: None,
     };
 
     #[inline]
@@ -227,6 +237,16 @@ pub struct SideConditions {
 pub struct Side {
     pub pokemon: [Pokemon; 6],
     pub active_index: u8,
+
+    /// PS's LIVE `side.pokemon` array, as canonical party slots (`roster[i]` is the canonical slot
+    /// of the mon PS keeps at array index `i`). The engine's own slots are fixed; PS's are not —
+    /// `switchIn` SWAPS the outgoing and incoming entries (`sim/battle-actions.ts:118-131`), so
+    /// after the first switch `roster[0]` is always the active in singles.
+    ///
+    /// Two mechanics read the array ORDER rather than the party: Beat Up's participant sequence and
+    /// **Illusion's disguise target** (the last able entry). Identity at battle start, because the
+    /// canonical slot IS the battle-start array index (the recorder's `rosterIndex`).
+    pub roster: [u8; 6],
 
     /// Stat stages of the active Pokémon, indexed by `BoostIndex` (-6..=6).
     pub boosts: [i8; BoostIndex::COUNT],
@@ -316,6 +336,7 @@ impl Side {
     pub const EMPTY: Side = Side {
         pokemon: [Pokemon::EMPTY; 6],
         active_index: 0,
+        roster: [0, 1, 2, 3, 4, 5],
         boosts: [0; BoostIndex::COUNT],
         volatiles: Volatiles::empty(),
         substitute_hp: 0,
@@ -368,6 +389,53 @@ impl Side {
     #[inline]
     pub fn boost(&self, idx: BoostIndex) -> i8 {
         self.boosts[idx as usize]
+    }
+
+    /// The party slot the OPPONENT sees in `slot` — the Illusion target when disguised, else
+    /// `slot` itself. Every protocol ident/details field and PS's `(source.illusion || source)`
+    /// reads go through this; nothing mechanical does.
+    #[inline]
+    pub fn apparent_slot(&self, slot: u8) -> u8 {
+        self.pokemon[slot as usize].illusion.unwrap_or(slot)
+    }
+
+    /// The mon the opponent sees in the active slot (the Illusion target while disguised).
+    #[inline]
+    pub fn apparent_active(&self) -> &Pokemon {
+        &self.pokemon[self.apparent_slot(self.active_index) as usize]
+    }
+
+    /// PS's Illusion choice for a mon that is ENTERING at array position 0: the last able entry of
+    /// the live array strictly after it (`data/abilities.ts:2011-2023`, run after `switchIn`'s
+    /// swap, so `pokemon.position` is already 0). `None` when nothing able is behind it, and
+    /// `None` for the entry itself (an Illusion mon never disguises as itself).
+    ///
+    /// `roster_after` is the array as it will be once the swap lands.
+    pub fn illusion_target(&self, roster_after: [u8; 6], entering: u8) -> Option<u8> {
+        let pos = roster_after.iter().position(|&s| s == entering)?;
+        for i in (pos + 1..6).rev() {
+            let cand = roster_after[i];
+            let p = &self.pokemon[cand as usize];
+            if p.species == crate::ids::Species::None {
+                continue; // beyond PS's array length — not a party member at all
+            }
+            // PS's `break` sits INSIDE the `!fainted` arm, so a fainted entry is skipped and the
+            // scan continues; the first able entry from the back ends it either way.
+            if !p.is_alive() {
+                continue;
+            }
+            // "If Ogerpon is in the last slot while the Illusion Pokemon is Terastallized,
+            // Illusion will not disguise as anything" — the assignment is skipped but the `break`
+            // still fires, so the scan does NOT fall through to an earlier candidate.
+            let base = p.base_species.to_id();
+            if self.pokemon[entering as usize].terastallized
+                && (base.starts_with("ogerpon") || base.starts_with("terapagos"))
+            {
+                return None;
+            }
+            return Some(cand);
+        }
+        None
     }
 }
 
@@ -452,12 +520,40 @@ impl State {
     /// stats are left intact (they follow from the public species); EVs/nature are zeroed because
     /// the exact spread is only ever *inferred* from observed damage, never announced.
     ///
+    /// **Illusion is masked here, not by the reveal bits.** A disguised foe announced itself as
+    /// somebody else in the protocol (`|switch|p1a: Ninetales|…`), so the viewer's whole picture of
+    /// the active slot — species, forme, level, gender, typing, stats — is the DISGUISE's. That
+    /// identity block is substituted into the observed active slot; HP / status / boosts /
+    /// volatiles are the real mon's, because those are exactly the things the log reports
+    /// truthfully about the slot regardless of who is standing in it. The `illusion` pointer itself
+    /// is scrubbed: knowing a disguise is up is knowing it is a disguise.
+    ///
+    /// Note what is deliberately NOT hidden: the disguise target keeps its own party entry, so the
+    /// observed foe roster shows that species twice. That matches this model's standing assumption
+    /// that the foe's ROSTER is public (randbats team preview / open sheets) while the identity of
+    /// the mon on the field is not.
+    ///
     /// This is the only place the reveal layer is read, and it is off the hot path — call it when
     /// feeding an agent or logging a position, not inside the per-turn transition.
     pub fn observe(&self, viewer: SideId) -> State {
         use crate::ids::{Ability, Item, Type};
         let mut obs = *self;
         let foe = obs.side_mut(viewer.other());
+        for slot in 0..6usize {
+            let Some(shown) = foe.pokemon[slot].illusion else { continue };
+            let d = foe.pokemon[shown as usize];
+            let p = &mut foe.pokemon[slot];
+            p.species = d.species;
+            p.base_species = d.base_species;
+            p.level = d.level;
+            p.gender = d.gender;
+            p.types = d.types;
+            p.live_types = d.live_types;
+            p.base_types = d.base_types;
+            p.stats = d.stats;
+            p.base_stats = d.base_stats;
+            p.illusion = None;
+        }
         for p in foe.pokemon.iter_mut() {
             if p.species == crate::ids::Species::None {
                 continue;

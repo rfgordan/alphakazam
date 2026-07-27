@@ -1362,13 +1362,17 @@ fn transform_data_of(state: &State, side: SideId) -> crate::instruction::Transfo
 /// Transform / Imposter: copy the foe's battle identity onto `side`'s active. Mirrors PS
 /// `transformInto`: species/types/stats(except HP)/ability/boosts copied; each copied move
 /// gets PP = min(5, base PP); crit volatiles (Focus Energy) copied. Fails against a
-/// substitute, a transformed target, or when the user is already transformed.
+/// substitute, a transformed target, or when the user is already transformed — and, per
+/// `sim/pokemon.ts:1274`, whenever EITHER mon is currently running an Illusion.
 fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     let foe = side.other();
-    let user_ok = b.state.side(side).active().is_alive() && !b.state.side(side).active().transformed;
+    let user_ok = b.state.side(side).active().is_alive()
+        && !b.state.side(side).active().transformed
+        && b.state.side(side).active().illusion.is_none();
     let target = b.state.side(foe).active();
     let target_ok = target.is_alive()
         && !target.transformed
+        && target.illusion.is_none()
         && !b.state.side(foe).volatiles.contains(VolatileStatus::Substitute);
     if !user_ok || !target_ok {
         return false;
@@ -1738,9 +1742,13 @@ pub fn maybe_trapped(state: &State, side: SideId) -> bool {
     if !foe.is_alive() {
         return false;
     }
+    // **The sweep reads the foe's APPARENT species** — `const species = (source.illusion ||
+    // source).species` (`sim/battle.ts:1732`). A disguised Zoroark therefore offers the DISGUISE's
+    // ability list to the inference, which is the one place Illusion changes a gate-visible field.
+    let foe_apparent = state.side(side.other()).apparent_active();
     // PS skips the ability the foe ACTUALLY has ("pokemon event was already run above"), which is
     // exactly the `is_trapped` case handled at the top.
-    species_possible_trap_abilities(foe.species)
+    species_possible_trap_abilities(foe_apparent.species)
         .iter()
         .filter(|&&ab| ab != foe.ability)
         .any(|&ab| match ab {
@@ -2605,6 +2613,12 @@ pub(crate) fn apply_revive(b: &mut Branch, side: SideId, slot: u8) {
     if counter != 0 {
         push(b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
     }
+    // Illusion's `onFaint` nulled the disguise when this mon went down (`sim/battle.ts:2578`).
+    // The engine leaves it on the corpse — nothing compares a fainted mon — so the ONE path that
+    // brings a corpse back into comparison has to clear it here.
+    if let Some(previous) = b.state.side(side).pokemon[slot as usize].illusion {
+        push(b, Instruction::SetIllusion { side, slot, previous: Some(previous), new: None });
+    }
 }
 
 pub(crate) fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
@@ -2766,6 +2780,11 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
     // Consecutive-use tracking belongs to the active slot — reset it as the mon leaves.
     reset_move_tracking(b, side);
+    // Illusion's `onBeforeSwitchIn` fires AFTER `switchIn` has swapped the array entries but
+    // BEFORE the `|switch|` line is added (`sim/battle-actions.ts:128-145`), so the disguise has to
+    // be installed ahead of the Switch instruction the protocol layer renders. The choice reads the
+    // POST-swap array, computed here because `Switch` is what performs the swap.
+    apply_illusion_choice(b, side, previous, target);
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
@@ -2801,6 +2820,32 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
         run_update_event(b);
+    }
+}
+
+/// Illusion `onBeforeSwitchIn` (`data/abilities.ts:2011-2023`): the entering mon's disguise is
+/// nulled and then re-chosen as the LAST able entry of PS's live `side.pokemon` array behind it.
+///
+/// Runs for the entering mon only, and only if it actually HAS the ability — the handler is the
+/// ability's, so a mon that lost Illusion (or never had it) neither picks nor clears. Consumes no
+/// PRNG: the scan is a plain loop and `singleEvent` never speed-sorts.
+fn apply_illusion_choice(b: &mut Branch, side: SideId, previous: u8, target: u8) {
+    if b.state.side(side).pokemon[target as usize].ability != crate::ids::Ability::Illusion {
+        return;
+    }
+    // The array as it will look once `Switch` performs the swap.
+    let mut roster_after = b.state.side(side).roster;
+    if let (Some(i), Some(j)) = (
+        roster_after.iter().position(|&x| x == previous),
+        roster_after.iter().position(|&x| x == target),
+    ) {
+        roster_after.swap(i, j);
+    }
+    let s = b.state.side(side);
+    let new = s.illusion_target(roster_after, target);
+    let prev = s.pokemon[target as usize].illusion;
+    if prev != new {
+        push(b, Instruction::SetIllusion { side, slot: target, previous: prev, new });
     }
 }
 
@@ -7485,10 +7530,30 @@ fn apply_damaging_hit_step7(b: &mut Branch, side: SideId, md: &crate::data::Move
     // `runEvent('DamagingHit')` is gated on `damagedDamage.length` — a Substitute hit records
     // `damage[i] === true`, not a number, so no `onDamagingHit` handler runs behind a sub.
     if !hit_sub {
+        apply_illusion_break(b, foe);
         apply_justified(b, foe, md);
         apply_rattled(b, foe, md);
         apply_thermal_exchange(b, foe, md);
         apply_weak_armor(b, foe, md);
+    }
+}
+
+/// Illusion's `onDamagingHit` → `singleEvent('End', Illusion)` → `onEnd`
+/// (`data/abilities.ts:2026-2042`). `beingCalledBack` is false on this path (it is only ever set
+/// by `switchIn`), so the disguise drops VISIBLY: `|replace|` with the real details, `|-end|` and,
+/// under Illusion Level Mod, the level hint. Draw-free; the state change is protocol-visible only.
+///
+/// Unordered among the `DamagingHit` handlers (no `onDamagingHitOrder`), and gated on
+/// `damagedDamage.length` exactly like the rest of step 7 — a Substitute hit does not break it.
+/// A hit that KOs still breaks it: `pokemon.fainted` is not set until `faintMessages`.
+fn apply_illusion_break(b: &mut Branch, victim: SideId) {
+    let slot = b.state.side(victim).active_index;
+    let p = &b.state.side(victim).pokemon[slot as usize];
+    if p.ability != crate::ids::Ability::Illusion {
+        return;
+    }
+    if let Some(previous) = p.illusion {
+        push(b, Instruction::BreakIllusion { side: victim, slot, previous });
     }
 }
 
