@@ -10022,7 +10022,27 @@ fn execute_status_move(
             let acc = accuracy_arg(&b, side, md);
             draw(&mut b, "randomChance", &[acc, 100], 1, "accuracy");
         }
-        if b.state.side(foe2).active().is_alive() && !sticky && (mine != Item::None || theirs != Item::None) {
+        // PS `trick.onHit` (`data/moves.ts:19889-19904`) fails the WHOLE swap the moment either
+        // side of the transfer is refused:
+        //   `const yourItem = target.takeItem(source); const myItem = source.takeItem();`
+        //   `if (yourItem === false || myItem === false || (!yourItem && !myItem)) { restore; return false }`
+        // and then a SECOND pair of `singleEvent('TakeItem')` checks with the holders CROSSED, so
+        // an item that cannot be HELD by the other end fails too. Both are the item's `onTakeItem`,
+        // which the Arceus plates / Silvally memories / Genesect drives / Origin items / Rusted
+        // Sword & Shield / Ogerpon masks / Blue & Red Orb refuse — most of them symmetrically
+        // (`(source && source.baseSpecies.num === 493) || pokemon.baseSpecies.num === 493`), which
+        // is exactly what `item_removable_from`'s `source` argument models.
+        //
+        // rb1099 d57: a Choice Scarf Chandelure Tricks an Arceus-Dark holding a Dread Plate. PS
+        // fails outright — both keep their items and Chandelure keeps its `choicelock`. The engine
+        // swapped, and moved the Choice lock to the Arceus with the Scarf.
+        let my_sp = b.state.side(side).active().species;
+        let their_sp = b.state.side(foe2).active().species;
+        let tradeable = item_removable_from(their_sp, theirs, Some(my_sp))
+            && item_removable_from(my_sp, mine, Some(their_sp));
+        if b.state.side(foe2).active().is_alive() && !sticky && tradeable
+            && (mine != Item::None || theirs != Item::None)
+        {
             let my_slot = b.state.side(side).active_index;
             let their_slot = b.state.side(foe2).active_index;
             push(&mut b, Instruction::ChangeItem { side, slot: my_slot, previous: mine, new: theirs });
