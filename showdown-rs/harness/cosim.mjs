@@ -41,6 +41,11 @@ const TEAMSET = arg('teamset', 'ou');
 const MAX_DECISIONS = Number(arg('max-decisions', '600'));
 const OUT = arg('out', path.join(__dirname, 'cosim-traces', `c${SEED_NUM}.json`));
 const DISTRIBUTIONS = argv.includes('--distributions');
+// `--policy "<cmd>"`: instead of the built-in random chooser, ask a long-lived child process for
+// every choice (see agents/scripts/policy_server.py). This is what makes a recorded trace
+// ON-POLICY: Showdown still drives the battle from the seed, so the trace goes through the
+// existing deterministic seed gate unchanged — one outcome per decision, byte-compared.
+const POLICY_CMD = arg('policy', null);
 const MAX_DIST_PATHS = Number(arg('max-dist-paths', '250000'));
 
 // ---- teams (packed; unique species per side so idents are unambiguous) -------
@@ -976,6 +981,96 @@ function chooseFor(request, rand) {
 	return { choice: 'default', resolved: { action: 'default' } };
 }
 
+// ---- policy child process --------------------------------------------------------
+
+// A line-delimited JSON exchange with a long-lived child. Long-lived because the alternative
+// (spawn per decision) pays a multi-second torch import on every single choice.
+function startPolicy(cmd) {
+	const { spawn } = require('node:child_process');
+	const child = spawn('/bin/sh', ['-c', cmd], { stdio: ['pipe', 'pipe', 'inherit'] });
+	let buf = '';
+	const waiters = [];
+	child.stdout.on('data', chunk => {
+		buf += chunk;
+		let i;
+		while ((i = buf.indexOf('\n')) >= 0) {
+			const line = buf.slice(0, i).trim();
+			buf = buf.slice(i + 1);
+			if (!line) continue;
+			const w = waiters.shift();
+			if (w) w(JSON.parse(line));
+		}
+	});
+	child.on('exit', code => {
+		while (waiters.length) waiters.shift()({ error: `policy exited (${code})` });
+	});
+	const ask = payload => new Promise(resolve => {
+		waiters.push(resolve);
+		child.stdin.write(JSON.stringify(payload) + '\n');
+	});
+	// The child emits {"ready":true} once its model is loaded.
+	const ready = new Promise(resolve => waiters.push(resolve));
+	return { ask, ready, kill: () => child.kill() };
+}
+
+// What PS says this side may legally do, in the terms the policy needs: move SLOTS, switch
+// targets by stable ROSTER INDEX (PS's live array reorders; roster indices don't), and tera.
+function allowedFor(request, side, roster) {
+	const out = { allowedMoves: [], allowedRoster: [], canTera: false };
+	if (!request || request.wait) return out;
+	const live = (m) => !m.condition.endsWith(' fnt') && m.condition !== '0 fnt';
+	const rosterOf = (m) => roster[side.n].findIndex(st => setKey(st) === setKey(side.pokemon[request.side.pokemon.indexOf(m)]?.set ?? {}));
+	if (request.forceSwitch) {
+		const mons = request.side.pokemon;
+		const reviving = mons.some(m => m.reviving);
+		for (let i = 0; i < mons.length; i++) {
+			if (mons[i].active) continue;
+			if (reviving ? live(mons[i]) : !live(mons[i])) continue;
+			const ri = roster[side.n].indexOf(side.pokemon[i].set);
+			if (ri >= 0) out.allowedRoster.push(ri);
+		}
+		return out;
+	}
+	const act = request.active?.[0];
+	if (!act) return out;
+	for (let i = 0; i < act.moves.length; i++) {
+		const m = act.moves[i];
+		if (!m.disabled && (m.pp === undefined || m.pp > 0)) out.allowedMoves.push(i);
+	}
+	out.canTera = !!act.canTerastallize;
+	if (!act.trapped && !act.maybeTrapped) {
+		const mons = request.side.pokemon;
+		for (let i = 0; i < mons.length; i++) {
+			if (mons[i].active || !live(mons[i])) continue;
+			const ri = roster[side.n].indexOf(side.pokemon[i].set);
+			if (ri >= 0) out.allowedRoster.push(ri);
+		}
+	}
+	void rosterOf;
+	return out;
+}
+
+// Turn the policy's answer back into a PS choice string. `rosterIndex` -> the CURRENT live-array
+// position, which is the only translation PS's ordering and the engine's roster ever need.
+function policyChoice(ans, side, roster, request) {
+	if (ans == null || ans.action == null) return null;
+	const a = ans.action;
+	// `resolved.moveId` is not decoration: the seed gate resolves a recorded move choice by ID
+	// against the engine's move set, and a null one fails as `choice:move-not-on-set`.
+	const moveIdAt = slot => request?.active?.[0]?.moves?.[slot]?.id ?? null;
+	if (a >= 0 && a <= 3) {
+		return { choice: `move ${a + 1}`, resolved: { action: 'move', moveId: moveIdAt(a), tera: false } };
+	}
+	if (a >= 9 && a <= 12) {
+		const slot = a - 9;
+		return { choice: `move ${slot + 1} terastallize`, resolved: { action: 'move', moveId: moveIdAt(slot), tera: true } };
+	}
+	const pos = side.pokemon.findIndex(p => roster[side.n].indexOf(p.set) === ans.rosterIndex);
+	if (pos < 0) return null;
+	const m = side.pokemon[pos];
+	return { choice: `switch ${pos + 1}`, resolved: { action: 'switch', ident: m.fullname, details: m.details } };
+}
+
 // ---- main -----------------------------------------------------------------------
 
 async function main() {
@@ -1017,6 +1112,13 @@ async function main() {
 	instrumentPrng(battle, draws);
 	const rng = { p1: makeRng(SEED_NUM * 2 + 1), p2: makeRng(SEED_NUM * 2 + 2) };
 
+	const policy = POLICY_CMD ? startPolicy(POLICY_CMD) : null;
+	if (policy) {
+		await policy.ready;
+		process.stderr.write(`policy ready: ${POLICY_CMD}\n`);
+	}
+	let policyFallbacks = 0;
+
 	const decisions = [];
 	let guard = 0;
 	while (!battle.ended && guard++ < MAX_DECISIONS) {
@@ -1027,7 +1129,24 @@ async function main() {
 			const req = side.activeRequest;
 			if (!req || req.wait) continue;
 			requests[side.id] = JSON.parse(JSON.stringify(req));
-			const c = chooseFor(req, rng[side.id]);
+			let c = null;
+			// Team preview is deterministic setup, not a policy decision — the recorder always
+			// answers `default` there (and the engine does not model it either).
+			if (policy && !req.teamPreview) {
+				const ans = await policy.ask({
+					state: snapshot(battle, roster),
+					side: side.id,
+					format: FORMAT,
+					requestState,
+					...allowedFor(req, side, roster),
+				});
+				c = policyChoice(ans, side, roster, req);
+				// A convert failure or an unusable answer falls back to the random chooser rather
+				// than aborting: the game stays recordable and the fallback count is reported, so
+				// a systematically failing policy is visible instead of silent.
+				if (!c) policyFallbacks++;
+			}
+			if (!c) c = chooseFor(req, rng[side.id]);
 			if (c) {
 				// Switch choices: also resolve to the stable roster index (forme-proof identity).
 				const m = c.choice.match(/^switch (\d+)$/);
@@ -1087,6 +1206,10 @@ async function main() {
 		fs.writeFileSync(OUT, gzipSync(body));
 	} else {
 		fs.writeFileSync(OUT, body);
+	}
+	if (policy) {
+		policy.kill();
+		if (policyFallbacks) process.stderr.write(`policy fallbacks: ${policyFallbacks} decision(s) fell back to the random chooser\n`);
 	}
 	console.log(`wrote ${OUT}: ${decisions.length} decisions, ${trace.result.turns} turns, winner=${trace.result.winner}, ps=${PS_COMMIT.slice(0, 12)}`);
 }
