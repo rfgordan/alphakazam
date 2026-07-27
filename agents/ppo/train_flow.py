@@ -241,6 +241,16 @@ def train(args):
 
     baselines = standard_baselines(anchor, device, pool or None) if args.eval_every else []
 
+    # E3 (NFSP-lite): reservoir-sample the learner's own acting decisions across the whole run —
+    # a uniform draw over the policy's history, which is exactly what the fictitious-play
+    # "average policy" is fit on afterward (probes/bc_train.py). Approximate algorithm-R done in
+    # batches: accept ~cap/seen of each step's rows into random slots.
+    res = None
+    if args.reservoir_out:
+        res = {"obs": None, "ids": None, "mask": None, "action": None,
+               "n": 0, "seen": 0, "cap": args.reservoir_cap,
+               "rng": np.random.default_rng(cfg.seed ^ 0x9E5)}
+
     window: list[int] = []
     start, start_step = time.time(), global_step
 
@@ -278,7 +288,33 @@ def train(args):
                                         dtype=np.int64)
                 teacher_t = torch.as_tensor(teacher_np, device=device)
 
-            reward, done, active, dyn, outcome = env.step(action.cpu().numpy(), opp_action)
+            action_np = action.cpu().numpy()
+            reward, done, active, dyn, outcome = env.step(action_np, opp_action)
+
+            if res is not None:
+                rows = np.flatnonzero(active.astype(bool))
+                if rows.size:
+                    if res["obs"] is None:
+                        res["obs"] = np.zeros((res["cap"], env.obs_dim), dtype=np.float32)
+                        res["ids"] = np.zeros((res["cap"], env.id_dim), dtype=np.int64)
+                        res["mask"] = np.zeros((res["cap"], env.n_actions), dtype=bool)
+                        res["action"] = np.zeros(res["cap"], dtype=np.int64)
+                    free = res["cap"] - res["n"]
+                    take_new = rows[:free]
+                    sl = slice(res["n"], res["n"] + take_new.size)
+                    res["obs"][sl] = obs_l[take_new]; res["ids"][sl] = ids_l[take_new]
+                    res["mask"][sl] = mask_l[take_new]; res["action"][sl] = action_np[take_new]
+                    res["n"] += take_new.size
+                    rest = rows[free:] if free else rows
+                    if res["n"] >= res["cap"] and rest.size:
+                        # batched algorithm-R: each survivor replaces a uniform slot w.p. cap/seen
+                        p = res["cap"] / max(res["cap"], res["seen"])
+                        pick = rest[res["rng"].random(rest.size) < p]
+                        if pick.size:
+                            slots_ = res["rng"].integers(0, res["cap"], size=pick.size)
+                            res["obs"][slots_] = obs_l[pick]; res["ids"][slots_] = ids_l[pick]
+                            res["mask"][slots_] = mask_l[pick]; res["action"][slots_] = action_np[pick]
+                    res["seen"] += rows.size
 
             reward_t = torch.as_tensor(reward, device=device)
             if rnad_ref is not None:
@@ -385,6 +421,14 @@ def train(args):
             save(update)
 
     save(update)
+    if res is not None and res["n"]:
+        np.savez_compressed(args.reservoir_out,
+                            obs=res["obs"][:res["n"]], ids=res["ids"][:res["n"]],
+                            mask=res["mask"][:res["n"]], action=res["action"][:res["n"]],
+                            ret=np.zeros(res["n"], dtype=np.float32),  # bc_train value target: unused
+                            gamma=cfg.gamma, obs_dim=env.obs_dim, id_dim=env.id_dim)
+        print(f"[reservoir] wrote {res['n']:,} of {res['seen']:,} seen decisions "
+              f"to {args.reservoir_out}")
     if exploit_net is not None:
         recent = window[-20_000:]
         summary = {"target": args.exploit, "steps": global_step, "games": total_games,
@@ -437,6 +481,10 @@ def main():
                         "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
     p.add_argument("--target-kl", type=float, default=0.0,
                    help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
+    p.add_argument("--reservoir-out", type=str, default=None, metavar="NPZ",
+                   help="reservoir-sample the learner's acting decisions across the run and "
+                        "write them here at exit — the NFSP average-policy dataset (E3)")
+    p.add_argument("--reservoir-cap", type=int, default=1_500_000)
     p.add_argument("--rnad-eta", type=float, default=0.0,
                    help=">0: R-NaD-style reward regularization toward a reference policy, "
                         "r' = r − η(log π − log π_ref) on acting steps (E4)")
