@@ -3487,6 +3487,15 @@ pub enum Pivot {
     Target(u8),
     /// Emit `Instruction::PivotPending` and leave the user in: the request-flow driver pauses
     /// for a `PivotLanding` choice. Never used on verification/enumeration paths.
+    ///
+    /// Two invariants the emission sites enforce, because the caller cannot:
+    /// * the EXECUTED move must be the self-switch move the pause was granted for — Struggle and
+    ///   the Encore `OverrideAction` redirect replace it inside `run_move_action` (see the
+    ///   re-derivation there);
+    /// * the side must still have somewhere to go. PS `sim/battle.ts:2904`:
+    ///   `if (switches[i] && !this.canSwitch(this.sides[i]))` clears `switchFlag` and drops the
+    ///   side out of `switches` — with an empty bench the mon simply stays in and no switch
+    ///   request is issued.
     Pause,
 }
 
@@ -4845,6 +4854,26 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         move_data(move_id)
     };
+    // **`Pivot::Pause` belongs to the move that RUNS, not the move that was CHOSEN.**
+    // `Flow::run_turn` stamps it on the action from the chosen slot — a `self_switch` move with an
+    // alive bench, or Revival Blessing with a fainted bench — but the two substitutions above
+    // (Struggle via `no_usable_move`, and the Encore `OverrideAction` redirect) replace the move
+    // afterwards, and every `match pivot` arm below keys on the ACTION. So the substitute inherited
+    // the pause: a PP-stalled mon with an entirely FAINTED bench picks Revival Blessing, Struggles,
+    // and its damaging path pushes `PivotPending` — a `PivotLanding` request for a side with
+    // nowhere to go (`request.rs:resume_pivot`'s tripwire; it killed a 4096-env trainer at ~1e-5
+    // games). Re-derive the pause from the executed move; `Pivot::Target` is left alone because the
+    // verification paths supply it from the RECORDED choice, which is already the executed move.
+    let pivot = match pivot {
+        Pivot::Pause
+            if struggling
+                || !(md.self_switch
+                    || matches!(md.id.to_id(), "revivalblessing" | "shedtail")) =>
+        {
+            Pivot::Stay
+        }
+        p => p,
+    };
     // Shell Side Arm: category resolved by `dispatch_move_inner`; the physical variant
     // additionally becomes a contact move (PS sets `move.flags.contact = 1`).
     if md.id.to_id() == "shellsidearm" {
@@ -5741,7 +5770,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             Pivot::Pause => {
                 for sb in &mut branches {
-                    if sb.state.side(side).active().is_alive() {
+                    if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) {
                         push(sb, Instruction::PivotPending { side });
                     }
                 }
@@ -6047,7 +6076,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                         apply_switch(&mut sb, side, t);
                         emit_switch_bracket(&mut sb, &pre, side, t);
                     },
-                    Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) { push(&mut sb, Instruction::PivotPending { side }); },
                     Pivot::Stay => {}
                 }
                 out.push(sb);
@@ -6108,7 +6137,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                         apply_switch(&mut sb, side, t);
                         emit_switch_bracket(&mut sb, &pre, side, t);
                     },
-                    Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) { push(&mut sb, Instruction::PivotPending { side }); },
                     Pivot::Stay => {}
                 }
                 out.push(sb);
@@ -6486,7 +6515,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     }
                 }
                 Pivot::Pause => {
-                    if sb.state.side(side).active().is_alive() {
+                    if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) {
                         push(&mut sb, Instruction::PivotPending { side });
                     }
                 }

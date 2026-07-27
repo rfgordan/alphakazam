@@ -352,11 +352,17 @@ impl Flow {
             if ok { Some(slot) } else { alive_bench(&self.state, side) }
         });
         let Some(slot) = slot else {
-            // A pivot pause whose bench emptied before the landing resolved. The path that
-            // produces this is still undiagnosed (rare — roughly 1 in 10^5 games; it killed the
-            // scale2 trainer on 2026-07-27), but PS's behavior with nowhere to go is "stay in",
-            // and skipping the switch is exactly that. Log loudly so the parity campaign can
-            // hunt it; do NOT kill a 4096-env training process over it.
+            // A pivot pause whose bench emptied before the landing resolved. The root is FIXED:
+            // `wants_pause` below grants `Pivot::Pause` off the CHOSEN move, and `run_move_action`
+            // then substitutes the move (Struggle via `no_usable_move`, or the Encore
+            // `OverrideAction` redirect) — a PP-stalled mon with an all-fainted bench picked
+            // Revival Blessing, Struggled, and Struggle's damaging path inherited the pause (then
+            // its own recoil killed the user). `generate.rs` re-derives the pause from the EXECUTED
+            // move and gates every `PivotPending` on `has_alive_bench`; `tests/pivot_landing_bench.rs`
+            // is the property, `tests/pivot_pause_survives_move_substitution.rs` the unit repro.
+            // This arm STAYS as a tripwire: PS's behavior with nowhere to go is "stay in"
+            // (`sim/battle.ts:2904` clears `switchFlag` when `!canSwitch`), which is what skipping
+            // the switch does, and a 4096-env trainer must not die on a future regression.
             eprintln!(
                 "[engine] PivotLanding with no live bench (side {:?}, turn {}) — staying in",
                 side, self.state.turn
