@@ -2667,7 +2667,40 @@ fn run_update_event(b: &mut Branch) {
     for side in order {
         apply_pinch_berry(b, side);
         consume_lum_if_statused(b, side);
+        retry_trace(b, side);
     }
+}
+
+/// Trace is an `onUpdate` handler, not a one-shot switch-in effect.
+///
+/// `data/abilities.ts:5075-5103`: `onStart` only sets `effectState.seek` and then hand-fires the
+/// SAME `onUpdate` once; `seek` is never cleared afterwards (only No Ability / Ability Shield
+/// suppress it up front), and the copy itself is what ends the retry — `setAbility` replaces
+/// Trace, so the holder stops carrying the handler. A Trace holder that switched in against an
+/// untraceable foe therefore keeps trying at EVERY `eachEvent('Update')` until a traceable foe
+/// appears.
+///
+/// rb1244 d10 t7: a Gardevoir switches in against a Protosynthesis Sandy Shocks (`notrace`), so
+/// its copy fails. p1's Volt Switch then pivots a Water Absorb mon in, and PS's very next Update
+/// fires `sample[1]@trace` and Gardevoir ends the unit on Water Absorb. The engine had modelled
+/// Trace only at the holder's own switch-in, so it kept Trace and swallowed no draw.
+fn retry_trace(b: &mut Branch, side: SideId) {
+    use crate::ids::Ability::Trace;
+    if !b.state.side(side).active().is_alive() || b.state.side(side).active().ability != Trace {
+        return;
+    }
+    let foe = side.other();
+    let fa = b.state.side(foe).active().ability;
+    if !b.state.side(foe).active().is_alive() || !ability_is_traceable(fa) {
+        return;
+    }
+    // `this.sample(possibleTargets)` runs even on a one-element list in singles.
+    draw(b, "sample", &[1], 0, "trace");
+    let slot = b.state.side(side).active_index;
+    push(b, Instruction::ChangeAbility { side, slot, previous: Trace, new: fa });
+    // The copied ability activates as if the holder just switched in (PS `setAbility` fires the
+    // new ability's `onStart`).
+    apply_switch_in_ability(b, side);
 }
 
 /// Switch both sides simultaneously: entries (and hazards) in speed order of the OUTGOING
