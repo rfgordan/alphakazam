@@ -4135,8 +4135,30 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
             }
         }
         VolatileStatus::Yawn => {
+            // The drowse is a VOLATILE, so it is refused by `onTryAddVolatile`, not by
+            // `onSetStatus` — a different (and shorter) list than "can this mon be put to sleep".
+            // Enumerated from the pin (`…filter(x => x.onTryAddVolatile)`), the handlers that
+            // return null for `yawn` are: insomnia, vitalspirit, purifyingsalt, shieldsdown
+            // (Meteor Minior), leafguard in sun, safeguard, and **electricterrain for a GROUNDED
+            // target**. `status_applies` already carries the ability half; the terrain half was
+            // missing, and it is NOT interchangeable with `status_blocked_by_field` — Misty
+            // Terrain blocks `confusion`, never `yawn`, so a Yawn under Misty still lands its
+            // volatile and only fails later at `onSetStatus`. (Safeguard is a side condition the
+            // engine does not model at all; noted, not fixed here.)
+            //
+            // rb1778 d36 t32: Pincurchin's Electric Surge terrain is still up when it pivots out
+            // to Copperajah and Meowstic's Prankster Yawn resolves. PS refuses the volatile; the
+            // engine drowsed a mon that cannot sleep.
+            let leaf_guard_sun = b.state.side(foe).active().ability == crate::ids::Ability::LeafGuard
+                && matches!(effective_weather(&b.state), Weather::Sun | Weather::HarshSun);
+            let electric_ground = b.state.terrain == crate::ids::Terrain::Electric
+                && is_grounded(&b.state, foe);
             let t = b.state.side(foe).active();
-            if t.status == Status::None && status_applies(t, Status::Sleep) {
+            if t.status == Status::None
+                && status_applies(t, Status::Sleep)
+                && !leaf_guard_sun
+                && !electric_ground
+            {
                 push(&mut b, Instruction::ApplyVolatile { side: foe, volatile: v });
                 let prev = b.state.side(foe).yawn_turns;
                 push(&mut b, Instruction::SetActiveCounter { side: foe, which: ActiveCounter::Yawn, previous: prev, new: 2 });
