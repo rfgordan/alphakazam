@@ -4806,6 +4806,37 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         {
             return execute_status_move(b, foe, &md, None);
         }
+        // Good as Gold (breakable): `onTryHit(target, source, move) { if (move.category ===
+        // 'Status' && target !== source) { -immune; return null; } }` (data/abilities.ts:1585-1596).
+        // `onTryHit` fires in `hitStepTryHitEvent`, which `trySpreadMoveHit` runs as step 1 —
+        // BEFORE `hitStepAccuracy` at step 4 (sim/battle-actions.ts:551-563). So a status move
+        // aimed at the holder makes **no accuracy draw at all**; the engine rolled one and then
+        // blocked only the move's PAYLOAD further down (the `foe_immune` gate in
+        // `execute_status_move`), leaving the PRNG stream one draw long.
+        //
+        // rb1277 d10 t8 is the witness: Lilligant's Sleep Powder into a Tera Dark Gholdengo. PS
+        // records ZERO draws for the unit; the engine rolled `randomChance(75,100)` and ran +1
+        // ahead from turn 8 on, first surfacing as `result random[16]@gigadrain` two units later.
+        //
+        // It returns `null`, not `false`, so `trySpreadMoveHit`'s `atLeastOneFailure` stays false
+        // and `pokemon.moveThisTurnResult = null` (:610) — NOT `false`. Stomping Tantrum doubles
+        // only on an explicit `false`, so `move_failed` must stay clear here.
+        //
+        // Placed above the Substitute block because `onTryHit` (priority 0) precedes Substitute's
+        // `onTryPrimaryHit`, and below Magic Bounce (`onTryHitPriority: 1`). Mold Breaker /
+        // Teravolt / Turboblaze pierce it as a `breakable` ability, and Mycelium Might sets
+        // `move.ignoreAbility` for the user's status moves.
+        if targets_foe
+            && b.state.side(foe).active().is_alive()
+            && b.state.side(foe).active().ability == crate::ids::Ability::GoodAsGold
+            && !matches!(
+                b.state.side(side).active().ability,
+                crate::ids::Ability::MoldBreaker | crate::ids::Ability::Teravolt
+                    | crate::ids::Ability::Turboblaze | crate::ids::Ability::MyceliumMight
+            )
+        {
+            return vec![b];
+        }
         // A Substitute blocks foe-targeting status moves unless they bypass it (sound
         // moves, Taunt, Encore, ...) or the user has Infiltrator. PS blocks the move at
         // `Substitute.onTryPrimaryHit` (inside `spreadMoveHit`, AFTER `hitStepAccuracy`), so a
