@@ -11157,7 +11157,55 @@ fn emit_after_move_shuffles(b: &mut Branch) {
     }
 }
 
-pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec<Branch> {
+/// Shed Skin's `onResidual` is `onResidualOrder: 5, onResidualSubOrder: 3`
+/// (`data/abilities.ts:4142-4151`) — the SAME slot as Hydration, and BEFORE the psn/tox/brn chip
+/// at order 9/10, so a holder cured this turn takes no status damage. But it is a 33% SPLIT and
+/// `apply_end_of_turn`'s deterministic core is a single `&mut Branch` walk over orders 1..29, so
+/// the split cannot happen inside it.
+///
+/// This wrapper hoists it: it enumerates the outcome combinations (at most one holder per side,
+/// so at most four) UP FRONT and runs the core once per combination with each holder's outcome
+/// FORCED. The core then emits the `randomChance(33,100)` draw and applies the cure at the exact
+/// order-5/3 slot. `None` = "this side has no Shed Skin roll to make".
+///
+/// PS's own guard is `if (pokemon.hp && pokemon.status && this.randomChance(33, 100))` — the roll
+/// is short-circuited unless the holder is alive AND statused, which is why the combination set is
+/// computed from exactly that predicate. It is evaluated here on the PRE-residual board and again,
+/// authoritatively, at the order-5/3 site; nothing between residual start and order 5/3 can add or
+/// remove a status, so the only way the two disagree is a holder that faints to the order-1 weather
+/// chip. In that case the site makes no draw and both forced branches are byte-identical — a
+/// harmless duplicate whose probabilities still sum to the parent's.
+///
+/// Witnesses: rb1315 d28 (PS 205, engine 189 = 205 − 258/16 — exactly one skipped status chip) and
+/// rb1380 d15.
+pub(crate) fn apply_end_of_turn(branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
+    let mut holders: Vec<SideId> = Vec::new();
+    for side in [SideId::One, SideId::Two] {
+        let p = branch.state.side(side).active();
+        if p.ability == crate::ids::Ability::ShedSkin && p.status != Status::None && p.is_alive() {
+            holders.push(side);
+        }
+    }
+    if holders.is_empty() {
+        return apply_end_of_turn_inner(branch, switched, [None, None]);
+    }
+    let mut out = Vec::new();
+    for mask in 0u32..(1u32 << holders.len()) {
+        let mut shed = [None, None];
+        let mut w = 1.0f32;
+        for (i, &side) in holders.iter().enumerate() {
+            let proc = (mask >> i) & 1 == 1;
+            shed[side.index()] = Some(proc);
+            w *= if proc { 33.0 / 100.0 } else { 67.0 / 100.0 };
+        }
+        out.extend(apply_end_of_turn_inner(scaled(&branch, w), switched, shed));
+    }
+    out
+}
+
+fn apply_end_of_turn_inner(
+    mut branch: Branch, _switched: [bool; 2], shed: [Option<bool>; 2],
+) -> Vec<Branch> {
     // PS's residual pass ABORTS the moment the battle ends: `fieldEvent` runs
     // `this.faintMessages(); if (this.ended) return;` after EVERY handler (sim/battle.ts:565-566,
     // and again at :519 for a duration-expiry `end`). `turnLoop` then returns on `this.ended`
@@ -11310,6 +11358,40 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec
                 let amt = wish.1.min(p.max_hp - p.hp);
                 let slot = b.state.side(side).active_index;
                 push(b, Instruction::Heal { side, slot, amount: amt });
+            }
+        }
+    }
+
+    // --- residual order 5/3: Shed Skin ---
+    // PS `data/abilities.ts:4142-4151`: `onResidualOrder: 5, onResidualSubOrder: 3`, guard
+    // `if (pokemon.hp && pokemon.status && this.randomChance(33, 100)) pokemon.cureStatus()`.
+    // That is BEFORE the psn/tox/brn chip at order 9/10, so a holder cured this turn takes NO
+    // status damage — the whole point of the fix (rb1315 d28: PS 205, engine 189 = 205 − 258/16;
+    // rb1380 d15). The outcome was forced by `apply_end_of_turn`'s wrapper because the core
+    // cannot branch mid-walk; see it for why.
+    //
+    // Speed order, not side order: with two holders the two draws are consecutive and the residual
+    // handler list is `speedSort`ed, so the FASTER holder rolls first. (The orders 5-7 loop below
+    // still runs in side order — a standing approximation that no drawing handler sits in.)
+    // Placed just ahead of that loop, i.e. between Wish (4) and Grassy Terrain (5/2): the ≤1-slot
+    // inversion against 5/2 is unobservable — no handler at order 5 reads or writes `status`, and
+    // none of them draws, so neither the stream position nor any HP is affected.
+    for side in residual_side_order(&b.state) {
+        if battle_over(&b.state) { ended_early = true; break 'residual; }
+        let Some(proc) = shed[side.index()] else { continue };
+        let p = b.state.side(side).active();
+        // Re-check PS's own short-circuit on the live board: a holder that fainted to the order-1
+        // weather chip makes no roll at all.
+        if p.ability != crate::ids::Ability::ShedSkin || p.status == Status::None || !p.is_alive() {
+            continue;
+        }
+        let slot = b.state.side(side).active_index;
+        let (prev, prev_ctr) = (p.status, p.status_counter);
+        draw(b, "randomChance", &[33, 100], proc as i64, "shedskin");
+        if proc {
+            push(b, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
+            if prev_ctr != 0 {
+                push(b, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
             }
         }
     }
@@ -11956,35 +12038,10 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, _switched: [bool; 2]) -> Vec
         })
         .collect::<Vec<_>>();
 
-    // Shed Skin: 33% chance each end of turn to cure the holder's status (branches).
+    // Shed Skin used to run HERE, in the branching tail after Harvest (28) — ten orders late, so a
+    // cured holder still took the order-9/10 status chip. It now runs at its real slot (5/3) inside
+    // the deterministic core; `apply_end_of_turn`'s wrapper hoists the 33% split.
     let mut out = branches_after_harvest;
-    for side in [SideId::One, SideId::Two] {
-        out = out
-            .into_iter()
-            .flat_map(|b| {
-                let p = b.state.side(side).active();
-                if p.ability == crate::ids::Ability::ShedSkin && p.status != Status::None && p.is_alive() {
-                    let slot = b.state.side(side).active_index;
-                    let (prev, prev_ctr) = (p.status, p.status_counter);
-                    // PS Shed Skin (abilities.ts, onResidual order 5 subOrder 3) rolls
-                    // `randomChance(33, 100)` for every living, statused holder each end of turn;
-                    // on success it cures. Emit the draw on both branches (proc=cure, noproc=keep)
-                    // so the residual draw stream carries it (was `ps unconsumed @shedskin`).
-                    let mut cure = scaled(&b, 33.0 / 100.0);
-                    draw(&mut cure, "randomChance", &[33, 100], 1, "shedskin");
-                    push(&mut cure, Instruction::ChangeStatus { side, slot, previous: prev, new: Status::None });
-                    if prev_ctr != 0 {
-                        push(&mut cure, Instruction::ChangeStatusCounter { side, slot, previous: prev_ctr, new: 0 });
-                    }
-                    let mut keep = scaled(&b, 67.0 / 100.0);
-                    draw(&mut keep, "randomChance", &[33, 100], 0, "shedskin");
-                    vec![cure, keep]
-                } else {
-                    vec![b]
-                }
-            })
-            .collect();
-    }
 
     // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
     let mut out = out;
