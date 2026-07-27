@@ -507,6 +507,15 @@ fn convert_volatiles(p: &Value, side: &mut Side) -> Res<()> {
             "noretreat" => { side.volatiles.insert(VolatileStatus::NoRetreat); }
             "octolock" => { side.volatiles.insert(VolatileStatus::Octolock); }
             "flashfire" => { side.volatiles.insert(VolatileStatus::FlashFire); }
+            "magnetrise" => {
+                side.volatiles.insert(VolatileStatus::MagnetRise);
+                side.magnet_rise_turns = dur;
+            }
+            // Focus Punch / Beak Blast add a duration-1 priority-charge marker at turn start; it is
+            // gone by every turn boundary and drives no cross-turn state (the engine re-derives the
+            // fail / burn-on-contact from within-turn damage records), so a mid-turn snapshot's
+            // marker maps to nothing.
+            "focuspunch" | "beakblast" => {}
             "truant" => { side.volatiles.insert(VolatileStatus::Truant); }
             "protosynthesis" => { side.volatiles.insert(VolatileStatus::Protosynthesis); }
             "quarkdrive" => { side.volatiles.insert(VolatileStatus::QuarkDrive); }

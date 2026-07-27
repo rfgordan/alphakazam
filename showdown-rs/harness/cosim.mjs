@@ -516,6 +516,26 @@ const TEAM_C6 = {
 		'Garganacl||leftovers|purifyingsalt|saltcure,recover,bodypress,stealthrock|Careful|248,,8,,252,|||||,,,,,Water',
 		'Corviknight||leftovers|pressure|bravebird,bodypress,roost,uturn|Impish|248,,168,,92,|||||,,,,,Flying',
 	]],
+	// c6b1 — the five state-machine moves: Rest + Sleep Talk (uniform sample over eligible slots,
+	// external sub-move), Focus Punch (lost-focus cancel when hit this turn — the foes are
+	// damaging attackers), Beak Blast (burn on contact during the charge turn — the foes are
+	// contact-heavy), Magnet Rise (5-turn levitation vs Garchomp's Earthquake), Hyperspace Fury
+	// (Hoopa-Unbound only, breaks Toxapex's Protect, self −1 Def).
+	c6b1: [[
+		'Snorlax||leftovers|thickfat|sleeptalk,rest,bodyslam,crunch|Careful|248,,8,,252,|||||,,,,,Normal',
+		'Dusknoir||leftovers|frisk|focuspunch,shadowpunch,willowisp,protect|Adamant|248,252,,,8,|||||,,,,,Ghost',
+		'Toucannon||heavydutyboots|keeneye|beakblast,bravebird,uturn,roost|Adamant|248,252,,,8,|||||,,,,,Flying',
+		'Klefki||leftovers|prankster|magnetrise,thunderwave,foulplay,spikes|Careful|248,,8,,252,|||||,,,,,Steel',
+		'Hoopa-Unbound||choiceband|magician|hyperspacefury,knockoff,drainpunch,zenheadbutt|Adamant|,252,,,4,252|||||,,,,,Dark',
+		'Blissey||leftovers|naturalcure|seismictoss,softboiled,icebeam,healbell|Calm|252,,252,,4,|||||,,,,,Normal',
+	], [
+		'Garchomp||leftovers|roughskin|earthquake,dragonclaw,stealthrock,swordsdance|Jolly|,252,,,4,252|||||,,,,,Ground',
+		'Iron Hands||leftovers|quarkdrive|drainpunch,thunderpunch,closecombat,swordsdance|Adamant|248,252,,,8,|||||,,,,,Fighting',
+		'Toxapex||leftovers|regenerator|surf,recover,haze,protect|Bold|248,252,8,,,|||||,,,,,Steel',
+		'Corviknight||leftovers|pressure|bravebird,bodypress,roost,irondefense|Impish|248,,168,,92,|||||,,,,,Flying',
+		'Amoonguss||leftovers|regenerator|spore,gigadrain,sludgebomb,synthesis|Calm|248,,80,,180,|||||,,,,,Water',
+		'Milotic||leftovers|marvelscale|scald,recover,icebeam,haze|Bold|252,,252,,4,|||||,,,,,Water',
+	]],
 };
 
 // ---- deterministic choice RNG -------------------------------------------------

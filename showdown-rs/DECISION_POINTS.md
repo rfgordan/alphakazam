@@ -1,6 +1,15 @@
 # Design: Decision-Point Engine (P1.2 + P1.4-fast-path)
 
-Status: DRAFT 2026-07-11 (Claude). Supersedes the whole-turn `step(a_red, a_blue)` bridge MDP.
+Status: 2026-07-11 — steps 1–3 LANDED (`2f2a144` sampled executor, `047f319` request flow);
+step 4 (FlowVec bridge) and step 5 (gate hardening) in flight via delegated agents.
+Implementation deviations from the draft: the executor mode is `Exec::{Enumerate,Sample}` with
+seam pruning (exact ancestral sampling) rather than a per-fork `Forker` trait — same guarantee,
+certified by `tests/sampled_distribution.rs`; pivot pause is signaled by a no-op
+`Instruction::PivotPending` under `Pivot::Pause` instead of a request-state return; pivot-free
+turns run the whole-turn resolver unchanged (composition risk confined to pivot turns, see
+`tests/request_flow.rs`). Known mask gap (deliberate, documented): trapping (Arena Trap/Shadow
+Tag/partial-trap) is not modeled in switch legality yet.
+
 Goal: train on the *real* rules (faint replacements, pivots, tera) at 10×+ current throughput.
 
 ## Why (two problems, one refactor)

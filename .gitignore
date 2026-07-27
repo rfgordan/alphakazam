@@ -11,3 +11,7 @@ target/
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# Claude agent worktrees + prng-exact campaign worktree (branch pushed separately)
+/.claude/
+/prng-exact/

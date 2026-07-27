@@ -212,6 +212,7 @@ impl Flow {
                 shell_phys: None,
                 custap: cu,
                 external_move: None,
+                skip_before_move: false,
             }),
             MoveChoice::Switch(_) => None,
         };

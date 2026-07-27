@@ -134,6 +134,7 @@ fn apply_dancer_copies(out: Vec<Branch>, side: SideId, move_id: crate::ids::Move
                 foe_pending_move: None,
                 custap: false,
                 external_move: Some(move_id),
+                skip_before_move: false,
             })
         })
         .collect()
@@ -290,6 +291,26 @@ fn move_ignores_ability(id: crate::ids::MoveId) -> bool {
         id.to_id(),
         "sunsteelstrike" | "moongeistbeam" | "photongeyser"
             | "searingsunrazesmash" | "menacingmoonrazemaelstrom"
+    )
+}
+
+/// Moves usable while asleep (PS `sleepUsable`): they run through sleep instead of being cancelled.
+fn is_sleep_usable(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "sleeptalk" | "snore")
+}
+
+/// Moves Sleep Talk may NOT call (PS `flags.nosleeptalk`; two-turn `charge` moves are excluded
+/// separately via `is_two_turn_move`). Mirrors the pinned move data exactly.
+fn move_no_sleeptalk(id: crate::ids::MoveId) -> bool {
+    matches!(
+        id.to_id(),
+        "assist" | "beakblast" | "belch" | "bide" | "blazingtorque" | "bounce" | "celebrate"
+            | "chatter" | "combattorque" | "copycat" | "dig" | "dive" | "dynamaxcannon" | "fly"
+            | "focuspunch" | "freezeshock" | "geomancy" | "holdhands" | "iceburn" | "magicaltorque"
+            | "mefirst" | "metronome" | "mimic" | "mirrormove" | "naturepower" | "noxioustorque"
+            | "phantomforce" | "razorwind" | "shadowforce" | "shelltrap" | "sketch" | "skullbash"
+            | "skyattack" | "skydrop" | "sleeptalk" | "solarbeam" | "solarblade" | "struggle"
+            | "uproar" | "wickedtorque"
     )
 }
 
@@ -543,7 +564,8 @@ fn is_grounded(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
     !(p.types.contains(&Type::Flying)
         || p.ability == crate::ids::Ability::Levitate
-        || p.item == Item::AirBalloon)
+        || p.item == Item::AirBalloon
+        || state.side(side).volatiles.contains(VolatileStatus::MagnetRise))
 }
 
 /// Whether `side`'s active Pokémon is prevented from switching out (gen9 trapping). Fainted
@@ -750,6 +772,7 @@ pub fn generate_move_action(
         foe_pending_move,
         custap: false,
         external_move: None,
+        skip_before_move: false,
     })
     .into_iter()
     .map(|b| StateInstructions { percentage: b.prob, instructions: b.ins })
@@ -840,7 +863,7 @@ pub(crate) fn generate_instructions_ctx(state: &State, s1: MoveChoice, s2: MoveC
     let move_actions: Vec<Action> = [(SideId::One, s1, pivot[0], custap[0]), (SideId::Two, s2, pivot[1], custap[1])]
         .into_iter()
         .filter_map(|(side, c, pv, cu)| match c {
-            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu, external_move: None }),
+            MoveChoice::Move(idx) => Some(Action { side, move_idx: idx, pivot: pv, foe_pending_move: None, shell_phys: None, custap: cu, external_move: None, skip_before_move: false }),
             MoveChoice::Switch(_) => None,
         })
         .collect();
@@ -1195,6 +1218,10 @@ fn reset_move_tracking(b: &mut Branch, side: SideId) {
     let (taunt, conf, perish, yawn, active) =
         (s.taunt_turns, s.confusion_turns, s.perish_turns, s.yawn_turns, s.active_turns);
     let (tc, hb) = (s.throat_chop_turns, s.heal_block_turns);
+    let mr = s.magnet_rise_turns;
+    if mr != 0 {
+        push(b, Instruction::SetActiveCounter { side, which: crate::instruction::ActiveCounter::MagnetRise, previous: mr, new: 0 });
+    }
     if tc != 0 {
         push(b, Instruction::SetActiveCounter { side, which: ThroatChop, previous: tc, new: 0 });
     }
@@ -1546,6 +1573,10 @@ pub(crate) struct Action {
     /// bookkeeping, no rampage lock (the "Dancer Petal Dance hack"), and no re-trigger of
     /// Dancer. The full BeforeMove gauntlet (sleep/attract/confusion/paralysis) still runs.
     pub(crate) external_move: Option<crate::ids::MoveId>,
+    /// PS `useMove` (as opposed to `runMove`): the BeforeMove gauntlet — sleep/freeze cancel —
+    /// is skipped for this call. Set only for a Sleep-Talk-invoked sub-move, whose user is still
+    /// asleep; the caller already ticked the sleep counter, so the sub-move must not re-tick it.
+    pub(crate) skip_before_move: bool,
 }
 
 fn resolve_moves(branches: Vec<Branch>, actions: &[Action], exec: &mut Exec) -> Vec<Branch> {
@@ -1824,6 +1855,9 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // first attempt after re-entering. `statsRaisedThisTurn` is a per-Pokémon PS field, but
     // only the active can have raised a stat this turn, so the volatile model is exact.
     VolatileStatus::Truant, VolatileStatus::StatsRaisedThisTurn,
+    // `statsLoweredThisTurn` mirrors the raised marker; Magnet Rise's levitation ends when the
+    // holder leaves the field (its 5-turn counter is an active-slot countdown like Throat Chop's).
+    VolatileStatus::StatsLoweredThisTurn, VolatileStatus::MagnetRise,
 ];
 
 /// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
@@ -2302,7 +2336,7 @@ fn apply_recharge(mut out: Vec<Branch>, side: SideId, move_id: crate::ids::MoveI
 
 /// Execute one move from `action.side`, returning the resulting branches.
 fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
-    let Action { side, move_idx, pivot, foe_pending_move, external_move, .. } = action;
+    let Action { side, move_idx, pivot, foe_pending_move, external_move, skip_before_move, .. } = action;
     let external = external_move.is_some();
     let attacker = b.state.side(side).active();
     if !attacker.is_alive() {
@@ -2345,6 +2379,13 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // PS `onTry` fails the move outright for non-Morpeko users.
             return vec![b];
         }
+    }
+    // Hyperspace Fury: only Hoopa-Unbound may use it (PS `onTry` `-fail` otherwise). Format-
+    // unreachable off Hoopa-Unbound, but modeled for completeness.
+    if md.id.to_id() == "hyperspacefury"
+        && attacker.species != crate::ids::Species::from_id("hoopaunbound").unwrap_or(crate::ids::Species::None)
+    {
+        return vec![b];
     }
     // Judgment: takes the type of the user's held Plate (PS `onModifyType` via
     // `item.onPlate`; randbats Arceus formes always hold their matching Plate).
@@ -2550,22 +2591,27 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
     let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
-    if status == Status::Sleep {
+    if status == Status::Sleep && !skip_before_move {
         // Early Bird burns sleep turns twice as fast (PS slp onBeforeMove: an extra time--).
         let tick = if b.state.side(side).active().ability == crate::ids::Ability::EarlyBird { 2 } else { 1 };
         if counter > tick {
             push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - tick });
-            return vec![b];
-        }
-        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
-        // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
-        // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
-        if truant_gate(&mut b, side) {
-            return vec![b];
+            // Sleep Talk / Snore act through sleep (PS `move.sleepUsable`); every other move is
+            // cancelled while the counter is still positive.
+            if !is_sleep_usable(move_id) {
+                return vec![b];
+            }
+        } else {
+            push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::Sleep, new: Status::None });
+            // The wake attempt reaches Truant's BeforeMove handler (priority 9, right after slp's
+            // 10): the toggle fires now, and a due loaf consumes the freshly-woken turn.
+            if truant_gate(&mut b, side) {
+                return vec![b];
+            }
         }
     }
     // Freeze: a frozen mon can't move (the 20% thaw + act is left unmodeled for now).
-    if b.state.side(side).active().status == Status::Freeze {
+    if b.state.side(side).active().status == Status::Freeze && !skip_before_move {
         return vec![b];
     }
 
@@ -2579,6 +2625,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     }
     // Are we cashing in a two-turn move that finished charging last turn?
     let executing_charge = matches!(pending, PendingMove::Charging(m) if m == move_id);
+
+    // Focus Punch: if the user was struck by a damaging move this turn it loses focus and the
+    // attempt is cancelled (PS `beforeMoveCallback` reads the `focuspunch` volatile's `lostFocus`,
+    // set by its `onHit` for any non-Status hit). This runs BEFORE deductPP/moveUsed in PS's
+    // runMove, so no PP is paid and lastMove is untouched. Priority −3 means the foe has already
+    // acted; the physical/special damage this side recorded this turn is exactly that signal.
+    if move_id.to_id() == "focuspunch"
+        && !external
+        && (b.state.side(side).physical_damage_taken > 0 || b.state.side(side).special_damage_taken > 0)
+    {
+        return vec![b];
+    }
 
     // PP is paid on the charge turn, not the strike turn. Pressure on the opposing active
     // costs one extra PP for any move that targets it (PS onDeductPP; cosim caught this).
@@ -2853,6 +2911,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if b.state.side(foe).volatiles.contains(VolatileStatus::Protect)
         // Mighty Cleave's flags carry no `protect` entry — it strikes straight through.
         && md.id.to_id() != "mightycleave"
+        // Hyperspace Fury (PS `breaksProtect`) tears through Protect.
+        && md.id.to_id() != "hyperspacefury"
         // Unseen Fist (Urshifu): contact moves ignore protection.
         && !(md.flag_contact && b.state.side(side).active().ability == crate::ids::Ability::UnseenFist)
     {
@@ -2906,8 +2966,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     }
 
     // Air Balloon: the holder is untargetable by Ground moves until the balloon pops.
+    // Magnet Rise: the levitating target is likewise immune (condition `onImmunity` Ground).
     if md.typ == Type::Ground
-        && b.state.side(foe).active().item == Item::AirBalloon
+        && (b.state.side(foe).active().item == Item::AirBalloon
+            || b.state.side(foe).volatiles.contains(VolatileStatus::MagnetRise))
         && b.state.side(foe).active().is_alive()
     {
         return apply_struggle_recoil(apply_recharge(vec![b], side, move_id), side, struggling);
@@ -3205,6 +3267,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|sb| apply_triattack_secondary(sb, side, &md))
                 .flat_map(|sb| apply_partial_trap(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .map(|sb| apply_beak_blast_burn(sb, side, &md, foe_pending_move))
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
                 .flat_map(|sb| apply_cursed_body(sb, side, &md))
                 .collect::<Vec<_>>()
@@ -5676,6 +5739,26 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
     vec![proc, noproc]
 }
 
+/// Beak Blast: while its user is charging (it selected Beak Blast and moves later this turn,
+/// priority −3), any attacker that strikes it with a CONTACT move is burned (PS's `beakblast`
+/// volatile `onHit` → `source.trySetStatus('brn')`). Here `side` is the attacker and
+/// `foe_pending_move` is the defender's not-yet-used move — Beak Blast means it is charging.
+fn apply_beak_blast_burn(
+    mut b: Branch,
+    side: SideId,
+    md: &crate::data::MoveData,
+    foe_pending_move: Option<crate::ids::MoveId>,
+) -> Branch {
+    if md.flag_contact
+        && foe_pending_move.is_some_and(|m| m.to_id() == "beakblast")
+        && status_applies(b.state.side(side).active(), Status::Burn)
+    {
+        let slot = b.state.side(side).active_index;
+        push(&mut b, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Burn });
+    }
+    b
+}
+
 /// Split a hit on the move's flinch chance (×2 under Serene Grace): the proc branch applies
 /// the Flinch volatile to the target, which `sequence_two_moves` uses to skip a target that
 /// hasn't moved yet. Inner Focus and an already-flinched target are immune.
@@ -6122,6 +6205,78 @@ fn execute_status_move(b: Branch, side: SideId, md: &crate::data::MoveData, foe_
         let mut b = b;
         if !b.state.side(side).volatiles.contains(VolatileStatus::Ingrain) {
             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Ingrain });
+        }
+        return vec![b];
+    }
+
+    // Sleep Talk: while asleep, call a uniformly-random *other* eligible move and execute it as an
+    // external (Dancer-style) sub-move — no PP, no bookkeeping. PS `onTry` requires the user to be
+    // asleep (or Comatose); a mon that woke this same turn fails. Each eligible slot is a 1/N
+    // branch (PS `this.sample`), so the actually-sampled move is always among the engine branches.
+    if md.id.to_id() == "sleeptalk" {
+        let (status, ability) = { let u = b.state.side(side).active(); (u.status, u.ability) };
+        if status != Status::Sleep && ability != crate::ids::Ability::Comatose {
+            return vec![b];
+        }
+        let mut eligible: Vec<u8> = Vec::new();
+        for i in 0..4u8 {
+            let mid = b.state.side(side).active().moves[i as usize].id;
+            if mid != crate::ids::MoveId::None
+                && !move_no_sleeptalk(mid)
+                && !is_two_turn_move(mid)
+            {
+                eligible.push(i);
+            }
+        }
+        if eligible.is_empty() {
+            return vec![b];
+        }
+        let n = eligible.len() as f32;
+        let mut out = Vec::new();
+        let st_slot = b.state.side(side).active().moves.iter()
+            .position(|m| m.id.to_id() == "sleeptalk").map(|i| i as u8);
+        for &idx in &eligible {
+            let called = b.state.side(side).active().moves[idx as usize].id;
+            let mut branch = scaled(&b, 1.0 / n);
+            // Pressure: when the CALLED move targets the Pressure holder, the extra PP comes out
+            // of Sleep Talk's own slot (PS useMoveInner: `callerMoveForPressure` — deducted before
+            // TryMove, so it applies even if the called move then fails).
+            if let Some(st_idx) = st_slot {
+                let foe_active = branch.state.side(side.other()).active();
+                if foe_active.is_alive()
+                    && foe_active.ability == crate::ids::Ability::Pressure
+                    && pressure_affected(&move_data(called))
+                    && branch.state.side(side).active().moves[st_idx as usize].pp > 0
+                {
+                    let aslot = branch.state.side(side).active_index;
+                    push(&mut branch, Instruction::DecrementPp { side, slot: aslot, move_index: st_idx, amount: 1 });
+                }
+            }
+            // PS `this.actions.useMove`: the sub-move skips the BeforeMove gauntlet (the user is
+            // still asleep; its sleep counter was already ticked when Sleep Talk itself ran).
+            out.extend(dispatch_move_inner(branch, Action {
+                side,
+                move_idx: idx,
+                pivot: Pivot::Stay,
+                shell_phys: None,
+                foe_pending_move: None,
+                custap: false,
+                external_move: Some(called),
+                skip_before_move: true,
+            }));
+        }
+        return out;
+    }
+
+    // Magnet Rise: levitate for 5 turns (Ground immunity + ungrounded). PS `onTry` fails while the
+    // user is Smack-Down'd / Ingrained or under Gravity, and `addVolatile` no-ops if already up.
+    if md.id.to_id() == "magnetrise" {
+        let mut b = b;
+        let vols = b.state.side(side).volatiles;
+        if !vols.contains(VolatileStatus::MagnetRise) && !vols.contains(VolatileStatus::Ingrain) {
+            push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::MagnetRise });
+            let prev = b.state.side(side).magnet_rise_turns;
+            push(&mut b, Instruction::SetActiveCounter { side, which: crate::instruction::ActiveCounter::MagnetRise, previous: prev, new: 5 });
         }
         return vec![b];
     }
@@ -7431,6 +7586,14 @@ pub(crate) fn apply_end_of_turn(mut branch: Branch, switched: [bool; 2]) -> Vec<
             push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::HealBlock, previous: hb, new: hb - 1 });
             if hb == 1 {
                 push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::HealBlock });
+            }
+        }
+        // Magnet Rise (PS onResidualOrder 18): tick the 5-turn levitation, expiring at 0.
+        let mr = b.state.side(side).magnet_rise_turns;
+        if mr > 0 {
+            push(b, Instruction::SetActiveCounter { side, which: ActiveCounter::MagnetRise, previous: mr, new: mr - 1 });
+            if mr == 1 {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::MagnetRise });
             }
         }
         let enc = b.state.side(side).encore;

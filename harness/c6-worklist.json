@@ -1,0 +1,32 @@
+{
+ "note": "C6: eligible-but-never-exercised after C3 (strict EXERCISED_DUMP accounting)",
+ "moves": [
+  "beakblast",
+  "bite",
+  "ceaselessedge",
+  "dragonenergy",
+  "focuspunch",
+  "freezingglare",
+  "heatcrash",
+  "heatwave",
+  "hyperspacefury",
+  "iceshard",
+  "jetpunch",
+  "lashout",
+  "lowkick",
+  "luminacrash",
+  "lunge",
+  "magnetrise",
+  "moongeistbeam",
+  "muddywater",
+  "originpulse",
+  "overheat",
+  "psystrike",
+  "ragingbull",
+  "sleeptalk",
+  "spacialrend",
+  "waterspout",
+  "weatherball",
+  "wildcharge"
+ ]
+}
