@@ -165,6 +165,13 @@ def train(args):
     anchor = build_model(cfg, env, device, aux=False)
     anchor_path = run_dir / "anchor.pt"
 
+    # --init: warm-start weights (e.g. a BC checkpoint) into an otherwise-fresh run. Distinct
+    # from --resume: no optimizer/counters/league state, and a resume takes precedence.
+    if args.init and ck is None:
+        ick = torch.load(args.init, map_location=device, weights_only=False)
+        model.load_state_dict(ick["model"] if "model" in ick else ick)
+        print(f"[train_flow] initialized weights from {args.init}")
+
     global_step, update, total_games = 0, 0, 0
     if ck is not None:
         model.load_state_dict(ck["model"])
@@ -395,6 +402,9 @@ def main():
                         "(0 = off). The proven curriculum used 2 vs 1-per-snapshot.")
     p.add_argument("--target-kl", type=float, default=0.0,
                    help=">0: cut the epoch loop when approx_kl exceeds this (recipe: 0.03)")
+    p.add_argument("--init", type=str, default=None, metavar="CKPT",
+                   help="warm-start model weights from this checkpoint (fresh optimizer/league; "
+                        "ignored when --resume finds a training_state)")
     p.add_argument("--exploit", type=str, default=None, metavar="CKPT",
                    help="best-response probe: train ONLY against this frozen checkpoint "
                         "(league disabled); the learner's win-rate curve is the "
