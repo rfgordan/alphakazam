@@ -131,17 +131,28 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 data["obs"][mb], data["masks"][mb], data["actions"][mb], obs_ids=mb_ids, return_aux=use_aux
             )
 
+            # "The learner actually chose here" (decision-point env: single-sided replacement /
+            # pivot-landing requests store a discarded action). Masked *mean* over the acting
+            # subset, so the gradient scale doesn't drift with how many no-op steps a batch
+            # happens to contain. All-ones for the whole-turn envs.
+            act_m = data.get("active")
+            if act_m is None:
+                act_m = torch.ones_like(data["log_probs"])
+            m = act_m[mb]
+            denom = m.sum().clamp(min=1.0)
+
             # Clipped policy (surrogate) objective.
             ratio = (new_log_prob - data["log_probs"][mb]).exp()
             adv = advantages[mb]
             unclipped = ratio * adv
             clipped = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv
-            policy_loss = -torch.min(unclipped, clipped).mean()
+            policy_loss = -(torch.min(unclipped, clipped) * m).sum() / denom
 
-            # Value regression toward GAE returns.
+            # Value regression toward GAE returns — over EVERY step: an inactive request is
+            # still a real state whose value the critic must predict.
             value_loss = 0.5 * (new_value - data["returns"][mb]).pow(2).mean()
 
-            entropy_loss = entropy.mean()
+            entropy_loss = (entropy * m).sum() / denom
             loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss
 
             # Auxiliary prediction losses — gradient flows to the trunk, NOT the policy head.
@@ -167,7 +178,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             optimizer.step()
 
             with torch.no_grad():
-                approx_kl = (data["log_probs"][mb] - new_log_prob).mean()
+                approx_kl = ((data["log_probs"][mb] - new_log_prob) * m).sum() / denom
             last = dict(
                 policy_loss=policy_loss.item(),
                 value_loss=value_loss.item(),

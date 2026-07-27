@@ -37,7 +37,12 @@ class ActorCritic(nn.Module):
             dim = embed["dim"]
             # One embedding table per distinct categorical (columns may share, e.g. the 4 moves).
             # Keys are prefixed because some table names (e.g. "type") collide with nn.Module attrs.
-            self.tables = nn.ModuleDict({f"e_{name}": nn.Embedding(size, dim) for name, size in embed["vocab"].items()})
+            # `sorted`: the table order fixes this module's parameter order, and Adam's state is
+            # keyed by parameter *position*. An unordered vocab mapping (the bridge used to hand
+            # back a Rust HashMap) made that order vary per process, so `--resume` loaded the
+            # weights fine (state dicts are name-keyed) and then died in the optimizer.
+            self.tables = nn.ModuleDict({f"e_{name}": nn.Embedding(size, dim)
+                                         for name, size in sorted(embed["vocab"].items())})
             embed_total = self.n_mons * len(self.col_tables) * dim
         input_dim = obs_dim + embed_total
 
