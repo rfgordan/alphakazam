@@ -115,7 +115,11 @@ def train(args):
                 setattr(cfg, k, ck[k])
 
     model = build_model(cfg, env, device, aux=cfg.aux)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5)
+    # fused=True: the per-minibatch Adam step was 23% of trainer wall time (py-spy, post-TF32) —
+    # 32 unfused step() calls per update over 10M params is kernel-launch soup. The fused CUDA
+    # kernel shares the same state-dict format, so resume is unaffected.
+    fused = device.type == "cuda"
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, eps=1e-5, fused=fused)
 
     # League, not a single frozen self. Training only against the most recent snapshot lets the
     # pair co-adapt and forget everything it stopped seeing; the reservoir keeps past checkpoints
