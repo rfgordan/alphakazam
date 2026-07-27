@@ -5549,22 +5549,51 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         let mut hb = scaled(&b, hit_prob);
         let calc = compute_damage(&hb, side, &md);
         let target_hp = hb.state.side(foe).active().hp;
-        let mut dealt = fixed.min(target_hp);
-        if (calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash)
-            && target_hp == calc.def_maxhp && dealt >= target_hp
-        {
-            dealt = target_hp - 1;
-            if calc.def_item == Item::FocusSash {
-                let slot = hb.state.side(foe).active_index;
-                push(&mut hb, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+        // A Substitute absorbs a FIXED-damage move exactly like any other. PS has no separate
+        // path for these: the `substitute` volatile's `onTryPrimaryHit` (`data/moves.ts`) calls
+        // `this.actions.getDamage(source, target, move)`, which is what runs the move's
+        // `damageCallback` — so Super Fang still reads the TARGET's HP for its half, and the
+        // resulting number is then subtracted from `substitute.hp`. This branch skipped the
+        // routing every damage-formula path already had, so a fixed-damage move punched straight
+        // through the Substitute and hit the mon.
+        // rb1326 d50 t40: a Super Fang for 18 into a 66-HP Substitute — PS leaves the sub at 48
+        // and the mon untouched at 37; the engine left the sub at 66, dropped the mon to 19 and
+        // bumped its `times_hit` (the Rage Fist counter) to 2.
+        let bypass_sub = md.flag_sound
+            || hb.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
+        let sub_hp = hb.state.side(foe).substitute_hp;
+        if sub_hp > 0 && !bypass_sub && hb.state.side(foe).volatiles.contains(VolatileStatus::Substitute) {
+            let sub_dmg = fixed.min(sub_hp);
+            push(&mut hb, Instruction::DamageSubstitute { side: foe, amount: sub_dmg });
+            if fixed >= sub_hp {
+                push(&mut hb, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Substitute });
             }
+            // `hits_landed` (the PS `timesAttacked` increment) is ZERO: `spreadMoveHit` rewrites a
+            // sub-absorbed entry to `damage[i] = true; targets[i] = null`
+            // (`sim/battle-actions.ts:1082-1085`), and the `timesAttacked` block at `:1011-1019`
+            // is gated on BOTH a non-null target and `typeof moveDamage[i] === 'number'`.
+            // Recoil and drain still apply — the Substitute's own `onTryPrimaryHit` runs them off
+            // the sub damage (`data/moves.ts`, substitute lines 59-64) — so `any_damage` stays true.
+            apply_post_damage(&mut hb, side, &md, sub_dmg as i32, true, true, 0, calc.life_orb, calc.def_item, calc.def_ability, false);
+            vec![(hb, false)]
+        } else {
+            let mut dealt = fixed.min(target_hp);
+            if (calc.def_ability == crate::ids::Ability::Sturdy || calc.def_item == Item::FocusSash)
+                && target_hp == calc.def_maxhp && dealt >= target_hp
+            {
+                dealt = target_hp - 1;
+                if calc.def_item == Item::FocusSash {
+                    let slot = hb.state.side(foe).active_index;
+                    push(&mut hb, Instruction::ChangeItem { side: foe, slot, previous: Item::FocusSash, new: Item::None });
+                }
+            }
+            if dealt > 0 {
+                let slot = hb.state.side(foe).active_index;
+                push(&mut hb, Instruction::Damage { side: foe, slot, amount: dealt });
+            }
+            apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability, false);
+            vec![(hb, false)]
         }
-        if dealt > 0 {
-            let slot = hb.state.side(foe).active_index;
-            push(&mut hb, Instruction::Damage { side: foe, slot, amount: dealt });
-        }
-        apply_post_damage(&mut hb, side, &md, dealt as i32, dealt > 0, false, (dealt > 0) as u8, calc.life_orb, calc.def_item, calc.def_ability, false);
-        vec![(hb, false)]
     } else if matches!(md.id.to_id(), "populationbomb")
         && realized_cursor(&b).is_some()
     {
