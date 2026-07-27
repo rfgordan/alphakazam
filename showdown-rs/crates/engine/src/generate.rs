@@ -634,6 +634,28 @@ fn switch_entry_speed(pre: &State, side: SideId, slot: u8) -> i32 {
 /// Run `f` with the switch bracket's cached Speeds installed as the Update tie speeds: the mon that
 /// just entered on `entered` uses `switch_entry_speed` off the PRE-switch board `pre`, the other
 /// side its live (already-cached) Speed. See `switch_entry_speed` for why the two differ.
+/// The three-shuffle bracket EVERY `switch` action fires after the swap: the switch action's
+/// runAction `eachEvent('Update')` (sim/battle.ts:2882), `runSwitch`'s `getAllActive()` speedSort
+/// (sim/battle-actions.ts:182), and `runSwitch`'s own runAction Update. Each is tie-gated on the
+/// Speed PS cached at `insertChoice` — see `switch_entry_speed`. `pre` is the board captured
+/// BEFORE `apply_switch`.
+///
+/// A PIVOT's mid-turn switch is a `switch` action too: `runAction` (sim/battle.ts:2897-2932) turns
+/// a `switchFlag` into a `switch` REQUEST whose choice is inserted and resolved exactly like a
+/// turn-action switch. It does NOT fire the pre-swap switch-out Update, though — that same block
+/// runs `BeforeSwitchOut` itself and sets `skipBeforeSwitchOutEventFlag`, and `switchIn`'s
+/// `eachEvent('Update')` (sim/battle-actions.ts:80-84) is gated on that flag being clear.
+/// Witness rb1029 d18/d19: Grafaiai (238) U-turns out to Cramorant (195) against a Meganium (195);
+/// PS records three `shuffle[2,0,2]` between the U-turn's draws and the foe's Swords Dance, the
+/// engine recorded none and ran three draws behind from turn 15 on.
+fn emit_switch_bracket(b: &mut Branch, pre: &State, side: SideId, target: u8) {
+    with_switch_bracket_speeds(b, pre, side, target, |b| {
+        emit_update(b); // switch action runAction Update (2882)
+        emit_update(b); // runSwitch getAllActive speedSort (battle-actions.ts:182)
+        emit_update(b); // runSwitch runAction Update (2882)
+    });
+}
+
 fn with_switch_bracket_speeds(
     b: &mut Branch, pre: &State, entered: SideId, slot: u8, f: impl FnOnce(&mut Branch),
 ) {
@@ -2104,11 +2126,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 apply_switch(b, side, target);
                 // All three sort on the Speed cached at `insertChoice({runSwitch})`, i.e. before
                 // this switch's hazards and switch-in ability — see `switch_entry_speed`.
-                with_switch_bracket_speeds(b, &pre, side, target, |b| {
-                    emit_update(b); // switch runAction Update (2882)
-                    emit_update(b); // runSwitch getAllActive speedSort
-                    emit_update(b); // runSwitch runAction Update (2882)
-                });
+                emit_switch_bracket(b, &pre, side, target);
             }
         }
     } else {
@@ -2131,11 +2149,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
                 // this switch's hazards and switch-in ability — see `switch_entry_speed`.
                 // (rb1021 d58: Magnezone switches into Sticky Web on a 151==151 tie; PS's cached
                 // 151 ties and fires all three, the post-hazard live 100 does not.)
-                with_switch_bracket_speeds(b, &pre, side, target, |b| {
-                    emit_update(b); // switch action runAction Update
-                    emit_update(b); // runSwitch getAllActive speedSort
-                    emit_update(b); // runSwitch runAction Update
-                });
+                emit_switch_bracket(b, &pre, side, target);
             }
         }
     }
@@ -4708,7 +4722,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             push(&mut b, Instruction::ChangeSubstituteHp { side, amount: sub_hp });
             push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Substitute });
             match pivot {
-                Pivot::Target(t) => { emit_pivot_trailing_update(&mut b); apply_switch_pass_sub(&mut b, side, t); }
+                Pivot::Target(t) => {
+                    emit_pivot_trailing_update(&mut b);
+                    let pre = b.state;
+                    apply_switch_pass_sub(&mut b, side, t);
+                    emit_switch_bracket(&mut b, &pre, side, t);
+                }
                 Pivot::Pause => push(&mut b, Instruction::PivotPending { side }),
                 Pivot::Stay => {}
             }
@@ -4854,7 +4873,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 for sb in &mut branches {
                     if sb.state.side(side).active().is_alive() {
                         emit_pivot_trailing_update(sb); // move action's 2882 (pre-switch board)
+                        let pre = sb.state;
                         apply_switch(sb, side, t);
+                        emit_switch_bracket(sb, &pre, side, t);
                     }
                 }
             }
@@ -5182,7 +5203,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             .flat_map(|x| apply_cursed_body(x, side, &md))
         {
             match pivot {
-                Pivot::Target(t) => if sb.state.side(side).active().is_alive() { emit_pivot_trailing_update(&mut sb); apply_switch(&mut sb, side, t); },
+                Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
+                    emit_pivot_trailing_update(&mut sb);
+                    let pre = sb.state;
+                    apply_switch(&mut sb, side, t);
+                    emit_switch_bracket(&mut sb, &pre, side, t);
+                },
                 Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
                 Pivot::Stay => {}
             }
@@ -5499,7 +5525,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 Pivot::Target(t) => {
                     if sb.state.side(side).active().is_alive() {
                         emit_pivot_trailing_update(&mut sb);
+                        let pre = sb.state;
                         apply_switch(&mut sb, side, t);
+                        emit_switch_bracket(&mut sb, &pre, side, t);
                     }
                 }
                 Pivot::Pause => {
