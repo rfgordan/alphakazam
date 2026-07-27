@@ -4883,6 +4883,28 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         }
     }
 
+    // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
+    // user BEFORE the hit is attempted: `useMoveInner` calls `battle.faint(pokemon, pokemon, move)`
+    // at `sim/battle-actions.ts:501`, and `trySpreadMoveHit` — which owns EVERY hit step, including
+    // `hitStepTryHitEvent` and the absorbing abilities below — is not reached until :519. So the
+    // user faints against a type-immune target, against an ABSORBING ability, through Protect, and
+    // on a miss alike. (Damp already cancelled the move above, so no faint there.) The hit-branch
+    // self-destruct in `apply_post_damage` is a no-op once the user is already down.
+    //
+    // This block used to sit BELOW the absorb section, whose early `return vec![b]` skipped it.
+    // rb1774 d10 t7: Golem-Alola (Galvanize) Explodes into a Volt Absorb Minun. PS's whole unit is
+    // one `randomChance[100,100]@encore` — no accuracy roll, no damage — and Golem is at 0 HP with
+    // a replacement queued. The engine's Golem walked away untouched.
+    if matches!(move_id.to_id(), "explosion" | "selfdestruct" | "mistyexplosion") {
+        let (alive, hp, aslot) = {
+            let p = b.state.side(side).active();
+            (p.is_alive(), p.hp, b.state.side(side).active_index)
+        };
+        if alive {
+            push(&mut b, Instruction::Damage { side, slot: aslot, amount: hp });
+        }
+    }
+
     // Absorbing abilities (Volt Absorb / Water Absorb / Dry Skin / Earth Eater) nullify a move
     // of their type that targets the holder AND heal it 1/4 max HP (PS onTryHit). This fires for
     // damaging AND status moves alike — e.g. Thunder Wave vs Volt Absorb heals and prevents the
@@ -5020,21 +5042,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             apply_crash_damage(&mut b, side, &md);
             return vec![b];
-        }
-    }
-
-    // Self-destructing "always" moves (Explosion / Self-Destruct / Misty Explosion) faint the
-    // user BEFORE the hit is attempted — PS gen9 queues `battle.faint(pokemon)` in `useMove`
-    // ahead of `tryMoveHit`. So the user faints even against a type-immune target, through
-    // Protect, or on a miss. (Damp already cancelled the move above, so no faint there.) The
-    // hit-branch self-destruct in `apply_post_damage` is a no-op once the user is already down.
-    if matches!(move_id.to_id(), "explosion" | "selfdestruct" | "mistyexplosion") {
-        let (alive, hp, aslot) = {
-            let p = b.state.side(side).active();
-            (p.is_alive(), p.hp, b.state.side(side).active_index)
-        };
-        if alive {
-            push(&mut b, Instruction::Damage { side, slot: aslot, amount: hp });
         }
     }
 
