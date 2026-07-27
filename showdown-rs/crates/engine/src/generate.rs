@@ -10908,11 +10908,28 @@ fn execute_status_move(
                 let boost = b.state.side(foe).boost(BoostIndex::Attack);
                 (t.stat(crate::ids::StatIndex::Attack) as f32 * boost_multiplier(boost)) as i16
             };
+            // Liquid Ooze is `onSourceTryHeal`, and its `canOoze` list is exactly
+            // `['drain', 'leechseed', 'strengthsap']` (`data/abilities.ts:2360`) — enumerated from
+            // the pin, not guessed. The engine had it on `drain` only. `battle.heal` runs
+            // `runEvent('TryHeal')` at `sim/battle.ts:2284`, BEFORE the `target.hp >= target.maxhp`
+            // bail at :2288 ("for things like Liquid Ooze, the Heal event still happens when
+            // nothing is healed"), so the ooze damage is the FULL sapped amount and lands even on
+            // a user at full HP — it must not be capped by missing HP the way the heal is.
+            //
+            // rb1745 d26 t20: Bellossom's Strength Sap into a Liquid Ooze Tentacruel. PS takes
+            // Bellossom from 202 to 0; the engine healed it 166.
             let (hp, maxhp) = { let p = b.state.side(side).active(); (p.hp, p.max_hp) };
-            let amount = atk_val.min(maxhp - hp);
-            if amount > 0 {
-                let slot = b.state.side(side).active_index;
-                push(&mut b, Instruction::Heal { side, slot, amount });
+            let slot = b.state.side(side).active_index;
+            if b.state.side(foe).active().ability == crate::ids::Ability::LiquidOoze {
+                let dmg = atk_val.min(hp);
+                if dmg > 0 {
+                    push(&mut b, Instruction::Damage { side, slot, amount: dmg });
+                }
+            } else {
+                let amount = atk_val.min(maxhp - hp);
+                if amount > 0 {
+                    push(&mut b, Instruction::Heal { side, slot, amount });
+                }
             }
             if apply_boost_clamped(&mut b, foe, BoostIndex::Attack, -1) < 0 {
                 react_to_stat_drop(&mut b, foe);
@@ -12240,7 +12257,17 @@ fn apply_end_of_turn_inner(
             let f = b.state.side(other).active();
             (f.max_hp - f.hp, b.state.side(other).active_index)
         };
-        if !heal_blocked(b, other) {
+        // Liquid Ooze on the SEEDED mon turns the seeder's payout into damage — `leechseed` is
+        // on its `canOoze` list (`data/abilities.ts:2360`) alongside `drain` and `strengthsap`.
+        // Heal Block still suppresses the heal; it does not suppress the ooze, which is a
+        // `this.damage` inside `onSourceTryHeal` and never reaches `heal`'s Heal-Block gate.
+        if b.state.side(side).active().ability == crate::ids::Ability::LiquidOoze {
+            let f_hp = b.state.side(other).active().hp;
+            let dmg = drain.min(f_hp);
+            if dmg > 0 {
+                push(b, Instruction::Damage { side: other, slot: fslot, amount: dmg });
+            }
+        } else if !heal_blocked(b, other) {
             let heal = drain.min(f_room);
             if heal > 0 {
                 push(b, Instruction::Heal { side: other, slot: fslot, amount: heal });
