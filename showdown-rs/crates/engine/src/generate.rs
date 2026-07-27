@@ -7023,6 +7023,22 @@ fn ice_face_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bo
         && p.species == crate::ids::Species::from_id("eiscue").unwrap_or(crate::ids::Species::None)
 }
 
+/// Is Disguise still up on the target — i.e. will THIS hit be the one it eats?
+///
+/// The predicate PS uses is `['mimikyu','mimikyutotem'].includes(target.species.id)` inside
+/// `onDamage` (`data/abilities.ts:963`), so it is re-evaluated PER HIT and stops being true the
+/// moment `onUpdate` forme-changes the mon into Mimikyu-Busted. Which is exactly why a MULTI-HIT
+/// move busts the disguise on hit 1 and then damages normally with hits 2..n — the whole-move
+/// `hits_max == 1` gate on the single-hit arm was never a statement about the mechanic, only about
+/// which arm owns it.
+fn disguise_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bool {
+    let p = b.state.side(foe).active();
+    matches!(md.category, MoveCategory::Physical | MoveCategory::Special)
+        && p.ability == crate::ids::Ability::Disguise
+        && !p.transformed
+        && p.species == crate::ids::Species::from_id("mimikyu").unwrap_or(crate::ids::Species::None)
+}
+
 /// Breaks an intact Ice Face and records the blocked hit. Transform instructions carry the
 /// complete previous forme data, so reversing a generated branch restores Eiscue exactly.
 /// Disguise busts: Mimikyu forme-changes to Mimikyu-Busted (identical stats/types/ability, so
@@ -7328,6 +7344,17 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
             calc = compute_damage(b, side, md);
             continue;
         }
+        // Disguise eats THIS hit and nothing more — `onUpdate`'s forme change into Mimikyu-Busted
+        // runs at the per-hit `eachEvent('Update')` (`battle-actions.ts:970`), so hit 2 onward
+        // finds `species.id === 'mimikyubusted'` and `onDamage` no longer fires. rb1621 d18:
+        // Triple Axel into an intact Mimikyu — PS's three hits are 0 (+ the 1/8 chip), then two
+        // real ones; the engine's `hits_max == 1` gate made all three real, and the mon died in
+        // both, so the ONLY surviving symptom was `species` 495 vs 496 on a corpse.
+        if disguise_is_intact(b, foe, md) {
+            bust_disguise(b, foe);
+            calc = compute_damage(b, side, md);
+            continue;
+        }
         let target_hp = b.state.side(foe).active().hp;
         if target_hp <= 0 {
             break;
@@ -7422,6 +7449,14 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
         }
         if ice_face_is_intact(b, foe, md) {
             break_ice_face(b, foe);
+            continue;
+        }
+        // Disguise eats ONE hit; `onUpdate`'s forme change lands at the per-hit
+        // `eachEvent('Update')` and hit 2 onward sees Mimikyu-Busted. See `disguise_is_intact`.
+        // This is the Triple Axel arm — rb1621 d18's witness.
+        if disguise_is_intact(b, foe, md) {
+            bust_disguise(b, foe);
+            restat_dirty = true;
             continue;
         }
         // Indexed moves change power each hit, and Ice Face — or a per-hit `onDamagingHit`
@@ -8939,6 +8974,22 @@ fn apply_multihit_realized_ma(
             any_damage = true;
             hit_sub = true;
             hits_executed += 1;
+            continue;
+        }
+        // Ice Face / Disguise are per-hit `onDamage` blocks whose guard is the target's CURRENT
+        // `species.id`, so they eat exactly ONE hit and are gone for the rest of the loop — the
+        // forme change lands at the per-hit `eachEvent('Update')` (`battle-actions.ts:970`). The
+        // other two hit loops (`apply_damage_hit_rolls`, `apply_damage_hit_indexed`) already did
+        // this for Ice Face; the multiaccuracy loop is the THIRD copy and had neither. rb1621 d18
+        // is the witness: Triple Axel into an intact Mimikyu.
+        if ice_face_is_intact(&hb, foe, md) {
+            break_ice_face(&mut hb, foe);
+            restat_dirty = true;
+            continue;
+        }
+        if disguise_is_intact(&hb, foe, md) {
+            bust_disguise(&mut hb, foe);
+            restat_dirty = true;
             continue;
         }
         let target_hp = hb.state.side(foe).active().hp;
