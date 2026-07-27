@@ -1,5 +1,127 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**BURN-DOWN IX (2026-07-27): 476/512 full games byte-exact from seed (93.0%), up from 466;
+init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
+traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
+Differ 99.50% (3812/3831), zero `rust extra`; sweep 3831/3831; smoke 18/18; round-trip PASS;
+engine tests 12 suites green. Kill criteria NOT triggered (1.0 games/commit over 10 commits;
+longest sub-line run is 2). `convert.rs` untouched — no fixture regeneration.
+
+**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "BURN-DOWN IX" — before anything else.**
+
+**Use the new tool FIRST. It is the most valuable thing this tranche produced.**
+
+> **`PRNG_TRACE=<game-prefix>`** prints, at every unit boundary, the engine's absolute PRNG
+> position (steps replayed from the seed) against PS's cumulative recorded advance count. The first
+> unit whose per-unit DELTAS differ is the unit that MISALIGNED the stream. A
+> `result random[16]@…` label names the unit that *reads* a bad stream, never the one that broke it
+> — this closes that gap.
+>
+> ```
+> GATE_THREADS=1 PRNG_TRACE=rb SEED_GATE=1 target/release/cosim harness/seed-sidecars/*.json.gz \
+>   2> pt.txt >/dev/null
+> ```
+>
+> It turned eight offset labels into eight units, which collapsed into three shared roots — and it
+> proved rb1362's long-standing "`replicate_select` `random(100)` decode bug" never existed.
+> **`DBG_SELECT=1`** is its companion (replicate_select's per-position candidates/shapes/value).
+
+**The other new source of ground truth: the sidecars record PS's `pokemon.speed` VERBATIM.** That
+is the cache every speed-tie predicate reads. Four of this tranche's ten commits came from diffing
+it against `effective_speed`. Use it before reasoning about any tie.
+
+The three biggest remaining levers, in order:
+
+1. **The six OFFSET games, already localized to a unit and a signed delta** (scoreboard section
+   "The six remaining OFFSET games"). rb1310 (−1) and rb1369 (+1) are a MIRROR PAIR on the
+   post-residual `eachEvent('Update')`, and `runAction`'s `case 'residual'` calls `updateSpeed()`
+   at its START (`sim/battle.ts:2835`) — so that trailing Update sorts on the PRE-residual cached
+   Speed, and Slow Start's counter hitting 0 at order 28 must not break its tie. Same cache rule as
+   the switch bracket, one event later. Start there.
+2. **The 20 `draws-match/state-diff` games.** Wrong MECHANICS with an aligned stream — the class no
+   census can see. Start from the `|Δhp| == 0` half (rb1093 boost.spe, rb1233 boost.def, rb1239
+   stall_counter, rb1253 species, rb1314 item, rb1345 pending_move, rb1347 last_berry, rb1360 pp,
+   rb1119/rb1359 types, rb1126 volatiles, rb1326 substitute_hp) — single-mechanic bugs with no
+   downstream noise.
+3. **Shed Skin's residual ORDER (5/3).** Two witnesses (rb1315, rb1380), fully diagnosed, and the
+   handler-list half already landed. The blocker is precise: `apply_end_of_turn`'s deterministic
+   core is a single `&mut Branch` loop over orders 1..29 and Shed Skin is a 33% SPLIT, so the core
+   must branch mid-loop. The Hydration block (same 5/3 slot, no draw) is the template for where the
+   cure goes.
+
+**Triage moves that keep paying, in order to run them:**
+1. `PRNG_TRACE` over every open game (above).
+2. The handler-list census off the sidecars — every `shuffle` draw carries `group` AND `full` (PS's
+   ENTIRE sorted handler list with `effect`/`effectType`/`order`/`subOrder`/`speed`). Group the
+   corpus by `(eventid, effect, effectType, order, subOrder)` and diff against the engine's model.
+   **As of this tranche EVERY signature and EVERY residual triple the corpus contains is modelled**,
+   so the census's next job is to prove a proposed handler is corpus-NEUTRAL before landing it —
+   which is exactly how `lockedmove` and Shed Skin were settled without a witness.
+3. Burn-down VII's `|Δhp| == 0` sweep (decode the volatile bitmask against `volatile.rs`,
+   discriminant = bit index, and read the DIRECTION — engine EXTRA vs MISSING).
+
+Traps that keep costing cycles:
+1. **A move-name recurrence is NOT a root.** The `knockoff` cluster was five games and five
+   different causes (two sandstorm, one Stomping Tantrum, one Shed Skin order, one offset). Cluster
+   by the DIVERGENT FIELD and the stream delta, never by the move.
+2. **`pokemon.speed` is a CACHE, refreshed only by `updateSpeed()`** — at `commitChoices`, at each
+   `insertChoice`, before each move action, and at the START of the residual action. Every
+   `eachEvent`/`speedSort` in between reads the stale value. `MOVE_TIE_SPEEDS` is the engine's hook
+   for this; `switch_entry_speed` is the switch-bracket case.
+3. **A hit-loop change must keep a `damage_inputs` snapshot straddling EVERY step-7 handler**,
+   drawing or not (burn-down VIII's regression: rb1198 / rb1302 / rb1395).
+4. **A cancel/immunity check below the `md.category == MoveCategory::Status` dispatch in
+   `execute_move_inner` is DEAD for status moves.**
+5. **`DRAWCMP=1`'s "PS-unconsumed `shuffle[2,0,2]` ×3" at a replacement unit is a FALSE POSITIVE** —
+   the bracket is consumed straight off `prng` in `step_unit`. Use `PRNG_TRACE` for the truth.
+6. **A speed-tie `shuffle` is NOT always state-neutral** (rb1250's double switch).
+7. **An indented block in a `///` doc comment compiles as a Rust DOCTEST** — `text`-fence pasted PS.
+8. **A draw-CLASS label is not a root label.**
+
+Frames that paid off and are worth keeping:
+- **`switchIn`'s order** (`sim/battle-actions.ts:135-155`): slot swap → `initEffectState` →
+  `BeforeSwitchIn` → `insertChoice({runSwitch})` **which calls `updateSpeed()`**. Everything the
+  entry DOES — hazards, `onStart`, Imposter, the switch-in's own weather — happens later, in
+  `runSwitch`. A PIVOT skips only the pre-swap switch-out Update (`skipBeforeSwitchOutEventFlag`),
+  never the 3-shuffle bracket.
+- **`ignoringAbility()`'s only liveness test is `!isActive`** (`sim/pokemon.ts:866`), and `isActive`
+  is cleared in `faintMessages` (`sim/battle.ts:2579`) at the END of the action. A mon that faints
+  to the current move still has a live ability and item for the rest of that move.
+- **`spreadMoveHit`'s numbered steps are the draw order, and step 5 precedes step 7.** Full table in
+  the burn-down VIII section; `apply_damaging_hit_step7` carries it as a doc comment.
+- **A Substitute hit is `damage[i] === true`** — truthy, so the target survives the
+  `if (!damage[i] && damage[i] !== 0)` filter and `secondaries()` still ROLLS. Only the effect is
+  blocked. `hit_sub` must never suppress a draw.
+- **`fieldEvent('Residual')` collects a handler for every effect with an `onResidual` OR a live
+  `duration`** (`getKey = 'duration'`, `sim/battle.ts:486`). Default subOrders (`:955-991`):
+  Condition 2, side-condition 4, field 5, Weather 5, Ability 7, Item 8. ONE globally ordered queue,
+  and it RETURNS the moment the battle ends.
+- **PS's `BeforeMove` ladder** (short-circuits on the first `false`): 100 glaiverush / grudge / rage
+  / chillyreception, 11 mustrecharge, 10 slp + frz, 9 Truant, 8 flinch, 7 disable, 6 gravity /
+  healblock / throatchop, 5 taunt, 3 confusion, 2 attract, 1 par, −1 destinybond.
+- **`first_draw_mismatch` compares the DAMAGE ROLL's RESULT** — a matching shape with a differing
+  `random(16)` proves a prng OFFSET. Now actionable via `PRNG_TRACE`.
+- **`DBG_INSTR=1`** (with `DBG_GAME`/`DBG_I`) prints the chosen branch's instruction stream — the
+  only thing that localizes a `draws-match/state-diff` unit.
+
+Practical notes (unchanged):
+- Recording: `bash harness/record-seeds.sh <first> <last>` — sequential, one node process, ~2 min
+  for 400 games, RESUMABLE. Sidecars are gitignored; rebuild fixtures with
+  `MAKE_FIXTURE=harness/seed-fixtures target/release/cosim harness/seed-sidecars/*.json.gz`.
+  **Regenerate fixtures whenever `convert.rs` changes** — they bake in its digests.
+- Triage loop: `GATE_THREADS=1 DBG_DIFF=1 DBG_GAME=rb SEED_GATE=1 cosim harness/seed-sidecars/*.json.gz
+  2> dbg.txt`. **The DIFF lines only appear on SIDECARS.** `VERBOSE=1` lifts the row cap.
+- The sidecar's `decisions[i]` is indexed by the gate's `dN` DIRECTLY, and carries `choices`, the
+  full post-`stateAfter` (including **`pokemon.speed`**, PS's Speed cache) and `draws` with
+  `{kind,args,result,move,effect,event,pokemon}` — plus `group`/`full`/`start`/`end` on a `shuffle`.
+- **`stateAfter.turn` / `midTurn` / `ended` are POST-state** (`harness/cosim.mjs:1057`).
+- **Judge every commit by the exact-SET diff on BOTH corpora, never by the count.**
+- The full 512 gate takes ~4 min; build + both gates + the differ exceeds a 600 s tool timeout —
+  run them as separate commands.
+
+--- historical (pre-burn-down-IX) below ---
+
+
 **BURN-DOWN VIII (2026-07-27): 466/512 full games byte-exact from seed (91.0%), up from 457;
 init-aligned 512/512. The audited 111 stayed 111/111 at every step.** Corpus: 111 audited
 traces + 401 fresh gen9randombattle seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400).
