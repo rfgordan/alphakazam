@@ -41,7 +41,7 @@ class FlowEnvVec:
 
     def __init__(self, num_envs: int, seed: int = 0, team_pool: str | None = None,
                  max_requests: int = 1000, shaping_coef: float = 0.0, gamma: float = 0.99,
-                 fog_species: bool = False, obs_version: int = 1):
+                 fog_species: bool = False, obs_version: int = 1, frames: int = 1):
         self.num_envs = num_envs
         self.shaping_coef = shaping_coef
         self.gamma = gamma
@@ -50,7 +50,11 @@ class FlowEnvVec:
         self.vec = se.FlowVec(num_envs, seed=seed, max_requests_per_episode=max_requests,
                               team_pool=team_pool, fog_species=fog_species,
                               obs_version=obs_version)
-        self.obs_dim = self.vec.obs_dim
+        assert frames in (1, 2)
+        self.frames = frames
+        # frames=2: previous request's obs appended after the current one (night-era D3 lever —
+        # memory for the switching game). Indices of the base block stay valid.
+        self.obs_dim = self.vec.obs_dim * frames
         self.n_actions = self.vec.n_actions
         self.id_dim = self.vec.id_dim
         self.pool_size = self.vec.pool_size
@@ -62,6 +66,9 @@ class FlowEnvVec:
         self.id_columns = meta.id_columns()
         self.vocab = meta.vocab_sizes()
 
+        self._pending_prev = None   # last request's RAW obs per side (frames=2 history)
+        self._reset_rows = None     # env rows whose history was cut by an episode reset
+        self._raw = None
         self._rng = np.random.default_rng(seed ^ 0xA5A5_5A5A)
         # Which physical side (RED/BLUE) the learner controls in each env this episode.
         self.learner_side = self._rng.integers(0, 2, size=num_envs).astype(np.int64)
@@ -79,6 +86,7 @@ class FlowEnvVec:
         """
         if self._cache is None:
             per_side = []
+            raws = []
             for s in (RED, BLUE):
                 mask = np.asarray(self.vec.legal_all(s), dtype=bool)
                 # A non-acting side gets an all-false mask from the engine; the policy still has
@@ -88,12 +96,22 @@ class FlowEnvVec:
                 if dead.any():
                     mask = mask.copy()
                     mask[dead] = True
+                raw = np.asarray(self.vec.observe_all(s), dtype=np.float32)
+                raws.append(raw)
+                obs = raw
+                if self.frames == 2:
+                    prev = self._pending_prev[s] if self._pending_prev is not None else raw
+                    if self._reset_rows is not None and self._reset_rows.size:
+                        prev = prev.copy()
+                        prev[self._reset_rows] = raw[self._reset_rows]  # new episode: no history
+                    obs = np.concatenate([raw, prev], axis=1)
                 per_side.append((
-                    np.asarray(self.vec.observe_all(s), dtype=np.float32),
+                    obs,
                     np.asarray(self.vec.observe_ids_all(s), dtype=np.int64),
                     mask,
                     np.asarray(self.vec.acting_all(s), dtype=bool),
                 ))
+            self._raw = raws
             self._cache = per_side
         return self._cache
 
@@ -161,6 +179,8 @@ class FlowEnvVec:
         blue_a = np.where(ls == RED, oa, la)
 
         done_np, winner_np = self.vec.step_all(red_a, blue_a, True)
+        if self.frames == 2 and self._raw is not None:
+            self._pending_prev = self._raw  # this request becomes the next one's history
         self._cache = None  # the board moved; every cached encode is stale
         done = np.asarray(done_np, dtype=bool)
         winner = np.asarray(winner_np, dtype=np.int64)
@@ -185,6 +205,8 @@ class FlowEnvVec:
         dyn[live, 2] = (f_post > f_pre)[live].astype(np.float32)
         dyn[live, 3] = (fo_post > fo_pre)[live].astype(np.float32)
 
+        if self.frames == 2:
+            self._reset_rows = np.flatnonzero(done)
         # Re-roll the learner's side for every env that just started a fresh episode.
         if done.any():
             self.learner_side = np.where(done, self._rng.integers(0, 2, size=self.num_envs), ls)
