@@ -6172,6 +6172,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
         emit_discarded_damage_rolls(&mut hb, crit_den);
         break_ice_face(&mut hb, foe);
+        // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`. Placed here,
+        // where the main path's `apply_post_damage` sits: after the damage step and ahead of the
+        // self-drops / secondaries, so a secondary reading HP reads the post-orb HP as PS's does.
+        apply_life_orb_recoil(&mut hb, side, &md);
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
         // battle-actions.ts:1127-1129) and still runs step 5, `secondaries()`. rb1038 t5: Throat
@@ -6247,6 +6251,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
         emit_discarded_damage_rolls(&mut hb, crit_den);
         bust_disguise(&mut hb, foe);
+        // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`.
+        apply_life_orb_recoil(&mut hb, side, &md);
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
         // `move.self.boosts` payload with its `random(100)` — and it sits AHEAD of step 5's
@@ -7518,6 +7524,28 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
 /// Applies a damaging move's hits sequentially (each its own roll and crit), clamped to HP
 /// and routed through any Substitute; returns true if a Substitute absorbed the damage (so
 /// the target's own secondaries/volatiles are blocked).
+/// PS Life Orb recoil (`data/items.ts:3408`), as a standalone step for the paths that do not go
+/// through `apply_post_damage`. `onAfterMoveSecondarySelf` tests only
+/// `source && source !== target && move.category !== 'Status' && !source.forceSwitchFlag`, and
+/// `useMoveInner` reaches it on any truthy `moveResult` — so a hit NULLIFIED to 0 damage by Ice
+/// Face or Disguise still pays the orb. Magic Guard blocks it (the effect is the ITEM, not a Move).
+/// `DamageCalc::life_orb` already folds in the Sheer Force suppression.
+fn apply_life_orb_recoil(b: &mut Branch, side: SideId, md: &crate::data::MoveData) {
+    if b.state.side(side).active().ability == crate::ids::Ability::MagicGuard {
+        return;
+    }
+    if !compute_damage(b, side, md).life_orb {
+        return;
+    }
+    let slot = b.state.side(side).active_index;
+    let atk = b.state.side(side).active();
+    if !atk.is_alive() {
+        return;
+    }
+    let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
+    push(b, Instruction::Damage { side, slot, amount: recoil });
+}
+
 fn ice_face_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bool {
     let p = b.state.side(foe).active();
     md.category == MoveCategory::Physical
@@ -8303,20 +8331,29 @@ fn apply_post_damage(
                 push(b, Instruction::Damage { side, slot: aslot, amount: rec });
             }
         }
-        // Magic Guard blocks EVERY non-Move damage source, not just move recoil:
-        // `onDamage(damage, target, source, effect) { if (effect.effectType !== 'Move') return
-        // false; }`. Life Orb's recoil is `onAfterMoveSecondarySelf` with the ITEM as the
-        // effect, Rough Skin / Iron Barbs / Aftermath pass the ABILITY and Rocky Helmet the
-        // ITEM — all four are blocked. rb1318 t2 / rb1174 t3: a Life Orb Magic Guard Reuniclus
-        // takes the engine's 33 HP of orb recoil and none of PS's.
-        let magic_guard = b.state.side(side).active().ability == Ab::MagicGuard;
-        // Life Orb recoil: 10% of the attacker's max HP, once after a damaging move.
-        if life_orb && !magic_guard {
-            let atk = b.state.side(side).active();
-            if atk.is_alive() {
-                let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
-                push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
-            }
+    }
+    // **Life Orb's recoil is NOT gated on damage dealt.** `lifeorb.onAfterMoveSecondarySelf`
+    // (`data/items.ts:3408`) tests only `source && source !== target && move.category !== 'Status'
+    // && !source.forceSwitchFlag`, and `useMoveInner` reaches it whenever `moveResult` is truthy
+    // (`sim/battle-actions.ts:525-534`) — which a hit nullified to 0 damage by Ice Face or Disguise
+    // IS. It sat inside the `any_damage` block with drain and recoil, both of which PS really does
+    // gate (`if (move.drain && damage)`, `if (move.recoil && move.totalDamage)`).
+    // rb1629 d31 t24: a Life Orb Shiftry's Leaf Blade is eaten by an intact Eiscue's Ice Face; PS
+    // still chips the Shiftry 30, which is exactly the margin by which Eiscue's Ice Spinner then
+    // KOs it (PS 0 HP, engine 19).
+    //
+    // Magic Guard blocks EVERY non-Move damage source, not just move recoil:
+    // `onDamage(damage, target, source, effect) { if (effect.effectType !== 'Move') return
+    // false; }`. Life Orb's recoil is `onAfterMoveSecondarySelf` with the ITEM as the
+    // effect, Rough Skin / Iron Barbs / Aftermath pass the ABILITY and Rocky Helmet the
+    // ITEM — all four are blocked. rb1318 t2 / rb1174 t3: a Life Orb Magic Guard Reuniclus
+    // takes the engine's 33 HP of orb recoil and none of PS's.
+    if life_orb && b.state.side(side).active().ability != Ab::MagicGuard {
+        let aslot = b.state.side(side).active_index;
+        let atk = b.state.side(side).active();
+        if atk.is_alive() {
+            let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
+            push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
         }
     }
     // The `runEvent('DamagingHit')` reactions (contact punishers, Stamina, Gooey, …). PS fires
