@@ -8512,10 +8512,18 @@ fn apply_post_damage(
                 _ => {}
             }
         }
-        // Soul-Heart: +1 SpA whenever a Pokémon faints from this hit.
+        // Soul-Heart: +1 SpA whenever a Pokémon faints from this hit — and, like every other
+        // KO-boost ability, NOT when that faint was the foe's LAST mon. `Battle#boost` opens with
+        // `if (this.gen > 5 && !target.side.foePokemonLeft()) return false;` (`sim/battle.ts:2028`),
+        // and `faintMessages` decrements `pokemon.side.pokemonLeft` BEFORE `runEvent('Faint')`, so
+        // the `onAnyFaint` handler that reaches `boost()` finds the counter already at zero.
+        // Moxie / the Neighs / Beast Boost all carry `side_has_living_mon` here; Soul-Heart was
+        // the copy that drifted. rb1573 d36 t28: Magearna-Original's Flash Cannon KOs the last
+        // Darkrai — PS ends at spa +2 with `statsRaisedThisTurn` false, the engine at +3.
         if !b.state.side(foe).active().is_alive()
             && b.state.side(side).active().ability == crate::ids::Ability::SoulHeart
             && b.state.side(side).active().is_alive()
+            && side_has_living_mon(&b.state, foe)
         {
             raise_boost(b, side, BoostIndex::SpecialAttack, 1);
         }
