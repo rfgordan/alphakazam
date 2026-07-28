@@ -13102,10 +13102,21 @@ pub(crate) fn apply_end_of_turn(branch: Branch, switched: [bool; 2]) -> Vec<Bran
             holders.push(side);
         }
     }
-    if holders.is_empty() {
-        return apply_end_of_turn_inner(branch, switched, [None, None]);
+    // A rampage lock whose LAST turn passed without the move being used expires at the residual
+    // and `onEnd`-confuses (see the residual block for the rule and the witnesses). Its
+    // `random(2, 6)` duration draw is pre-forked here for the same reason Shed Skin's is: the
+    // residual body cannot branch.
+    let mut conf: Vec<SideId> = Vec::new();
+    for side in [SideId::One, SideId::Two] {
+        if residual_rampage_confuses(&branch.state, side) {
+            conf.push(side);
+        }
+    }
+    if holders.is_empty() && conf.is_empty() {
+        return apply_end_of_turn_inner(branch, switched, [None, None], [None, None]);
     }
     let mut out = Vec::new();
+    let conf_combos = 4usize.pow(conf.len() as u32);
     for mask in 0u32..(1u32 << holders.len()) {
         let mut shed = [None, None];
         let mut w = 1.0f32;
@@ -13114,13 +13125,49 @@ pub(crate) fn apply_end_of_turn(branch: Branch, switched: [bool; 2]) -> Vec<Bran
             shed[side.index()] = Some(proc);
             w *= if proc { 33.0 / 100.0 } else { 67.0 / 100.0 };
         }
-        out.extend(apply_end_of_turn_inner(scaled(&branch, w), switched, shed));
+        for cmask in 0..conf_combos {
+            let mut conf_dur = [None, None];
+            let mut cw = w;
+            let mut m = cmask;
+            for &side in &conf {
+                conf_dur[side.index()] = Some(2 + (m % 4) as u8);
+                m /= 4;
+                cw *= 0.25;
+            }
+            out.extend(apply_end_of_turn_inner(scaled(&branch, cw), switched, shed, conf_dur));
+        }
     }
     out
 }
 
+/// Will this side's rampage lock expire AT THE RESIDUAL with a confusion?
+///
+/// `lockedmove` carries `duration: 2` and `onEnd(target) { if (trueDuration > 1) return;
+/// target.addVolatile('confusion') }` (`data/conditions.ts`). The DURATION is what ends the
+/// volatile, and PS ticks it in the residual pass — **whether or not the mon used the move that
+/// turn**. The engine releases the lock at move time (the `n == 1` arm of `apply_rampage_state`),
+/// which agrees with PS on every turn the locked mon actually moves and leaves the lock armed
+/// forever on a turn it does not.
+///
+/// PS gives out such turns freely, and the corpus has three:
+/// * rb5059 d31-d33: a Lilligant's Petal Dance KOs the Chi-Yu at t26; t27 is the REPLACEMENT
+///   turn — a `switch` request whose `go()` still inserts `beforeTurn`+`residual` — so PS ticks
+///   the duration to 0 and releases with no move used at all. Own Tempo, so no confusion.
+/// * rb5160 and rb5321, same shape. rb5321 is the one that shows the missing draw directly:
+///   `PS-unconsumed random[2, 6]@confusion`.
+fn residual_rampage_confuses(state: &State, side: SideId) -> bool {
+    let crate::state::PendingMove::Rampaging(_, n) = state.side(side).pending_move else {
+        return false;
+    };
+    let p = state.side(side).active();
+    n <= 1
+        && p.is_alive()
+        && p.ability != crate::ids::Ability::OwnTempo
+        && !state.side(side).volatiles.contains(VolatileStatus::Confusion)
+}
+
 fn apply_end_of_turn_inner(
-    mut branch: Branch, _switched: [bool; 2], shed: [Option<bool>; 2],
+    mut branch: Branch, _switched: [bool; 2], shed: [Option<bool>; 2], conf_dur: [Option<u8>; 2],
 ) -> Vec<Branch> {
     // PS's residual pass ABORTS the moment the battle ends: `fieldEvent` runs
     // `this.faintMessages(); if (this.ended) return;` after EVERY handler (sim/battle.ts:565-566,
@@ -13864,6 +13911,30 @@ fn apply_end_of_turn_inner(
                     previous: crate::state::PendingMove::Rampaging(m, n),
                     new: crate::state::PendingMove::Rampaging(m, n - 1),
                 });
+            } else {
+                // n == 1 AND the lock is still armed: the mon did NOT use the move this turn (a
+                // use releases it at move time), so this is PS's `duration` reaching 0 with the
+                // volatile still up — `onEnd` fires here. See `residual_rampage_confuses`.
+                push(b, Instruction::SetPendingMove {
+                    side,
+                    previous: crate::state::PendingMove::Rampaging(m, n),
+                    new: crate::state::PendingMove::None,
+                });
+                if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                    push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+                }
+                if let Some(t) = conf_dur[side.index()] {
+                    let prev = b.state.side(side).confusion_turns;
+                    draw(b, "random", &[2, 6], t as i64, "confusion");
+                    push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
+                    push(b, Instruction::SetActiveCounter {
+                        side,
+                        which: crate::instruction::ActiveCounter::Confusion,
+                        previous: prev,
+                        new: t,
+                    });
+                    consume_lum_if_statused(b, side);
+                }
             }
         }
     }
