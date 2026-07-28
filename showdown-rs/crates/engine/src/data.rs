@@ -225,17 +225,6 @@ impl MoveData {
     }
 }
 
-/// Build a boost array from (BoostIndex, delta) pairs.
-const fn boosts(pairs: &[(BoostIndex, i8)]) -> [i8; BoostIndex::COUNT] {
-    let mut out = [0i8; BoostIndex::COUNT];
-    let mut i = 0;
-    while i < pairs.len() {
-        out[pairs[i].0 as usize] = pairs[i].1;
-        i += 1;
-    }
-    out
-}
-
 impl MoveData {
     /// The empty/no-op move (id 0), used as the table's index-0 sentinel.
     pub const fn none() -> Self {

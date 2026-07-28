@@ -2514,7 +2514,7 @@ fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [
 
     // 1) Switches resolve before moves, in speed order when both sides switch (the slower
     //    side's switch-in ability resolves last and e.g. its weather wins).
-    let mut switch_actions: Vec<(SideId, u8)> = [(SideId::One, s1), (SideId::Two, s2)]
+    let switch_actions: Vec<(SideId, u8)> = [(SideId::One, s1), (SideId::Two, s2)]
         .into_iter()
         .filter_map(|(side, c)| match c {
             MoveChoice::Switch(t) => Some((side, t)),
@@ -4107,9 +4107,6 @@ const ALL_VOLATILES: &[VolatileStatus] = &[
     // only the active can have raised a stat this turn, so the volatile model is exact.
     VolatileStatus::Truant, VolatileStatus::StatsRaisedThisTurn,
 ];
-
-/// Per-hit critical-hit probability (gen9 base, no crit-stage modifiers modeled).
-const CRIT: f32 = 1.0 / 24.0;
 
 /// Crit chance for this attack. Stages: base 0 (1/24), +(crit_ratio-1) from the move (Slash
 /// family), +2 Focus Energy / Dragon Cheer, +1 Scope Lens / Razor Claw, +1 Super Luck;
@@ -9954,10 +9951,6 @@ fn maybe_eat_sitrus(b: &mut Branch, side: SideId) {
     }
 }
 
-fn on_berry_eaten(b: &mut Branch, side: SideId) {
-    on_berry_eaten_id(b, side, Item::None)
-}
-
 /// Apply a berry's on-eat effect to the active mon WITHOUT consuming an item — used by Cud Chew
 /// to re-apply the effect of an already-eaten berry. Covers the healing/status-curing berries
 /// that random battles actually carry on Cud Chew users (Sitrus, Lum, single-status cures).
@@ -12535,13 +12528,6 @@ fn emit_drag_switchin_sort(b: &mut Branch, dragged: SideId, target: u8) {
     }
 }
 
-/// The 16 damage rolls of a landing Future Sight / Doom Desire: computed at hit time from the
-/// stored caster's Special Attack vs the target's current Special Defense. (Approximation: no
-/// caster boosts.)
-fn future_sight_rolls(state: &State, target_side: SideId, caster_slot: u8) -> [i16; 16] {
-    future_sight_rolls_crit(state, target_side, caster_slot, false)
-}
-
 fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, is_crit: bool) -> [i16; 16] {
     let src_side = target_side.other();
     let caster = &state.side(src_side).pokemon[(caster_slot as usize).min(5)];
@@ -13849,7 +13835,7 @@ fn apply_end_of_turn_inner(
     // Shed Skin used to run HERE, in the branching tail after Harvest (28) — ten orders late, so a
     // cured holder still took the order-9/10 status chip. It now runs at its real slot (5/3) inside
     // the deterministic core; `apply_end_of_turn`'s wrapper hoists the 33% split.
-    let mut out = branches_after_harvest;
+    let out = branches_after_harvest;
 
     // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
     let mut out = out;
