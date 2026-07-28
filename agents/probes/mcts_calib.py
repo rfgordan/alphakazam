@@ -41,6 +41,7 @@ def load_ckpt(path: str, device):
     # Ride the fog setting along so evaluators construct MATCHING envs — a fog-trained net
     # evaluated on leaky obs (or vice versa) is silently out of distribution.
     net.fog_species = bool(ck.get("fog_species", False))
+    net.obs_version = int(ck.get("obs_version", 1))
     return net, ck.get("global_step", 0)
 
 
@@ -72,7 +73,8 @@ def main():
 
     t0 = time.perf_counter()
     r = evaluate_flow(net, timed, device, n_games=args.games, num_envs=args.envs,
-                      team_pool=POOL, seed=777, fog_species=net.fog_species)
+                      team_pool=POOL, seed=777, fog_species=net.fog_species,
+                      obs_version=net.obs_version)
     wall = time.perf_counter() - t0
 
     # Policy per-action cost at the same batch size, for the matched-time report.

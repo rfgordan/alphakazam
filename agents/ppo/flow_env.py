@@ -41,13 +41,15 @@ class FlowEnvVec:
 
     def __init__(self, num_envs: int, seed: int = 0, team_pool: str | None = None,
                  max_requests: int = 1000, shaping_coef: float = 0.0, gamma: float = 0.99,
-                 fog_species: bool = False):
+                 fog_species: bool = False, obs_version: int = 1):
         self.num_envs = num_envs
         self.shaping_coef = shaping_coef
         self.gamma = gamma
         self.fog_species = fog_species
+        self.obs_version = obs_version
         self.vec = se.FlowVec(num_envs, seed=seed, max_requests_per_episode=max_requests,
-                              team_pool=team_pool, fog_species=fog_species)
+                              team_pool=team_pool, fog_species=fog_species,
+                              obs_version=obs_version)
         self.obs_dim = self.vec.obs_dim
         self.n_actions = self.vec.n_actions
         self.id_dim = self.vec.id_dim

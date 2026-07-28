@@ -27,7 +27,8 @@ def main():
     for name in args.baselines.split(","):
         opp = "random" if name == "random" else make_scripted_heuristic()
         r = evaluate_flow(net, opp, device, n_games=args.games, num_envs=args.envs,
-                          team_pool=POOL, seed=31337, fog_species=net.fog_species)
+                          team_pool=POOL, seed=31337, fog_species=net.fog_species,
+                          obs_version=net.obs_version)
         print(json.dumps({"ckpt": args.ckpt, "step": step, "baseline": name,
                           **{k: r[k] for k in ("win_rate", "ci_low", "ci_high",
                                                "wins", "losses", "draws")}}), flush=True)

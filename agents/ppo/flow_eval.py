@@ -133,6 +133,39 @@ def _heuristic_actions_rust(vec, envs, mask, rng, stats: dict | None = None) -> 
     return out
 
 
+def make_fog_heuristic(stats: dict | None = None):
+    """The heuristic restricted to its INFORMATION SET — the public-info referee.
+
+    Same `HeuristicBaseline` logic, but read off `state_json_observed`: unseen foe species
+    blanked, unrevealed items/moves hidden, spreads zeroed. This approximates the poke-env-era
+    SimpleHeuristicsPlayer (which only saw revealed mons), modulo one residual edge: `observe`
+    keeps the foe active's computed stats (poke-env estimated them). Python path (no Rust port)
+    — eval-only speed is fine.
+    """
+    from .baselines import HeuristicBaseline
+    heur = HeuristicBaseline()
+
+    def fn(vec, envs, mask, rng):
+        out = np.zeros(len(envs), dtype=np.int64)
+        for row, (e, side) in enumerate(envs):
+            try:
+                st = json.loads(vec.state_json_observed(e, side))
+                me, foe = _adapt_side(st["sides"][side]), _adapt_side(st["sides"][1 - side])
+                a = heur._action_for(_TYPE_CHART, me, foe, mask[row])
+            except Exception as exc:
+                if stats is not None:
+                    stats["fallbacks"] = stats.get("fallbacks", 0) + 1
+                    stats.setdefault("last_error", f"{type(exc).__name__}: {exc}")
+                a = -1
+            if a is None or a < 0 or a >= N_ACTIONS or not mask[row][a]:
+                legal = np.flatnonzero(mask[row])
+                a = int(rng.choice(legal)) if legal.size else 0
+            out[row] = a
+        return out
+
+    return fn
+
+
 def make_mcts_opponent(time_ms: int = 100):
     """pmariglia's perfect-information MCTS as a flow-eval opponent (EXPLORATION_PLAN P0b).
 
@@ -184,14 +217,15 @@ def make_scripted_heuristic(stats: dict | None = None):
 
 def evaluate_flow(model, opponent, device, n_games: int = 300, num_envs: int = 128,
                   team_pool: str | None = None, seed: int = 12345, max_requests: int = 600,
-                  max_steps: int = 20_000, fog_species: bool = False) -> dict:
+                  max_steps: int = 20_000, fog_species: bool = False,
+                  obs_version: int = 1) -> dict:
     """Play `model` (greedy) against `opponent` until `n_games` finish. Returns win-rate + Wilson CI.
 
     `opponent` is either the string "random", or a callable
     `(obs, ids, mask, rows) -> actions`, or a torch net played greedily.
     """
     env = FlowEnvVec(num_envs, seed=seed, team_pool=team_pool, max_requests=max_requests,
-                     fog_species=fog_species)
+                     fog_species=fog_species, obs_version=obs_version)
     rng = np.random.default_rng(seed ^ 0x5EED)
     # Learner on RED for even envs, BLUE for odd — the reported rate averages both perspectives.
     learner_side = (np.arange(num_envs) % 2).astype(np.int64)

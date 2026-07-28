@@ -19,7 +19,7 @@
 use crate::data::move_data;
 use crate::damage::type_multiplier;
 use crate::ids::{BoostIndex, MoveCategory, MoveId, Species, StatIndex, Status, Type};
-use crate::state::{PendingMove, Pokemon, Side, SideId, State};
+use crate::state::{MoveSlot, PendingMove, Pokemon, Side, SideId, State};
 use crate::volatile::VolatileStatus;
 
 const STATUS_COUNT: usize = 7; // None,Burn,Paralysis,Sleep,Freeze,Poison,Toxic
@@ -108,7 +108,10 @@ pub fn encode_ids(state: &State, viewer: SideId) -> Vec<i64> {
 
 /// Encode the battle from `viewer`'s perspective into a length-[`OBS_DIM`] vector.
 pub fn encode(state: &State, viewer: SideId) -> Vec<f32> {
-    let observed = state.observe(viewer);
+    encode_observed(&state.observe(viewer), viewer)
+}
+
+fn encode_observed(observed: &State, viewer: SideId) -> Vec<f32> {
     let mut v = Vec::with_capacity(OBS_DIM);
 
     // Per-mon blocks: viewer's side first, then the foe's.
@@ -143,10 +146,120 @@ pub fn encode(state: &State, viewer: SideId) -> Vec<f32> {
         let foe_active = observed.side(side_id.other()).active();
         encode_active_moves(&mut v, observed.side(side_id), foe_active);
     }
-    encode_matchup(&mut v, &observed, viewer);
+    encode_matchup(&mut v, observed, viewer);
 
     debug_assert_eq!(v.len(), OBS_DIM, "encode produced {} feats, expected {}", v.len(), OBS_DIM);
     v
+}
+
+// --- v2: damage-calc feature block (EXPLORATION/goal: night-era est-damage features, honest) ---
+
+/// v2 appends the night-era damage-calc block to the v1 layout: per active move (both sides)
+/// an expected-damage fraction + KO flag, plus per viewer-slot switch-matchup scalars. All of
+/// it is computed from the OBSERVED state only (post-fog projection), so it is honest by
+/// construction — see `tests/obs_honesty.rs` scramble-invariance.
+pub const OBS_EXTRA_V2: usize = 2 * 4 * 2 + 6 + 6;
+pub const OBS_DIM_V2: usize = OBS_DIM + OBS_EXTRA_V2;
+
+pub fn encode_v2(state: &State, viewer: SideId) -> Vec<f32> {
+    let observed = state.observe(viewer);
+    let mut v = encode_observed(&observed, viewer);
+    v.reserve(OBS_EXTRA_V2);
+
+    // Expected damage of each ACTIVE move vs the opposing active + would-it-KO, both sides.
+    // The foe's unrevealed moves are MoveSlot::EMPTY post-observe -> contribute zeros.
+    for side_id in [viewer, viewer.other()] {
+        let att_side = observed.side(side_id);
+        let def_side = observed.side(side_id.other());
+        let att = att_side.active();
+        let def = def_side.active();
+        for m in 0..4 {
+            let frac = est_damage_frac(&observed, att_side, att, def_side, def, att.moves[m]);
+            v.push((frac / 2.0).min(1.0));
+            let def_hp_frac = if def.max_hp > 0 { def.hp.max(0) as f32 / def.max_hp as f32 } else { 1.0 };
+            v.push((frac >= def_hp_frac && frac > 0.0) as u8 as f32);
+        }
+    }
+    // Switch matchup, per viewer party slot: (a) worst incoming hit from the foe's REVEALED
+    // active moves vs that mon; (b) that mon's own best move vs the foe active.
+    let me = observed.side(viewer);
+    let foe = observed.side(viewer.other());
+    let foe_active = foe.active();
+    for slot in 0..6 {
+        let p = &me.pokemon[slot];
+        let mut worst = 0.0f32;
+        if p.species != Species::None && p.hp > 0 {
+            for m in 0..4 {
+                worst = worst.max(est_damage_frac(&observed, foe, foe_active, me, p, foe_active.moves[m]));
+            }
+        }
+        v.push((worst / 2.0).min(1.0));
+    }
+    for slot in 0..6 {
+        let p = &me.pokemon[slot];
+        let mut best = 0.0f32;
+        if p.species != Species::None && p.hp > 0 {
+            for m in 0..4 {
+                best = best.max(est_damage_frac(&observed, me, p, foe, foe_active, p.moves[m]));
+            }
+        }
+        v.push((best / 2.0).min(1.0));
+    }
+
+    debug_assert_eq!(v.len(), OBS_DIM_V2, "encode_v2 produced {} feats, expected {}", v.len(), OBS_DIM_V2);
+    v
+}
+
+/// Lightweight expected-damage estimate as a fraction of the defender's max HP: the gen-9 core
+/// formula with STAB / type / burn / screens / weather modifiers and the average (0.925) roll.
+/// An ESTIMATE for feature purposes — the real resolver stays authoritative.
+fn est_damage_frac(state: &State, att_side: &Side, att: &Pokemon, def_side: &Side,
+                   def: &Pokemon, mv: MoveSlot) -> f32 {
+    if mv.id == MoveId::None || att.species == Species::None || def.species == Species::None
+        || def.max_hp <= 0 || att.hp <= 0 {
+        return 0.0;
+    }
+    let md = move_data(mv.id);
+    if md.base_power == 0 || matches!(md.category, MoveCategory::Status) {
+        return 0.0;
+    }
+    let te = type_multiplier(md.typ, def.types);
+    if te == 0.0 {
+        return 0.0;
+    }
+    use crate::ids::{StatIndex::*, Weather};
+    let physical = matches!(md.category, MoveCategory::Physical);
+    let (a_idx, d_idx) = if physical { (Attack, Defense) } else { (SpecialAttack, SpecialDefense) };
+    let a = att.stats[a_idx as usize].max(1) as f32;
+    let d = def.stats[d_idx as usize].max(1) as f32;
+    let l = att.level as f32;
+    let mut dmg = ((2.0 * l / 5.0 + 2.0) * md.base_power as f32 * a / d) / 50.0 + 2.0;
+    if att.types[0] == md.typ || att.types[1] == md.typ {
+        dmg *= if att.terastallized && att.types[0] == md.typ { 2.0 } else { 1.5 };
+    }
+    dmg *= te;
+    if physical && matches!(att.status, Status::Burn) {
+        dmg *= 0.5;
+    }
+    let sc = &def_side.side_conditions;
+    let screened = if physical { sc.reflect > 0 || sc.aurora_veil > 0 }
+                   else { sc.light_screen > 0 || sc.aurora_veil > 0 };
+    if screened {
+        dmg *= 0.5;
+    }
+    match state.weather {
+        Weather::Rain | Weather::HeavyRain => {
+            if md.typ == Type::Water { dmg *= 1.5; }
+            if md.typ == Type::Fire { dmg *= 0.5; }
+        }
+        Weather::Sun | Weather::HarshSun => {
+            if md.typ == Type::Fire { dmg *= 1.5; }
+            if md.typ == Type::Water { dmg *= 0.5; }
+        }
+        _ => {}
+    }
+    let acc = if md.accuracy == 0 { 1.0 } else { md.accuracy as f32 / 100.0 };
+    (dmg * 0.925 * acc) / def.max_hp as f32
 }
 
 /// Active mon's dynamic ("field") state: substitute, volatiles, status counter, multi-turn
@@ -156,7 +269,7 @@ fn encode_field(v: &mut Vec<f32>, side: &Side) {
     let present = p.species != Species::None;
     let max_hp = p.max_hp.max(1) as f32;
 
-    v.push(if present { (side.substitute_hp.max(0) as f32) / max_hp } else { 0.0 });
+    v.push(if present { ((side.substitute_hp.max(0) as f32) / max_hp).min(1.0) } else { 0.0 });
     for vol in VOLATILES {
         v.push(side.volatiles.contains(vol) as u8 as f32);
     }

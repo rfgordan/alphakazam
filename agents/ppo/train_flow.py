@@ -102,7 +102,7 @@ def train(args):
 
     env = FlowEnvVec(cfg.num_envs, seed=cfg.seed, team_pool=pool or None,
                      max_requests=args.max_requests, shaping_coef=cfg.shaping_coef, gamma=cfg.gamma,
-                     fog_species=args.fog_species)
+                     fog_species=args.fog_species, obs_version=args.obs_version)
     if env.pool_size == 0:
         print("[train_flow] WARNING: no team pool loaded — every env replays the same fixed "
               "debug matchup. This is not a real training distribution.")
@@ -232,7 +232,7 @@ def train(args):
                     "obs_dim": env.obs_dim, "n_actions": env.n_actions,
                     "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
                     "embed_dim": cfg.embed_dim, "fog_species": args.fog_species,
-                    "belief_head": args.belief_head},
+                    "belief_head": args.belief_head, "obs_version": args.obs_version},
                    state_path)
         # A separate, weights-only artifact per checkpoint — this is what the on-policy cosim
         # sidecar and offline evals load, and it must never be a half-written training_state.
@@ -241,7 +241,7 @@ def train(args):
                     "obs_dim": env.obs_dim, "n_actions": env.n_actions,
                     "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
                     "embed_dim": cfg.embed_dim, "fog_species": args.fog_species,
-                    "belief_head": args.belief_head}, ckpt)
+                    "belief_head": args.belief_head, "obs_version": args.obs_version}, ckpt)
         if args.keep_checkpoints > 0:
             for old in sorted(glob.glob(str(run_dir / "ckpt_*.pt")))[:-args.keep_checkpoints]:
                 os.remove(old)
@@ -429,7 +429,8 @@ def train(args):
             for name, opp in baselines:
                 r = evaluate_flow(model, opp, device, n_games=args.eval_games,
                                   num_envs=min(cfg.num_envs, 128), team_pool=pool or None,
-                                  seed=cfg.seed + update, fog_species=args.fog_species)
+                                  seed=cfg.seed + update, fog_species=args.fog_species,
+                                  obs_version=args.obs_version)
                 note = ""
                 if name == "heuristic":
                     st = HEURISTIC_STATS.get("ref", {})
@@ -493,6 +494,8 @@ def main():
     p.add_argument("--embed-dim", type=int, default=32)
     p.add_argument("--shaping-coef", type=float, default=0.0)
     p.add_argument("--aux", action="store_true", help="auxiliary opponent-action / world-model heads")
+    p.add_argument("--obs-version", type=int, default=1, choices=[1, 2],
+                   help="2 = +damage-calc feature block (encode_v2, honest by scramble test)")
     p.add_argument("--fog-species", action="store_true",
                    help="honest fog of war: unseen foe species are masked in the obs (W8). "
                         "Breaking obs-semantics change — do NOT flip on a run trained without it")

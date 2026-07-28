@@ -859,6 +859,14 @@ fn draw_state(pool: &Option<Arc<Vec<PoolTeam>>>, rng: &mut Rng) -> State {
     }
 }
 
+/// Version-dispatched encoding for the flow bridge (v2 = +damage-calc block).
+fn enc_v(version: u8, st: &engine::state::State, side: SideId) -> Vec<f32> {
+    if version == 2 { engine::encode::encode_v2(st, side) } else { engine::encode::encode(st, side) }
+}
+fn obs_dim_v(version: u8) -> usize {
+    if version == 2 { engine::encode::OBS_DIM_V2 } else { engine::encode::OBS_DIM }
+}
+
 // ---- request-driven vectorized bridge (13-action decision-point MDP) ------------------------
 
 use engine::request::{Flow, PlayerChoice, Request};
@@ -1141,6 +1149,8 @@ pub struct FlowVec {
     capture_protocol: bool,
     /// Fog of war: `State::observe` blanks never-seen foe species (see `State::fog_species`).
     fog_species: bool,
+    /// Observation version: 1 = classic 643-dim, 2 = +damage-calc block (`encode_v2`, honest).
+    obs_version: u8,
     /// Determinization donors: every pool member as a ready `Pokemon`, and the same indexed by
     /// species id — hidden attributes of seen foes and whole unseen slots are sampled from here.
     donors_all: Arc<Vec<engine::state::Pokemon>>,
@@ -1253,7 +1263,7 @@ impl FlowVec {
     /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
     /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false, fog_species = false))]
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false, fog_species = false, obs_version = 1))]
     fn new(
         num_envs: usize,
         seed: u64,
@@ -1261,7 +1271,11 @@ impl FlowVec {
         team_pool: Option<String>,
         capture_protocol: bool,
         fog_species: bool,
+        obs_version: u8,
     ) -> PyResult<Self> {
+        if !(obs_version == 1 || obs_version == 2) {
+            return Err(pyo3::exceptions::PyValueError::new_err("obs_version must be 1 or 2"));
+        }
         let pool = load_pool_opt(team_pool)?;
         let mut draw_rngs: Vec<Rng> = (0..num_envs)
             .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
@@ -1291,6 +1305,7 @@ impl FlowVec {
             pool,
             capture_protocol,
             fog_species,
+            obs_version,
             donors_all: Arc::new(donors_all),
             donors_by_species: Arc::new(donors_by_species),
         })
@@ -1331,7 +1346,7 @@ impl FlowVec {
     }
     #[getter]
     fn obs_dim(&self) -> usize {
-        engine::encode::OBS_DIM
+        obs_dim_v(self.obs_version)
     }
     #[getter]
     fn n_actions(&self) -> usize {
@@ -1420,10 +1435,11 @@ impl FlowVec {
             base.state = determinize_foe(&f.state, me, &self.donors_all, &self.donors_by_species, &mut z);
         }
         let f = &base;
+        let ver = self.obs_version;
         let my_mask = flow_legal_mask(&f.state, f.request(), me);
         let opp_mask = flow_legal_mask(&f.state, f.request(), me.other());
         const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
-        let obs_dim = engine::encode::OBS_DIM;
+        let obs_dim = obs_dim_v(ver);
         let id_dim = engine::encode::ID_DIM;
         let mut obs = vec![0f32; P * obs_dim];
         let mut ids = vec![0i64; P * id_dim];
@@ -1451,7 +1467,7 @@ impl FlowVec {
                     let c_opp = flow_choice(&sim.state, me.other(), aj as u8);
                     let (c0, c1) = if me == SideId::One { (c_me, c_opp) } else { (c_opp, c_me) };
                     let next = sim.submit([Some(c0), Some(c1)]);
-                    o.copy_from_slice(&engine::encode::encode(&sim.state, me));
+                    o.copy_from_slice(&enc_v(ver, &sim.state, me));
                     idr.copy_from_slice(&engine::encode::encode_ids(&sim.state, me));
                     if let Request::Terminal { winner } = next {
                         *d = true;
@@ -1526,7 +1542,8 @@ impl FlowVec {
         let (c0, c1) = if me == SideId::One { (c_me, c_opp) } else { (c_opp, c_me) };
         let next = root.submit([Some(c0), Some(c1)]);
 
-        let obs_dim = engine::encode::OBS_DIM;
+        let ver = self.obs_version;
+        let obs_dim = obs_dim_v(ver);
         let id_dim = engine::encode::ID_DIM;
         const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
         let pack = |kind: u8,
@@ -1587,7 +1604,7 @@ impl FlowVec {
                             let (cc0, cc1) =
                                 if me == SideId::One { (m, o2) } else { (o2, m) };
                             let nn = sim.submit([Some(cc0), Some(cc1)]);
-                            o.copy_from_slice(&engine::encode::encode(&sim.state, me));
+                            o.copy_from_slice(&enc_v(ver, &sim.state, me));
                             idr.copy_from_slice(&engine::encode::encode_ids(&sim.state, me));
                             if let Request::Terminal { winner } = nn {
                                 *d = true;
@@ -1606,11 +1623,25 @@ impl FlowVec {
             }
             _ => {
                 // Single-sided pause (pivot landing / replace / revive): evaluate as a leaf.
-                let o = engine::encode::encode(&root.state, me).to_vec();
+                let o = enc_v(ver, &root.state, me);
                 let i = engine::encode::encode_ids(&root.state, me).to_vec();
                 pack(1, o, i, vec![false], vec![0.0], vec![true], 1)
             }
         }
+    }
+
+    /// `state_json` of env `e` as seen from `side`'s INFORMATION SET: `State::observe` with
+    /// species fog forced on (regardless of the env's own flag). For building public-info
+    /// referees — e.g. the fog-heuristic that answers "how much of the heuristic's strength is
+    /// perfect information?"
+    fn state_json_observed(&self, env: usize, side: u8) -> PyResult<String> {
+        let f = self
+            .flows
+            .get(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("env out of range"))?;
+        let mut st = f.state;
+        st.fog_species = true;
+        Ok(state_json_of(&st.observe(sid(side))))
     }
 
     /// Belief-head training targets (EXPLORATION_PLAN W9), from the TRUE state — free labels.
@@ -1688,14 +1719,15 @@ impl FlowVec {
         Ok(Array1::from_vec(acts).into_pyarray_bound(py))
     }
 
-    /// (N, OBS_DIM) f32 observations from `side`'s perspective.
+    /// (N, obs_dim) f32 observations from `side`'s perspective (layout per `obs_version`).
     fn observe_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<f32>> {
         let n = self.flows.len();
-        let dim = engine::encode::OBS_DIM;
+        let ver = self.obs_version;
+        let dim = obs_dim_v(ver);
         let mut flat = vec![0f32; n * dim];
         py.allow_threads(|| {
             flat.par_chunks_mut(dim).zip(self.flows.par_iter()).for_each(|(dst, f)| {
-                dst.copy_from_slice(&engine::encode::encode(&f.state, sid(side)));
+                dst.copy_from_slice(&enc_v(ver, &f.state, sid(side)));
             });
         });
         Array2::from_shape_vec((n, dim), flat).unwrap().into_pyarray_bound(py)

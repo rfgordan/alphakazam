@@ -607,6 +607,39 @@ impl State {
             // (they're implied by the species and bound the observed damage rolls).
             p.evs = [0; StatIndex::COUNT];
             p.nature = Nature::Serious;
+            if self.fog_species {
+                // HONEST MODE (the ladder information set — see the scramble-invariance test):
+                //  * computed stats are re-derived from PUBLIC info (base stats + level, the
+                //    standard randbats 85 EV / 31 IV / neutral spread) — the true spread's
+                //    exact stats must not leak. Randbats spreads are near-uniform, so the
+                //    estimate is usually exact anyway; the point is provenance, not accuracy.
+                //  * sleep-turns-remaining is hidden in PS (rolled server-side); toxic stage is
+                //    public arithmetic. Zero the counter only for sleep.
+                for s in [StatIndex::Attack, StatIndex::Defense, StatIndex::SpecialAttack,
+                          StatIndex::SpecialDefense, StatIndex::Speed] {
+                    let idx = s as usize;
+                    p.stats[idx] = crate::damage::compute_stat(
+                        p.base_stats[idx] as u16, 31, 85, p.level, Nature::Serious, s);
+                }
+                if p.status == Status::Sleep {
+                    p.status_counter = 0;
+                }
+                // Raw HP totals are hidden (PS shows the foe's HP as a percentage): re-derive
+                // max HP from public info and rescale current HP to preserve the fraction.
+                if p.max_hp > 0 {
+                    let frac = p.hp.max(0) as f32 / p.max_hp as f32;
+                    let est = crate::damage::compute_hp(p.base_stats[0] as u16, 31, 85, p.level);
+                    p.max_hp = est;
+                    p.hp = (frac * est as f32).round() as i16;
+                }
+            }
+        }
+        if self.fog_species {
+            // Substitute presence is public; its remaining HP is not.
+            let foe_side = obs.side_mut(viewer.other());
+            if foe_side.substitute_hp > 0 {
+                foe_side.substitute_hp = i16::MAX; // encoder clamps: reads as "sub up, HP unknown"
+            }
         }
         obs
     }
