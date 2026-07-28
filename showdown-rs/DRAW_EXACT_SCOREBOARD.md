@@ -3,8 +3,8 @@
 Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the customgame rail in one
 command. **`bash harness/gate-rb.sh [out-set]`** — the real-format rail. PS pin: `b9dc987d`.
 
-**Current: 894 / 912 customgame (98.0%) and 96 / 101 randbats (95.0%). Read the OFFSET & PIVOT
-TRANCHE section immediately below before anything else.**
+**Current: 905 / 912 customgame (99.2%) and 96 / 101 randbats (95.0%). Read the ENDGAME TRANCHE
+section immediately below before anything else.**
 
 **Two corpora now, and they are not interchangeable.**
 
@@ -16,6 +16,229 @@ TRANCHE section immediately below before anything else.**
   because `cosim.mjs` used to rewrite the formatid. Only the 101 are real random battles.
   `cosim::trace::ruleset_for` keys off a separate, explicit `ruleset` field for exactly this
   reason; absent ⇒ customgame.
+
+---
+
+# ==== ENDGAME TRANCHE — the three named leads, and the last two `rust extra`s (2026-07-28) ====
+
+**HEADLINE: 905 / 912 customgame (99.2%, up from 894) and 96 / 101 randbats (95.0%, unmoved).**
+Eleven parity commits, newly-non-exact EMPTY on BOTH rails at every one, audited 111/111 at every
+one. **Per-commit yield 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 — exactly one game each, eleven for eleven.**
+All three named leads closed, and both remaining `rust extra` draws in the corpus are gone.
+
+| # | commit | what | 912 | rb |
+|---|--------|------|-----|----|
+| 1 | `172c798` | **`getConfusionDamage` is a STANDALONE formula** — burn does not halve it | 895 | 96 |
+| 2 | `13449d1` | **the 970 `eachEvent('Update')` is PER HIT**, not per move | 896 | 96 |
+| 3 | `6c90118` | the **Tera 60-BP floor applies under a STELLAR tera** too | 897 | 96 |
+| 4 | `5f7db02` | **Shell Side Arm's category tie is a DRAW**, not just a branch | 898 | 96 |
+| 5 | `1fdbc9d` | a **SUBSTITUTE-absorbed hit never phazes** | 899 | 96 |
+| 6 | `3e4d9b7` | two terastallizing sides make **TWO commitChoices tie shuffles** | 900 | 96 |
+| 7 | `477eefe` | the switch bracket's **THIRD Update is past `fieldEvent('SwitchIn')`** | 901 | 96 |
+| 8 | `77bac7b` | **Effect Spore's roll is gated at DamagingHit**, not after Life Orb | 902 | 96 |
+| 9 | `d794089` | **Soul-Heart does not fire on the KO that ends the battle** | 903 | 96 |
+| 10 | `8fdf08d` | **Life Orb's recoil is not gated on damage dealt** | 904 | 96 |
+| 11 | `dc10230` | a target the **Knock Off just KO'd still loses its item** | 905 | 96 |
+
+## The three named leads, all closed — and two of the three were the OTHER kind of bug
+
+**rb1448 was the damage bug it looked like.** `getConfusionDamage` (`battle-actions.ts:1854-1866`)
+is four truncated divisions, a 16-bit truncation and `randomizer`, and then it is done. It never
+calls `getDamage`/`modifyDamage`, so **every modifier that lives there is absent — including the
+burn halving** (`:1845`). `conditions.ts brn` carries only
+`onModifyAtk() {} // hardcoded in BattleActions#modifyDamage()`, which is precisely why it cannot
+reach a path that does not call it. A burned, +1-Atk Roaring Moon: bd 62, roll 14 → PS 53, engine
+`modify(53, 0.5)` = 26.
+
+**rb1661 was an OFFSET.** `this.battle.eachEvent('Update')` is the LAST STATEMENT OF
+`hitStepMoveHitLoop`'S LOOP BODY (`battle-actions.ts:965`) — a five-hit Scale Shot fires FIVE of
+them, and the engine emitted one. Every hit past the first read its crit roll out of the shuffle
+the engine had not emitted.
+
+**rb1347 was an OFFSET wearing the Terapagos pair's clothes.** The scoreboard grouped it with
+rb1795 because both were 3-HP gaps on a Terapagos, and rb1795 really was a damage bug (the Tera
+60-BP floor, which PS applies to a Stellar tera under a DIFFERENT predicate rather than skipping).
+rb1347's Psychic-into-Tera-Shell had nothing wrong with it at all: `PRNG_TRACE=rb1347` reads
+`d78 engine=235 ps=235`, `d80 engine=243 ps=244`, and the missing draw is **Shell Side Arm's
+`randomChance(1, 2)` category tie**, two decisions earlier. The engine forked both categories at
+half each and never emitted the coin.
+
+> **The campaign lesson held for two of the three named leads, and the label lied about which.**
+> Run `PRNG_TRACE` on a `result random[…]` or a bare-`hp` game BEFORE reading its state diff. It is
+> one command and it separates "the engine computed the wrong number" from "the engine is standing
+> in the wrong place", which are different investigations with different costs.
+
+## Both remaining `rust extra` draws are closed
+
+Zero over-emission is the campaign's hard invariant, and the seed rail had exactly two violations
+left. They had opposite roots and the same shape — the engine standing one draw ahead of PS.
+
+1. **rb1760: a Substitute-absorbed hit never phazes.** `spreadMoveHit` step 0 sets
+   `targets[i] = null` on `HIT_SUBSTITUTE` (`battle-actions.ts:1083-1085`); step 6's `forceSwitch`
+   (`:1125`, `:1377`) iterates `targets` and skips the null. It is the SAME nulling that already
+   suppressed `onHit`, the self-drops and the secondaries in the engine — the phaze was the one
+   consumer that had not been wired to it, and it emitted a `sample[5]@drag` for the privilege.
+2. **rb1751: the switch bracket's third Update is on the far side of `fieldEvent('SwitchIn')`.**
+   `runSwitch` (`battle-actions.ts:180-193`) does the `getAllActive(true)` speedSort FIRST, then
+   `fieldEvent('SwitchIn')`, and only then returns to `runAction`'s trailing Update (`:2882`). A
+   switch-in ability that `formeChange`s the entrant has REFRESHED the Speed cache the first two
+   sorted on — `setSpecies` ends in `this.speed = this.storedStats.spe`, the RAW stat. A
+   Minior-Green enters at 235 against a Speed-tied Scream Tail, the first two shuffles fire, Shields
+   Down makes it Minior-Meteor at a raw 140, and PS's third Update does not tie.
+
+## Seven rules this tranche cost a landing each to learn
+
+1. **`step 8 precedes `faintMessages`` is a rule with more than one consumer.** `after_hit_user_alive`
+   was introduced for Ceaseless Edge / Stone Axe / Glaive Rush; this tranche found it wanted at
+   **Effect Spore** (a 3-HP Life Orb user dies to its own orb, and the engine read the corpse and
+   skipped the `random(100)` PS had already rolled) and, mirrored onto the DEFENDER, at **Knock
+   Off** (`takeItem` never reads `pokemon.hp`, and `isActive` stays true until a replacement enters,
+   so a target the Knock Off just KO'd still loses its item). When a guard asks "is it alive", ask
+   *at which PS line*.
+2. **`Battle#boost` refuses everything once the foe side is empty.**
+   `if (this.gen > 5 && !target.side.foePokemonLeft()) return false;` (`battle.ts:2028`), and
+   `faintMessages` decrements `pokemonLeft` BEFORE `runEvent('Faint')` — so no KO-boost ability
+   fires on the KO that ends the battle. Moxie / the Neighs / As One / Beast Boost all carried the
+   guard; **Soul-Heart was the copy that drifted.** Fifth pair this campaign.
+3. **`speedSort` shuffles EVERY tie group, not the interesting one.** Two terastallizing sides give
+   `commitChoices` a `[tera, tera, move, move]` queue and TWO draws — `shuffle[4,0,2]` then
+   `shuffle[4,2,4]`. The comment beside the code called the tera tie "vanishingly rare" and left it
+   unmodelled; rb1464 is the witness, and the seed gate's forced-tie peek carried the same
+   assumption ("still consumes exactly one `random` draw") and had to be stepped forward too.
+4. **A gate can be right for the wrong reason and a fork can be right with no draw.** Shell Side Arm
+   enumerated its two categories at ½ each — correct probabilities, correct state, and no coin. The
+   probability path never notices; the seed rail slides one draw for the rest of the game.
+5. **Life Orb is not part of the damage bookkeeping.** `onAfterMoveSecondarySelf` tests only
+   `move.category !== 'Status'` and a truthy `moveResult` — a hit NULLIFIED to 0 by Ice Face or
+   Disguise is one. It had been sitting inside `apply_post_damage`'s `if any_damage` block next to
+   drain and recoil, both of which PS really does gate, and the two nullifying arms return before
+   `apply_post_damage` at all.
+6. **The Stellar tera arm of a rule is a DIFFERENT PREDICATE, not an exclusion.** The 60-BP floor
+   reads `source.terastallized === 'Stellar' ? !source.stellarBoostedTypes.includes(move.type) :
+   source.hasType(move.type)` (`:1664`). The engine skipped Stellar outright. `stellarBoostedTypes`
+   stays unmodelled for the reason `damage::stab_mod` already documents — `:1785` never pushes for
+   Terapagos-Stellar, the only Stellar user randbats produces.
+7. **A species change is not always a `formeChange`.** Folding Imposter into the switch bracket's
+   post-`SwitchIn` Speed refresh regressed EIGHT games at once (rb1060 rb1241 rb1303 rb1359 rb1591
+   rb1598 rb1669 rb1749 + rb5081). `transformInto` runs `setSpecies(species, effect, true)` first —
+   caching the Speed computed for the copied species from the TRANSFORMER's own level/IVs/EVs/nature
+   — and only then overwrites `storedStats` with the target's, leaving `speed` at that intermediate.
+   The engine's post-state carries the copied stat, not the intermediate.
+
+## The twelve remaining opens, evidenced
+
+**7 on the customgame rail, 5 on randbats.** Every one has `align=true` and a per-game first
+divergence below. `SEED_GATE=1 VERBOSE=1 DBG_GAME=<g> DBG_DIFF=1 cosim harness/seed-sidecars[-rb]/<g>.json.gz`
+reproduces each; the slim fixtures cannot supply the DIFF FIELD.
+
+| game | rail | first divergence | evidence | what would close it |
+|---|---|---|---|---|
+| rb1011 | fresh | d43 t33 `draws-match/state-diff` | `s0#3.hp` 140 vs 77 | bare `hp`, gap 63 — a whole extra hit or a doubled modifier; `DBG_INSTR` the unit |
+| rb1012 | fresh | d60 t52 `draws-match/state-diff` | `s0#2.hp` 138 vs 185 | bare `hp`, engine deals 47 MORE than PS |
+| rb1525 | fresh | d23 t19 `draws-match/state-diff` | `s1#5.hp` 211 vs 231 | bare `hp`, gap 20 |
+| rb1572 | fresh | d29 t22 `draws-match/state-diff` | `s0#1.hp` 191 vs 190 | bare `hp`, gap **1** — a rounding/chain-order item, the most expensive shape there is |
+| rb1581 | fresh | d36 t30 `draws-match/state-diff` | `s0#2.hp` 205 vs 131 | bare `hp`, gap 74 |
+| rb1681 | fresh | d45 t34 `draws-match/state-diff` | `s1.wish` (1,214) vs (2,214) | **REPRESENTATION, not behaviour** — see below |
+| rb1769 | fresh | d2 t3 `draws-match/state-diff` | `s1#0.hp` 242 vs 228 | bare `hp`, gap 14, and it is **decision 2** — the cheapest reproduction in the corpus |
+| rb5021 | randbats | d21 t19 `PS randomChance[100,100]@gigadrain (rust shuffle[2,0,2]@update)` | `s1#4.hp` 363 vs 364 | **move-order tie composed wrong** — see below |
+| rb5026 | randbats | d30 t23 `draws-match/state-diff` | `s1#1.hp` 233 vs 204 | bare `hp`, gap 29 |
+| rb5037 | randbats | d12 t11 `result random[16]@gunkshot (rust =3)` | `s0#0.hp` | run `PRNG_TRACE=rb5037` FIRST |
+| rb5059 | randbats | d33 t28 `draws-match/state-diff` | `s1.volatiles` bit 20 + `pending_move` `Rampaging(601, 1)` vs `None` | **rampage lock outlives PS's** — a Petal Dance at `SetMoveStreak 3→4` that PS has already released |
+| rb5100 | randbats | d11 t9 `move-order-tie (ambiguous shuffle fork)` | `s1#3.hp` | the tie machinery's own class |
+
+### rb1681 is a representation mismatch, not a mechanics one
+
+PS's Wish slot condition **has no `duration` field at all** — `addSlotCondition` copies
+`status.duration`, and `wish`'s condition declares none (`data/moves.ts:20937-20958`). It runs off
+`this.effectState.startingTurn` and an `onResidual` that returns while
+`getOverflowedTurnCount() <= startingTurn`. `convert.rs:709` therefore derives the engine's counter
+as `if turn <= startingTurn + 1 { 2 } else { 1 }`.
+
+Measured over the 401 pinned sidecars: **118 of the 124 recorded wish snapshots have
+`turn - startingTurn == 2` (→ 1) and all 6 with `== 1` (→ 2) are `midTurn: true` decisions.** The
+engine ticks 2→1 at the cast turn's residual, which is right for every end-of-turn snapshot and
+wrong for a MID-TURN snapshot taken after that residual. The heal TIMING is correct in both. A fix
+is a converter/engine counter re-basing, not a mechanics change, and it wants the mid-turn boundary
+semantics pinned down first.
+
+### rb5021: the move-order tie composition is right, and this game still disagrees
+
+`emit_turn_start_bracket` emits four shuffles and the gate composes side One first iff
+`b0 == b3` (commit `queue.sort()` bit vs the gen-8 dynamic re-sort bit). **That rule was tested and
+confirmed this tranche**: flipping it to `b0 != b3` costs **92 games** on the 912 rail (905 → 810)
+and 6 on randbats. It is heavily exercised and correct.
+
+rb5021 d21 t19 nevertheless comes out backwards. Both actives are at Speed 96; PS's four turn-start
+shuffles are `[2,0,2] [2,0,2] [2,0,2] [3,0,2]` in exactly the modelled positions; the bits are
+`b0=1 b1=1 b2=1 b3=0`, so the engine resolves Snorlax first while PS resolves Amoonguss first. The
+symptom is the engine emitting Snorlax's `runAction` Update BEFORE Giga Drain's accuracy roll
+instead of after it — one shuffle moved, and Giga Drain then reads roll 9 where PS read 11.
+Note `b0 == b2` would give PS's answer here; that is numerology, not a hypothesis, and it should not
+be adopted without a second witness. **NAMED OPEN.** rb5100's `move-order-tie (ambiguous shuffle
+fork)` is the same machinery and is the obvious second witness to take with it.
+
+## Final gate numbers (re-run at the certifying commit `dc10230`)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111** (ABSOLUTE INVARIANT, held at every commit) |
+| Seed gate, pinned 401 | `SEED_GATE=1 cosim harness/seed-fixtures/*.fx.json.gz` | **399 / 401 = 99.5%** (was 397) |
+| Seed gate, fresh 400 | `SEED_GATE=1 cosim harness/seed-fixtures-fresh/*.fx.json.gz` | **395 / 400 = 98.8%** (was 386) |
+| **Seed gate, all 912** | `bash harness/gate-912.sh` | **905 / 912 = 99.2%** (was 894) |
+| **Seed gate, randbats 101** | `bash harness/gate-rb.sh` | **96 / 101 = 95.0%** (unmoved); init-aligned 101 / 101 |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831**, EXACTNESS **100.00%**, coverage 100.00% |
+| State sweep, randbats | `cosim harness/seed-sidecars-rb/*.json.gz` | 3702 / 3712 = **99.73%**, coverage 100.00% |
+| Draw differ, audited | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3813 / 3831 = 99.53%**; **zero `rust extra`** |
+| Distribution smoke | `bash harness/run-distribution-smoke.sh` | **18 / 18** |
+| Exporter round-trip | `ROUNDTRIP_GATE=1 cosim …` | **PASS** — 3829/3829 move units, 4832/4832 states |
+| Engine + cosim tests | `cargo test --release -p engine -p cosim -j 2` | all suites green |
+| Pivot property fuzz | `PIVOT_FUZZ_GAMES=200000 cargo test -p engine --test pivot_landing_bench` | **0 violations / 200 000** |
+
+## Asymptote assessment
+
+**The kill criterion was never approached: eleven commits, eleven games, no commit flipped zero on
+the customgame rail.** But the shape of the work changed completely, and that is the finding.
+
+**Yield is now exactly 1.00 games/commit and the variance is gone.** Every previous tranche had a
+cluster somewhere — Illusion paid 2 games on one commit, the offset tranche paid 5. This one paid
+one, eleven times, because **there are no clusters left**: eleven roots, eleven species/item/ability
+interactions, no two sharing a mechanism. The bucket table the last three tranches used as a
+triage instrument is now meaningless — twelve opens, twelve distinct roots, one entry each.
+
+**The randbats rail did not move at all.** Eleven customgame games and zero randbats games is the
+first time the two rails have fully decoupled. All eleven roots are format-independent mechanics
+(confusion damage, per-hit Updates, STAB floors, Life Orb, Knock Off), so this is not "the fixes
+did not generalize" — it is that the 5 remaining randbats opens are a different population: two of
+the five are the move-order-tie machinery (rb5021, rb5100), one is a rampage-lock lifetime
+(rb5059), and only two are the bare-`hp` tail. **The randbats rail is now the more interesting
+corpus**, and it is 101 games against 912.
+
+**What the remaining 12 actually are.** Six bare `hp` (rb1011 rb1012 rb1525 rb1572 rb1581 rb1769,
+plus rb5026), one representation mismatch that is not a bug (rb1681), two move-order-tie
+(rb5021 rb5100), one rampage-lock lifetime (rb5059), one `result random[16]` that has not yet been
+PRNG_TRACEd (rb5037). **Five of the twelve are NOT the bare-`hp` asymptote**, which is a better
+ratio than any tranche since XII.
+
+**Recommendation for the next tranche, in order:**
+
+1. **Take the move-order-tie pair (rb5021 + rb5100) first.** Two witnesses on one machinery, the
+   composition rule is proven correct in general (the 92-game flip experiment), and a third
+   instrument is needed — instrument `speedSort` against the recorded shuffle ARGS per tie group
+   rather than reasoning about bit positions. This is the only remaining class with two members.
+2. **rb1769 d2 and rb5059 d33 are the cheapest reproductions in the corpus** — decision 2 and a
+   zero-draw unit respectively. A bare-`hp` bug at d2 needs no replay at all.
+3. **rb1681 wants a decision about the wish counter's REPRESENTATION**, not a mechanics fix. Pin
+   down what `turn` means on a `midTurn: true` decision record first; the same question probably
+   governs `futuremove` (`convert.rs:713`), which uses the identical `endingTurn` arithmetic.
+4. **Record seeds 1801-2200 — this recommendation is now FOUR tranches old, and this tranche is the
+   first evidence that it may no longer pay.** The fresh half has closed to within 0.7 points of the
+   pinned half (98.8% vs 99.5%, from 5.5 points three tranches ago). Shared classes are no longer
+   regrowing at this exactness level: nine of the eleven flips were fresh games, but every root was
+   found by reading PS source against ONE witness, not by clustering. **A fourth 400-seed recording
+   would buy roughly four more singletons at 99.2% base rate, each costing a full investigation.**
+   Recording +400 RANDBATS seeds (5101-5500) is now the better buy by a wide margin: that rail is
+   101 games at 95.0%, its opens are structurally different, and it is the format the engine is
+   actually for.
 
 ---
 

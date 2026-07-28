@@ -1,150 +1,73 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
-**OFFSET & PIVOT TRANCHE (2026-07-27): 894 / 912 customgame (98.0%, up from 878) and 96 / 101
-randbats (95.0%, up from 94).** Eight commits, newly-non-exact EMPTY on BOTH rails at every one,
-audited **111/111** at every one, 2.25 games/commit.
+**ENDGAME TRANCHE (2026-07-28): 905 / 912 customgame (99.2%, up from 894) and 96 / 101 randbats
+(95.0%, unmoved).** Eleven parity commits, newly-non-exact EMPTY on BOTH rails at every one,
+audited **111/111** at every one. **Per-commit yield exactly 1.00 — one game each, eleven for
+eleven.** All three of the previous tranche's named leads closed, and **both remaining `rust extra`
+draws in the corpus are gone** (rb1760's phantom `sample[5]@drag`, rb1751's extra switch-bracket
+Update).
 
-**The scoreboard's named offset lead was right about the shape and the label named the wrong unit.**
-`PRNG_TRACE=rb1670` put the break one unit BEFORE the `result random[16]@secretsword` label, at
-`engine=141 ps=140` — one phantom draw, from a Clodsire's Toxic.
+**Two of the three named leads were OFFSETS, and one label lied about which game it belonged to.**
+rb1347 was grouped with rb1795 as "the Terapagos pair, both 3 HP"; rb1795 really was a damage bug
+(the Tera 60-BP floor, which PS applies to a Stellar tera under a DIFFERENT predicate rather than
+skipping), but rb1347's Psychic-into-Tera-Shell was fine — the missing draw was **Shell Side Arm's
+`randomChance(1,2)` category tie two decisions earlier**, which the engine forked at half each and
+never emitted. `PRNG_TRACE` found it in one command.
 
-> **`hitStepAccuracy` hard-codes `move.alwaysHit || (move.id === 'toxic' && gen >= 8 &&
-> pokemon.hasType('Poison'))` into the `accuracy = true` arm (`battle-actions.ts:726`).** An
-> `accuracy === true` makes NO draw; a numeric 100 still rolls `randomChance(100, 100)`.
+> **Run `PRNG_TRACE=<game>` on a `result random[...]` or bare-`hp` game BEFORE reading its state
+> diff.** It separates "computed the wrong number" from "standing in the wrong place", which are
+> different investigations with different costs. It paid on rb1347, rb1416 and rb1751 this tranche.
 
-And the `target_already_statused` gate at the substitute-blocked accuracy site was **the same rule
-wearing the wrong name**: d6's Toxic user is **Toxtricity, Electric/POISON**. `hitStepTryImmunity`
-has no status check; `setStatus` fails inside `moveHit`, long after step 4. All three Keldeo games
-closed on that one commit.
+**Seven rules this tranche cost a landing each** (full text in the scoreboard):
 
-**The `PivotLanding with no live bench` root is fixed.** `Flow::run_turn` decides the pause from the
-CHOSEN move; `run_move_action` then substitutes it — **Struggle** (`no_usable_move`) or the **Encore
-`OverrideAction` redirect** — and every `match pivot` arm keys on the ACTION. A PP-stalled mon with
-an all-FAINTED bench picks Revival Blessing (pause granted off `has_fainted_bench`), Struggles,
-Struggle's damaging path pushes `PivotPending`, and Struggle's own recoil kills the user.
-`run_move_action` now re-derives the pause from the EXECUTED move and every `PivotPending` site
-requires `has_alive_bench` (PS's own gate, `sim/battle.ts:2904`). **`tests/pivot_landing_bench.rs`
-is the property**: 12 violations / 20 000 games before, 0 / 200 000 after; `PIVOT_FUZZ_GAMES` sets
-the budget. The `resume_pivot` / `resume_revive` eprintlns stay as tripwires.
+1. **"step 8 precedes `faintMessages`" has more than one consumer.** `after_hit_user_alive` was
+   built for Ceaseless Edge / Stone Axe / Glaive Rush; it was also wanted at **Effect Spore** and,
+   mirrored onto the DEFENDER, at **Knock Off** (`takeItem` never reads `pokemon.hp`, so a target
+   the Knock Off just KO'd still loses its item). When a guard asks "is it alive", ask *at which PS
+   line*.
+2. **`Battle#boost` refuses everything once the foe side is empty** (`battle.ts:2028`), and
+   `faintMessages` decrements `pokemonLeft` BEFORE `runEvent('Faint')`. Moxie / the Neighs / As One
+   / Beast Boost all carried the guard; **Soul-Heart was the copy that drifted** — fifth
+   duplicated-logic pair this campaign.
+3. **`speedSort` shuffles EVERY tie group.** Two terastallizing sides give `commitChoices` a
+   `[tera, tera, move, move]` queue and TWO draws, `shuffle[4,0,2]` then `shuffle[4,2,4]`.
+4. **A fork can be right with no draw.** Shell Side Arm enumerated both categories at ½ each —
+   correct probabilities, correct state, no coin. The probability path never notices; the seed rail
+   slides one draw for the rest of the game.
+5. **Life Orb is not part of the damage bookkeeping.** `onAfterMoveSecondarySelf` tests only
+   `move.category !== 'Status'` and a truthy `moveResult` — a hit nullified to 0 by Ice Face or
+   Disguise pays the orb.
+6. **A Stellar-tera arm is a DIFFERENT PREDICATE, not an exclusion** (`battle-actions.ts:1664`).
+7. **A species change is not always a `formeChange`.** Folding Imposter into the switch bracket's
+   post-`SwitchIn` Speed refresh regressed EIGHT games at once; `transformInto` calls `setSpecies`
+   BEFORE it copies `storedStats`, so the cached Speed is an intermediate the engine never holds.
 
-**Six rules this tranche cost a landing each:**
+**THE MOVE-ORDER-TIE COMPOSITION IS PROVEN CORRECT AND rb5021 STILL DISAGREES.** `b0 == b3`
+(commit `queue.sort()` bit vs gen-8 dynamic re-sort bit) was tested by flipping it: **92 games lost
+on the 912 rail (905 -> 810)** and 6 on randbats. It is heavily exercised. rb5021 d21 nevertheless
+resolves backwards with `b0=1 b1=1 b2=1 b3=0` on a clean four-shuffle turn-start bracket.
+**NAMED OPEN — take it with rb5100 (`move-order-tie (ambiguous shuffle fork)`), the second witness
+on the same machinery, and instrument `speedSort` against the recorded shuffle ARGS per tie group
+instead of reasoning about bit positions.**
 
-1. **`flags: { breakable: 1 }` is the WHOLE of Mold Breaker** (`sim/battle.ts:836`). The engine
-   blanked the defender's ability wholesale in `compute_damage` — deleting **Shadow Shield**
-   (`flags: {}`, unlike Multiscale) and the four **Ruin** abilities — and suppressed nothing on the
-   boost path, where **Contrary IS breakable**. `ability_breakable()` is the pinned dex's 83 names.
-   `Full Metal Body` is `cantsuppress`: filter per-ability, never as a group. `suppressingAbility`
-   needs an ACTIVE MOVE, so Intimidate / Sticky Web / Octolock are outside it.
-2. **Two identically-shaped consecutive draws are invisible to the differ and load-bearing for the
-   SELECTOR.** Two Harvest holders both roll `randomChance[1,2]`; PS `speedSort`s the Residual list
-   so the FASTER holder rolls first. rb5073 d51 read `draws-match/state-diff` and was pure ordering.
-3. **`frz.onAfterMoveSecondary`, not `onHit`.** A `thawsTarget` move cures the freeze at
-   `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` (`battle-actions.ts:1026`) — so a
-   frozen target hit by Scald is still frozen when the burn is tried and ends with NO status.
-4. **`transformInto` ends with `setAbility(target.ability, this, true)` and `setAbility` runs
-   `singleEvent('Start', ability, ...)` — the copied ability ACTIVATES.** An Imposter Ditto copying
-   Intimidate Intimidates. And the switch-OUT abilities read the LIVE ability, from
-   `runEvent('BeforeSwitchOut')` before `clearVolatile()`.
-5. **An early return out of the damaging path must bring `miss_out` with it.** Both nullifying-
-   ability arms returned `out` alone, so the engine generated no miss outcome and
-   `replicate_select` fell through to the only branch there was. They were also missing BOTH
-   `eachEvent('Update')`s (970 / 1024) — a nullified hit is still a connecting hit.
-6. **`ignoreEvasion` and `ignoreDefensive` are two fields**, on the same four moves, and only the
-   accuracy half was wired. The flag form zeroes a NEGATIVE stage too.
+**The twelve remaining opens are twelve distinct roots — the bucket table is dead.** Six bare `hp`
+(rb1011 rb1012 rb1525 rb1572 rb1581 rb1769 + rb5026), one REPRESENTATION mismatch that is not a bug
+(rb1681's Wish counter — PS's slot condition has no `duration` at all, and all 6 anomalous snapshots
+in 401 sidecars are `midTurn: true`), two move-order-tie, one rampage-lock lifetime (rb5059), one
+un-traced `result random[16]` (rb5037). Evidenced table in the scoreboard.
 
-**Three named leads, all localized** (see the scoreboard for the reasoning):
-rb1448 d8 (a 26-damage instruction with a clean draw stream where PS has one 69 confusion hit),
-rb1661 d55 (a per-hit `shuffle@scaleshot` missing in the realized multi-hit loop — the same class
-as the Ice Face / Disguise Updates just fixed), and the Terapagos pair, both **exactly 3 HP** off in
-opposite directions.
+**The two rails have DECOUPLED.** Eleven customgame games and zero randbats games, for the first
+time. All eleven roots are format-independent mechanics, so this is not a generalization failure —
+the 5 remaining randbats opens are simply a different population (two tie-machinery, one rampage
+lock, two bare `hp`). **Recording +400 RANDBATS seeds (5101-5500) is now a better buy than the
+fourth customgame batch**: that rail is 101 games at 95.0%, its opens are structurally different,
+and it is the format the engine is actually for. The fresh customgame half has closed to within
+0.7 points of the pinned half (98.8% vs 99.5%, from 5.5 three tranches ago) — shared classes are no
+longer regrowing at this exactness level.
 
-**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "OFFSET & PIVOT TRANCHE" — before anything
-else.**
-
----
-
-**ILLUSION TRANCHE (2026-07-27): 878 / 912 customgame (96.3%, up from 870) and 94 / 101 randbats
-(93.1%, up from 93). Illusion is modelled end-to-end.** Six parity commits, newly-non-exact EMPTY on
-BOTH rails at every one, 1.8 games/commit. Sweeps 100.00% audited / 99.73% randbats; differ 99.53%
-zero `rust extra`; round-trip PASS; smoke 18/18; 18 test suites green.
-
-**What Illusion needed, and what it did NOT need.** Two state fields — `Pokemon::illusion` (the
-disguise target as a canonical party slot) and **`Side::roster`, PS's LIVE `side.pokemon` ARRAY**,
-which `switchIn` permutes by swapping the outgoing and incoming entries and which Illusion's
-"last able member" scan reads. `Instruction::Switch` performs the swap and the swap is an
-involution, so apply and reverse are the same operation. The disguise is chosen AFTER that swap and
-BEFORE `add('switch')`, so `SetIllusion` is pushed ahead of `Switch`. A switch-OUT never breaks it
-(`beingCalledBack` is true at the ability's `End`), which is why a BENCHED Zoroark carries one.
-Masking is two functions: `toString` takes the slot from the real mon and the NAME from the
-disguise, `getFullDetails` takes the SPECIES always and the LEVEL only under **Illusion Level Mod** —
-the flag's first real behaviour. Outside the protocol it changes exactly two things: `transformInto`
-fails on either side, and **the `maybeTrapped` inference sweeps `(source.illusion || source)
-.species`** (`sim/battle.ts:1732`).
-
-**The witnesses were already in the corpus: rb5005, rb5016, rb5017, rb5047.** No recording run was
-needed. They were all byte-exact beforehand because `convert.rs`'s `if b(p, "illusion")` guard was
-DEAD — `illusion` serializes as a `[Pokemon:pNx]` STRING and `as_bool` on a string is `None`.
-
-**Manifest decision:** `roster` and `illusion` are in `diff_states` and NOT in the digest walk, so
-the 902 committed fixtures did not have to be regenerated. `digest.rs` states the asymmetry. Both
-fields are gated on the FULL-STATE rails — the state sweep over `harness/cosim-traces/` and
-`harness/seed-sidecars-rb/`, where the four witnesses live.
-
-**THE TOOL THAT MADE THE TRANCHE: the bare-`hp` classifier.** Do not go game-by-game blind. For each
-open game, run `SEED_GATE=1 VERBOSE=1` for `dN[tT]:label | field`, then `DBG_GAME/DBG_I/DBG_INSTR/
-DBG_DIFF` for the instructions and every DIFF, then read the sidecar's own `d(N-1).stateAfter` for
-the two actives' species/item/ability and the field. ~4 minutes for the whole open set. It turned a
-flat list of 46 "bare hp" games into eight named clusters, and the two clusters taken (Terapagos 6,
-Eiscue 3) paid 5 games in 2 commits. **Re-run it after every landing** — the ranking changes.
-
-**Buckets still open** (see the scoreboard for the full table): Exeggutor-Alola / Harvest (3),
-Keldeo / Secret Sword (3), Loaded Dice (3), Mold Breaker (3), Regigigas / Slow Start (2),
-Mimikyu / Disguise-the-other-way (2), and 21 singletons.
-
-> **rb1670 is an OFFSET bug wearing a damage bug's clothes.** PS crit + roll 7 gives exactly 102 by
-> the engine's own formula, and the engine still resolved the unit on a non-crit branch — so the
-> crit branch was not live, so the PRNG position was already off by a draw that produced no state
-> difference anywhere earlier. `PRNG_TRACE=rb1670`. rb1642 has the same shape.
-
-**Six rules this tranche cost a landing each to learn:**
-
-1. **`draw(...)` is a branch PREDICATE, not just a stream-advance.** `seedgate.rs:330-352` draws
-   from the live PRNG and keeps only branches whose RECORDED result matches. The Ice Face / Disguise
-   arms hardcoded their discarded crit and damage rolls to 0 because the values cannot matter — and
-   thereby pruned themselves out of the gate. Record the realized value even when you discard it.
-2. **`runEvent('OverrideAction')` is the FIRST thing `runMove` does** (`battle-actions.ts:228`),
-   before the move object every `onModifyType` edits exists. The engine's Encore redirect ran 130
-   lines later and discarded the whole chain — rb1734's Judgment came out NORMAL-typed and bounced
-   off a Ghost. The redirect was never missing; its POSITION was.
-3. **`onAfterHit` is step 8: after step 7's `DamagingHit`, and BEFORE `move.recoil` and Life Orb's
-   `onAfterMoveSecondarySelf` (`useMoveInner:533`).** Both hazard-layer opens were that one
-   inversion — Ceaseless Edge not laid because Life Orb had already killed the user (rb1765), and a
-   Toxic Debris layer surviving a Mortal Spin that should have wiped it (rb1591).
-4. **An `onEffectiveness` handler that RETURNS a value REPLACES the type mod.** Tera Shell's `-1` is
-   not an extra resist step: a 4× hit and a resisted hit both land on exactly ×0.5. And **Stellar
-   never consults the chart at all** — ×2 into any Terastallized target, neutral into everyone else,
-   with its own STAB rule (`isSTAB ? 2 : [4915, 4096]`).
-5. **`formeRegression` restores the SET species, not `baseSpecies`.** They agree for Ogerpon and do
-   not for Terapagos, whose Tera Shift already moved `baseSpecies`. It is also the first regression
-   that moves max HP: `updateMaxHp` keeps a corpse at 0 rather than sending it negative.
-6. **"Two engine copies drift" is now a THREE-copy rule.** The hit loop exists three times and the
-   third had neither Ice Face nor Disguise; the two `onDamage`-returns-0 abilities exist twice and
-   only one handled `pivot`. Grep for the second implementation, then for the third.
-
-**Read the first section of `DRAW_EXACT_SCOREBOARD.md` — "ILLUSION TRANCHE" — before anything
-else.**
+**Repo hazard, unchanged:** `engines` is a symlink; never `git add` it.
 
 ---
-
-**RULESET TRANCHE (2026-07-27): format rules are CONFIGURABLE and `[Gen 9] Random Battle` is a
-gated corpus for the first time — 93 / 101 byte-exact from seed (92.1%), init-aligned 101/101.**
-The customgame rail moved 868 → 870 / 912 as a side effect. Ten commits, newly-non-exact EMPTY on
-BOTH rails at every one. Differ 99.53% audited / 99.35% randbats; sweeps 100.00% / 99.62%; smoke
-18/18; round-trip PASS; 17 test suites / 102 tests green.
-
-**Run the two rails: `bash harness/gate-912.sh /tmp/a.txt` and `bash harness/gate-rb.sh
-/tmp/b.txt`.** Judge on the SET (`comm -13 before after` MUST be empty), never the count. Both
-scripts pass `VERBOSE=1` deliberately — without it the per-game listing truncates at 45 rows.
 
 ## Read this before touching a trace's `format` field
 
@@ -165,7 +88,7 @@ Entry contract: `trace::first_decision_state(&ruleset)` — `"teampreview"` with
 `"start"` without. A no-preview recording carries a SYNTHETIC decision 0 holding `battle.start()`'s
 draws and the board at the first move request, so decision 1 onward is shape-identical.
 
-## Six things this tranche cost a landing each to learn
+## Six things an EARLIER tranche cost a landing each to learn (kept: still true)
 
 1. **`RULESET_SPEC.md` §9's Speed example is wrong.** `getStat` caps Speed at 10000
    (`sim/pokemon.ts:638`) BEFORE `getActionSpeed` truncates to 13 bits (`:649`), under the SAME
@@ -190,7 +113,7 @@ draws and the board at the first move request, so decision 1 onward is shape-ide
 > it is now the highest-yield thing to grep for. When you find a PS predicate in the engine, look
 > for the second implementation BEFORE anything else.
 
-## Where to go next
+## Where to go next (STALE — written before the endgame tranche; superseded by the head above)
 
 **The 8 remaining randbats opens are all one class: the damage/HP asymptote** (five bare `hp`, two
 `result random[16]`, and rb5021's ONE-HP Giga Drain with the draws matching exactly). There is
