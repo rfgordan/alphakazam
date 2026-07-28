@@ -1,5 +1,74 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**RANDBATS-500 TRANCHE (2026-07-28): 472 / 500 randbats (94.4%) and 905 / 912 customgame (99.2%,
+UNMOVED).** One corpus commit and **twelve parity commits, 15 games**, newly-non-exact EMPTY on
+BOTH rails at every one, audited **111/111** at every one. **Zero `rust extra` on both rails.**
+
+**The randbats rail is now 500 games.** Seeds 5101-5500 were recorded and their slim fixtures
+committed to `harness/seed-fixtures-rb-fresh/` (399 — rb5139 was already pinned in the 101).
+`bash harness/gate-rb.sh [out-set]` now runs BOTH dirs and unions the non-exact SET, exactly as
+`gate-912.sh` does. Rebuilding the pinned 101 from their sidecars reproduces the committed fixtures
+BYTE-IDENTICALLY, so the fixture builder is deterministic and the corpus is re-derivable from
+`harness/record-seeds.sh 5001 5500` + `MAKE_FIXTURE=`.
+
+**THE HEADLINE FINDING: the two rails have fully decoupled, and the format rail is the live one.**
+Twelve parity commits moved randbats sixteen games and customgame ZERO. The previous tranche was
+the exact mirror (eleven commits, eleven customgame, zero randbats). The 399 fresh randbats games
+opened at **90.2%** against the pinned 101's 95.0%; twelve of the sixteen games closed were fresh.
+Yield was 1.33 games/commit and **three commits paid two games each** — the first clusters in three
+tranches, and all three were MECHANISM clusters, not species clusters.
+
+**rb5021 — the scoreboard's priority named open, "the move-order tie composed wrong" — was two
+draws of Sleep Clause drift, and `b0 == b3` is right.** `PRNG_TRACE` put the engine two draws ahead
+before d21 even began. The proof that the composition is correct is in the corpus itself: **the
+sidecar records each `speedSort` GROUP as it stood before the shuffle.** d21's commit sort reads
+`[p1 Amoonguss, p2 Snorlax]` and the dynamic re-sort reads `[p2 Snorlax, p1 Amoonguss]`, so b0 = 1;
+PS then executes Amoonguss, so b3 = 1; `b0 == b3` gives PS's answer exactly. Read the group arrays
+before ever reasoning about bit positions again — rb5100 is the last member of that class.
+
+> **`SleepClauseBlocked` records that the CLAUSE SPOKE, not that the move landed.** A Spore into a
+> side that already has a sleeper fails at `trySetStatus`, so `hitStepMoveHitLoop` breaks at
+> `hit === 1` and PS fires neither the 970 nor the 1024 Update. The engine's "did the status move
+> land" test counted the clause instruction as an effect. **This bug cannot exist on the customgame
+> rail** — Sleep Clause Mod is only live under `gen9randombattle`. 12 of the 500 games activate it
+> (15 activations, 46 sleep inflictions overall).
+
+**Six rules this tranche cost a landing each** (full text in the scoreboard):
+
+1. **A per-hit `onHit` that changes a damage input must be applied PER HIT.** Beak Blast's contact
+   burn is step 3, so a Triple Axel's hit 1 burns the attacker and hits 2-3 use the halved Atk:
+   48 / 48 / 81 = 177, against the engine's 48 / 96 / 162.
+2. **`hitStepTryHitEvent` is moveStep 2 — a THIRD accuracy-suppressing gate**, alongside
+   `hitStepTryImmunity` (4) and `accuracy_forced_true`. Two of the tranche's three `rust extra`s
+   were that one line (Oblivious vs Taunt; Wind Rider vs Whirlwind). When an ability refuses a
+   move, ask *at which hit step*.
+3. **`runEvent('DamagingHit')` runs the target's handlers AND the source's — both, not either.**
+   A Flame Body defender was deleting the attacker's Poison Touch roll. The Shield Dust / Covert
+   Cloak gate belongs with the SOURCE handlers and suppresses the DRAW.
+4. **A hit NULLIFIED by Ice Face / Disguise still runs steps 4 through 8.** `onDamage` returns the
+   NUMBER 0. This file had learned it for step 4 and for the two Updates and still ended at 7.
+5. **`setType` refuses a terastallized user.** Double Shock's `hasType('Electric')` gate goes
+   through `getTypes()`, which short-circuits on `terastallized` — a Pawmot terastallized to
+   ELECTRIC passes the gate and changes nothing.
+6. **Where a residual handler lives in this file IS its residual order**, and the branching tail is
+   not an order. Two commits in a row, opposite directions: Yawn (23) had to move OUT of the tail;
+   the rampage expiry (no `onResidualOrder`, so PS sorts it LAST) had to move IN.
+
+**Gates at the certifying commit `5e7e358`:** audited 111/111; combined 905/912 (SET identical at
+every commit: rb1011 rb1012 rb1525 rb1572 rb1581 rb1681 rb1769); randbats 472/500 (pinned 98/101,
+fresh 374/399), init-aligned 500/500; sweep 3831/3831 EXACTNESS 100.00%; draw differ 3816/3831 =
+99.61% with zero `rust extra`; engine + cosim 26 targets green.
+
+**The 35 remaining opens are triaged in the scoreboard.** 26 of them are a bare `hp` with no second
+field (20 randbats, 6 customgame) — a genuine asymptote for the first time. **Next tranche, in
+order: record randbats 5501-6500 (a THOUSAND); then rb5199 d6 and rb5386 d6, the two cheapest
+non-`hp` reproductions; then the rb5142 + rb5214 Struggle pair, the only two-member class left;
+then rb5289's Harvest (the roll MATCHES and the berry is not restored).** rb5164 is a NAMED OPEN:
+`after_hit_user_alive` is one snapshot too EARLY when the user dies to a step-7 Rocky Helmet chip,
+and closing it means moving the deferred step-7 flush ahead of `apply_post_damage`.
+
+---
+
 **ENDGAME TRANCHE (2026-07-28): 905 / 912 customgame (99.2%, up from 894) and 96 / 101 randbats
 (95.0%, unmoved).** Eleven parity commits, newly-non-exact EMPTY on BOTH rails at every one,
 audited **111/111** at every one. **Per-commit yield exactly 1.00 — one game each, eleven for

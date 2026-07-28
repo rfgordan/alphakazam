@@ -3,19 +3,278 @@
 Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the customgame rail in one
 command. **`bash harness/gate-rb.sh [out-set]`** — the real-format rail. PS pin: `b9dc987d`.
 
-**Current: 905 / 912 customgame (99.2%) and 96 / 101 randbats (95.0%). Read the ENDGAME TRANCHE
-section immediately below before anything else.**
+**Current: 905 / 912 customgame (99.2%) and 472 / 500 randbats (94.4%). Read the RANDBATS-500
+TRANCHE section immediately below before anything else.**
 
 **Two corpora now, and they are not interchangeable.**
 
-* **1013 games total.** The customgame rail is 912: 111 audited traces / 3831 move units
+* **1412 games total.** The customgame rail is 912: 111 audited traces / 3831 move units
   (`harness/cosim-traces/`), 401 seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) and 400
-  more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). The randbats rail is 101
-  (`harness/seed-fixtures-rb/`, seeds 5001-5100 + 5139).
+  more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). The randbats rail is **500**:
+  `harness/seed-fixtures-rb/` (101, seeds 5001-5100 + 5139) and
+  `harness/seed-fixtures-rb-fresh/` (399, seeds 5101-5500 minus the already-pinned 5139).
 * Every one of the 912 STAMPS `format: gen9randombattle` and was **played as `gen9customgame`**,
-  because `cosim.mjs` used to rewrite the formatid. Only the 101 are real random battles.
+  because `cosim.mjs` used to rewrite the formatid. Only the 500 are real random battles.
   `cosim::trace::ruleset_for` keys off a separate, explicit `ruleset` field for exactly this
   reason; absent ⇒ customgame.
+
+---
+
+# ==== RANDBATS-500 TRANCHE — the format rail quintuples, and it is where the bugs are (2026-07-28) ====
+
+**HEADLINE: 472 / 500 randbats (94.4%, from 96/101 = 95.0% on a corpus one fifth the size) and
+905 / 912 customgame (99.2%, UNMOVED).** One corpus commit and **twelve parity commits, 15 games,
+newly-non-exact EMPTY on BOTH rails at every one, audited 111/111 at every one.**
+
+**The randbats rail is now 500 games** — `harness/seed-fixtures-rb/` (101, seeds 5001-5100 + 5139)
+plus `harness/seed-fixtures-rb-fresh/` (399, seeds 5101-5500 minus the already-pinned 5139).
+`gate-rb.sh` runs both and unions the non-exact SET, exactly as `gate-912.sh` does. Determinism was
+checked, not assumed: rebuilding the pinned 101 from their sidecars reproduces the committed
+fixtures BYTE-IDENTICALLY.
+
+| # | commit | what | rb | 912 |
+|---|--------|------|----|-----|
+| 0 | `05468c0` | **corpus**: 399 fresh randbats fixtures; first gate **456 / 500** | 456 | 905 |
+| 1 | `86d2dd8` | **Beak Blast's burn is PER HIT** — hits 2+ are computed on the halved Atk | 457 | 905 |
+| 2 | `4a4e31a` | a multi-hit move **ENDS when the USER dies mid-loop** (`!pokemon.hp`) | 458 | 905 |
+| 3 | `19d50c2` | **Oblivious blocks Taunt at `hitStepTryHitEvent`** — step 2, before accuracy | 459 | 905 |
+| 4 | `8be00dd` | the wind-move list was hand-copied and **missing `whirlwind`** | 460 | 905 |
+| 5 | `914295e` | a target's Flame Body and an attacker's Poison Touch **BOTH roll** | 461 | 905 |
+| 6 | `cd059ec` | a **SLEEP-CLAUSE-blocked status move did not land** — no 970, no 1024 | 462 | 905 |
+| 7 | `309e59c` | a **NULLIFIED hit still reaches step 8** — Knock Off through Ice Face / Disguise | 464 | 905 |
+| 8 | `c4abf23` | **`setType` REFUSES a terastallized user** — Double Shock does nothing | 466 | 905 |
+| 9 | `c3fe0ac` | a **rampage lock expires at the RESIDUAL**, not at move time | 468 | 905 |
+| 10 | `30b3b83` | the **Toxic stage STOPS at 15** | 470 | 905 |
+| 11 | `440ec5f` | **Yawn's sleep is residual order 23**, ahead of Harvest's coin (28) | 471 | 905 |
+| 12 | `5e7e358` | a **SLEEPING rampager drops the lock** — and the expiry belongs in the TAIL | 472 | 905 |
+
+## The finding: the two rails have fully decoupled, and the format rail is the live one
+
+**Twelve parity commits moved the randbats rail sixteen games and the customgame rail ZERO.** The
+previous tranche was the mirror image (eleven commits, eleven customgame games, zero randbats), and
+the conclusion it drew — "the randbats rail is now the more interesting corpus, and it is 101 games
+against 912" — is now measured rather than argued. Recording +400 randbats seeds was the right buy:
+**the 399 fresh games opened at 90.2% against the pinned 101's 95.0%**, i.e. the fresh half carried
+39 opens where the pinned half carried 5, and twelve of the sixteen games closed this tranche were
+fresh.
+
+**Yield was 1.33 games/commit against last tranche's exactly 1.00, and three commits paid two
+games each** — the first clusters the campaign has seen in three tranches. All three clusters were
+mechanism clusters, not species clusters: two nullifying abilities on one missing step, two
+witnesses for one `setType` guard, two rampage games on one residual placement.
+
+**Sleep Clause Mod earned its corpus.** `cd059ec` is a bug that CANNOT exist on the customgame
+rail — the clause is only live under `gen9randombattle` — and it was the root of the scoreboard's
+priority named open (below). 12 of the 500 games activate the clause, 15 activations, against 46
+sleep inflictions overall.
+
+## rb5021 is closed, and the `b0 == b3` composition it was named for was never wrong
+
+The scoreboard's **priority named open** recorded d21 t19 as `move-order tie composed wrong`: two
+Speed-96 actives, four turn-start shuffles, `b0=1 b1=1 b2=1 b3=0`, PS resolving Amoonguss where the
+engine resolved Snorlax. **`PRNG_TRACE` says the engine was already TWO DRAWS AHEAD when d21
+began** (`d20 engine=52 ps=52`, `d21 engine=60 ps=58`).
+
+**The recorded shuffle GROUPS settle the composition question outright.** The sidecar stores each
+`speedSort` group as it stood BEFORE the shuffle:
+
+* d21's commit sort group reads `[p1: Amoonguss, p2: Snorlax]`
+* d21's dynamic re-sort group reads `[p2: Snorlax, p1: Amoonguss]` — so the commit shuffle SWAPPED,
+  i.e. **b0 = 1**
+* PS then executes Amoonguss, so the dynamic shuffle swapped back — **b3 = 1**
+
+`b0 == b3` -> side One first -> Amoonguss. **The rule reproduces PS exactly.** The instrument the
+last tranche asked for already existed in the corpus; what was needed was to read the group arrays
+instead of counting bit positions.
+
+The real bug was at d20 t18, a Spore into a side that already had a sleeper. Sleep Clause Mod is an
+`onSetStatus` returning FALSE, so `trySetStatus` fails, `moveHit` returns false,
+`hitStepMoveHitLoop` breaks at `hit === 1`, and PS fires NEITHER the per-hit Update (970) nor the
+post-hit-loop one (1024). The engine detects "the status move landed" as ">= 1 effect instruction
+that is not protect bookkeeping" — and `SleepClauseBlocked` is an instruction. On a tied board that
+is two phantom shuffles.
+
+> **`SleepClauseBlocked` records that the CLAUSE SPOKE, not that the move landed.**
+
+## Zero `rust extra` again — and two of the three were the same PS line
+
+The fresh 399 reintroduced three over-emissions, the campaign's one hard invariant. All three are
+closed:
+
+1. **rb5280** `randomChance[90,100]@accuracy`: a 40-HP Meowscarada Triple Axels a Rocky Helmet
+   Pecharunt and dies to the hit-1 chip. `hitStepMoveHitLoop`'s LAST statement is
+   `this.battle.eachEvent('Update'); if (!pokemon.hp && targets.length === 1) { hit++; break; }` —
+   a check on the USER, after the per-hit Update. `apply_damage_hit_rolls` carried the opposite
+   assumption verbatim in a comment: *"A user faint mid-loop (recoil/contact item) is folded into
+   `apply_post_damage`, so it never truncates the loop here; the corpus has no such multi-hit
+   matchup."* The 399 fresh games have one.
+2. **rb5477** `randomChance[1,24]@crit`: an Enamorus Taunts an Oblivious Whiscash and PS draws
+   NOTHING for the turn. `oblivious.onTryHit` returns `null` for attract / captivate / taunt, from
+   `hitStepTryHitEvent` — **moveStep 2**, three ahead of `hitStepAccuracy`. The engine had the rule
+   only as an EFFECT gate at the volatile-application site. The `rust extra` label sat TWO decisions
+   downstream of its cause.
+3. **rb5343** `sample[1]@drag`: a Skarmory Whirlwinds a Wind Rider Shiftry. The handler was present
+   (`flag_blocked`, built for Well-Baked Body / Soundproof / Bulletproof); `is_wind_move` was a
+   hand-written list of 14 where the pinned dex has **17**, missing `whirlwind`, `sandstorm` and
+   `tailwind`.
+
+## Six rules this tranche cost a landing each to learn
+
+1. **A per-hit `onHit` that changes a damage input must be applied PER HIT.** Beak Blast's contact
+   burn is step 3 of `spreadMoveHit`, so a Triple Axel's hit 1 burns the attacker and hits 2-3 are
+   computed on the halved Attack. The arithmetic is exact: 48 / 48 / 81 = 177 = PS's 284 -> 107,
+   against the engine's 48 / 96 / 162. The machinery already existed for a Flame Body burn
+   (rb1198's `restat_dirty`); Beak Blast is the same fact one step earlier in the same function.
+2. **`hitStepTryHitEvent` is moveStep 2 and it is a THIRD accuracy-suppressing gate**, alongside
+   `hitStepTryImmunity` (4) and `accuracy_forced_true`. Two of this tranche's three `rust extra`s
+   were on that one line. When an ability refuses a move, ask **at which hit step**, because
+   anything before 5 deletes the accuracy draw and not just the effect.
+3. **`runEvent('DamagingHit')` runs the target's handlers AND the source's — both, not either.**
+   `apply_contact_secondaries` had Flame Body / Static / Poison Point and Poison Touch in one
+   `match`, so a Flame Body defender silently deleted the attacker's Poison Touch roll. rb5413 d2
+   shows PS rolling `randomChance[3,10]` TWICE for one Shadow Sneak. The Shield Dust / Covert Cloak
+   gate belongs with the SOURCE handlers, where PS puts it, and it suppresses the DRAW.
+4. **A hit NULLIFIED by Ice Face / Disguise still runs steps 4 through 8.** `onDamage` returns the
+   NUMBER 0, so the target stays in `targets`. This file had already learned it for step 4
+   (rb1093) and for the two Updates (rb1191) and still ended both arms at step 7; Knock Off's
+   `onAfterHit` was simply absent.
+5. **`setType` refuses a terastallized user** ("cannot have their base type changed except via
+   forme change"). Double Shock's `onTryMove` gate is `hasType('Electric')`, which goes through
+   `getTypes()` and short-circuits on `terastallized` — so a Pawmot terastallized to ELECTRIC
+   passes the gate, deals damage, and changes nothing. The engine's comment at the site asserted
+   the gate already excluded terastallized users; it excludes every tera type except the one that
+   matters.
+6. **Where a residual handler lives in this file IS its residual order**, and the branching tail is
+   not an order. Anything that forks gets written into the tail because the deterministic core
+   cannot branch, and silently acquires order 28+. Two commits in a row, opposite directions:
+   **Yawn** (order 23) had to move OUT of the tail to draw its `random(2,5)` ahead of Harvest's
+   coin, and the **rampage expiry** had to move INTO it — `lockedmove` has no `onResidualOrder`, so
+   PS sorts it LAST, and from the core it could not see the sleep the tail had just applied. (Shed
+   Skin, hoisted from the same tail to order 5/3 two tranches ago, is the precedent both cite.)
+
+## The rampage lock, in full
+
+Three games and two arms of one condition, both about the RESIDUAL rather than the move:
+
+* **`duration: 2` is what ends the volatile, and PS ticks it whether or not the mon used the move.**
+  rb5059's Lilligant KOs the Chi-Yu at t26; **t27 is the replacement turn** — a `switch` request
+  whose `go()` still inserts `beforeTurn` + `residual` — so PS releases with no move phase at all.
+  The engine released only in the `n == 1` arm at MOVE time, and left the lock armed forever on a
+  turn with no use. The `onEnd` confusion's `random(2,6)` is pre-forked in `apply_end_of_turn`
+  exactly as Shed Skin's 33% roll is, since the residual body cannot branch.
+* **A sleeping rampager's lock is `delete`d, not `end`ed** — `if (target.status === 'slp') { delete
+  target.volatiles['lockedmove']; }`, with PS's own comment "don't lock, and bypass confusion for
+  calming". rb5160's Outrage user is Yawned to sleep on the turn it starts the rampage.
+
+## Final gate numbers (re-run at the certifying commit `5e7e358`)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111** (ABSOLUTE INVARIANT, held at every commit) |
+| Seed gate, pinned 401 | `SEED_GATE=1 cosim harness/seed-fixtures/*.fx.json.gz` | **399 / 401 = 99.5%** |
+| Seed gate, fresh 400 | `SEED_GATE=1 cosim harness/seed-fixtures-fresh/*.fx.json.gz` | **395 / 400 = 98.8%** |
+| **Seed gate, all 912** | `bash harness/gate-912.sh` | **905 / 912 = 99.2%** (unmoved; SET identical at every commit) |
+| Seed gate, randbats pinned 101 | (inside `gate-rb.sh`) | **98 / 101 = 97.0%** (was 96) |
+| Seed gate, randbats fresh 399 | (inside `gate-rb.sh`) | **374 / 399 = 93.7%** (was 360) |
+| **Seed gate, randbats 500** | `bash harness/gate-rb.sh` | **472 / 500 = 94.4%** (was 456); init-aligned 500 / 500 |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831**, EXACTNESS **100.00%**, coverage 100.00% |
+| State sweep, randbats 101 | `cosim harness/seed-sidecars-rb/rb50*.json.gz` | EXACTNESS **99.75%**, coverage 100.00% |
+| Draw differ, audited | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3816 / 3831 = 99.61%**; **zero `rust extra`** |
+| Engine + cosim tests | `cargo test --release -p engine -p cosim -j 2` | all 26 targets green |
+
+## The 35 remaining opens — 7 customgame, 28 randbats
+
+The seven customgame opens are **UNCHANGED** from the endgame tranche: `rb1011 rb1012 rb1525
+rb1572 rb1581 rb1681 rb1769`. Six are a bare `hp`; rb1681 is the Wish counter REPRESENTATION
+question (not a mechanics bug) and was not re-examined this tranche.
+
+**The 28 randbats opens, by first divergent FIELD:** 20 bare `hp`, 2 `item`, 2 `volatiles`, and one
+each of `times_hit` / `status_counter` / `boost.spa` / `substitute_hp`.
+
+| game | first divergence | evidence | note |
+|---|---|---|---|
+| rb5026 | d30 t23 `draws-match/state-diff` | `s1#1.hp` 233 vs 204 | bare `hp`, gap 29 |
+| rb5037 | d12 t11 `result random[16]@gunkshot (rust =3)` | `s0#0.hp` 39 vs 1, `status` None vs Poison | offset — `PRNG_TRACE` first |
+| rb5100 | d11 t9 `move-order-tie (ambiguous shuffle fork)` | `s1#3.hp` 134 vs 127 | **the LAST tie-machinery game**; rb5021's twin closed as an offset, so read the recorded shuffle GROUPS here before touching the composition |
+| rb5134 | d25 t22 `draws-match/state-diff` | `s1#2.hp` 309 vs 271 | bare `hp` |
+| rb5142 | d45 t35 `args randomChance[1,24]@struggle (rust [100,100])` | `s1#4.times_hit` 0 vs 1 | a MID-TURN Struggle: Encore locks a Latias onto Recover, Psychic Noise's Heal Block disables it, all four slots are gone. The engine ran only the foe's move for the unit |
+| rb5146 | d37 t33 `result random[16]@foulplay (rust =13)` | `s1#0.hp` 209 vs 203 | offset |
+| rb5163 | d63 t54 `draws-match/state-diff` | `s0#5.hp` 256 vs 216 | bare `hp` |
+| rb5164 | d44 t35 `draws-match/state-diff` | `s1#0.item` None vs RockyHelmet | **NAMED OPEN, see below** |
+| rb5199 | d6 t5 `PS-unconsumed randomChance[3,10]@cursedbody` | `s0.volatiles` + `s0.disable` (0,0) vs (618,3) | the engine skipped a Cursed Body roll PS made — d6, cheap |
+| rb5207 | d48 t44 `draws-match/state-diff` | `s1#2.hp` 141 vs 125, `status` None vs Toxic | |
+| rb5214 | d56 t48 `PS-unconsumed randomChance[1,24]@struggle` | `s0#5.hp` 180 vs 125 | second Struggle game, opposite sign to rb5142 |
+| rb5236 | d80 t70 `draws-match/state-diff` | `s1#1.hp` 155 vs 81 | the longest game in the corpus |
+| rb5246 | d19 t17 `draws-match/state-diff` | `s1.boost.spa` 2 vs 3 | one missing +1 SpA |
+| rb5268 | d48 t40 `PS shuffle[2,0,2]@shedtail (rust randomChance[1,4]@par)` | `s0.substitute_hp` 66 vs 38 | Shed Tail's sub HP + an order mismatch |
+| rb5289 | d40 t36 `draws-match/state-diff` | `s1#2.item` None vs SitrusBerry, `last_berry` inverted | **Harvest rolled TRUE and the engine did not restore the berry** — the roll matched, the restore did not fire |
+| rb5300 | d34 t26 `draws-match/state-diff` | `s1#4.hp` 62 vs 79, `status` Burn vs None | the engine burned where PS did not |
+| rb5301 | d8 t7 `PS randomChance[1,24]@bulletseed (rust shuffle[2,0,2]@disablemove)` | `s0#5.hp`, `times_hit` 4 vs 5 | |
+| rb5346 | d27 t23 `draws-match/state-diff` | `s0#4.hp` 156 vs 25 | biggest bare-`hp` gap in the corpus (131) |
+| rb5350 | d30 t26 `result random[16]@thunderbolt (rust =8)` | `s0#2.hp` 149 vs 150, `status` None vs Paralysis | offset |
+| rb5358 | d31 t29 `args randomChance[1,4]@par (rust [100,100])` | `s0#3.hp` 116 vs 121 | |
+| rb5366 | d54 t46 `draws-match/state-diff` | `s1#0.hp` 277 vs 234 | bare `hp` |
+| rb5377 | d50 t44 `draws-match/state-diff` | `s1#0.status_counter` 0 vs 1 | a Toxic applied this turn; PS's stage is 1 where the engine's is 0 |
+| rb5386 | d6 t7 `draws-match/state-diff` | `s0.confusion_turns` 1 vs 0 | the confusion counter is decremented at a different site than PS's `onBeforeMove`; d6, cheap |
+| rb5400 | d33 t26 `result random[16]@ironhead (rust =1)` | `s0#2.hp` 133 vs 148 | offset |
+| rb5424 | d15 t13 `PS shuffle[2,0,2]@generic (rust randomChance[90,100]@accuracy)` | `s1#4.hp` 75 vs 68 | a residual `@generic` sort the engine does not emit |
+| rb5451 | d61 t50 `draws-match/state-diff` | `s0#1.hp` 16 vs 0 | PS KOs, the engine leaves 16 |
+| rb5465 | d10 t8 `result random[16]@leafstorm (rust =9)` | `s0#3.hp` 243 vs 245, `s1.boost.def` 1 vs 0 | offset; the stray +1 Def is the tell |
+| rb5490 | d47 t42 `draws-match/state-diff` | `s0#2.hp` 221 vs 257 | bare `hp` |
+
+### rb5164: `after_hit_user_alive` is one snapshot too EARLY for a step-7 kill. NAMED OPEN.
+
+A 9-HP Okidogi Knock Offs an Amoonguss holding a **Rocky Helmet** and dies to the 1/6 chip. Knock
+Off's `onAfterHit` is `if (source.hp) { target.takeItem() }` — step 8 — and the helmet chip is
+`onDamagingHit`, step **7**, genuinely ahead of it. So PS's guard is FALSE and the helmet survives;
+the engine took it.
+
+The engine's `after_hit_user_alive` is snapshotted at the top of `apply_post_damage`, which is
+correct for the case it was built for (the user dying to its OWN Life Orb, which PS applies after
+step 8 — rb1314) and wrong here, because the engine **defers the step-7 flush past
+`apply_post_damage`**. Closing it means moving that flush ahead of `apply_post_damage`, which the
+step-5-before-step-7 secondaries ordering currently forbids. It is the same "ask at which PS line"
+lesson as the endgame tranche's rule 1, with a third answer.
+
+## Asymptote assessment
+
+**The kill criterion was not approached: twelve parity commits, twelve non-zero yields.** No commit
+flipped zero games on the randbats rail. It was, however, approached on the OTHER rail — **all
+twelve flipped exactly zero customgame games**, which is the real result.
+
+**Corpus size, not cleverness, is the binding constraint, and it has been for two tranches.** The
+endgame tranche argued a fourth 400-seed CUSTOMGAME recording "would buy roughly four more
+singletons at 99.2% base rate" and that +400 randbats was the better buy by a wide margin. Measured:
+the 399 fresh randbats games opened at **90.2%** and yielded **twelve** closed games in twelve
+commits, three of them in two-game clusters. That is three times the predicted customgame return,
+and every root was format-agnostic mechanics that the 912 corpus had simply never exercised.
+
+**The remaining population is a genuine bare-`hp` asymptote for the first time.** 20 of the 28
+randbats opens and 6 of the 7 customgame opens are a bare `hp` with no second field — 26 of 35, up
+from 7 of 12. The structurally distinct classes the last tranche pointed at are gone: the
+move-order-tie class is down from two members to one (rb5100), and rb5021 left it by being an
+offset. What is left of the non-`hp` tail is eight singletons.
+
+**Recommendation for the next tranche, in order:**
+
+1. **Record randbats seeds 5501-6500 — a THOUSAND, not four hundred.** This is the second tranche
+   in a row where the recommendation to grow the format corpus paid, and the marginal return has
+   not fallen: the fresh 399 are still at 93.7% against the pinned 101's 97.0%, so the newest games
+   are still where the bugs are. At a 94.4% base rate, +1000 games buys roughly 56 opens, and the
+   evidence of this tranche is that they arrive in mechanism clusters rather than singletons.
+2. **Take rb5199 (d6) and rb5386 (d6) first** — the two cheapest reproductions left, both with a
+   named non-`hp` field, both a handful of turns into the game.
+3. **rb5142 + rb5214 are a Struggle pair** and the only two-member class remaining. Both involve a
+   forced Struggle under a disable/Encore/Heal-Block interaction; rb5142's `midTurn: true` decision
+   is the harder half and would want the mid-turn request semantics pinned down first — the same
+   question rb1681's Wish counter has been waiting on for two tranches.
+4. **rb5289's Harvest is a one-line bug wearing a state diff**: the `randomChance[1,2]` MATCHES and
+   the berry is not restored. Read `maybe_eat_sitrus` / the `can_restore` predicate against a mon
+   that has a `last_berry` and an empty item slot.
+5. **Do NOT touch rb5100's tie composition without reading the recorded shuffle groups first.**
+   rb5021 spent a tranche as a named tie-machinery open and was two draws of Sleep Clause drift.
+   The sidecar's `group` / `full` arrays are the instrument; `b0 == b3` has now been confirmed twice,
+   once by a 92-game flip experiment and once by direct group inspection.
 
 ---
 
