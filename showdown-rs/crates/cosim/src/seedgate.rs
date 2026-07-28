@@ -592,6 +592,14 @@ fn step_unit(
         // sides). The commit shuffle (b0) shifts its RANGE with the queue length but still consumes
         // exactly one `random` draw, so composing b0 vs the dynamic bit is unchanged.
         let k = tera[0] as u32 + tera[1] as u32;
+        // With BOTH sides terastallizing, `commitChoices`' `queue.sort()` has TWO tie groups —
+        // the two `terastallize` actions at [0,2) and the two moves at [2,4) — and `speedSort`
+        // shuffles each, so the move-order bit is the SECOND draw, not the first. (A both-move
+        // tie implies the actives are Speed-tied, so the tera pair ties whenever we are here.)
+        // See `emit_turn_start_bracket`'s step 1a; rb1464 d5 t5 is the witness.
+        if k == 2 {
+            let _ = peek.random_range(0, 2); // commitChoices sort, tera tie group [0,2)
+        }
         let b0 = peek.random_range(0, 2);
         let _b1 = peek.random_range(0, 2); // eachEvent('BeforeTurn')
         let _b2 = peek.random_range(0, 2); // runAction Update after beforeTurn
