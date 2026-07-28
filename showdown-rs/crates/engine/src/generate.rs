@@ -4414,8 +4414,21 @@ fn dispatch_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if phys < spec {
         return execute_move_inner(b, Action { shell_phys: Some(false), ..action });
     }
-    let mut out = execute_move_inner(scaled(&b, 0.5), Action { shell_phys: Some(true), ..action });
-    out.extend(execute_move_inner(scaled(&b, 0.5), Action { shell_phys: Some(false), ..action }));
+    // The tie is a REAL `randomChance(1, 2)` (`data/moves.ts:16242`), and it has to be EMITTED, not
+    // just enumerated: the engine forked the two categories at ½ each but drew nothing, so every
+    // later draw in the unit read one slot early. `onModifyMove` runs in `useMoveInner`, i.e. after
+    // the whole `BeforeMove` ladder (which `execute_move` has already rolled above this call) and
+    // before `hitStepAccuracy` — exactly this position. rb1347 d78 t71 is the witness: a
+    // Slowbro-Galar with atk == spa == 224 into a Salamence, PS
+    // `randomChance[1,2] = true @ shellsidearm ModifyMove` and then the accuracy roll; the engine
+    // went straight to accuracy and was one draw behind for the rest of the game (d80's Psychic
+    // read roll 11 where PS read 9 — a state diff on an OFFSET stream, two decisions downstream).
+    let mut phys_b = scaled(&b, 0.5);
+    draw(&mut phys_b, "randomChance", &[1, 2], 1, "shellsidearm");
+    let mut spec_b = scaled(&b, 0.5);
+    draw(&mut spec_b, "randomChance", &[1, 2], 0, "shellsidearm");
+    let mut out = execute_move_inner(phys_b, Action { shell_phys: Some(true), ..action });
+    out.extend(execute_move_inner(spec_b, Action { shell_phys: Some(false), ..action }));
     out
 }
 
