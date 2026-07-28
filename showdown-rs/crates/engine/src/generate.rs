@@ -4636,27 +4636,35 @@ fn apply_status_target_volatile(mut b: Branch, side: SideId, md: &crate::data::M
 }
 
 /// The confusion self-hit: a 40-BP typeless physical attack the mon lands on itself, using
-/// its own (boosted) Attack and Defense, halved by burn. Enumerates the 16 damage rolls.
+/// its own (boosted) Attack and Defense. Enumerates the 16 damage rolls.
+///
+/// **`getConfusionDamage` (`sim/battle-actions.ts:1854-1866`) is a STANDALONE formula, not a trip
+/// through `getDamage`/`modifyDamage`.** It is four truncated divisions, a 16-bit truncation, and
+/// `randomizer` — and then it is done. Every modifier that lives in `modifyDamage` is therefore
+/// ABSENT: no STAB, no type effectiveness, no weather, no crit, no items/abilities — and **no burn
+/// halving**, because the `pokemon.status === 'brn'` block is `modifyDamage`'s (`:1845`), and
+/// `conditions.ts brn` carries only `onModifyAtk() {} // hardcoded in BattleActions#modifyDamage()`.
+/// A burned mon's confusion self-hit deals FULL damage. (rb1448 d8: a burned, +1-Atk Roaring Moon,
+/// bd 62, roll 14 → PS 53; the engine halved to 26.)
 fn confusion_self_hit(b: Branch, side: SideId) -> Vec<Branch> {
-    let (level, atk, def, burned, hp) = {
+    let (level, atk, def, hp) = {
         let s = b.state.side(side);
         let p = s.active();
         let atk = boosted_stat(p.stat(crate::ids::StatIndex::Attack) as i64, s.boost(BoostIndex::Attack));
         let def = boosted_stat(p.stat(crate::ids::StatIndex::Defense) as i64, s.boost(BoostIndex::Defense)).max(1);
-        (p.level as i64, atk, def, p.status == Status::Burn, p.hp)
+        (p.level as i64, atk, def, p.hp)
     };
     let lvl_factor = 2 * level / 5 + 2;
-    let bd = (lvl_factor * 40 * atk) / def / 50 + 2;
+    // `tr(baseDamage, 16)` (`:1863`) — "Damage is 16-bit context in self-hit confusion damage".
+    // Unreachable at legal stats (the /50 caps bd in the hundreds), modelled because PS writes it.
+    let bd = ((lvl_factor * 40 * atk) / def / 50 + 2) % 65536;
     let mut out = Vec::with_capacity(16);
     for i in 0..16i64 {
         // PS `randomizer`: tr(tr(bd * (100 - random(16))) / 100). Roll `i` maps to factor
         // (100 - i)/100 — the SAME orientation as the main damage path (branch result == roll,
         // higher roll → less damage). The old `85 + i` inverted this: the branch the differ/gate
         // selected for a recorded roll R computed (85+R)/100 instead of (100-R)/100, over-dealing.
-        let mut dmg = bd * (100 - i) / 100;
-        if burned {
-            dmg /= 2;
-        }
+        let dmg = bd * (100 - i) / 100;
         let dmg = (dmg.max(1) as i16).min(hp);
         let mut sb = scaled(&b, 1.0 / 16.0);
         // PS's confusion self-hit rolls `random(16)` for its damage (no crit, typeless 40 BP).
