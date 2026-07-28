@@ -69,7 +69,8 @@ def greedy_actions(net, obs, ids, mask, device):
 def build_model(cfg, env, device, aux: bool):
     embed = {"n_mons": env.n_mons, "cols": env.id_columns, "vocab": env.vocab, "dim": cfg.embed_dim}
     return ActorCritic(env.obs_dim, env.n_actions, cfg.hidden_dim, cfg.n_hidden_layers,
-                       embed=embed, aux=aux).to(device)
+                       embed=embed, aux=aux,
+                       outcome=getattr(cfg, "outcome_head", False)).to(device)
 
 
 def train(args):
@@ -81,6 +82,7 @@ def train(args):
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         embed_dim=args.embed_dim, seed=args.seed, device=args.device or "auto",
         shaping_coef=args.shaping_coef, aux=args.aux, target_kl=args.target_kl,
+        outcome_head=args.outcome_head,
     )
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -206,7 +208,8 @@ def train(args):
         league.add(model, global_step)
 
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, env.obs_dim, env.n_actions, device,
-                           id_dim=env.id_dim, aux=cfg.aux)
+                           id_dim=env.id_dim, aux=cfg.aux,
+                           outcome=getattr(cfg, "outcome_head", False))
     logger = RunLogger(str(run_dir.parent), run_dir.name,
                        wandb_project=args.wandb_project if args.wandb else None)
     logger.config({"cfg": vars(cfg), "obs_dim": env.obs_dim, "n_actions": env.n_actions,
@@ -330,7 +333,10 @@ def train(args):
                        opp_action=torch.as_tensor(opp_action, device=device) if cfg.aux else None,
                        dyn_target=torch.as_tensor(dyn, device=device) if cfg.aux else None,
                        active=torch.as_tensor(active.astype(np.float32), device=device),
-                       teacher_action=teacher_t)
+                       teacher_action=teacher_t,
+                       outcome_reward=torch.as_tensor(outcome, device=device)
+                       if buffer.outcome else None,
+                       outcome_value=model.outcome_pred if buffer.outcome else None)
             global_step += cfg.num_envs
 
             for e in np.flatnonzero(done):
@@ -349,6 +355,8 @@ def train(args):
                 torch.as_tensor(mask_l, device=device),
                 obs_ids=torch.as_tensor(ids_l, device=device))
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
+        if buffer.outcome:
+            buffer.compute_gae_outcome(model.outcome_pred, cfg.gamma, cfg.gae_lambda)
         data = buffer.flat_view()
         if args.kickstart_coef > 0:
             frac = max(0.0, 1.0 - global_step / max(1, args.kickstart_anneal_steps))
@@ -466,6 +474,9 @@ def main():
     p.add_argument("--embed-dim", type=int, default=32)
     p.add_argument("--shaping-coef", type=float, default=0.0)
     p.add_argument("--aux", action="store_true", help="auxiliary opponent-action / world-model heads")
+    p.add_argument("--outcome-head", action="store_true",
+                   help="second value head on UNSHAPED terminal-outcome lambda-returns — the "
+                        "search evaluator (E2 branch-B fix; EXPLORATION_PLAN W7)")
     p.add_argument("--snapshot-every", type=int, default=20,
                    help="add the current policy to the league reservoir every N updates")
     p.add_argument("--pool-size", type=int, default=20, help="league reservoir size (0 = unbounded)")

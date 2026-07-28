@@ -159,6 +159,14 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             # still a real state whose value the critic must predict.
             value_loss = 0.5 * (new_value - data["returns"][mb]).pow(2).mean()
 
+            # Outcome head: regression toward UNSHAPED λ-returns ("who wins from here", ±1
+            # scale). Trained alongside, never part of the PPO baseline.
+            outcome_loss_v = 0.0
+            if "outcome_return" in data and getattr(model, "outcome_pred", None) is not None:
+                outcome_loss = 0.5 * (model.outcome_pred - data["outcome_return"][mb]).pow(2).mean()
+                value_loss = value_loss + outcome_loss  # rides the value coefficient
+                outcome_loss_v = outcome_loss.item()
+
             entropy_loss = (entropy * m).sum() / denom
             loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss
 
@@ -208,6 +216,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 aux_delta=aux_delta_v,    # world-model HP-Δ MSE (watch vs its irreducible floor)
                 aux_ko=aux_ko_v,          # world-model KO BCE
                 kick_loss=kick_v,         # kickstart distillation CE (0 when off/annealed out)
+                outcome_loss=outcome_loss_v,  # win-prob head MSE (0 when head absent)
             )
     return last
 

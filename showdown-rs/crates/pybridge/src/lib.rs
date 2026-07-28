@@ -1354,6 +1354,138 @@ impl FlowVec {
         ))
     }
 
+    /// Depth-2 support (EXPLORATION_PLAN W7): advance a CLONE by the root joint pair
+    /// (`a_self`, `a_opp`), then expand the SUCCESSOR. Three shapes, tagged by `kind`:
+    ///   0 = terminal   — `obs[0]` unused, `outcome[0]` is the ±1/0 result
+    ///   1 = leaf       — successor is not a Turn (single-sided pause/replace): `obs[0]`/`ids[0]`
+    ///                    hold the successor encoded from `side`'s view
+    ///   2 = expanded   — successor is a Turn: rows are ITS 13×13 joint grid, exactly like
+    ///                    [`lookahead_obs`] (invalid pairs zero, `valid` flags set)
+    /// The caller solves the child matrix game (kind 2) and backs its value up to the root —
+    /// depth-limited subgame solving with equilibrium backups at simultaneous nodes.
+    #[allow(clippy::type_complexity)]
+    fn lookahead_pair_obs<'py>(
+        &self,
+        py: Python<'py>,
+        env: usize,
+        side: u8,
+        seed: u64,
+        a_self: u8,
+        a_opp: u8,
+    ) -> PyResult<(
+        u8,
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<i64>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+    )> {
+        let f = self
+            .flows
+            .get(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("env out of range"))?;
+        if !matches!(f.request(), Request::Turn) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lookahead_pair_obs is only valid at a Turn request",
+            ));
+        }
+        let me = sid(side);
+        let mut root = f.clone();
+        let mut z = seed ^ 0xD1B5_4A32_D192_ED03u64;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        root.rng = z ^ (z >> 27);
+        let c_me = flow_choice(&root.state, me, a_self);
+        let c_opp = flow_choice(&root.state, me.other(), a_opp);
+        let (c0, c1) = if me == SideId::One { (c_me, c_opp) } else { (c_opp, c_me) };
+        let next = root.submit([Some(c0), Some(c1)]);
+
+        let obs_dim = engine::encode::OBS_DIM;
+        let id_dim = engine::encode::ID_DIM;
+        const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
+        let pack = |kind: u8,
+                    obs: Vec<f32>,
+                    ids: Vec<i64>,
+                    done: Vec<bool>,
+                    outcome: Vec<f32>,
+                    valid: Vec<bool>,
+                    rows: usize| {
+            Ok((
+                kind,
+                Array2::from_shape_vec((rows, obs_dim), obs).unwrap().into_pyarray_bound(py),
+                Array2::from_shape_vec((rows, id_dim), ids).unwrap().into_pyarray_bound(py),
+                Array1::from_vec(done).into_pyarray_bound(py),
+                Array1::from_vec(outcome).into_pyarray_bound(py),
+                Array1::from_vec(valid).into_pyarray_bound(py),
+            ))
+        };
+
+        match next {
+            Request::Terminal { winner } => {
+                let out = if winner < 0 {
+                    0.0
+                } else if winner == me.index() as i64 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                pack(0, vec![0.0; obs_dim], vec![0; id_dim], vec![true], vec![out], vec![true], 1)
+            }
+            Request::Turn => {
+                let my_mask = flow_legal_mask(&root.state, Request::Turn, me);
+                let opp_mask = flow_legal_mask(&root.state, Request::Turn, me.other());
+                let mut obs = vec![0f32; P * obs_dim];
+                let mut ids = vec![0i64; P * id_dim];
+                let mut done = vec![false; P];
+                let mut outcome = vec![0f32; P];
+                let mut valid = vec![false; P];
+                py.allow_threads(|| {
+                    obs.par_chunks_mut(obs_dim)
+                        .zip(ids.par_chunks_mut(id_dim))
+                        .zip(done.par_iter_mut())
+                        .zip(outcome.par_iter_mut())
+                        .zip(valid.par_iter_mut())
+                        .enumerate()
+                        .for_each(|(p, ((((o, idr), d), out), v))| {
+                            let (ai, aj) = (p / N_ACTIONS_FLOW, p % N_ACTIONS_FLOW);
+                            if !my_mask[ai] || !opp_mask[aj] {
+                                return;
+                            }
+                            let mut sim = root.clone();
+                            let mut z2 =
+                                seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(p as u64 + 7));
+                            z2 = (z2 ^ (z2 >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                            sim.rng = z2 ^ (z2 >> 27);
+                            let m = flow_choice(&sim.state, me, ai as u8);
+                            let o2 = flow_choice(&sim.state, me.other(), aj as u8);
+                            let (cc0, cc1) =
+                                if me == SideId::One { (m, o2) } else { (o2, m) };
+                            let nn = sim.submit([Some(cc0), Some(cc1)]);
+                            o.copy_from_slice(&engine::encode::encode(&sim.state, me));
+                            idr.copy_from_slice(&engine::encode::encode_ids(&sim.state, me));
+                            if let Request::Terminal { winner } = nn {
+                                *d = true;
+                                *out = if winner < 0 {
+                                    0.0
+                                } else if winner == me.index() as i64 {
+                                    1.0
+                                } else {
+                                    -1.0
+                                };
+                            }
+                            *v = true;
+                        });
+                });
+                pack(2, obs, ids, done, outcome, valid, P)
+            }
+            _ => {
+                // Single-sided pause (pivot landing / replace / revive): evaluate as a leaf.
+                let o = engine::encode::encode(&root.state, me).to_vec();
+                let i = engine::encode::encode_ids(&root.state, me).to_vec();
+                pack(1, o, i, vec![false], vec![0.0], vec![true], 1)
+            }
+        }
+    }
+
     /// (N,) scripted-heuristic action for every env, from `sides[i]`'s perspective (0/1).
     /// -1 where the heuristic has no opinion (non-acting request, or a state the Python
     /// implementation would raise on) — see [`heuristic_action_of`]. The Python-side wrapper

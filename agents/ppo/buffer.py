@@ -10,12 +10,13 @@ import torch
 
 class RolloutBuffer:
     def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device, id_dim: int = 0,
-                 aux: bool = False):
+                 aux: bool = False, outcome: bool = False):
         self.steps = steps
         self.num_envs = num_envs
         self.device = device
         self.id_dim = id_dim
         self.aux = aux
+        self.outcome = outcome
 
         shape = (steps, num_envs)
         self.obs = torch.zeros(shape + (obs_dim,), device=device)
@@ -40,14 +41,25 @@ class RolloutBuffer:
         # lazily on the first add() that supplies one.
         self.teacher_actions = None
 
+        # Outcome-head channel (E2 branch-B fix): the UNSHAPED terminal reward, the head's own
+        # rollout predictions (for bootstrapping), and its λ-returns — a second GAE pass whose
+        # targets mean "who wins from here" on the ±1 scale.
+        self.outcome_rewards = torch.zeros(shape, device=device) if outcome else None
+        self.outcome_values = torch.zeros(shape, device=device) if outcome else None
+        self.outcome_returns = torch.zeros(shape, device=device) if outcome else None
+
         # Filled by compute_gae().
         self.advantages = torch.zeros(shape, device=device)
         self.returns = torch.zeros(shape, device=device)
 
     def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None,
-            opp_action=None, dyn_target=None, active=None, teacher_action=None):
+            opp_action=None, dyn_target=None, active=None, teacher_action=None,
+            outcome_reward=None, outcome_value=None):
         self.obs[t] = obs
         self.active[t] = 1.0 if active is None else active
+        if self.outcome and outcome_reward is not None:
+            self.outcome_rewards[t] = outcome_reward
+            self.outcome_values[t] = outcome_value
         if teacher_action is not None:
             if self.teacher_actions is None:
                 self.teacher_actions = torch.full((self.steps, self.num_envs), -1,
@@ -81,6 +93,19 @@ class RolloutBuffer:
             self.advantages[t] = last_gae
         self.returns = self.advantages + self.values
 
+    @torch.no_grad()
+    def compute_gae_outcome(self, last_outcome_value, gamma: float, gae_lambda: float):
+        """λ-returns for the outcome head over the UNSHAPED terminal reward — same recursion as
+        `compute_gae`, bootstrapped by the outcome head's own predictions."""
+        last_gae = torch.zeros(self.num_envs, device=self.device)
+        for t in reversed(range(self.steps)):
+            next_nonterminal = 1.0 - self.dones[t]
+            next_value = last_outcome_value if t == self.steps - 1 else self.outcome_values[t + 1]
+            delta = (self.outcome_rewards[t] + gamma * next_value * next_nonterminal
+                     - self.outcome_values[t])
+            last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
+            self.outcome_returns[t] = last_gae + self.outcome_values[t]
+
     def flat_view(self):
         """Flatten [steps, num_envs, ...] -> [steps*num_envs, ...] for minibatching."""
         d = dict(
@@ -100,4 +125,6 @@ class RolloutBuffer:
             d["dyn_target"] = self.dyn_targets.reshape(-1, 4)
         if self.teacher_actions is not None:
             d["teacher_action"] = self.teacher_actions.reshape(-1)
+        if self.outcome:
+            d["outcome_return"] = self.outcome_returns.reshape(-1)
         return d

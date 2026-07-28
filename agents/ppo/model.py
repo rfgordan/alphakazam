@@ -22,13 +22,17 @@ MASK_FILL = -1e8
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, n_actions, hidden_dim=928, n_hidden_layers=2,
-                 embed: dict | None = None, aux: bool = False):
+                 embed: dict | None = None, aux: bool = False, outcome: bool = False):
         """`embed`, if given: {n_mons, cols: [table-name per ID column], vocab: {table: size}, dim}.
         `aux=True` adds prediction heads (opponent move + turn dynamics) that share the trunk but
-        NOT the policy head — they enrich the representation without biasing the policy."""
+        NOT the policy head — they enrich the representation without biasing the policy.
+        `outcome=True` adds a second value head trained on the UNSHAPED terminal outcome —
+        "who wins from here" on the ±1 scale, commensurate with terminal leaves. The GAE critic
+        stays the PPO baseline; this head exists to be a search evaluator (E2 branch-B fix)."""
         super().__init__()
         self.embed_cfg = embed
         self.has_aux = aux
+        self.has_outcome = outcome
         self.n_actions = n_actions
         embed_total = 0
         if embed is not None:
@@ -63,9 +67,14 @@ class ActorCritic(nn.Module):
             self.aux_opp_head = nn.Linear(hidden_dim, n_actions)
             self.aux_dyn_head = nn.Linear(hidden_dim + 2 * n_actions, 4)
 
+        if outcome:
+            self.outcome_head = nn.Linear(hidden_dim, 1)
+
         self.apply(_orthogonal_init)
         _orthogonal_init(self.policy_head, gain=0.01)
         _orthogonal_init(self.value_head, gain=1.0)
+        if outcome:
+            _orthogonal_init(self.outcome_head, gain=1.0)
 
     def _embed(self, obs_ids: torch.Tensor) -> torch.Tensor:
         """obs_ids [B, n_mons*n_cols] (long) -> flat embedding features [B, n_mons*n_cols*dim]."""
@@ -84,12 +93,17 @@ class ActorCritic(nn.Module):
         return self.trunk(self._features(obs, obs_ids))
 
     def forward(self, obs, action_mask=None, obs_ids=None):
-        """Return (logits, value). `action_mask` [..., n_actions] bool (True = legal)."""
+        """Return (logits, value). `action_mask` [..., n_actions] bool (True = legal).
+
+        When the outcome head exists, its prediction is left on `self.outcome_pred` (same
+        stash pattern as `teacher_log_prob`) — callers that want it read it after the call.
+        """
         h = self._trunk_features(obs, obs_ids)
         logits = self.policy_head(h)
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, MASK_FILL)
         value = self.value_head(h).squeeze(-1)
+        self.outcome_pred = self.outcome_head(h).squeeze(-1) if self.has_outcome else None
         return logits, value
 
     def act(self, obs, action_mask=None, action=None, obs_ids=None, return_aux=False,
@@ -111,6 +125,7 @@ class ActorCritic(nn.Module):
         self.teacher_log_prob = None
         if teacher_action is not None:
             self.teacher_log_prob = dist.log_prob(teacher_action.clamp(min=0))
+        self.outcome_pred = self.outcome_head(h).squeeze(-1) if self.has_outcome else None
         out = (action, dist.log_prob(action), dist.entropy(), value)
         if return_aux:
             # Return the trunk features so the dynamics head can be conditioned on the actions
