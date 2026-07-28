@@ -6615,7 +6615,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // Dragon Tail / Circle Throw: the survivor is dragged out (uniform over the bench).
             // Only a connecting hit drags — a MISS (which sits in `out` from the accuracy split
             // above) must leave the target in place, so the drag lives on the hit branches here.
-            if md.force_switch {
+            //
+            // **A SUBSTITUTE-absorbed hit never phazes.** `spreadMoveHit`'s step 0 sets
+            // `targets[i] = null` on `HIT_SUBSTITUTE` (`battle-actions.ts:1083-1085`), and step 6's
+            // `forceSwitch` (`:1125`, `:1377`) iterates `targets` and skips the null — the same
+            // nulling that already suppresses `onHit`, the self-drops and the secondaries here.
+            // The engine dragged anyway and, worse, EMITTED the `sample[5]@drag` for it: rb1760 d7
+            // t8, a Dragon Tail into a Substitute the target made the same turn, was the corpus's
+            // only `rust extra` on the seed rail.
+            if md.force_switch && !hit_sub {
                 out.extend(apply_drag(sb, foe));
             } else {
                 out.push(sb);
