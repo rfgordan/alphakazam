@@ -101,6 +101,7 @@ fn damage_16_bit_truncation_is_a_no_op_at_legal_damage() {
         attacker_burned: false,
         weather: Weather::None,
         terastallized: false,
+        defender_terastallized: false,
         tera_type: Type::None,
         life_orb: false,
         adaptability: false,

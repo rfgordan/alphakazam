@@ -328,6 +328,12 @@ fn export_pokemon(
     if p.transformed {
         m.insert("transformed".into(), json!(true));
     }
+    // `pokemon.illusion` is a `[Pokemon:pNx]` reference whose letter is the target's ARRAY index,
+    // so it has to be resolved through the same emitted order the array uses.
+    if let Some(shown) = p.illusion {
+        let arr = emit_order_side(side).iter().position(|&s| s == shown as usize).unwrap_or(0);
+        m.insert("illusion".into(), json!(pokemon_ref(si, arr)));
+    }
 
     // Status + statusState (sleep `time`, toxic `stage`, and the sleep-clause source/target
     // side encoding `convert` reads: foe-sourced sleep <=> source & target on different sides).
@@ -575,23 +581,32 @@ fn export_set(p: &Pokemon) -> Value {
     })
 }
 
-/// Roster slots in PS live-array order: ACTIVE mon first (field position 0), then the remaining
-/// non-empty roster slots ascending. PS indexes `slotConditions[position]` and requires the
-/// active mon at position 0, so the emitted array must be active-first (not roster order).
+/// Roster slots in PS live-array order — `Side::roster` with the empty slots dropped.
+///
+/// PS indexes `slotConditions[position]` and requires the active mon at position 0, and
+/// `Side::roster` already carries that invariant (`switchIn` swaps the outgoing and incoming
+/// entries, so index 0 is the active from the first switch onward). Emitting `roster` verbatim
+/// rather than "active-first then ascending" is what makes `convert(export(S)) == S` hold once
+/// `roster` is part of the compared manifest — and it is the order Illusion and Beat Up read.
+///
+/// At the terminal sentinel there is no active; the roster order is still the right answer.
 fn emit_order(state: &State, si: usize) -> Vec<usize> {
-    let side = &state.sides[si];
+    emit_order_side(&state.sides[si])
+}
+
+fn emit_order_side(side: &Side) -> Vec<usize> {
+    let mut order: Vec<usize> = side
+        .roster
+        .iter()
+        .map(|&s| s as usize)
+        .filter(|&s| side.pokemon[s].species != engine::ids::Species::None)
+        .collect();
+    // Defensive: a state built without roster bookkeeping (hand-made fixtures, `State::EMPTY`
+    // edits) can leave the active off index 0. PS's deserializer would reject that.
     let active_index = side.active_index as usize;
-    let has_active = side.active_index != u8::MAX;
-    let mut order = Vec::new();
-    if has_active && side.pokemon[active_index].species != engine::ids::Species::None {
-        order.push(active_index);
-    }
-    for slot in 0..6usize {
-        if has_active && slot == active_index {
-            continue;
-        }
-        if side.pokemon[slot].species != engine::ids::Species::None {
-            order.push(slot);
+    if side.active_index != u8::MAX && side.pokemon[active_index].species != engine::ids::Species::None {
+        if let Some(pos) = order.iter().position(|&s| s == active_index) {
+            order.swap(0, pos);
         }
     }
     order

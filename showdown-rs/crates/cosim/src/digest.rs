@@ -38,6 +38,22 @@
 //! Consequence: `state_digest(a) == state_digest(b)` ⟺ `diff_states(a, b).is_empty()`, up to a
 //! 2⁻¹²⁸ collision. Certified empirically: the slim gate reproduces the full gate's exact-game
 //! SET on the whole 111-trace corpus (`FIXTURE_SELFTEST=1`).
+//!
+//! ## Two deliberate exclusions (the ⟸ direction only)
+//!
+//! `Side::roster` (PS's live `side.pokemon` ORDER) and `Pokemon::illusion` (the Illusion disguise
+//! pointer) are compared by `diff_states` and are NOT digested. The equivalence therefore holds
+//! only one way for them: a digest mismatch still implies a `diff_states` difference, but two
+//! states can be digest-equal while differing in roster order or in a disguise.
+//!
+//! This is a deliberate CORPUS decision, not an oversight. Every committed slim fixture stores a
+//! digest computed at fixture-build time; adding a field to this walk invalidates all 902 of them
+//! and forces a regeneration commit. Neither field can change any other field's value — the
+//! disguise is protocol-only apart from the `maybeTrapped` inference (which the request comparison
+//! covers directly), and the roster order only feeds Beat Up and Illusion. Both fields ARE gated,
+//! on the full-state rails: the state sweep over `harness/cosim-traces/` and
+//! `harness/seed-sidecars-rb/` runs `diff_states` over complete PS snapshots, and the four Zoroark
+//! witnesses (rb5005, rb5016, rb5017, rb5047) live in the latter.
 
 use engine::ids::Status;
 use engine::state::{PendingMove, Side, State};

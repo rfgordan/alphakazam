@@ -151,7 +151,12 @@ fn is_switch_out_reset(instructions: &[Instruction], i: usize) -> bool {
 pub fn switch_line(state: &State, side: SideId, hp_style: HpStyle) -> String {
     let slot = state.side(side).active_index;
     let p = &state.sides[side.index()].pokemon[slot as usize];
-    format!("|switch|{}|{}|{}", ident(state, side, slot), details(p), hp_frac(p.hp, p.max_hp, hp_style))
+    format!(
+        "|switch|{}|{}|{}",
+        ident(state, side, slot),
+        details_masked(state, side, slot),
+        hp_frac(p.hp, p.max_hp, hp_style)
+    )
 }
 
 /// Emit a `|move|USER|Move|TARGET`. PS points the animation at the FOE only for foe-directed
@@ -181,12 +186,30 @@ fn emit_instruction(
         Switch { side, next, .. } => {
             let p = &s.sides[side.index()].pokemon[next as usize];
             // |drag| for a forced switch is indistinguishable here; emit |switch|.
+            // `SetIllusion` is pushed AHEAD of `Switch` (PS runs `onBeforeSwitchIn` before
+            // `add('switch')`), so the disguise is already installed in `s` here.
             out.push(format!(
                 "|switch|{}|{}|{}",
                 ident(s, side, next),
-                details(p),
+                details_masked(s, side, next),
                 hp_frac(p.hp, p.max_hp, hp_style)
             ));
+        }
+        // The Illusion break, PS `data/abilities.ts:2030-2040`: `|replace|` carrying the mon's REAL
+        // details, then `|-end|`, then — only under Illusion Level Mod — the level hint. `hint()`
+        // is called WITH its `once` argument here (unlike Sleep Clause Mod's), so it is emitted at
+        // most once per battle; that de-duplication is the caller's, not this function's.
+        BreakIllusion { side, slot, .. } => {
+            // PS nulls `pokemon.illusion` BEFORE both adds, so both idents are the REAL mon's.
+            let p = &s.sides[side.index()].pokemon[slot as usize];
+            out.push(format!("|replace|{}|{}", ident_real(s, side, slot), details(p)));
+            out.push(format!("|-end|{}|Illusion", ident_real(s, side, slot)));
+            if s.ruleset.illusion_level_mod {
+                out.push(
+                    "|-hint|Illusion Level Mod is active, so this Pok\u{e9}mon's true level was hidden."
+                        .to_string(),
+                );
+            }
         }
         Damage { side, slot, amount } if amount != 0 => {
             // Effectiveness line (recomputed from the type chart) precedes the damage, PS-style,
@@ -300,7 +323,18 @@ fn emit_instruction(
 
 /// PS position ident for a specific party slot's mon: `pNx: Name`. Singles → the active slot is
 /// position `a`; a non-active slot uses its would-be letter (only ever appears mid-switch).
+/// **Illusion-masked.** PS's `Pokemon#toString` (`sim/pokemon.ts:532-535`) is
+/// `this.getSlot() + ((this.illusion) ? this.illusion.fullname : this.fullname).slice(2)` — the
+/// SLOT is the real mon's, the NAME is the disguise's. Every `|-damage|`, `|-boost|`, `|move|`,
+/// `|faint|`, … line goes through it, so masking here masks the whole stream.
 fn ident(s: &State, side: SideId, slot: u8) -> String {
+    let shown = s.sides[side.index()].apparent_slot(slot);
+    let p = &s.sides[side.index()].pokemon[shown as usize];
+    format!("{}: {}", pos_ref(s, side, slot), prettify(p.species.to_id()))
+}
+
+/// `ident` WITHOUT the Illusion mask — for the two lines PS emits after nulling the disguise.
+fn ident_real(s: &State, side: SideId, slot: u8) -> String {
     let p = &s.sides[side.index()].pokemon[slot as usize];
     format!("{}: {}", pos_ref(s, side, slot), prettify(p.species.to_id()))
 }
@@ -318,10 +352,37 @@ fn pos_ref(s: &State, side: SideId, slot: u8) -> String {
 
 /// PS `|switch|` details field: `Species` (+ `, L{n}` if not 100). Gender omitted (cosmetic).
 fn details(p: &crate::state::Pokemon) -> String {
-    if p.level != 100 {
-        format!("{}, L{}", prettify(p.species.to_id()), p.level)
+    details_at(p.species, p.level)
+}
+
+fn details_at(species: crate::ids::Species, level: u8) -> String {
+    if level != 100 {
+        format!("{}, L{}", prettify(species.to_id()), level)
     } else {
-        prettify(p.species.to_id())
+        prettify(species.to_id())
+    }
+}
+
+/// **Illusion-masked** details, PS `getFullDetails` (`sim/pokemon.ts:545-556`):
+///
+/// ```ts
+/// if (this.illusion) details = this.illusion.getUpdatedDetails(
+///     this.battle.ruleTable.has('illusionlevelmod') ? this.illusion.level : this.level);
+/// ```
+///
+/// The SPECIES is always the disguise's. The LEVEL is the disguise's only under **Illusion Level
+/// Mod** — without the rule a disguised mon shows its OWN level under the foe's name, which is the
+/// classic Zoroark tell. `[Gen 9] Random Battle` has the rule; `[Gen 9] Custom Game` does not.
+fn details_masked(s: &State, side: SideId, slot: u8) -> String {
+    let sd = &s.sides[side.index()];
+    let real = &sd.pokemon[slot as usize];
+    match real.illusion {
+        None => details(real),
+        Some(shown) => {
+            let d = &sd.pokemon[shown as usize];
+            let level = if s.ruleset.illusion_level_mod { d.level } else { real.level };
+            details_at(d.species, level)
+        }
     }
 }
 

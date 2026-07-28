@@ -231,7 +231,7 @@ impl Flow {
 
         // Decomposed path (a pivot move is in play), mirroring generate_instructions_ctx:
         // custap -> switches -> tera -> ordered moves (pausing on PivotPending) -> EOT.
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
         let mut exec = Exec::Sample(self.rng);
         let custap = crate::generate::custap_stage(std::slice::from_mut(&mut b), &self.state, m1, m2);
 
@@ -356,23 +356,29 @@ impl Flow {
             if ok { Some(slot) } else { alive_bench(&self.state, side) }
         });
         let Some(slot) = slot else {
-            // A pivot pause whose bench emptied before the landing resolved. The path that
-            // produces this is still undiagnosed (rare — roughly 1 in 10^5 games; it killed the
-            // scale2 trainer on 2026-07-27), but PS's behavior with nowhere to go is "stay in",
-            // and skipping the switch is exactly that. Log loudly so the parity campaign can
-            // hunt it; do NOT kill a 4096-env training process over it.
+            // A pivot pause whose bench emptied before the landing resolved. The root is FIXED:
+            // `wants_pause` below grants `Pivot::Pause` off the CHOSEN move, and `run_move_action`
+            // then substitutes the move (Struggle via `no_usable_move`, or the Encore
+            // `OverrideAction` redirect) — a PP-stalled mon with an all-fainted bench picked
+            // Revival Blessing, Struggled, and Struggle's damaging path inherited the pause (then
+            // its own recoil killed the user). `generate.rs` re-derives the pause from the EXECUTED
+            // move and gates every `PivotPending` on `has_alive_bench`; `tests/pivot_landing_bench.rs`
+            // is the property, `tests/pivot_pause_survives_move_substitution.rs` the unit repro.
+            // This arm STAYS as a tripwire: PS's behavior with nowhere to go is "stay in"
+            // (`sim/battle.ts:2904` clears `switchFlag` when `!canSwitch`), which is what skipping
+            // the switch does, and a 4096-env trainer must not die on a future regression.
             eprintln!(
                 "[engine] PivotLanding with no live bench (side {:?}, turn {}) — staying in",
                 side, self.state.turn
             );
-            let b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+            let b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
             match second {
                 Some(a) => self.continue_after_first(b, a, switched),
                 None => self.finish_turn(b, switched),
             }
             return;
         };
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
         // Shed Tail passes its Substitute to the lander; every other pivot clears it.
         if pass_sub {
             crate::generate::apply_switch_pass_sub(&mut b, side, slot);
@@ -403,7 +409,7 @@ impl Flow {
             Some(slot) if valid(slot) => Some(slot),
             _ => fainted_bench(&self.state, side),
         };
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
         match slot {
             Some(slot) => crate::generate::apply_revive(&mut b, side, slot),
             // Same defensive stance as the pivot fallback above: a Revive request with no

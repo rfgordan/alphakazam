@@ -331,7 +331,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -406,6 +406,18 @@ pub(crate) struct Branch {
     /// a thread-local cannot carry it); read by `run_move_action`'s trailing 2882 emit; reset at
     /// the top of every `run_move_action`. See `apply_drag` for the PS derivation.
     pub(crate) drag_tie_speeds: Option<[i32; 2]>,
+    /// Transient (NOT part of State): was the ATTACKER still standing at the moment PS runs a
+    /// move's `onAfterHit`?
+    ///
+    /// `onAfterHit` lives INSIDE `spreadMoveHit` (`sim/battle-actions.ts:1144`), guarded by
+    /// `pokemon.hp`, immediately after `runEvent('DamagingHit')`. Everything that can kill the
+    /// attacker afterwards — `move.recoil`, and Life Orb's `onAfterMoveSecondarySelf` at
+    /// `useMoveInner:533` — happens LATER. The engine applies both inside `apply_post_damage`,
+    /// which runs at the end of the hit loop and therefore BEFORE the `onAfterHit` payloads
+    /// (Ceaseless Edge's Spikes, Stone Axe's Stealth Rock, Glaive Rush's volatile). Testing
+    /// `is_alive()` at those sites asks the question one self-KO too late, so `apply_post_damage`
+    /// snapshots the answer here first. `true` when no damaging move has resolved.
+    pub(crate) after_hit_user_alive: bool,
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -1435,13 +1447,17 @@ fn transform_data_of(state: &State, side: SideId) -> crate::instruction::Transfo
 /// Transform / Imposter: copy the foe's battle identity onto `side`'s active. Mirrors PS
 /// `transformInto`: species/types/stats(except HP)/ability/boosts copied; each copied move
 /// gets PP = min(5, base PP); crit volatiles (Focus Energy) copied. Fails against a
-/// substitute, a transformed target, or when the user is already transformed.
+/// substitute, a transformed target, or when the user is already transformed — and, per
+/// `sim/pokemon.ts:1274`, whenever EITHER mon is currently running an Illusion.
 fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     let foe = side.other();
-    let user_ok = b.state.side(side).active().is_alive() && !b.state.side(side).active().transformed;
+    let user_ok = b.state.side(side).active().is_alive()
+        && !b.state.side(side).active().transformed
+        && b.state.side(side).active().illusion.is_none();
     let target = b.state.side(foe).active();
     let target_ok = target.is_alive()
         && !target.transformed
+        && target.illusion.is_none()
         && !b.state.side(foe).volatiles.contains(VolatileStatus::Substitute);
     if !user_ok || !target_ok {
         return false;
@@ -1491,6 +1507,14 @@ fn apply_transform(b: &mut Branch, side: SideId) -> bool {
     } else if !foe_fe && my_fe {
         push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::FocusEnergy });
     }
+    // **The copied ability FIRES.** `transformInto` ends with `this.setAbility(pokemon.ability,
+    // this, true)` (`sim/pokemon.ts`), and `setAbility` runs `singleEvent('Start', ability, ...)`
+    // on the new ability for every gen > 3 — so an Imposter Ditto copying an Intimidate mon
+    // Intimidates. rb1502 d20: a Ditto Impostered into a +2/+1 Incineroar and PS dropped the real
+    // Incineroar's Attack to +1. The recursion terminates on its own: the copied ability can only
+    // be `Imposter` if the target was an untransformed Ditto, and the re-entry then fails
+    // `user_ok` because this mon is now `transformed`.
+    apply_switch_in_ability(b, side);
     true
 }
 
@@ -1811,9 +1835,13 @@ pub fn maybe_trapped(state: &State, side: SideId) -> bool {
     if !foe.is_alive() {
         return false;
     }
+    // **The sweep reads the foe's APPARENT species** — `const species = (source.illusion ||
+    // source).species` (`sim/battle.ts:1732`). A disguised Zoroark therefore offers the DISGUISE's
+    // ability list to the inference, which is the one place Illusion changes a gate-visible field.
+    let foe_apparent = state.side(side.other()).apparent_active();
     // PS skips the ability the foe ACTUALLY has ("pokemon event was already run above"), which is
     // exactly the `is_trapped` case handled at the top.
-    species_possible_trap_abilities(foe.species)
+    species_possible_trap_abilities(foe_apparent.species)
         .iter()
         .filter(|&&ab| ab != foe.ability)
         .any(|&ab| match ab {
@@ -1881,6 +1909,11 @@ fn accuracy_of(b: &Branch, side: SideId, md: &crate::data::MoveData) -> f32 {
         return 1.0;
     }
     let id = md.id.to_id();
+    // gen >= 8: Toxic used by a Poison-type NEVER misses (`accuracy = true`,
+    // battle-actions.ts:726) — a No Guard-shaped override, not a numeric 100.
+    if id == "toxic" && atk.types.contains(&Type::Poison) {
+        return 1.0;
+    }
     // Weather-perfect (forced-`true`) accuracy — always hits. (Sun-halved Thunder/Hurricane is a
     // NUMERIC 50 and flows through `accuracy_numerator` below.)
     match (id, effective_weather(&b.state)) {
@@ -1900,6 +1933,15 @@ fn chain_mod(prev: i64, next: i64) -> i64 {
 /// Whether a move ignores the target's evasion boost (`ignoreEvasion: true`, data/moves.ts) —
 /// its accuracy stage combines only the attacker's accuracy boost, not the target's evasion.
 fn move_ignores_evasion(id: crate::ids::MoveId) -> bool {
+    matches!(id.to_id(), "chipaway" | "darkestlariat" | "nihillight" | "sacredsword")
+}
+
+/// Whether a move ignores the target's DEFENSIVE stage (`ignoreDefensive: true`, data/moves.ts).
+/// The same four moves carry both flags, but they are two different PS fields and only the
+/// evasion one was wired: `getDamage` sets `defBoosts = 0` outright (`battle-actions.ts:1701`),
+/// for a negative stage as well as a positive one. rb1781 d5: Sacred Sword into a +1 Def
+/// Krookodile — PS deals 87, the engine divided through the 1.5x and dealt 59.
+fn move_ignores_defensive(id: crate::ids::MoveId) -> bool {
     matches!(id.to_id(), "chipaway" | "darkestlariat" | "nihillight" | "sacredsword")
 }
 
@@ -1979,6 +2021,8 @@ fn counter_family_ontry_fails(b: &Branch, side: SideId, md: &crate::data::MoveDa
 /// damage roll still happens, so the engine must not emit an accuracy draw here. Cases:
 ///   * No Guard on either side (`onAnyAccuracy` returns true),
 ///   * a Glaive Rush target (its volatile's `onAccuracy` returns true),
+///   * **gen >= 8 Toxic used by a Poison-type** (`battle-actions.ts:726`, hard-coded into
+///     `hitStepAccuracy` alongside `move.alwaysHit`),
 ///   * weather-perfect accuracy: Blizzard in snow, and Thunder/Hurricane/Bleakwind Storm/
 ///     Wildbolt Storm/Sandsear Storm in rain (`onModifyMove` sets `move.accuracy = true`).
 /// The sun case for Thunder/Hurricane sets a NUMERIC 50 (still rolls) and is deliberately absent.
@@ -1992,6 +2036,9 @@ fn accuracy_forced_true(b: &Branch, side: SideId, md: &crate::data::MoveData) ->
         return true;
     }
     if b.state.side(side.other()).volatiles.contains(VolatileStatus::GlaiveRush) {
+        return true;
+    }
+    if md.id.to_id() == "toxic" && atk.types.contains(&Type::Poison) {
         return true;
     }
     matches!(
@@ -2112,7 +2159,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -2189,7 +2236,13 @@ fn embody_aspect_stat(ability: crate::ids::Ability) -> Option<BoostIndex> {
 
 /// One of the four `Ogerpon-*-Tera` formes.
 fn species_is_ogerpon_tera(species: crate::ids::Species) -> bool {
-    ["ogerpontealtera", "ogerponwellspringtera", "ogerponhearthflametera", "ogerponcornerstonetera"]
+    [
+        "ogerpontealtera", "ogerponwellspringtera", "ogerponhearthflametera", "ogerponcornerstonetera",
+        // Terapagos-Stellar carries `formeRegression` for the same reason (`formeChange` with no
+        // `source`, `sim/pokemon.ts:1449-1452`) and regresses all the way to the SET species —
+        // Terapagos, not Terapagos-Terastal — because PS restores from `set.species`.
+        "terapagosstellar",
+    ]
         .iter()
         .any(|n| crate::ids::Species::from_id(n) == Some(species))
 }
@@ -2221,8 +2274,31 @@ fn regress_fainted_tera_formes(b: &mut Branch) {
             let mut new = previous;
             new.species = p.base_species;
             new.ability = p.base_ability;
+            // PS restores from the SET (`battle.ts:2573`: `dex.species.get(pokemon.set.species ||
+            // pokemon.set.name)`), not from `baseSpecies`. For Ogerpon the two agree. For Terapagos
+            // they do NOT: Tera Shift's own permanent forme change already moved `baseSpecies` to
+            // Terapagos-Terastal, so a fainted Terapagos-Stellar goes back to plain **Terapagos**
+            // with **Tera Shift**, two steps down. rb1040 d10: the engine stopped at
+            // Terapagos-Terastal (791) where PS has Terapagos (789).
+            if Some(previous.species) == crate::ids::Species::from_id("terapagosstellar") {
+                if let Some(base) = crate::ids::Species::from_id("terapagos") {
+                    new.species = base;
+                    new.ability = crate::ids::Ability::TeraShift;
+                }
+            }
             if new.species == previous.species && new.ability == previous.ability {
                 continue;
+            }
+            // Ogerpon's four Tera formes share a base-stat line; **Terapagos-Stellar does not** —
+            // base HP 160 back down to Terapagos's 90 — and `formeChange` ends in `updateMaxHp`.
+            // Randbats spread (31 IV / 85 EV / neutral), the same assumption the Tera Shift entry
+            // forme change makes.
+            let (ob, nb) = (crate::data::base_stats(previous.species), crate::data::base_stats(new.species));
+            if ob != nb {
+                new.stats = respread_stats(ob, nb, p.stats, p.level);
+                if ob[0] != nb[0] {
+                    new.stats[0] = crate::damage::compute_hp(nb[0], 31, 85, p.level);
+                }
             }
             let previous_base_moves = p.base_moves;
             push(b, Instruction::Transform { side, slot, previous, new, previous_base_moves });
@@ -2342,7 +2418,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -2556,7 +2632,7 @@ pub fn replacement_field_change_draws(state: &State, replacements: &[(SideId, u8
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -2689,6 +2765,12 @@ pub(crate) fn apply_revive(b: &mut Branch, side: SideId, slot: u8) {
     if counter != 0 {
         push(b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: 0 });
     }
+    // Illusion's `onFaint` nulled the disguise when this mon went down (`sim/battle.ts:2578`).
+    // The engine leaves it on the corpse — nothing compares a fainted mon — so the ONE path that
+    // brings a corpse back into comparison has to clear it here.
+    if let Some(previous) = b.state.side(side).pokemon[slot as usize].illusion {
+        push(b, Instruction::SetIllusion { side, slot, previous: Some(previous), new: None });
+    }
 }
 
 pub(crate) fn apply_switch(b: &mut Branch, side: SideId, target: u8) {
@@ -2713,6 +2795,13 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     if previous == target {
         return;
     }
+    // **The switch-out abilities read the LIVE ability, before any of this function's reverts.**
+    // PS fires them from `runEvent('BeforeSwitchOut')` (`sim/battle.ts:2919`), which happens before
+    // `switchIn` calls `clearVolatile()` — so a Ditto that Impostered into a Regenerator mon still
+    // has Regenerator when it leaves. The engine read the ability ~120 lines down, AFTER
+    // `revert_transform` had already put Imposter back. rb1502 d17: a Ditto-as-Klawf switches out
+    // at 19 HP; PS heals it to 94 (baseMaxhp 225 / 3), the engine healed nothing.
+    let switch_out_ability = s.active().ability;
     // The outgoing mon is the current opposing active from the foe's perspective, so its exit ends
     // any foe-sourced trap (partial trap / Mean Look / Octolock / Jaw Lock) it was holding the foe
     // in — PS clears the linked `trapped`/`partiallytrapped` when the trapper's `clearVolatile`
@@ -2836,7 +2925,7 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     // Regenerator restores 1/3 of its max HP. Both act on the mon before it leaves.
     let (out_ability, out_status, out_hp, out_max) = {
         let o = b.state.side(side).active();
-        (o.ability, o.status, o.hp, o.max_hp)
+        (switch_out_ability, o.status, o.hp, o.max_hp)
     };
     if out_ability == crate::ids::Ability::NaturalCure && out_status != Status::None {
         push(b, Instruction::ChangeStatus { side, slot: previous, previous: out_status, new: Status::None });
@@ -2850,6 +2939,11 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     }
     // Consecutive-use tracking belongs to the active slot — reset it as the mon leaves.
     reset_move_tracking(b, side);
+    // Illusion's `onBeforeSwitchIn` fires AFTER `switchIn` has swapped the array entries but
+    // BEFORE the `|switch|` line is added (`sim/battle-actions.ts:128-145`), so the disguise has to
+    // be installed ahead of the Switch instruction the protocol layer renders. The choice reads the
+    // POST-swap array, computed here because `Switch` is what performs the swap.
+    apply_illusion_choice(b, side, previous, target);
     push(b, Instruction::Switch { side, previous, next: target });
 
     apply_entry_hazards(b, side);
@@ -2885,6 +2979,51 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
     if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
         run_update_event(b);
+    }
+}
+
+/// The crit + damage rolls PS makes and then throws away, for the `onDamage`-returns-0 abilities
+/// (Ice Face, Disguise): `getDamage` still rolls `randomChance(1, critMult)` and `random(16)`
+/// before `onDamage` zeroes the result, so the stream has to advance by exactly those two draws
+/// plus the ModifyDamage screen-tie shuffle.
+///
+/// The RESULTS are recorded from the realized source when there is one. They change nothing about
+/// the branch, but the seed gate's branch selector filters on recorded-result equality with the
+/// live PRNG, so a hardcoded value desyncs the unit.
+fn emit_discarded_damage_rolls(hb: &mut Branch, crit_den: i32) {
+    let mut cur = realized_cursor(hb);
+    if crit_den > 0 {
+        let v = cur.as_mut().map_or(0, |c| c.peek("randomChance", &[1, crit_den]));
+        draw(hb, "randomChance", &[1, crit_den], v, "crit");
+    }
+    let v = cur.as_mut().map_or(0, |c| c.peek("random", &[16]));
+    draw(hb, "random", &[16], v, "damage-roll");
+    emit_modifydamage_shuffle(hb);
+}
+
+/// Illusion `onBeforeSwitchIn` (`data/abilities.ts:2011-2023`): the entering mon's disguise is
+/// nulled and then re-chosen as the LAST able entry of PS's live `side.pokemon` array behind it.
+///
+/// Runs for the entering mon only, and only if it actually HAS the ability — the handler is the
+/// ability's, so a mon that lost Illusion (or never had it) neither picks nor clears. Consumes no
+/// PRNG: the scan is a plain loop and `singleEvent` never speed-sorts.
+fn apply_illusion_choice(b: &mut Branch, side: SideId, previous: u8, target: u8) {
+    if b.state.side(side).pokemon[target as usize].ability != crate::ids::Ability::Illusion {
+        return;
+    }
+    // The array as it will look once `Switch` performs the swap.
+    let mut roster_after = b.state.side(side).roster;
+    if let (Some(i), Some(j)) = (
+        roster_after.iter().position(|&x| x == previous),
+        roster_after.iter().position(|&x| x == target),
+    ) {
+        roster_after.swap(i, j);
+    }
+    let s = b.state.side(side);
+    let new = s.illusion_target(roster_after, target);
+    let prev = s.pokemon[target as usize].illusion;
+    if prev != new {
+        push(b, Instruction::SetIllusion { side, slot: target, previous: prev, new });
     }
 }
 
@@ -2958,7 +3097,7 @@ fn retry_trace(b: &mut Branch, side: SideId) {
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -3372,6 +3511,15 @@ pub enum Pivot {
     Target(u8),
     /// Emit `Instruction::PivotPending` and leave the user in: the request-flow driver pauses
     /// for a `PivotLanding` choice. Never used on verification/enumeration paths.
+    ///
+    /// Two invariants the emission sites enforce, because the caller cannot:
+    /// * the EXECUTED move must be the self-switch move the pause was granted for — Struggle and
+    ///   the Encore `OverrideAction` redirect replace it inside `run_move_action` (see the
+    ///   re-derivation there);
+    /// * the side must still have somewhere to go. PS `sim/battle.ts:2904`:
+    ///   `if (switches[i] && !this.canSwitch(this.sides[i]))` clears `switchFlag` and drops the
+    ///   side out of `switches` — with an empty bench the mon simply stays in and no switch
+    ///   request is issued.
     Pause,
 }
 
@@ -3533,7 +3681,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds, after_hit_user_alive: b.after_hit_user_alive }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -4686,6 +4834,39 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // SECOND time, where PS goes back to using Blood Moon.
         move_id = crate::ids::MoveId::from_id("struggle").unwrap_or(crate::ids::MoveId::None);
     }
+    // **`runEvent('OverrideAction')` is the FIRST thing `runMove` does** (`battle-actions.ts:228`),
+    // before `getActiveMove` builds the object every `onModifyType` / `onModifyMove` then edits.
+    // Encore's handler (`data/moves.ts:4754`) returns the encored move id whenever the chosen move
+    // is not it, so an Encore that lands EARLIER IN THE SAME TURN redirects an action that was
+    // already chosen. PS's exclusions are exactly `struggle`, Z/Max, and an external (Dancer) move;
+    // the multi-turn guard is the engine's own and is kept.
+    //
+    // This used to sit ~130 lines DOWN, after the whole move-modifier chain, and re-assigned `md =
+    // move_data(enc.0)` — throwing away every modifier and leaving `move_id` pointing at the move
+    // the player picked. rb1734 d30 t24: a Prankster Encore locks an Arceus-Electric that chose
+    // Recover into Judgment; the engine substituted RAW Judgment, i.e. **Normal**-type, because the
+    // Zap Plate's `onModifyType` had been applied to Recover's `MoveData` and then discarded — and
+    // Normal is IMMUNE to the Ghost-type Sableye in front of it. So the move failed at moveStep 3
+    // with no accuracy roll (`PS-unconsumed randomChance[100, 100]@judgment`) where PS KO'd the
+    // Sableye. The redirect itself was never the bug; its POSITION was.
+    let mut move_idx = move_idx;
+    let mut move_id = move_id;
+    if !struggling && !external {
+        let enc = b.state.side(side).encore;
+        if enc.0 != crate::ids::MoveId::None
+            && b.state.side(side).pending_move == crate::state::PendingMove::None
+        {
+            if let Some(enc_slot) =
+                b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0)
+            {
+                if enc_slot as u8 != move_idx {
+                    move_idx = enc_slot as u8;
+                    move_id = enc.0;
+                }
+            }
+        }
+    }
+    let move_idx = move_idx;
     let move_id = move_id;
     let mut md = if struggling {
         let mut m = crate::data::MoveData::none();
@@ -4696,6 +4877,26 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         m
     } else {
         move_data(move_id)
+    };
+    // **`Pivot::Pause` belongs to the move that RUNS, not the move that was CHOSEN.**
+    // `Flow::run_turn` stamps it on the action from the chosen slot — a `self_switch` move with an
+    // alive bench, or Revival Blessing with a fainted bench — but the two substitutions above
+    // (Struggle via `no_usable_move`, and the Encore `OverrideAction` redirect) replace the move
+    // afterwards, and every `match pivot` arm below keys on the ACTION. So the substitute inherited
+    // the pause: a PP-stalled mon with an entirely FAINTED bench picks Revival Blessing, Struggles,
+    // and its damaging path pushes `PivotPending` — a `PivotLanding` request for a side with
+    // nowhere to go (`request.rs:resume_pivot`'s tripwire; it killed a 4096-env trainer at ~1e-5
+    // games). Re-derive the pause from the executed move; `Pivot::Target` is left alone because the
+    // verification paths supply it from the RECORDED choice, which is already the executed move.
+    let pivot = match pivot {
+        Pivot::Pause
+            if struggling
+                || !(md.self_switch
+                    || matches!(md.id.to_id(), "revivalblessing" | "shedtail")) =>
+        {
+            Pivot::Stay
+        }
+        p => p,
     };
     // Shell Side Arm: category resolved by `dispatch_move_inner`; the physical variant
     // additionally becomes a contact move (PS sets `move.flags.contact = 1`).
@@ -4742,6 +4943,21 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     if md.id.to_id() == "judgment" {
         if let Some(t) = plate_type(attacker.item) {
             md.typ = t;
+        }
+    }
+    // Tera Starstorm: `onModifyType` (`data/moves.ts:19259`) makes it **Stellar** — and flips it
+    // physical on the same Atk-vs-SpA test Tera Blast uses — as soon as the user is
+    // Terapagos-Stellar, which is the forme Tera Shift's Terastallization produces. Without this
+    // the move stayed NORMAL, i.e. immune into any Ghost and resisted by Rock/Steel, and it took
+    // ordinary Normal STAB instead of the Stellar rule in `damage::stab_mod`.
+    if md.id.to_id() == "terastarstorm"
+        && Some(attacker.species) == crate::ids::Species::from_id("terapagosstellar")
+    {
+        md.typ = Type::Stellar;
+        if attacker.terastallized
+            && attacker.stat(crate::ids::StatIndex::Attack) > attacker.stat(crate::ids::StatIndex::SpecialAttack)
+        {
+            md.category = MoveCategory::Physical;
         }
     }
     // Tera Blast: when the user is Terastallized it becomes the tera type and uses whichever
@@ -4849,21 +5065,6 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let mut move_idx = move_idx;
     let slot = b.state.side(side).active_index;
 
-    // Encore: the user is locked into its encored move — the chosen slot is overridden
-    // (PS onOverrideAction). Skipped while committed to a multi-turn move or Struggling.
-    let enc = b.state.side(side).encore;
-    if enc.0 != crate::ids::MoveId::None
-        && !struggling
-        && !external
-        && b.state.side(side).pending_move == crate::state::PendingMove::None
-    {
-        if let Some(enc_slot) = b.state.side(side).active().moves.iter().position(|m| m.id == enc.0 && m.pp > 0) {
-            if enc_slot as u8 != move_idx {
-                move_idx = enc_slot as u8;
-                md = move_data(enc.0);
-            }
-        }
-    }
     // A rampaging mon (Outrage / Thrash / ...) is locked into its move and pays no PP on
     // continuation turns.
     let rampaging_now = matches!(b.state.side(side).pending_move, crate::state::PendingMove::Rampaging(..));
@@ -5521,23 +5722,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             && !md.flag_bypass_sub
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator
         {
-            // A status move whose ONLY landing effect is a major status (Toxic/Thunder Wave/
-            // Will-O-Wisp/Poison Powder/…) is failed by PS's `hitStepTryImmunity` BEFORE
-            // `hitStepAccuracy` when the target already carries a major status — `runStatusImmunity`
-            // rejects it, so no accuracy draw (d6 t58-62: Toxic on an already-paralyzed, subbed
-            // Garchomp → PS's only draw is Garchomp's own full-para check). A status move that also
-            // does something else (boost drop / volatile) still rolls behind the sub.
-            let status_only = md.status != Status::None
-                && md.target_boosts.iter().all(|&x| x == 0)
-                && md.target_volatile.is_none()
-                && !md.force_switch;
-            let target_already_statused = status_only
-                && b.state.side(foe).active().status != Status::None;
+            // An ALREADY-STATUSED target does NOT suppress the roll. `setStatus` fails inside
+            // `moveHit`, long after `hitStepAccuracy`, and `hitStepTryImmunity` (battle-actions.ts:
+            // 661-684) has no status check at all. This site used to carry a `target_already_statused`
+            // gate justified by d6 t58-62 ("Toxic on an already-paralyzed, subbed Garchomp draws
+            // nothing") — but d6's Toxic user is **Toxtricity, Electric/POISON**, so the real reason
+            // was the gen-8 Poison-type Toxic override, which now lives in `accuracy_forced_true`.
+            // rb5039 d46 (Toxic into an already-badly-poisoned, subbed Keldeo) and rb1642 d35
+            // (Will-O-Wisp into a statused, subbed Keldeo) are the counter-witnesses: PS rolls.
             if annotating()
                 && md.accuracy != 0
                 && !accuracy_forced_true(&b, side, &md)
                 && status_move_reaches_accuracy(&b, side, &md)
-                && !target_already_statused
             {
                 let acc = accuracy_arg(&b, side, &md);
                 let hp = accuracy_of(&b, side, &md);
@@ -5598,7 +5794,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             }
             Pivot::Pause => {
                 for sb in &mut branches {
-                    if sb.state.side(side).active().is_alive() {
+                    if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) {
                         push(sb, Instruction::PivotPending { side });
                     }
                 }
@@ -5864,11 +6060,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // forces no-crit, onEffectiveness forces typeMod 0), then onDamage zeroes the result. Emit
         // those two draw-and-discards so the from-seed stream advances exactly as PS's does.
         let crit_den = ps_crit_den(&b, side, &md);
-        if crit_den > 0 {
-            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
-        }
-        draw(&mut hb, "random", &[16], 0, "damage-roll");
-        emit_modifydamage_shuffle(&mut hb);
+        // **A draw-and-discard still has to record the REAL value.** The result is irrelevant to
+        // the outcome — `onDamage` zeroes the damage whatever the crit and roll were — but the seed
+        // gate does not "pick the closest branch": it draws from the real PRNG and keeps only the
+        // branches whose RECORDED result equals what it drew (`seedgate.rs:330-352`). A hardcoded
+        // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
+        // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
+        // claimed 0, and the unit desynced on a draw whose value cannot matter.
+        emit_discarded_damage_rolls(&mut hb, crit_den);
         break_ice_face(&mut hb, foe);
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
@@ -5882,14 +6081,39 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             .flat_map(|x| if external { vec![x] } else { start_rampage_lock(x, side, move_id) })
         {
             apply_damage_secondaries(&mut hb, side, &md, false);
-            out.extend(
-                apply_target_secondary(hb, side, &md)
-                    .into_iter()
-                    .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                    .flat_map(|sb| apply_cursed_body(sb, side, &md))
-                    .flat_map(|sb| apply_contact_secondaries(sb, side, &md)),
-            );
+            for mut sb in apply_target_secondary(hb, side, &md)
+                .into_iter()
+                .flat_map(|sb| apply_flinch_split(sb, side, &md))
+                .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+            {
+                // A nullified hit is still a connecting hit, so the per-hit `eachEvent('Update')`
+                // (970) and the post-hit-loop one (1024) both fire.
+                emit_update_hit(&mut sb);
+                emit_update(&mut sb);
+                // **A nullified hit still CONNECTED, so a pivot user still leaves.** `selfSwitch`
+                // is set in `hitStepMoveHitLoop` on `move.totalDamage !== false`, and Ice Face's
+                // `onDamage` returns the NUMBER 0 — the target stays in `targets` and the move
+                // counts as a hit. The Disguise arm below already did this; the Ice Face arm
+                // returned without ever looking at `pivot`, so a U-turn into an intact Eiscue
+                // simply stayed in. rb1710 d18 / rb1410 d33 / rb1629 d31.
+                match pivot {
+                    Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
+                        emit_pivot_trailing_update(&mut sb);
+                        let pre = sb.state;
+                        apply_switch(&mut sb, side, t);
+                        emit_switch_bracket(&mut sb, &pre, side, t);
+                    },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Stay => {}
+                }
+                out.push(sb);
+            }
         }
+        // The accuracy split's MISS branch belongs to this arm's return too — a nullifying
+        // ability does not make the move stop rolling accuracy, and dropping the branch leaves the
+        // seed gate with nothing to select when PS's roll was a miss.
+        out.extend(miss_out);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -5911,11 +6135,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // stream advances exactly as PS's does (a bare bust under-emitted 2 draws — e.g. U-turn into
         // an intact Mimikyu — desyncing every later damage roll).
         let crit_den = ps_crit_den(&b, side, &md);
-        if crit_den > 0 {
-            draw(&mut hb, "randomChance", &[1, crit_den], 0, "crit");
-        }
-        draw(&mut hb, "random", &[16], 0, "damage-roll");
-        emit_modifydamage_shuffle(&mut hb);
+        // **A draw-and-discard still has to record the REAL value.** The result is irrelevant to
+        // the outcome — `onDamage` zeroes the damage whatever the crit and roll were — but the seed
+        // gate does not "pick the closest branch": it draws from the real PRNG and keeps only the
+        // branches whose RECORDED result equals what it drew (`seedgate.rs:330-352`). A hardcoded
+        // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
+        // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
+        // claimed 0, and the unit desynced on a draw whose value cannot matter.
+        emit_discarded_damage_rolls(&mut hb, crit_den);
         bust_disguise(&mut hb, foe);
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
@@ -5935,6 +6162,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|x| apply_cursed_body(x, side, &md))
                 .flat_map(|x| apply_contact_secondaries(x, side, &md))
             {
+                // Same two Updates as the Ice Face arm: `onDamage` returned the NUMBER 0, so the
+                // target stayed in `targets` and PS ran the rest of `hitStepMoveHitLoop`.
+                // rb1191 d17: a Thunderbolt busts an intact Mimikyu on a Speed-TIED board and PS
+                // logs two `shuffle[2,0,2]@thunderbolt`; the engine logged one.
+                emit_update_hit(&mut sb);
+                emit_update(&mut sb);
                 match pivot {
                     Pivot::Target(t) => if sb.state.side(side).active().is_alive() {
                         emit_pivot_trailing_update(&mut sb);
@@ -5942,12 +6175,17 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                         apply_switch(&mut sb, side, t);
                         emit_switch_bracket(&mut sb, &pre, side, t);
                     },
-                    Pivot::Pause => if sb.state.side(side).active().is_alive() { push(&mut sb, Instruction::PivotPending { side }); },
+                    Pivot::Pause => if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) { push(&mut sb, Instruction::PivotPending { side }); },
                     Pivot::Stay => {}
                 }
                 out.push(sb);
             }
         }
+        // Same as the Ice Face arm above: keep the miss branch. rb1421 d26 — a 70-accuracy
+        // Hurricane into an intact Mimikyu, where PS MISSED and the engine had generated no miss
+        // outcome at all, so `replicate_select` fell through to the only branch there was and
+        // busted the Disguise.
+        out.extend(miss_out);
         return apply_struggle_recoil(apply_recharge(out, side, move_id), side, struggling);
     }
 
@@ -6187,22 +6425,34 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // Stone Axe sets Stealth Rock on the target's side whether the hit landed on the mon
         // OR its Substitute (PS has both `onAfterHit` and `onAfterSubDamage`), as long as the
         // user is still standing. Glaive Rush's self-drawback likewise applies on any hit.
-        if md.id.to_id() == "stoneaxe" && hb.state.side(side).active().is_alive() {
+        //
+        // "Still standing" means **at PS's `onAfterHit`**, which is inside `spreadMoveHit` and
+        // therefore ahead of `move.recoil` and Life Orb — both of which the engine has already
+        // applied by this point. rb1765 d6 t5: a 16-HP Life Orb Samurott-Hisui lands Ceaseless
+        // Edge and dies to the orb; PS lays the Spikes first and the engine, reading a corpse,
+        // laid none. See `Branch::after_hit_user_alive`.
+        if md.id.to_id() == "stoneaxe" && hb.after_hit_user_alive {
             apply_hazard(&mut hb, foe, SideConditionId::StealthRock);
         }
         // Ceaseless Edge lays a layer of Spikes on the target's side on any hit (PS
         // `onAfterHit`/`onAfterSubDamage`), as long as the user is still standing.
-        if md.id.to_id() == "ceaselessedge" && hb.state.side(side).active().is_alive() {
+        if md.id.to_id() == "ceaselessedge" && hb.after_hit_user_alive {
             apply_hazard(&mut hb, foe, SideConditionId::Spikes);
         }
-        if md.id.to_id() == "glaiverush" && hb.state.side(side).active().is_alive()
+        if md.id.to_id() == "glaiverush" && hb.after_hit_user_alive
             && !hb.state.side(side).volatiles.contains(VolatileStatus::GlaiveRush)
         {
             push(&mut hb, Instruction::ApplyVolatile { side, volatile: VolatileStatus::GlaiveRush });
         }
         apply_relic_song_forme(&mut hb, side, &md);
         apply_throat_spray(&mut hb, side, &md);
-        apply_spin_clear(&mut hb, side, &md);
+        // `apply_spin_clear` USED to sit here. It is an `onAfterHit` payload (step 8) and it
+        // removes the SPINNER's OWN side conditions — which is the one onAfterHit effect that can
+        // be undone by a step-7 `onDamagingHit` handler laying a hazard on that same side.
+        // rb1591 d19 t17: a Ditto transformed into Glimmora uses Mortal Spin into the real
+        // Glimmora; PS's Toxic Debris (step 7) scatters a Toxic Spikes layer on the SPINNER's side
+        // and the spin (step 8) then wipes it — net zero. The engine ran the spin first and kept
+        // the layer. Moved to the step-7 boundary below, in both arms.
         apply_white_herb(&mut hb, side);
         // A Substitute blocks the target's own secondaries (boosts/status) and contact
         // abilities; otherwise split on the move's secondary, then the contact-status ability.
@@ -6221,6 +6471,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             emit_sub_secondary_rolls(&mut hb, side, &md);
             // Step 7 still closes the hit — the deferred no-draw event, gated on the sub.
             apply_damaging_hit_step7(&mut hb, side, &md, true);
+            apply_spin_clear(&mut hb, side, &md);
             vec![hb]
         } else {
             apply_beak_blast_burn(&mut hb, side, &md, foe_pending_move);
@@ -6250,7 +6501,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 // orders Rough Skin / Iron Barbs (`onDamagingHitOrder: 1`) and Rocky Helmet (2)
                 // ahead of the unordered contact-status set — a chip that faints the attacker must
                 // suppress its paralysis/burn. See `apply_damaging_hit_step7`.
-                .map(|mut sb| { apply_damaging_hit_step7(&mut sb, side, &md, false); sb })
+                // ---- step 7 ends, step 8 (`onAfterHit`) begins ----
+                .map(|mut sb| {
+                    apply_damaging_hit_step7(&mut sb, side, &md, false);
+                    apply_spin_clear(&mut sb, side, &md);
+                    // `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` — the frz thaw of
+                    // a `thawsTarget` move lives HERE, after the secondary that would have burned.
+                    apply_thaw_after_secondary(&mut sb, side, foe, &md);
+                    sb
+                })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .collect::<Vec<_>>()
@@ -6302,7 +6561,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     }
                 }
                 Pivot::Pause => {
-                    if sb.state.side(side).active().is_alive() {
+                    if sb.state.side(side).active().is_alive() && has_alive_bench(&sb.state, side) {
                         push(&mut sb, Instruction::PivotPending { side });
                     }
                 }
@@ -6388,16 +6647,67 @@ impl Iterator for HitCombos {
 /// Compute a move's damage rolls (non-crit and crit) and the defender-side fields needed
 /// after application. Pure with respect to `b` (reads state, mutates nothing) so both the
 /// exact per-hit path and the sumset-DP path can call it once and share the result.
+/// Does Mold Breaker / Teravolt / Turboblaze (and `move.ignoreAbility`) suppress this ability?
+///
+/// **`flags: { breakable: 1 }` in `data/abilities.ts` is the whole rule.** PS `sim/battle.ts:836`:
+/// `if (effect.effectType === 'Ability' && effect.flags['breakable'] &&
+/// this.suppressingAbility(effectHolder)) continue;`, and `suppressingAbility` (`:365`) is just
+/// "there is an active move and it has `ignoreAbility`". Everything else is untouched — the engine
+/// used to blank the defender's ability wholesale, which silently deleted the abilities PS
+/// deliberately left OUT of the flag:
+///
+/// * **Shadow Shield** (`flags: {}`) is not Multiscale (`breakable: 1`) — rb1612, a Mold Breaker
+///   Haxorus's Iron Head into a full-HP Lunala, where PS still halved the damage.
+/// * **the four Ruin abilities** (`flags: {}`) — rb1588, a Mold Breaker Excadrill's Iron Head into
+///   Wo-Chien, where PS still applied Tablets of Ruin's ×0.75 to Excadrill's Attack.
+/// * **Prism Armor** (`flags: {}`) is not Filter / Solid Rock (`breakable: 1`); no corpus witness
+///   yet, same class.
+///
+/// The list is the 83 `breakable: 1` abilities of the pinned dex, minus `mountaineer` and
+/// `rebound` (CAP-only, absent from the engine's `Ability` enum).
+fn ability_breakable(a: crate::ids::Ability) -> bool {
+    use crate::ids::Ability as Ab;
+    matches!(
+        a,
+        Ab::ArmorTail | Ab::AromaVeil | Ab::AuraBreak | Ab::BattleArmor | Ab::BigPecks |
+        Ab::Bulletproof | Ab::ClearBody | Ab::Contrary | Ab::Damp | Ab::Dazzling | Ab::Disguise |
+        Ab::DrySkin | Ab::EarthEater | Ab::Filter | Ab::FlashFire | Ab::FlowerGift | Ab::FlowerVeil |
+        Ab::Fluffy | Ab::FriendGuard | Ab::FurCoat | Ab::GoodAsGold | Ab::GrassPelt | Ab::GuardDog |
+        Ab::Heatproof | Ab::HeavyMetal | Ab::HyperCutter | Ab::IceFace | Ab::IceScales |
+        Ab::Illuminate | Ab::Immunity | Ab::InnerFocus | Ab::Insomnia | Ab::KeenEye | Ab::LeafGuard |
+        Ab::Levitate | Ab::LightMetal | Ab::LightningRod | Ab::Limber | Ab::MagicBounce |
+        Ab::MagmaArmor | Ab::MarvelScale | Ab::MindsEye | Ab::MirrorArmor | Ab::MotorDrive |
+        Ab::Multiscale | Ab::Oblivious | Ab::Overcoat | Ab::OwnTempo | Ab::PastelVeil | Ab::PunkRock |
+        Ab::PurifyingSalt | Ab::QueenlyMajesty | Ab::SandVeil | Ab::SapSipper | Ab::ShellArmor |
+        Ab::ShieldDust | Ab::Simple | Ab::SnowCloak | Ab::SolidRock | Ab::Soundproof | Ab::StickyHold |
+        Ab::StormDrain | Ab::Sturdy | Ab::SuctionCups | Ab::SweetVeil | Ab::TangledFeet |
+        Ab::Telepathy | Ab::TeraShell | Ab::ThermalExchange | Ab::ThickFat | Ab::Unaware |
+        Ab::VitalSpirit | Ab::VoltAbsorb | Ab::WaterAbsorb | Ab::WaterBubble | Ab::WaterVeil |
+        Ab::WellBakedBody | Ab::WhiteSmoke | Ab::WindRider | Ab::WonderGuard | Ab::WonderSkin
+    )
+}
+
+/// Does `side`'s move set PS's `move.ignoreAbility` — i.e. does it suppress the TARGET's
+/// `breakable` abilities while it resolves? Mold Breaker / Teravolt / Turboblaze on the user, or a
+/// move with its own `ignoreAbility` (Sunsteel Strike / Moongeist Beam / Photon Geyser). Mycelium
+/// Might is deliberately absent: it sets the flag only for the user's STATUS moves, and the one
+/// status site that needs it already folds it into its own `status_breaker`.
+fn move_breaks_abilities(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    matches!(b.state.side(side).active().ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze)
+        || move_ignores_ability(md.id)
+}
+
 fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> DamageCalc {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let attacker = b.state.side(side).active();
     let defender = b.state.side(foe).active();
-    // Mold Breaker suppresses the defender's damage-affecting ability for this move; `def_ab`
-    // is the defender's ability as the damage calc should see it (None when suppressed).
+    // Mold Breaker suppresses the defender's damage-affecting ability for this move — but **only
+    // if it is `breakable`**. `def_ab` is the defender's ability as the damage calc should see it.
     let mb = matches!(attacker.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze)
         || move_ignores_ability(md.id);
-    let def_ab = if mb { Ab::None } else { defender.ability };
+    let def_ab = if mb && ability_breakable(defender.ability) { Ab::None } else { defender.ability };
 
     // Foul Play uses the defender's Attack stat and Attack boost (attacker's burn still
     // applies; Unaware on the defender ignores... the defender's own boost is used as-is).
@@ -6440,7 +6750,11 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     } else {
         b.state.side(side).boost(atk_boost_idx)
     };
-    let def_boost = if attacker.ability == crate::ids::Ability::Unaware { 0 } else { b.state.side(foe).boost(def_boost_idx) };
+    let def_boost = if attacker.ability == crate::ids::Ability::Unaware || move_ignores_defensive(md.id) {
+        0
+    } else {
+        b.state.side(foe).boost(def_boost_idx)
+    };
 
     // Protosynthesis / Quark Drive on the boosted offensive / defensive stat. PS uses
     // chainModify([5325, 4096]) — modifier 5325, NOT 13/10 (which rounds to 5324).
@@ -6676,8 +6990,14 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     let adaptability = attacker.ability == Ab::Adaptability;
     // Tera Shell: Terapagos-Terastal at full HP resists every hit by one extra step (breakable,
     // so `def_ab` already reflects Mold Breaker suppressing it).
+    // PS's guard set (`sim/pokemon.ts:2224`) is `category === 'Status' || id === 'struggle' ||
+    // !runImmunity(move) || totalTypeMod < 0 || hp < maxhp`. The first two are excluded here, the
+    // immunity one is moot (an immune move deals nothing anyway) and the `totalTypeMod < 0` one
+    // lives in `damage.rs` where the chart result is known.
     let tera_shell = def_ab == Ab::TeraShell
         && defender.hp == defender.max_hp
+        && md.category != MoveCategory::Status
+        && md.id.to_id() != "struggle"
         && crate::ids::Species::from_id("terapagosterastal") == Some(defender.species);
     // Returned for post-damage (contact punishers); also suppressed under Mold Breaker.
     let def_ability = def_ab;
@@ -6912,6 +7232,13 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             bp_chain = bp_step(bp_chain, POW[fallen]);
         }
     }
+    // 17: Dry Skin on the DEFENDER — `onFoeBasePower` ×1.25 for an incoming Fire move
+    // (`data/abilities.ts` dryskin, `onFoeBasePowerPriority: 17`). The engine modelled Dry Skin's
+    // Water absorb and its weather residual and not this half. rb1636 d5: a Delphox's Fire Blast
+    // into a Toxicroak — 43 HP of the 244 PS took off it.
+    if def_ab == Ab::DrySkin && md.typ == Type::Fire {
+        bp_chain = bp_step(bp_chain, 5120); // 1.25 = 5120/4096
+    }
     // 19: Strong Jaw (bite ×1.5) / Sharpness (slicing ×1.5).
     if attacker.ability == Ab::StrongJaw && md.flag_bite {
         bp_chain = bp_step(bp_chain, 6144);
@@ -7012,6 +7339,7 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
             effective_weather(&b.state)
         },
         terastallized: attacker.terastallized,
+        defender_terastallized: defender.terastallized,
         tera_type: attacker.tera_type,
         life_orb: false,
         adaptability,
@@ -7060,6 +7388,22 @@ fn ice_face_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bo
     md.category == MoveCategory::Physical
         && p.ability == crate::ids::Ability::IceFace
         && p.species == crate::ids::Species::from_id("eiscue").unwrap_or(crate::ids::Species::None)
+}
+
+/// Is Disguise still up on the target — i.e. will THIS hit be the one it eats?
+///
+/// The predicate PS uses is `['mimikyu','mimikyutotem'].includes(target.species.id)` inside
+/// `onDamage` (`data/abilities.ts:963`), so it is re-evaluated PER HIT and stops being true the
+/// moment `onUpdate` forme-changes the mon into Mimikyu-Busted. Which is exactly why a MULTI-HIT
+/// move busts the disguise on hit 1 and then damages normally with hits 2..n — the whole-move
+/// `hits_max == 1` gate on the single-hit arm was never a statement about the mechanic, only about
+/// which arm owns it.
+fn disguise_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bool {
+    let p = b.state.side(foe).active();
+    matches!(md.category, MoveCategory::Physical | MoveCategory::Special)
+        && p.ability == crate::ids::Ability::Disguise
+        && !p.transformed
+        && p.species == crate::ids::Species::from_id("mimikyu").unwrap_or(crate::ids::Species::None)
 }
 
 /// Breaks an intact Ice Face and records the blocked hit. Transform instructions carry the
@@ -7367,6 +7711,17 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
             calc = compute_damage(b, side, md);
             continue;
         }
+        // Disguise eats THIS hit and nothing more — `onUpdate`'s forme change into Mimikyu-Busted
+        // runs at the per-hit `eachEvent('Update')` (`battle-actions.ts:970`), so hit 2 onward
+        // finds `species.id === 'mimikyubusted'` and `onDamage` no longer fires. rb1621 d18:
+        // Triple Axel into an intact Mimikyu — PS's three hits are 0 (+ the 1/8 chip), then two
+        // real ones; the engine's `hits_max == 1` gate made all three real, and the mon died in
+        // both, so the ONLY surviving symptom was `species` 495 vs 496 on a corpse.
+        if disguise_is_intact(b, foe, md) {
+            bust_disguise(b, foe);
+            calc = compute_damage(b, side, md);
+            continue;
+        }
         let target_hp = b.state.side(foe).active().hp;
         if target_hp <= 0 {
             break;
@@ -7461,6 +7816,14 @@ fn apply_damage_hit_indexed(b: &mut Branch, side: SideId, md: &crate::data::Move
         }
         if ice_face_is_intact(b, foe, md) {
             break_ice_face(b, foe);
+            continue;
+        }
+        // Disguise eats ONE hit; `onUpdate`'s forme change lands at the per-hit
+        // `eachEvent('Update')` and hit 2 onward sees Mimikyu-Busted. See `disguise_is_intact`.
+        // This is the Triple Axel arm — rb1621 d18's witness.
+        if disguise_is_intact(b, foe, md) {
+            bust_disguise(b, foe);
+            restat_dirty = true;
             continue;
         }
         // Indexed moves change power each hit, and Ice Face — or a per-hit `onDamagingHit`
@@ -7569,10 +7932,30 @@ fn apply_damaging_hit_step7(b: &mut Branch, side: SideId, md: &crate::data::Move
     // `runEvent('DamagingHit')` is gated on `damagedDamage.length` — a Substitute hit records
     // `damage[i] === true`, not a number, so no `onDamagingHit` handler runs behind a sub.
     if !hit_sub {
+        apply_illusion_break(b, foe);
         apply_justified(b, foe, md);
         apply_rattled(b, foe, md);
         apply_thermal_exchange(b, foe, md);
         apply_weak_armor(b, foe, md);
+    }
+}
+
+/// Illusion's `onDamagingHit` → `singleEvent('End', Illusion)` → `onEnd`
+/// (`data/abilities.ts:2026-2042`). `beingCalledBack` is false on this path (it is only ever set
+/// by `switchIn`), so the disguise drops VISIBLY: `|replace|` with the real details, `|-end|` and,
+/// under Illusion Level Mod, the level hint. Draw-free; the state change is protocol-visible only.
+///
+/// Unordered among the `DamagingHit` handlers (no `onDamagingHitOrder`), and gated on
+/// `damagedDamage.length` exactly like the rest of step 7 — a Substitute hit does not break it.
+/// A hit that KOs still breaks it: `pokemon.fainted` is not set until `faintMessages`.
+fn apply_illusion_break(b: &mut Branch, victim: SideId) {
+    let slot = b.state.side(victim).active_index;
+    let p = &b.state.side(victim).pokemon[slot as usize];
+    if p.ability != crate::ids::Ability::Illusion {
+        return;
+    }
+    if let Some(previous) = p.illusion {
+        push(b, Instruction::BreakIllusion { side: victim, slot, previous });
     }
 }
 
@@ -7744,6 +8127,9 @@ fn apply_post_damage(
 ) {
     use crate::ids::Ability as Ab;
     let foe = side.other();
+    // PS's `onAfterHit` fired back inside `spreadMoveHit`, BEFORE any of the self-damage below.
+    // Snapshot its `pokemon.hp` guard now — see `Branch::after_hit_user_alive`.
+    b.after_hit_user_alive = b.state.side(side).active().is_alive();
     if any_damage {
         let aslot = b.state.side(side).active_index;
         // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt — unless the
@@ -8287,13 +8673,38 @@ fn apply_thermal_exchange(b: &mut Branch, foe: SideId, md: &crate::data::MoveDat
     }
 }
 
-/// A frozen target thaws when hit by a damaging Fire-type move or one of the `thawsTarget`
-/// moves (Scald / Steam Eruption / Matcha Gotcha / Hydro Steam — PS frz `onHit`).
+/// `frz.onDamagingHit` (`data/conditions.ts:116`): a damaging FIRE-type move (Polar Flare
+/// excepted) cures the freeze as part of the hit.
 fn apply_thaw_on_hit(b: &mut Branch, foe: SideId, md: &crate::data::MoveData) {
+    if md.typ == Type::Fire && md.category != MoveCategory::Status && md.id.to_id() != "polarflare" {
+        cure_freeze(b, foe);
+    }
+}
+
+/// `frz.onAfterMoveSecondary` (`data/conditions.ts:111-115`): a `thawsTarget` move (Scald /
+/// Steam Eruption / Matcha Gotcha / Hydro Steam) cures the freeze **after the secondaries**, at
+/// `hitStepMoveHitLoop`'s trailing `afterMoveSecondaryEvent` (`battle-actions.ts:1026`).
+///
+/// The position is the whole mechanic. A frozen target hit by Scald is STILL FROZEN when
+/// `secondaries()` tries the 30% burn, so `setStatus` fails on the already-statused mon and the
+/// thaw then leaves it with NO status at all. The engine cured at `onHit` — before the
+/// secondaries — and the same roll produced a burn. rb1711 d14: a frozen Bellibolt switches into
+/// a Scald, PS ends the turn statusless at 170 HP and the engine burned it, then took the 20-HP
+/// burn residual, landing at 150.
+///
+/// PS skips the whole event under Sheer Force (`afterMoveSecondaryEvent`'s guard) — and Sheer
+/// Force also strips the secondary, so a Sheer Force Scald neither burns nor thaws.
+fn apply_thaw_after_secondary(b: &mut Branch, side: SideId, foe: SideId, md: &crate::data::MoveData) {
+    let sheer_force = b.state.side(side).active().ability == crate::ids::Ability::SheerForce
+        && md.secondary_chance > 0;
+    if !sheer_force && matches!(md.id.to_id(), "scald" | "steameruption" | "matchagotcha" | "hydrosteam") {
+        cure_freeze(b, foe);
+    }
+}
+
+fn cure_freeze(b: &mut Branch, foe: SideId) {
     let d = b.state.side(foe).active();
-    let thaws = (md.typ == Type::Fire && md.category != MoveCategory::Status)
-        || matches!(md.id.to_id(), "scald" | "steameruption" | "matchagotcha" | "hydrosteam");
-    if d.is_alive() && d.status == Status::Freeze && thaws {
+    if d.is_alive() && d.status == Status::Freeze {
         let slot = b.state.side(foe).active_index;
         push(b, Instruction::ChangeStatus { side: foe, slot, previous: Status::Freeze, new: Status::None });
         clear_status_counter(b, foe, slot);
@@ -8960,6 +9371,22 @@ fn apply_multihit_realized_ma(
             hits_executed += 1;
             continue;
         }
+        // Ice Face / Disguise are per-hit `onDamage` blocks whose guard is the target's CURRENT
+        // `species.id`, so they eat exactly ONE hit and are gone for the rest of the loop — the
+        // forme change lands at the per-hit `eachEvent('Update')` (`battle-actions.ts:970`). The
+        // other two hit loops (`apply_damage_hit_rolls`, `apply_damage_hit_indexed`) already did
+        // this for Ice Face; the multiaccuracy loop is the THIRD copy and had neither. rb1621 d18
+        // is the witness: Triple Axel into an intact Mimikyu.
+        if ice_face_is_intact(&hb, foe, md) {
+            break_ice_face(&mut hb, foe);
+            restat_dirty = true;
+            continue;
+        }
+        if disguise_is_intact(&hb, foe, md) {
+            bust_disguise(&mut hb, foe);
+            restat_dirty = true;
+            continue;
+        }
         let target_hp = hb.state.side(foe).active().hp;
         if target_hp <= 0 {
             break;
@@ -9398,19 +9825,34 @@ fn on_berry_eaten_id(b: &mut Branch, side: SideId, berry: Item) {
     }
 }
 
+/// The no-Mold-Breaker case (switch-in abilities, hazards, residuals, contact abilities).
+fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+    apply_boost_clamped_ex(b, target, stat, delta, false)
+}
+
 /// Apply a stat-stage change to the target, respecting Clear Body (blocks reductions) and
 /// the ±6 clamp. Returns the effective change actually applied (0 if blocked/clamped out).
-fn apply_boost_clamped(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8) -> i8 {
+///
+/// `breaker` is "this change comes from a move whose user has Mold Breaker / Teravolt /
+/// Turboblaze (or `move.ignoreAbility`)". It suppresses the target's `breakable` abilities for
+/// exactly this change, which is what PS's `suppressingAbility` (`sim/battle.ts:365`) does — and
+/// it is only true while such a MOVE is resolving, so Intimidate / Sticky Web / Octolock / a
+/// contact ability's own drop pass `false`. **`Contrary` is `breakable: 1`**: rb1430 d26, a Mold
+/// Breaker Tinkaton's Play Rough into a Malamar, where PS applied the −1 Attack as a DROP
+/// (2 → 1) and the engine inverted it into a raise (2 → 3). `Full Metal Body` is NOT breakable
+/// (`cantsuppress`), which is why the blocker set has to be filtered per-ability.
+fn apply_boost_clamped_ex(b: &mut Branch, target: SideId, stat: BoostIndex, delta: i8, breaker: bool) -> i8 {
     use crate::ids::Ability as Ab;
+    let seen = |a: Ab| if breaker && ability_breakable(a) { Ab::None } else { a };
     // Contrary inverts the change before anything else (so a "drop" becomes a raise and is no
     // longer blocked by Clear Body / counted as a drop by Defiant).
-    let delta = if b.state.side(target).active().ability == Ab::Contrary { -delta } else { delta };
+    let delta = if seen(b.state.side(target).active().ability) == Ab::Contrary { -delta } else { delta };
     // Every apply_boost_clamped call is an OPPONENT-inflicted change on `target` (self-drops go
     // through apply_self_boost), so the "source && target === source" self-skip in PS's onTryBoost
     // handlers never fires here. Protective abilities block foe-inflicted stat *drops*.
     if delta < 0 {
         let tgt = b.state.side(target).active();
-        let ab = tgt.ability;
+        let ab = seen(tgt.ability);
         // Clear Body / Full Metal Body / White Smoke block every stat drop; Flower Veil does so
         // for a Grass-type holder; Big Pecks only Defense; Keen Eye / Mind's Eye only Accuracy.
         let block_all = matches!(ab, Ab::ClearBody | Ab::FullMetalBody | Ab::WhiteSmoke)
@@ -10062,6 +10504,9 @@ fn apply_alluringvoice_confusion(b: Branch, side: SideId, md: &crate::data::Move
 
 fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
     let mut b = b;
+    // The attacker's Mold Breaker suppresses the target's `breakable` abilities for this move's
+    // secondary boosts too — Contrary among them (rb1430 d26).
+    let mb_move = move_breaks_abilities(&b, side, md);
     // 100%-secondary moves the engine applies through `target_volatile`/a dedicated handler
     // (secondary_chance == 0) still cost PS one `random(100)` at the secondaries site.
     if extra_secondary_roll_move(md.id)
@@ -10133,7 +10578,7 @@ fn apply_target_secondary(b: Branch, side: SideId, md: &crate::data::MoveData) -
     if target_eligible {
         for (i, &delta) in md.secondary_boosts.iter().enumerate() {
             // One `AfterEachBoost` per actually-changed stat (sim/battle.ts:2073).
-            if delta != 0 && apply_boost_clamped(&mut proc, foe, BOOST_ORDER[i], delta) < 0 {
+            if delta != 0 && apply_boost_clamped_ex(&mut proc, foe, BOOST_ORDER[i], delta, mb_move) < 0 {
                 react_to_stat_drop(&mut proc, foe);
                 apply_white_herb(&mut proc, foe);
             }
@@ -10978,7 +11423,8 @@ fn execute_status_move(
         let sub_blocks = b.state.side(foe2).volatiles.contains(VolatileStatus::Substitute)
             && b.state.side(side).active().ability != crate::ids::Ability::Infiltrator;
         if b.state.side(foe2).active().is_alive() && !sub_blocks {
-            if apply_boost_clamped(&mut b, foe2, BoostIndex::Evasion, -1) < 0 {
+            let mb_move = move_breaks_abilities(&b, side, &md);
+            if apply_boost_clamped_ex(&mut b, foe2, BoostIndex::Evasion, -1, mb_move) < 0 {
                 react_to_stat_drop(&mut b, foe2);
             }
         }
@@ -11298,7 +11744,8 @@ fn execute_status_move(
                     push(&mut b, Instruction::Heal { side, slot, amount });
                 }
             }
-            if apply_boost_clamped(&mut b, foe, BoostIndex::Attack, -1) < 0 {
+            let mb_move = move_breaks_abilities(&b, side, &md);
+            if apply_boost_clamped_ex(&mut b, foe, BoostIndex::Attack, -1, mb_move) < 0 {
                 react_to_stat_drop(&mut b, foe);
             }
         }
@@ -11359,7 +11806,6 @@ fn execute_status_move(
     // Taunt roll `randomChance(110, 100)`).
     if md.accuracy != 0
         && md.target != crate::data::MoveTarget::User
-        && !(md.id.to_id() == "toxic" && b.state.side(side).active().types.contains(&Type::Poison))
         && !accuracy_forced_true(&b, side, md)
     {
         let acc = accuracy_arg(&b, side, md);
@@ -11424,7 +11870,7 @@ fn execute_status_move(
     // Boosts a status move applies to the foe (Growl, ...), respecting Clear Body.
     if hit.state.side(foe).active().is_alive() && !foe_immune {
         for (i, &delta) in md.target_boosts.iter().enumerate() {
-            if delta != 0 && apply_boost_clamped(&mut hit, foe, BOOST_ORDER[i], delta) < 0 {
+            if delta != 0 && apply_boost_clamped_ex(&mut hit, foe, BOOST_ORDER[i], delta, status_breaker) < 0 {
                 // PS fires `AfterEachBoost` INSIDE `boost()`'s per-stat loop (sim/battle.ts:2073),
                 // once for every stat whose `boostBy` was non-zero — so a TWO-stat drop wakes
                 // Defiant / Competitive TWICE. Parting Shot (atk -1, spa -1) into Competitive is
@@ -11906,6 +12352,7 @@ fn future_sight_rolls_crit(state: &State, target_side: SideId, caster_slot: u8, 
         attacker_burned: false,
         weather: state.weather,
         terastallized: caster.terastallized,
+        defender_terastallized: false,
         tera_type: caster.tera_type,
         life_orb: false,
         adaptability: false,
@@ -13118,7 +13565,15 @@ fn apply_end_of_turn_inner(
         }
         return out_h;
     }
-    for side in [SideId::One, SideId::Two] {
+    // Speed order, not side order: two Harvest holders make two consecutive, IDENTICALLY-SHAPED
+    // `randomChance[1,2]` draws, so the differ cannot tell them apart but the SELECTOR must —
+    // the seed gate hands the first recorded result to whichever holder the engine rolls first.
+    // The residual handler list is `speedSort`ed, so the FASTER holder rolls first. rb5073 d51:
+    // a Tropius (base Spe 51, berry still held, roll discarded) and an Exeggutor-Alola (base 45,
+    // berry eaten) both carry Harvest+Sitrus; PS's pair is `False, True`, and rolling side-One
+    // first gave the Exeggutor the False, so its Sitrus never regrew and never healed the 78 HP
+    // that `hitStepMoveHitLoop`'s Update would have eaten it for.
+    for side in residual_side_order(&out_h[0].state) {
         out_h = out_h
             .into_iter()
             .flat_map(|b| {

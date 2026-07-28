@@ -21,7 +21,19 @@
 //! stores both `previous` and `new`.
 
 use crate::ids::{Ability, BoostIndex, Item, MoveId, Status, Terrain, Type, Weather};
-use crate::state::{PendingMove, SideId, State};
+use crate::state::{PendingMove, Side, SideId, State};
+
+/// PS's `switchIn` array rewrite: the outgoing mon takes the incoming one's array index and vice
+/// versa (`sim/battle-actions.ts:128-131`). An involution, so it serves apply AND reverse.
+fn swap_roster(s: &mut Side, previous: u8, next: u8) {
+    let (Some(i), Some(j)) = (
+        s.roster.iter().position(|&x| x == previous),
+        s.roster.iter().position(|&x| x == next),
+    ) else {
+        return;
+    };
+    s.roster.swap(i, j);
+}
 
 /// Selects which of the active Pokémon's simple turn-countdowns an instruction touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +127,19 @@ pub enum Instruction {
     // --- active Pokémon selection ---
     /// Change a side's active slot. Boost/volatile resets are emitted as their own
     /// instructions, so this is purely the index swap.
+    /// Also SWAPS the two mons' entries in `Side::roster` — PS's `switchIn` rewrites
+    /// `side.pokemon[…]` for both (`sim/battle-actions.ts:128-131`). The swap is an involution, so
+    /// apply and reverse are the same operation.
     Switch { side: SideId, previous: u8, next: u8 },
+
+    // --- Illusion ---
+    /// Set/clear `pokemon.illusion` SILENTLY: the `onBeforeSwitchIn` choice (which always begins
+    /// by nulling the old value) and the `onFaint` clear. Emits no protocol.
+    SetIllusion { side: SideId, slot: u8, previous: Option<u8>, new: Option<u8> },
+    /// The VISIBLE break — PS's `singleEvent('End', Illusion)` reaching `onEnd` with
+    /// `beingCalledBack` false, i.e. the `onDamagingHit` path. Clears the disguise and emits
+    /// `|replace|` + `|-end|…|Illusion|` (plus the Illusion Level Mod hint).
+    BreakIllusion { side: SideId, slot: u8, previous: u8 },
 
     // --- HP ---
     Damage { side: SideId, slot: u8, amount: i16 },
@@ -261,8 +285,16 @@ impl State {
     pub fn apply_one(&mut self, ins: Instruction) {
         use Instruction::*;
         match ins {
-            Switch { side, next, .. } => {
-                self.side_mut(side).active_index = next;
+            Switch { side, previous, next } => {
+                let s = self.side_mut(side);
+                s.active_index = next;
+                swap_roster(s, previous, next);
+            }
+            SetIllusion { side, slot, new, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = new;
+            }
+            BreakIllusion { side, slot, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = None;
             }
             Damage { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp -= amount;
@@ -288,11 +320,19 @@ impl State {
                 let p = &mut self.sides[side.index()].pokemon[slot as usize];
                 p.species = new.species;
                 for i in 1..6 { p.stats[i] = new.stats[i]; }
-                // Forme changes (Tera Shift) can change max HP; damage taken is preserved.
+                // Forme changes (Tera Shift, Terapagos-Stellar's faint regression) can change max
+                // HP. PS's `updateMaxHp` (`sim/pokemon.ts:1499-1507`) is
+                // `this.hp = this.hp <= 0 ? 0 : Math.max(1, newMaxHP - (this.maxhp - this.hp))` —
+                // damage taken is preserved, but **a fainted mon stays at 0** rather than going
+                // negative when max HP SHRINKS. (The `max(1)` floor is not reproduced: it needs a
+                // live mon whose damage taken exceeds the new maximum, which no gen-9 forme change
+                // can produce, and clamping there would cost exact reversibility.)
                 if new.stats[0] != previous.stats[0] {
                     p.stats[0] = new.stats[0];
                     p.max_hp = new.stats[0];
-                    p.hp += new.stats[0] - previous.stats[0];
+                    if p.hp > 0 {
+                        p.hp += new.stats[0] - previous.stats[0];
+                    }
                 }
                 p.types = new.types;
                 p.live_types = new.live_types;
@@ -450,8 +490,16 @@ impl State {
     pub fn reverse_one(&mut self, ins: Instruction) {
         use Instruction::*;
         match ins {
-            Switch { side, previous, .. } => {
-                self.side_mut(side).active_index = previous;
+            Switch { side, previous, next } => {
+                let s = self.side_mut(side);
+                s.active_index = previous;
+                swap_roster(s, previous, next); // involution
+            }
+            SetIllusion { side, slot, previous, .. } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = previous;
+            }
+            BreakIllusion { side, slot, previous } => {
+                self.sides[side.index()].pokemon[slot as usize].illusion = Some(previous);
             }
             Damage { side, slot, amount } => {
                 self.sides[side.index()].pokemon[slot as usize].hp += amount;
@@ -479,7 +527,9 @@ impl State {
                 if new.stats[0] != previous.stats[0] {
                     p.stats[0] = previous.stats[0];
                     p.max_hp = previous.stats[0];
-                    p.hp -= new.stats[0] - previous.stats[0];
+                    if p.hp > 0 {
+                        p.hp -= new.stats[0] - previous.stats[0];
+                    }
                 }
                 p.types = previous.types;
                 p.live_types = previous.live_types;
