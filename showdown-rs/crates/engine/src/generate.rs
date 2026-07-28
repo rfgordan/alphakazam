@@ -590,12 +590,24 @@ pub(crate) fn custap_stage(branches: &mut [Branch], state: &State, s1: MoveChoic
 
 /// Damaging moves with the `wind` flag (Wind Rider / Wind Power triggers). Non-damaging wind
 /// moves (Whirlwind, Tailwind, Sandstorm) route through the status path and are not covered.
+/// `flags: { wind: 1 }` — ENUMERATED off the pinned dex (`Dex.forGen(9).moves.all()`), all 17,
+/// not recalled. The hand-written version of this list had 14 and was missing `whirlwind`,
+/// `sandstorm` and `tailwind`.
+///
+/// **`whirlwind` is the one that cost a game.** rb5343 d48 t41: a Skarmory Whirlwinds a Shiftry
+/// with WIND RIDER. `windrider.onTryHit` (`data/abilities.ts:5490`) tests `move.flags['wind']`,
+/// gives the target +1 Atk and returns `null` at moveStep 2 — so the drag never happens and PS
+/// draws nothing. The engine dragged and emitted a `rust extra` `sample[1]@drag`.
+///
+/// `sandstorm` (target `all`) and `tailwind` (target `allySide`) never reach a foe's `TryHit`, so
+/// they are inert on this path; they are here because the LIST is the dex's, not a curated subset.
 fn is_wind_move(id: crate::ids::MoveId) -> bool {
     matches!(
         id.to_id(),
         "aeroblast" | "aircutter" | "bleakwindstorm" | "blizzard" | "fairywind" | "gust"
             | "heatwave" | "hurricane" | "icywind" | "petalblizzard" | "sandsearstorm"
-            | "springtidestorm" | "twister" | "wildboltstorm"
+            | "sandstorm" | "springtidestorm" | "tailwind" | "twister" | "whirlwind"
+            | "wildboltstorm"
     )
 }
 
