@@ -5843,7 +5843,18 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // breaks BEFORE 970 and fires neither. Both are actives-Speed-tie shuffles (no-op off a
         // tie), so this only affects tied boards. Detect a successful moveHit per-branch as "the
         // status resolution added ≥1 effect instruction" — a failed move applies none. Pure
-        // protect-fail bookkeeping (only a `SetStallCounter` reset) is NOT a moveHit success.
+        // protect-fail bookkeeping (only a `SetStallCounter` reset) is NOT a moveHit success, and
+        // neither is a **`SleepClauseBlocked`**: Sleep Clause Mod is an `onSetStatus` that returns
+        // FALSE, so `trySetStatus` fails, `moveHit` returns false, `hitStepMoveHitLoop` breaks at
+        // `hit === 1` and PS fires NEITHER Update. The instruction records that the clause SPOKE,
+        // not that the move landed.
+        //
+        // rb5021 d20 t18: a Spore into a side that already has a sleeper, on a 96-vs-96 board. The
+        // engine emitted 970 + 1024, ran TWO draws ahead from turn 18, and the damage surfaced at
+        // d21 dressed as a move-order-tie bug — the `b0 == b3` composition was never wrong. The
+        // recorded shuffle GROUPS prove it: d21's commit sort reads `[p1 Amoonguss, p2 Snorlax]`
+        // and the dynamic re-sort reads `[p2 Snorlax, p1 Amoonguss]`, so b0 = 1 (swapped), and PS
+        // then executes Amoonguss, so b3 = 1 — `b0 == b3` gives PS's answer exactly.
         //
         // The 970/1024 Updates fire only when PS enters the per-POKEMON `hitStepMoveHitLoop`
         // (`spreadMoveHit`, battle-actions.ts). A status move that targets a SIDE or the FIELD
@@ -5866,7 +5877,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 let did_something = sb.ins.len() > ins_before
                     && sb.ins[ins_before..]
                         .iter()
-                        .any(|i| !matches!(i, Instruction::SetStallCounter { .. } | Instruction::SetStallTurns { .. }));
+                        .any(|i| {
+                            !matches!(
+                                i,
+                                Instruction::SetStallCounter { .. }
+                                    | Instruction::SetStallTurns { .. }
+                                    | Instruction::SleepClauseBlocked { .. }
+                            )
+                        });
                 if did_something {
                     emit_update_hit(sb); // 970 (per-hit, pre-faint board)
                     emit_update(sb); // 1024 (post-hit-loop, alive-gated)
