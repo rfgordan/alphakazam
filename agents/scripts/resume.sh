@@ -3,7 +3,7 @@
 # twelve-line command into tmux (multi-line paste through iTerm -> ssh -> tmux is exactly the
 # thing that mangles backslash continuations).
 #
-#   agents/scripts/resume.sh                 # resume runs/scale2, detached, with W&B
+#   agents/scripts/resume.sh                 # resume runs/hero1 (honest recipe), detached, with W&B
 #   agents/scripts/resume.sh runs/other      # a different run directory
 #   NO_SIDECAR=1 agents/scripts/resume.sh    # trainer only
 #   agents/scripts/resume.sh runs/scale2 --entropy-coef 0.01    # extra args are appended
@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RUN_DIR=${1:-runs/scale2}
+RUN_DIR=${1:-runs/hero1}
 [ $# -gt 0 ] && shift || true
 
 exec ./scripts/launch_train.sh "$RUN_DIR" \
@@ -25,6 +25,11 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--target-kl 0.03 \
 	--shaping-coef 0.15 \
 	--league-heuristic-weight 4.0 \
+	--fog-species \
+	--obs-version 2 \
+	--frames 2 \
+	--outcome-head \
+	--team-pool ../showdown-rs/harness/team-pool/gen9randombattle-100k.jsonl.gz \
 	--ckpt-every 10 \
 	--snapshot-every 10 \
 	--pool-size 24 \
