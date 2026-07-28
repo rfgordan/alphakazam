@@ -1139,6 +1139,12 @@ pub struct FlowVec {
     pool: Option<Arc<Vec<PoolTeam>>>,
     /// When set, each Flow accumulates PS protocol lines (fetched per-env via `protocol_log`).
     capture_protocol: bool,
+    /// Fog of war: `State::observe` blanks never-seen foe species (see `State::fog_species`).
+    fog_species: bool,
+    /// Determinization donors: every pool member as a ready `Pokemon`, and the same indexed by
+    /// species id — hidden attributes of seen foes and whole unseen slots are sampled from here.
+    donors_all: Arc<Vec<engine::state::Pokemon>>,
+    donors_by_species: Arc<std::collections::HashMap<u16, Vec<engine::state::Pokemon>>>,
 }
 
 /// The reproducible outcome-sampling seed for env `i` (matches the pre-pool behaviour).
@@ -1148,10 +1154,98 @@ fn flow_seed(seed: u64, i: usize) -> u64 {
 
 /// A fresh `Flow`: pool teams drawn with `draw_rng` (or the fixed matchup when there is no pool),
 /// seeded for outcome sampling by `outcome_seed`.
-fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64, capture: bool) -> Flow {
+fn fresh_flow(pool: &Option<Arc<Vec<PoolTeam>>>, draw_rng: &mut Rng, outcome_seed: u64, capture: bool, fog: bool) -> Flow {
     let mut f = Flow::new(draw_state(pool, draw_rng), outcome_seed);
+    f.state.fog_species = fog;
+    // Leads are visible from turn 0; later entrances reveal via the switch instruction.
+    f.state.reveal_leads();
     f.set_protocol_capture(capture);
     f
+}
+
+/// splitmix64 step for the determinization sampler.
+fn mix64(z: &mut u64) -> u64 {
+    *z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut x = *z;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Resample everything the viewer cannot know about the foe (EXPLORATION_PLAN W8): unseen party
+/// slots are replaced wholesale by pool donors (species-clause respected), and seen mons keep
+/// their battle state while unrevealed moves/item/ability/tera are spliced from a same-species
+/// donor. The viewer's own side and all global state are untouched. Falls back to the true
+/// attribute where the pool has no donor (rare) — a bounded perfect-info leak, never a crash.
+fn determinize_foe(
+    state: &State,
+    viewer: SideId,
+    donors_all: &[engine::state::Pokemon],
+    donors_by_species: &std::collections::HashMap<u16, Vec<engine::state::Pokemon>>,
+    z: &mut u64,
+) -> State {
+    use engine::state::{MoveSlot, Reveal};
+    let mut st = *state;
+    let foe = viewer.other();
+    let mut used: Vec<u16> = st
+        .side(foe)
+        .pokemon
+        .iter()
+        .filter(|p| p.species != engine::ids::Species::None && p.reveal.has(Reveal::SPECIES))
+        .map(|p| p.species.0)
+        .collect();
+    let sd = st.side_mut(foe);
+    for slot in 0..6 {
+        let p = &mut sd.pokemon[slot];
+        if p.species == engine::ids::Species::None {
+            continue;
+        }
+        let r = p.reveal;
+        if !r.has(Reveal::SPECIES) {
+            if donors_all.is_empty() {
+                continue;
+            }
+            for _ in 0..12 {
+                let cand = &donors_all[(mix64(z) % donors_all.len() as u64) as usize];
+                if !used.contains(&cand.species.0) {
+                    let keep = p.reveal;
+                    *p = *cand;
+                    p.reveal = keep;
+                    used.push(cand.species.0);
+                    break;
+                }
+            }
+            continue;
+        }
+        let Some(cands) = donors_by_species.get(&p.species.0) else { continue };
+        let d = &cands[(mix64(z) % cands.len() as u64) as usize];
+        if !r.has(Reveal::ITEM) {
+            p.item = d.item;
+        }
+        if !r.has(Reveal::ABILITY) {
+            p.ability = d.ability;
+            p.base_ability = d.base_ability;
+        }
+        if !r.has(Reveal::TERA) {
+            p.tera_type = d.tera_type;
+        }
+        let seen: Vec<engine::ids::MoveId> = (0..4u8)
+            .filter(|&i| r.move_seen(i))
+            .map(|i| p.moves[i as usize].id)
+            .collect();
+        let mut dpool: Vec<MoveSlot> = d
+            .moves
+            .iter()
+            .copied()
+            .filter(|m| m.id != engine::ids::MoveId::None && !seen.contains(&m.id))
+            .collect();
+        for i in 0..4u8 {
+            if !r.move_seen(i) {
+                p.moves[i as usize] = dpool.pop().unwrap_or(MoveSlot::EMPTY);
+            }
+        }
+    }
+    st
 }
 
 #[pymethods]
@@ -1159,21 +1253,35 @@ impl FlowVec {
     /// `team_pool`: path to a gzipped JSONL pool (harness/gen-team-pool.mjs output). When set, each
     /// env draws two random real-PS random-battle teams per reset; otherwise the fixed matchup.
     #[new]
-    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false))]
+    #[pyo3(signature = (num_envs, seed = 0, max_requests_per_episode = 1000, team_pool = None, capture_protocol = false, fog_species = false))]
     fn new(
         num_envs: usize,
         seed: u64,
         max_requests_per_episode: u32,
         team_pool: Option<String>,
         capture_protocol: bool,
+        fog_species: bool,
     ) -> PyResult<Self> {
         let pool = load_pool_opt(team_pool)?;
         let mut draw_rngs: Vec<Rng> = (0..num_envs)
             .map(|i| Rng(seed.wrapping_add(0x51_ED_27_09).wrapping_add((i as u64) << 32)))
             .collect();
         let flows = (0..num_envs)
-            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i), capture_protocol))
+            .map(|i| fresh_flow(&pool, &mut draw_rngs[i], flow_seed(seed, i), capture_protocol, fog_species))
             .collect();
+        // Determinization donors, built once: every pool member as a ready Pokemon.
+        let mut donors_all = Vec::new();
+        let mut donors_by_species: std::collections::HashMap<u16, Vec<engine::state::Pokemon>> =
+            std::collections::HashMap::new();
+        if let Some(p) = &pool {
+            for team in p.iter() {
+                for m in team.iter() {
+                    let mon = engine::team::build_member_resolved(m);
+                    donors_by_species.entry(mon.species.0).or_default().push(mon);
+                    donors_all.push(mon);
+                }
+            }
+        }
         Ok(FlowVec {
             flows,
             reqs: vec![0; num_envs],
@@ -1182,6 +1290,9 @@ impl FlowVec {
             draw_rngs,
             pool,
             capture_protocol,
+            fog_species,
+            donors_all: Arc::new(donors_all),
+            donors_by_species: Arc::new(donors_by_species),
         })
     }
 
@@ -1276,12 +1387,14 @@ impl FlowVec {
     /// — row `a_self * 13 + a_opp`; `outcome` is ±1/0 from `side`'s view when `done`, else 0;
     /// invalid pairs are zero rows. Call again with a different `seed` for a fresh stochastic
     /// draw per pair (the caller averages samples).
+    #[pyo3(signature = (env, side, seed, det_seed = None))]
     fn lookahead_obs<'py>(
         &self,
         py: Python<'py>,
         env: usize,
         side: u8,
         seed: u64,
+        det_seed: Option<u64>,
     ) -> PyResult<(
         Bound<'py, PyArray2<f32>>,
         Bound<'py, PyArray2<i64>>,
@@ -1299,6 +1412,14 @@ impl FlowVec {
             ));
         }
         let me = sid(side);
+        // det_seed: search under the viewer's INFORMATION SET — the foe's hidden attributes are
+        // resampled from the pool (W8 realistic search) instead of read from the true state.
+        let mut base = f.clone();
+        if let Some(ds) = det_seed {
+            let mut z = ds;
+            base.state = determinize_foe(&f.state, me, &self.donors_all, &self.donors_by_species, &mut z);
+        }
+        let f = &base;
         let my_mask = flow_legal_mask(&f.state, f.request(), me);
         let opp_mask = flow_legal_mask(&f.state, f.request(), me.other());
         const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
@@ -1364,6 +1485,7 @@ impl FlowVec {
     /// The caller solves the child matrix game (kind 2) and backs its value up to the root —
     /// depth-limited subgame solving with equilibrium backups at simultaneous nodes.
     #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (env, side, seed, a_self, a_opp, det_seed = None))]
     fn lookahead_pair_obs<'py>(
         &self,
         py: Python<'py>,
@@ -1372,6 +1494,7 @@ impl FlowVec {
         seed: u64,
         a_self: u8,
         a_opp: u8,
+        det_seed: Option<u64>,
     ) -> PyResult<(
         u8,
         Bound<'py, PyArray2<f32>>,
@@ -1391,6 +1514,10 @@ impl FlowVec {
         }
         let me = sid(side);
         let mut root = f.clone();
+        if let Some(ds) = det_seed {
+            let mut dz = ds;
+            root.state = determinize_foe(&f.state, me, &self.donors_all, &self.donors_by_species, &mut dz);
+        }
         let mut z = seed ^ 0xD1B5_4A32_D192_ED03u64;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         root.rng = z ^ (z >> 27);
@@ -1632,6 +1759,7 @@ impl FlowVec {
         let seed = self.seed;
         let pool = &self.pool;
         let capture = self.capture_protocol;
+        let fog = self.fog_species;
         let (dones, winners): (Vec<bool>, Vec<i64>) = py.allow_threads(|| {
             self.flows
                 .par_iter_mut()
@@ -1658,7 +1786,7 @@ impl FlowVec {
                         _ => (false, -1),
                     };
                     if done && auto_reset {
-                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i), capture);
+                        *flow = fresh_flow(pool, draw_rng, flow_seed(seed, i), capture, fog);
                         *reqs = 0;
                     }
                     (done, winner)

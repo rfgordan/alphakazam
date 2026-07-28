@@ -3017,6 +3017,10 @@ fn apply_switch_inner(b: &mut Branch, side: SideId, target: u8, fire_ability: bo
             push(b, Instruction::SetHealingWish { side, previous: true, new: false });
         }
     }
+    // Entering the field reveals the species (fog-of-war bookkeeping; `State::observe` reads it
+    // when `fog_species` is on). Reversible instruction like every other reveal, so the branch
+    // machinery undoes it cleanly; no-op when already seen.
+    reveal(b, side, 0, crate::state::Reveal::SPECIES);
     if fire_ability && b.state.side(side).active().is_alive() {
         apply_switch_in_ability(b, side);
         run_update_event(b);

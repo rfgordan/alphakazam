@@ -479,6 +479,13 @@ pub struct State {
     pub trick_room_turns: i8,
 
     pub turn: u32,
+
+    /// Battle CONFIGURATION like `ruleset` (not state; absent from the diff/digest manifests):
+    /// when set, [`State::observe`] blanks foe party members whose `Reveal::SPECIES` bit is
+    /// unset — real fog of war. Off by default because every checkpoint trained before
+    /// 2026-07-28 learned on observations that (incorrectly) showed the full enemy roster;
+    /// flipping this under a live run would shift its input distribution. New runs opt in.
+    pub fog_species: bool,
 }
 
 impl State {
@@ -496,6 +503,7 @@ impl State {
         trick_room: false,
         trick_room_turns: 0,
         turn: 0,
+        fog_species: false,
     };
 
     #[inline]
@@ -535,6 +543,18 @@ impl State {
     ///
     /// This is the only place the reveal layer is read, and it is off the hot path — call it when
     /// feeding an agent or logging a position, not inside the per-turn transition.
+    /// Mark both starting actives as species-revealed (battle-init bookkeeping — leads are
+    /// visible from turn 0; every later entrance reveals via `Instruction::Reveal`).
+    pub fn reveal_leads(&mut self) {
+        for s in [SideId::One, SideId::Two] {
+            let sd = self.side_mut(s);
+            let idx = sd.active_index as usize;
+            if idx < 6 {
+                sd.pokemon[idx].reveal.flags |= Reveal::SPECIES;
+            }
+        }
+    }
+
     pub fn observe(&self, viewer: SideId) -> State {
         use crate::ids::{Ability, Item, Type};
         let mut obs = *self;
@@ -559,6 +579,15 @@ impl State {
                 continue;
             }
             let r = p.reveal;
+            if self.fog_species && !r.has(Reveal::SPECIES) {
+                // Never sent out: the viewer knows only that a healthy, unknown party member
+                // exists. hp/max_hp = 1/1 keeps the "healthy" fraction; everything else blanks.
+                let mut q = Pokemon::EMPTY;
+                q.hp = 1;
+                q.max_hp = 1;
+                *p = q;
+                continue;
+            }
             if !r.has(Reveal::ITEM) {
                 p.item = Item::Unknown;
             }

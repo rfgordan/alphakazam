@@ -81,7 +81,7 @@ def _solve_child(q_flat: np.ndarray, cnt_flat: np.ndarray) -> float:
 
 
 def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, seed: int = 0,
-                              timing: dict | None = None):
+                              timing: dict | None = None, det: bool = False):
     """Depth-2 search with equilibrium backups (EXPLORATION_PLAN W7, the ReBeL concept scoped).
 
     Root Turn state: prune both sides' actions to the policy's top-`topk` legal choices, advance
@@ -140,7 +140,8 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
                         for k in range(n_samples):
                             counter[0] += 1
                             kind, obs, ids, done, outc, valid = vec.lookahead_pair_obs(
-                                e, s, counter[0], int(a1), int(a2))
+                                e, s, counter[0], int(a1), int(a2),
+                                counter[0] * 37 + 11 if det else None)
                             obs = np.asarray(obs); ids = np.asarray(ids)
                             done = np.asarray(done); outc = np.asarray(outc)
                             valid = np.asarray(valid)
@@ -195,7 +196,8 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
 
 
 def make_value_search_agent(net, device, n_samples: int = 2, seed: int = 0,
-                            timing: dict | None = None, greedy_pick: bool = False):
+                            timing: dict | None = None, greedy_pick: bool = False,
+                            det: bool = False):
     """A `(vec, envs, mask_rows, rng) -> actions` agent: 1-ply matrix-game search over V."""
     counter = [seed]
 
@@ -292,6 +294,9 @@ def main():
     ap.add_argument("--envs", type=int, default=64)
     ap.add_argument("--samples", type=int, default=2)
     ap.add_argument("--depth", type=int, default=1, choices=[1, 2])
+    ap.add_argument("--det", action="store_true",
+                    help="determinized (honest) search: foe hidden info resampled per draw "
+                         "instead of read from the true state (W8)")
     ap.add_argument("--topk", type=int, default=4, help="depth 2: policy-prior action pruning")
     ap.add_argument("--opponent", type=str, default="heuristic",
                     choices=["heuristic", "raw", "random", "mcts"])
@@ -305,10 +310,10 @@ def main():
     timing: dict = {}
     if args.depth == 2:
         agent = make_subgame_search_agent(net, device, topk=args.topk,
-                                          n_samples=args.samples, timing=timing)
+                                          n_samples=args.samples, timing=timing, det=args.det)
     else:
         agent = make_value_search_agent(net, device, n_samples=args.samples, timing=timing,
-                                        greedy_pick=args.greedy_pick)
+                                        greedy_pick=args.greedy_pick, det=args.det)
     opp = {"heuristic": lambda: make_scripted_heuristic(),
            "raw": lambda: net,
            "random": lambda: "random",
@@ -316,7 +321,7 @@ def main():
 
     t0 = time.perf_counter()
     r = evaluate_flow(agent, opp, device, n_games=args.games, num_envs=args.envs,
-                      team_pool=POOL, seed=20_2607)
+                      team_pool=POOL, seed=20_2607, fog_species=net.fog_species)
     print(json.dumps({
         "ckpt": args.ckpt, "step": step, "arm": f"value-search d{args.depth} x{args.samples}" + (f" topk{args.topk}" if args.depth == 2 else ""),
         "opponent": args.opponent,

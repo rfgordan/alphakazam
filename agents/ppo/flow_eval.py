@@ -184,13 +184,14 @@ def make_scripted_heuristic(stats: dict | None = None):
 
 def evaluate_flow(model, opponent, device, n_games: int = 300, num_envs: int = 128,
                   team_pool: str | None = None, seed: int = 12345, max_requests: int = 600,
-                  max_steps: int = 20_000) -> dict:
+                  max_steps: int = 20_000, fog_species: bool = False) -> dict:
     """Play `model` (greedy) against `opponent` until `n_games` finish. Returns win-rate + Wilson CI.
 
     `opponent` is either the string "random", or a callable
     `(obs, ids, mask, rows) -> actions`, or a torch net played greedily.
     """
-    env = FlowEnvVec(num_envs, seed=seed, team_pool=team_pool, max_requests=max_requests)
+    env = FlowEnvVec(num_envs, seed=seed, team_pool=team_pool, max_requests=max_requests,
+                     fog_species=fog_species)
     rng = np.random.default_rng(seed ^ 0x5EED)
     # Learner on RED for even envs, BLUE for odd — the reported rate averages both perspectives.
     learner_side = (np.arange(num_envs) % 2).astype(np.int64)
