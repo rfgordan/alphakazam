@@ -35,7 +35,7 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--pool-size 24 \
 	--opponent-slots 4 \
 	--pfsp-mode frontier \
-	--eval-every 25 \
+	--eval-every 75 \
 	--eval-games 300 \
 	--wandb \
 	--wandb-project deep-showdown \
