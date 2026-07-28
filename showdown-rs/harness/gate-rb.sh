@@ -3,7 +3,9 @@
 #
 #   101  randbats fixtures  harness/seed-fixtures-rb/*.fx.json.gz        (seeds 5001-5100 + 5139)
 #   399  fresh   fixtures   harness/seed-fixtures-rb-fresh/*.fx.json.gz  (seeds 5101-5500 minus 5139)
-#   = 500 games total.
+#  1000  1000    fixtures   harness/seed-fixtures-rb-1000/*.fx.json.gz   (seeds 5501-6500)
+#   = 1500 games total. The total is COUNTED from the globs, not hardcoded — add a dir, add a
+#   `run` line, and the arithmetic follows.
 #
 # These are the ONLY committed recordings actually PLAYED under gen9randombattle — Sleep Clause
 # Mod live, `Dex#trunc` (13-bit Speed / 16-bit damage), no team preview, percent HP. Every other
@@ -39,14 +41,20 @@ run() { # <label> <files...>
     "$TMP/$label.log" | sed 's/\.fx\.json\.gz$//' >> "$TMP/set"
 }
 
+TOT=0
+count() { TOT=$(( TOT + $# )); }
+count harness/seed-fixtures-rb/*.fx.json.gz
+count harness/seed-fixtures-rb-fresh/*.fx.json.gz
+count harness/seed-fixtures-rb-1000/*.fx.json.gz
+
 run rb100 harness/seed-fixtures-rb/*.fx.json.gz
 run rbfresh harness/seed-fixtures-rb-fresh/*.fx.json.gz
+run rb1000 harness/seed-fixtures-rb-1000/*.fx.json.gz
 
 sort -u "$TMP/set" -o "$TMP/set"
-TOT=500
 BAD=$(wc -l < "$TMP/set" | tr -d ' ')
 echo "----"
 echo "COMBINED-RB: $(( TOT - BAD )) / $TOT exact ; non-exact $BAD"
-sed -n '/^first-divergence category/,/^exact games/p' "$TMP/rbfresh.log" | head -20
+sed -n '/^first-divergence category/,/^exact games/p' "$TMP/rb1000.log" | head -24
 
 if [ -n "$OUT" ]; then cp "$TMP/set" "$OUT"; echo "non-exact set -> $OUT"; fi
