@@ -8585,8 +8585,18 @@ fn apply_post_damage(
         // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
         // policy consumed, the engine at +0 / +0 with it merely knocked away.
         apply_weakness_policy(b, foe, &md);
+        // **A target the Knock Off just KO'd still loses its item.** `onAfterHit` is step 8, and
+        // `faintMessages` has not run — `takeItem` (`sim/pokemon.ts:1851-1866`) checks only
+        // `this.item` and a `TakeItem` event; `pokemon.isActive` stays true until a replacement
+        // switches in and `pokemon.hp` is never consulted. Testing `is_alive()` here asked the
+        // question one faint too early, exactly as `after_hit_user_alive` does for the ATTACKER
+        // (which is where PS's real guard sits: `useMoveInner` never reaches step 8 with a dead
+        // user). rb1314 d5 t5: p1's Knock Off takes a Light Clay off an Abomasnow and KOs it in
+        // the same hit; the engine kept the item, and it stayed invisible for 40 turns until a
+        // Revival Blessing at d45 put the corpse back on the field holding it.
         let f = b.state.side(foe).active();
-        if f.is_alive()
+        if f.species != crate::ids::Species::None
+            && b.after_hit_user_alive
             && f.item != Item::None
             && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
             && def_ability != Ab::StickyHold
