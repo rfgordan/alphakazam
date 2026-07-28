@@ -10187,7 +10187,17 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
             || a.item == Item::SafetyGoggles;
         // PS `runStatusImmunity('powder')` gates the roll: a powder-immune attacker (Grass /
         // Overcoat / Safety Goggles), or an absent source, means NO `random(100)` at all.
-        if !a.is_alive() || powder_immune {
+        //
+        // "Absent" is `this.fainted`, and PS asks it at `runEvent('DamagingHit')` —
+        // `battle-actions.ts:1142`, INSIDE `spreadMoveHit`. `move.recoil` and Life Orb's
+        // `onAfterMoveSecondarySelf` both land after that, but the engine applies them in
+        // `apply_post_damage`, which runs at the end of the hit loop and therefore BEFORE this.
+        // Reading `is_alive()` alone asks the question one self-KO too late, so fall back to the
+        // snapshot `apply_post_damage` takes for exactly this reason (`after_hit_user_alive`).
+        // rb1416 d20 t15: a 3-HP burned Copperajah lands Superpower on a Vileplume and dies to its
+        // own Life Orb; PS rolls `random[100] = 65 @ effectspore DamagingHit` first, the engine
+        // read a corpse and rolled nothing, and ran a draw behind from turn 15 on.
+        if !(a.is_alive() || b.after_hit_user_alive) || powder_immune {
             return vec![b];
         }
         let mut out = Vec::new();
