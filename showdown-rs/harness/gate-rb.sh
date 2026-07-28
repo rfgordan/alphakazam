@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The REAL-FORMAT rail: seed gate over the `[Gen 9] Random Battle` corpus.
 #
-#   101  randbats fixtures  harness/seed-fixtures-rb/*.fx.json.gz  (seeds 5001-5100 + 5139)
+#   101  randbats fixtures  harness/seed-fixtures-rb/*.fx.json.gz        (seeds 5001-5100 + 5139)
+#   399  fresh   fixtures   harness/seed-fixtures-rb-fresh/*.fx.json.gz  (seeds 5101-5500 minus 5139)
+#   = 500 games total.
 #
 # These are the ONLY committed recordings actually PLAYED under gen9randombattle — Sleep Clause
 # Mod live, `Dex#trunc` (13-bit Speed / 16-bit damage), no team preview, percent HP. Every other
@@ -13,6 +15,7 @@
 #   ...fix...
 #   bash harness/gate-rb.sh /tmp/rb-after.txt
 #   comm -13 /tmp/rb-before.txt /tmp/rb-after.txt   # newly-non-exact — MUST BE EMPTY
+#   comm -23 /tmp/rb-before.txt /tmp/rb-after.txt   # newly exact — the yield
 #
 # Usage: bash harness/gate-rb.sh [out-nonexact-set-file]
 set -euo pipefail
@@ -24,14 +27,26 @@ COSIM=target/release/cosim
 OUT="${1:-}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+: > "$TMP/set"
 
-# VERBOSE=1 is REQUIRED (seedgate.rs truncates the per-game listing at 45 rows without it).
-SEED_GATE=1 VERBOSE=1 "$COSIM" harness/seed-fixtures-rb/*.fx.json.gz > "$TMP/log" 2>&1 || true
-grep -m1 'FULL-GAME EXACT' "$TMP/log"
-grep -m1 'init-aligned' "$TMP/log"
-awk '/^per-game first divergence/{f=1;next} /^first-divergence category/{f=0} f && NF {print $1}' \
-  "$TMP/log" | sed 's/\.fx\.json\.gz$//' | sort -u > "$TMP/set"
-echo "non-exact: $(wc -l < "$TMP/set" | tr -d ' ')"
-sed -n '/^first-divergence category/,/^exact games/p' "$TMP/log" | head -20
+run() { # <label> <files...>
+  local label="$1"; shift
+  # VERBOSE=1 is REQUIRED (seedgate.rs truncates the per-game listing at 45 rows without it).
+  SEED_GATE=1 VERBOSE=1 "$COSIM" "$@" > "$TMP/$label.log" 2>&1 || true
+  printf '%-8s %s\n' "$label" "$(grep -m1 'FULL-GAME EXACT' "$TMP/$label.log")"
+  printf '%-8s %s\n' "" "$(grep -m1 'init-aligned' "$TMP/$label.log")"
+  awk '/^per-game first divergence/{f=1;next} /^first-divergence category/{f=0} f && NF {print $1}' \
+    "$TMP/$label.log" | sed 's/\.fx\.json\.gz$//' >> "$TMP/set"
+}
+
+run rb100 harness/seed-fixtures-rb/*.fx.json.gz
+run rbfresh harness/seed-fixtures-rb-fresh/*.fx.json.gz
+
+sort -u "$TMP/set" -o "$TMP/set"
+TOT=500
+BAD=$(wc -l < "$TMP/set" | tr -d ' ')
+echo "----"
+echo "COMBINED-RB: $(( TOT - BAD )) / $TOT exact ; non-exact $BAD"
+sed -n '/^first-divergence category/,/^exact games/p' "$TMP/rbfresh.log" | head -20
 
 if [ -n "$OUT" ]; then cp "$TMP/set" "$OUT"; echo "non-exact set -> $OUT"; fi
