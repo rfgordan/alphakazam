@@ -6183,6 +6183,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
                 .flat_map(|sb| apply_cursed_body(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
+                .flat_map(|sb| apply_source_damaging_hit(sb, side, &md))
             {
                 // A nullified hit is still a connecting hit, so the per-hit `eachEvent('Update')`
                 // (970) and the post-hit-loop one (1024) both fire.
@@ -6260,6 +6261,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|x| apply_flinch_split(x, side, &md))
                 .flat_map(|x| apply_cursed_body(x, side, &md))
                 .flat_map(|x| apply_contact_secondaries(x, side, &md))
+                .flat_map(|x| apply_source_damaging_hit(x, side, &md))
             {
                 // Same two Updates as the Ice Face arm: `onDamage` returned the NUMBER 0, so the
                 // target stayed in `targets` and PS ran the rest of `hitStepMoveHitLoop`.
@@ -6614,6 +6616,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_source_damaging_hit(sb, side, &md) })
                 .collect::<Vec<_>>()
         };
         for mut sb in branches {
@@ -10332,35 +10335,59 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
         draw(&mut b, "randomChance", &[3, 10], 0, "cutecharm");
         return vec![b];
     }
-    // Toxic Chain (attacker) badly-poisons the target on any damaging hit (30%, not contact-
-    // gated). Otherwise a contact hit can trigger the defender's status ability or the
-    // attacker's Poison Touch.
-    let (target, status, poison_touch) = if atk_ab == Ab::ToxicChain {
-        (foe, Status::Toxic, false)
-    } else if !md.flag_contact {
+    // The DEFENDER's contact-status `onDamagingHit` abilities. The ATTACKER's
+    // `onSourceDamagingHit` ones (Poison Touch, Toxic Chain) are a SEPARATE handler on the same
+    // event and live in `apply_source_damaging_hit` — see it for why this is not a `match`.
+    if !md.flag_contact {
         return vec![b];
-    } else {
-        match def_ab {
-            Ab::FlameBody => (side, Status::Burn, false),
-            Ab::Static => (side, Status::Paralysis, false),
-            Ab::PoisonPoint => (side, Status::Poison, false),
-            _ if atk_ab == Ab::PoisonTouch => (foe, Status::Poison, true),
-            _ => return vec![b],
-        }
-    };
-    // Poison Touch is the ONE contact ability that PS gates on the target's Shield Dust /
-    // Covert Cloak: it returns BEFORE the roll, so no `randomChance` at all (the other contact
-    // abilities status the attacker and ignore its Shield Dust). PS ref: abilities.ts poisontouch.
-    if poison_touch {
-        let t = b.state.side(target).active();
-        if t.ability == Ab::ShieldDust || t.item == Item::CovertCloak {
-            return vec![b];
-        }
     }
-    // PS `onDamagingHit` / `onSourceDamagingHit` rolls `randomChance(3, 10)` on every qualifying
-    // hit, INDEPENDENT of whether the status can be applied (`trySetStatus` runs inside the proc
-    // branch). When it can't land — target already statused / type-immune / fainted this hit —
-    // the roll is a single draw-and-discard. The engine previously skipped the draw entirely.
+    let status = match def_ab {
+        Ab::FlameBody => Status::Burn,
+        Ab::Static => Status::Paralysis,
+        Ab::PoisonPoint => Status::Poison,
+        _ => return vec![b],
+    };
+    let _ = atk_ab;
+    damaging_hit_status_roll(b, side, status)
+}
+
+/// The ATTACKER's `onSourceDamagingHit` status abilities — **Poison Touch** (contact-gated) and
+/// **Toxic Chain** (any damaging hit). PS runs them in the SAME `runEvent('DamagingHit')` as the
+/// defender's Flame Body / Static / Poison Point, as a DIFFERENT handler: `findEventHandlers`
+/// collects the target's `on<Event>` first and the source's `onSource<Event>` last, so when both
+/// sides carry one, **both roll, target first**.
+///
+/// The engine had them in a single `match` with the defender's abilities — the defender's arm
+/// won and the attacker's roll vanished. rb5413 d2 t3 is the witness and it is DECISION 2: a
+/// Muk-Alola (Poison Touch) Shadow Sneaks a Magcargo (Flame Body). PS's stream for the hit is
+/// `acc, crit, roll, randomChance[3,10]=false, randomChance[3,10]=false` — TWO 30% rolls — and
+/// the engine emitted one. d3's Poison Jab repeats it with `true, false`.
+///
+/// Both abilities return BEFORE their `randomChance` on a Shield Dust / Covert Cloak target
+/// (`abilities.ts:3328`, `:5050`, each with the same "Despite not being a secondary" comment), so
+/// that gate suppresses the DRAW, not just the effect. The defender-side abilities status the
+/// ATTACKER and have no such check.
+fn apply_source_damaging_hit(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    let status = match b.state.side(side).active().ability {
+        Ab::ToxicChain => Status::Toxic,
+        Ab::PoisonTouch if md.flag_contact => Status::Poison,
+        _ => return vec![b],
+    };
+    let t = b.state.side(foe).active();
+    if t.ability == Ab::ShieldDust || t.item == Item::CovertCloak {
+        return vec![b];
+    }
+    damaging_hit_status_roll(b, foe, status)
+}
+
+/// The `randomChance(3, 10)` every `DamagingHit` status ability shares.
+///
+/// PS rolls it INDEPENDENT of whether the status can be applied (`trySetStatus` runs inside the
+/// proc branch). When it can't land — target already statused / type-immune / fainted this hit —
+/// the roll is a single draw-and-discard.
+fn damaging_hit_status_roll(b: Branch, target: SideId, status: Status) -> Vec<Branch> {
     let can_land = b.state.side(target).active().is_alive()
         && status_applies(b.state.side(target).active(), status);
     if !can_land {
@@ -10371,8 +10398,6 @@ fn apply_contact_secondaries(b: Branch, side: SideId, md: &crate::data::MoveData
     let chance = 0.30;
     let mut proc = scaled(&b, chance);
     let mut noproc = scaled(&b, 1.0 - chance);
-    // PS contact-status abilities (Static/Flame Body/Poison Point) and Poison Touch/Toxic Chain
-    // roll `randomChance(3, 10)` in their onDamagingHit handler.
     draw(&mut proc, "randomChance", &[3, 10], 1, "contact-status");
     draw(&mut noproc, "randomChance", &[3, 10], 0, "contact-status");
     let slot = proc.state.side(target).active_index;
@@ -10501,6 +10526,7 @@ fn realized_per_hit_damaging_hit(
     let cands: Vec<Branch> = apply_cursed_body(b.clone(), side, md)
         .into_iter()
         .flat_map(|sb| apply_contact_secondaries(sb, side, md))
+        .flat_map(|sb| apply_source_damaging_hit(sb, side, md))
         .collect();
     // Nothing rolled and nothing applied: the common case, no cursor movement.
     if cands.len() == 1 && cands[0].draws.len() == base {
