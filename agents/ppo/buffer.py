@@ -10,13 +10,14 @@ import torch
 
 class RolloutBuffer:
     def __init__(self, steps: int, num_envs: int, obs_dim: int, n_actions: int, device, id_dim: int = 0,
-                 aux: bool = False, outcome: bool = False):
+                 aux: bool = False, outcome: bool = False, belief: bool = False):
         self.steps = steps
         self.num_envs = num_envs
         self.device = device
         self.id_dim = id_dim
         self.aux = aux
         self.outcome = outcome
+        self.belief = belief
 
         shape = (steps, num_envs)
         self.obs = torch.zeros(shape + (obs_dim,), device=device)
@@ -41,6 +42,11 @@ class RolloutBuffer:
         # lazily on the first add() that supplies one.
         self.teacher_actions = None
 
+        # Belief-head labels: 11 hidden-identity targets + their is-hidden mask (see
+        # pybridge belief_targets_all).
+        self.belief_targets = torch.zeros(shape + (11,), dtype=torch.long, device=device) if belief else None
+        self.belief_masks = torch.zeros(shape + (11,), device=device) if belief else None
+
         # Outcome-head channel (E2 branch-B fix): the UNSHAPED terminal reward, the head's own
         # rollout predictions (for bootstrapping), and its λ-returns — a second GAE pass whose
         # targets mean "who wins from here" on the ±1 scale.
@@ -54,12 +60,15 @@ class RolloutBuffer:
 
     def add(self, t: int, obs, mask, action, log_prob, value, reward, done, obs_ids=None,
             opp_action=None, dyn_target=None, active=None, teacher_action=None,
-            outcome_reward=None, outcome_value=None):
+            outcome_reward=None, outcome_value=None, belief_target=None, belief_mask=None):
         self.obs[t] = obs
         self.active[t] = 1.0 if active is None else active
         if self.outcome and outcome_reward is not None:
             self.outcome_rewards[t] = outcome_reward
             self.outcome_values[t] = outcome_value
+        if self.belief and belief_target is not None:
+            self.belief_targets[t] = belief_target
+            self.belief_masks[t] = belief_mask
         if teacher_action is not None:
             if self.teacher_actions is None:
                 self.teacher_actions = torch.full((self.steps, self.num_envs), -1,
@@ -127,4 +136,7 @@ class RolloutBuffer:
             d["teacher_action"] = self.teacher_actions.reshape(-1)
         if self.outcome:
             d["outcome_return"] = self.outcome_returns.reshape(-1)
+        if self.belief:
+            d["belief_target"] = self.belief_targets.reshape(-1, 11)
+            d["belief_mask"] = self.belief_masks.reshape(-1, 11)
         return d

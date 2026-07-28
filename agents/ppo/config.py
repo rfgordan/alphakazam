@@ -46,6 +46,10 @@ class PPOConfig:
     # --- outcome head (search evaluator: unshaped terminal-outcome lambda-returns) ---
     outcome_head: bool = False
 
+    # --- belief heads (predict hidden foe identity from public obs; W9) ---
+    belief_head: bool = False
+    belief_coef: float = 0.5
+
     # --- potential-based reward shaping (Φ = team HP differential; policy-invariant) ---
     shaping_coef: float = 0.0   # 0 = off (pure sparse reward); ~0.5 is a sane on-value
 

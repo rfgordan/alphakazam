@@ -22,7 +22,8 @@ MASK_FILL = -1e8
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, n_actions, hidden_dim=928, n_hidden_layers=2,
-                 embed: dict | None = None, aux: bool = False, outcome: bool = False):
+                 embed: dict | None = None, aux: bool = False, outcome: bool = False,
+                 belief: bool = False):
         """`embed`, if given: {n_mons, cols: [table-name per ID column], vocab: {table: size}, dim}.
         `aux=True` adds prediction heads (opponent move + turn dynamics) that share the trunk but
         NOT the policy head — they enrich the representation without biasing the policy.
@@ -33,6 +34,7 @@ class ActorCritic(nn.Module):
         self.embed_cfg = embed
         self.has_aux = aux
         self.has_outcome = outcome
+        self.has_belief = belief
         self.n_actions = n_actions
         embed_total = 0
         if embed is not None:
@@ -69,6 +71,18 @@ class ActorCritic(nn.Module):
 
         if outcome:
             self.outcome_head = nn.Linear(hidden_dim, 1)
+
+        if belief:
+            # Belief heads (W9): predict the FOE's hidden identity from the public obs — 6 party
+            # species + the active's item + its 4 move slots. Supervised from the true state
+            # (labels are free during self-play), trained only on HIDDEN entries. Off the trunk,
+            # never the policy head: they shape representation and later steer determinization.
+            assert embed is not None, "belief heads need the embedding vocab for output sizes"
+            v = embed["vocab"]
+            self.belief_species = nn.Linear(hidden_dim, 6 * v["species"])
+            self.belief_item = nn.Linear(hidden_dim, v["item"])
+            self.belief_moves = nn.Linear(hidden_dim, 4 * v["move"])
+            self._belief_sizes = (v["species"], v["item"], v["move"])
 
         self.apply(_orthogonal_init)
         _orthogonal_init(self.policy_head, gain=0.01)
@@ -126,6 +140,7 @@ class ActorCritic(nn.Module):
         if teacher_action is not None:
             self.teacher_log_prob = dist.log_prob(teacher_action.clamp(min=0))
         self.outcome_pred = self.outcome_head(h).squeeze(-1) if self.has_outcome else None
+        self.trunk_h = h if self.has_belief else None
         out = (action, dist.log_prob(action), dist.entropy(), value)
         if return_aux:
             # Return the trunk features so the dynamics head can be conditioned on the actions
@@ -133,6 +148,13 @@ class ActorCritic(nn.Module):
             aux = {"opp": self.aux_opp_head(h), "h": h}
             return (*out, aux)
         return out
+
+    def belief_logits(self, h):
+        """(species [B,6,Vs], item [B,Vi], moves [B,4,Vm]) from trunk features."""
+        vs, vi, vm = self._belief_sizes
+        return (self.belief_species(h).view(-1, 6, vs),
+                self.belief_item(h),
+                self.belief_moves(h).view(-1, 4, vm))
 
     def predict_dynamics(self, h, a_self, a_opp):
         """World-model prediction [hp_delta_self, hp_delta_opp, ko_self, ko_opp] conditioned on both

@@ -1613,6 +1613,54 @@ impl FlowVec {
         }
     }
 
+    /// Belief-head training targets (EXPLORATION_PLAN W9), from the TRUE state — free labels.
+    /// Per env, about the FOE of `side`: `targets [N, 11]` = [species of party slot 0..5,
+    /// active item, active move slot 0..3] as embedding ids; `mask [N, 11]` = 1 where the entry
+    /// is HIDDEN from `side` (a real prediction target) and present, 0 where revealed/absent.
+    fn belief_targets_all<'py>(
+        &self,
+        py: Python<'py>,
+        side: u8,
+    ) -> (Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>) {
+        use engine::state::Reveal;
+        const K: usize = 11;
+        let n = self.flows.len();
+        let me = sid(side);
+        let mut tgt = vec![0i64; n * K];
+        let mut msk = vec![0f32; n * K];
+        for (i, f) in self.flows.iter().enumerate() {
+            let foe = f.state.side(me.other());
+            let t = &mut tgt[i * K..(i + 1) * K];
+            let m = &mut msk[i * K..(i + 1) * K];
+            for slot in 0..6 {
+                let p = &foe.pokemon[slot];
+                if p.species == engine::ids::Species::None {
+                    continue;
+                }
+                t[slot] = p.species.0 as i64;
+                m[slot] = if p.reveal.has(Reveal::SPECIES) { 0.0 } else { 1.0 };
+            }
+            let ai = foe.active_index as usize;
+            if ai < 6 {
+                let p = &foe.pokemon[ai];
+                t[6] = p.item as i64;
+                m[6] = if p.reveal.has(Reveal::ITEM) { 0.0 } else { 1.0 };
+                for mv in 0..4usize {
+                    let ms = p.moves[mv];
+                    if ms.id == engine::ids::MoveId::None {
+                        continue;
+                    }
+                    t[7 + mv] = ms.id.0 as i64;
+                    m[7 + mv] = if p.reveal.move_seen(mv as u8) { 0.0 } else { 1.0 };
+                }
+            }
+        }
+        (
+            Array2::from_shape_vec((n, K), tgt).unwrap().into_pyarray_bound(py),
+            Array2::from_shape_vec((n, K), msk).unwrap().into_pyarray_bound(py),
+        )
+    }
+
     /// (N,) scripted-heuristic action for every env, from `sides[i]`'s perspective (0/1).
     /// -1 where the heuristic has no opinion (non-acting request, or a state the Python
     /// implementation would raise on) — see [`heuristic_action_of`]. The Python-side wrapper

@@ -70,7 +70,8 @@ def build_model(cfg, env, device, aux: bool):
     embed = {"n_mons": env.n_mons, "cols": env.id_columns, "vocab": env.vocab, "dim": cfg.embed_dim}
     return ActorCritic(env.obs_dim, env.n_actions, cfg.hidden_dim, cfg.n_hidden_layers,
                        embed=embed, aux=aux,
-                       outcome=getattr(cfg, "outcome_head", False)).to(device)
+                       outcome=getattr(cfg, "outcome_head", False),
+                       belief=getattr(cfg, "belief_head", False)).to(device)
 
 
 def train(args):
@@ -82,7 +83,7 @@ def train(args):
         hidden_dim=args.hidden_dim, n_hidden_layers=args.n_hidden_layers,
         embed_dim=args.embed_dim, seed=args.seed, device=args.device or "auto",
         shaping_coef=args.shaping_coef, aux=args.aux, target_kl=args.target_kl,
-        outcome_head=args.outcome_head,
+        outcome_head=args.outcome_head, belief_head=args.belief_head,
     )
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -210,7 +211,8 @@ def train(args):
 
     buffer = RolloutBuffer(cfg.rollout_steps, cfg.num_envs, env.obs_dim, env.n_actions, device,
                            id_dim=env.id_dim, aux=cfg.aux,
-                           outcome=getattr(cfg, "outcome_head", False))
+                           outcome=getattr(cfg, "outcome_head", False),
+                           belief=getattr(cfg, "belief_head", False))
     logger = RunLogger(str(run_dir.parent), run_dir.name,
                        wandb_project=args.wandb_project if args.wandb else None)
     logger.config({"cfg": vars(cfg), "obs_dim": env.obs_dim, "n_actions": env.n_actions,
@@ -229,7 +231,8 @@ def train(args):
                     "update": update, "total_games": total_games,
                     "obs_dim": env.obs_dim, "n_actions": env.n_actions,
                     "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
-                    "embed_dim": cfg.embed_dim, "fog_species": args.fog_species},
+                    "embed_dim": cfg.embed_dim, "fog_species": args.fog_species,
+                    "belief_head": args.belief_head},
                    state_path)
         # A separate, weights-only artifact per checkpoint — this is what the on-policy cosim
         # sidecar and offline evals load, and it must never be a half-written training_state.
@@ -237,7 +240,8 @@ def train(args):
         torch.save({"model": model.state_dict(), "global_step": global_step, "update": update,
                     "obs_dim": env.obs_dim, "n_actions": env.n_actions,
                     "hidden_dim": cfg.hidden_dim, "n_hidden_layers": cfg.n_hidden_layers,
-                    "embed_dim": cfg.embed_dim, "fog_species": args.fog_species}, ckpt)
+                    "embed_dim": cfg.embed_dim, "fog_species": args.fog_species,
+                    "belief_head": args.belief_head}, ckpt)
         if args.keep_checkpoints > 0:
             for old in sorted(glob.glob(str(run_dir / "ckpt_*.pt")))[:-args.keep_checkpoints]:
                 os.remove(old)
@@ -292,6 +296,19 @@ def train(args):
                                         dtype=np.int64)
                 teacher_t = torch.as_tensor(teacher_np, device=device)
 
+            belief_t = belief_m = None
+            if buffer.belief:
+                # Labels for the CURRENT (pre-step) obs, from the true state — both sides
+                # fetched, learner's perspective selected per env.
+                t0_, m0_ = env.vec.belief_targets_all(0)
+                t1_, m1_ = env.vec.belief_targets_all(1)
+                sel = (env.learner_side == 1)[:, None]
+                belief_t = torch.as_tensor(np.where(sel, np.asarray(t1_), np.asarray(t0_)),
+                                           device=device)
+                belief_m = torch.as_tensor(
+                    np.where(sel, np.asarray(m1_), np.asarray(m0_)).astype(np.float32),
+                    device=device)
+
             action_np = action.cpu().numpy()
             reward, done, active, dyn, outcome = env.step(action_np, opp_action)
 
@@ -337,7 +354,8 @@ def train(args):
                        teacher_action=teacher_t,
                        outcome_reward=torch.as_tensor(outcome, device=device)
                        if buffer.outcome else None,
-                       outcome_value=model.outcome_pred if buffer.outcome else None)
+                       outcome_value=model.outcome_pred if buffer.outcome else None,
+                       belief_target=belief_t, belief_mask=belief_m)
             global_step += cfg.num_envs
 
             for e in np.flatnonzero(done):
@@ -478,6 +496,9 @@ def main():
     p.add_argument("--fog-species", action="store_true",
                    help="honest fog of war: unseen foe species are masked in the obs (W8). "
                         "Breaking obs-semantics change — do NOT flip on a run trained without it")
+    p.add_argument("--belief-head", action="store_true",
+                   help="predict hidden foe identity (6 species + active item/moves) from the "
+                        "public obs — free labels from the true state (W9)")
     p.add_argument("--outcome-head", action="store_true",
                    help="second value head on UNSHAPED terminal-outcome lambda-returns — the "
                         "search evaluator (E2 branch-B fix; EXPLORATION_PLAN W7)")

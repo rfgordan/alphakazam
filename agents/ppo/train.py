@@ -170,6 +170,32 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
             entropy_loss = (entropy * m).sum() / denom
             loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy_loss
 
+            # Belief heads (W9): CE on HIDDEN foe-identity entries only. The revealed ones are
+            # already in the obs (a copy task that would dilute the loss); `belief_mask` keeps
+            # exactly the entries the viewer cannot see.
+            belief_loss_v = belief_acc_v = 0.0
+            if "belief_target" in data and getattr(model, "trunk_h", None) is not None:
+                bt = data["belief_target"][mb]
+                bm = data["belief_mask"][mb]
+                sp_l, it_l, mv_l = model.belief_logits(model.trunk_h)
+                parts = []
+                # species: entries 0..5, item: 6, moves: 7..10
+                ce = F.cross_entropy
+                for k in range(6):
+                    parts.append((ce(sp_l[:, k], bt[:, k], reduction="none") * bm[:, k]).sum()
+                                 / bm[:, k].sum().clamp(min=1.0))
+                parts.append((ce(it_l, bt[:, 6], reduction="none") * bm[:, 6]).sum()
+                             / bm[:, 6].sum().clamp(min=1.0))
+                for k in range(4):
+                    parts.append((ce(mv_l[:, k], bt[:, 7 + k], reduction="none") * bm[:, 7 + k]).sum()
+                                 / bm[:, 7 + k].sum().clamp(min=1.0))
+                belief_loss = torch.stack(parts).mean()
+                loss = loss + getattr(cfg, "belief_coef", 0.5) * belief_loss
+                belief_loss_v = belief_loss.item()
+                with torch.no_grad():
+                    hit = (sp_l.argmax(-1) == bt[:, :6]).float() * bm[:, :6]
+                    belief_acc_v = (hit.sum() / bm[:, :6].sum().clamp(min=1.0)).item()
+
             # Kickstart distillation: -log pi(teacher_action) on steps where the teacher had an
             # opinion AND the learner was acting; the coefficient anneals to 0 (train_flow owns
             # the schedule). Weak supervision that shapes early exploration, then gets out of
@@ -217,6 +243,8 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 aux_ko=aux_ko_v,          # world-model KO BCE
                 kick_loss=kick_v,         # kickstart distillation CE (0 when off/annealed out)
                 outcome_loss=outcome_loss_v,  # win-prob head MSE (0 when head absent)
+                belief_loss=belief_loss_v,    # hidden-identity CE (0 when head absent)
+                belief_acc=belief_acc_v,      # unrevealed-species top-1 accuracy
             )
     return last
 
