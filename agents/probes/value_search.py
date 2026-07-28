@@ -56,6 +56,14 @@ def solve_matrix_game(Q: np.ndarray, rows: np.ndarray, cols: np.ndarray,
     return r_avg / r_avg.sum()
 
 
+def _frame2(obs_np, prev_np=None):
+    """Frames=2 input: [current, previous]. prev=None duplicates current — the exact encoding
+    a history-cut (episode start) produces, so it is in-distribution for a frames-trained net."""
+    if prev_np is None:
+        prev_np = obs_np
+    return np.concatenate([obs_np, prev_np], axis=1)
+
+
 def _leaf_values(net, device, obs_np, ids_np) -> np.ndarray:
     """Leaf evaluation: the outcome head when the checkpoint has one (W7), else the critic."""
     if len(obs_np) == 0:
@@ -95,6 +103,7 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
 
     def fn(vec, envs, mask, rng):
         t0 = time.perf_counter()
+        f2 = getattr(net, "frames", 1) == 2
         out = np.zeros(len(envs), dtype=np.int64)
         acting = {s: np.asarray(vec.acting_all(s), dtype=bool) for s in (0, 1)}
         turn_rows = [i for i, (e, s) in enumerate(envs) if acting[s][e] and acting[1 - s][e]]
@@ -108,10 +117,12 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
             o = np.stack([obs_by[envs[i][1]][envs[i][0]] for i in other_rows])
             d = np.stack([ids_by[envs[i][1]][envs[i][0]] for i in other_rows])
             m = np.stack([mask[i] for i in other_rows])
-            out[np.array(other_rows)] = _policy_actions(net, o, d, m, device)
+            out[np.array(other_rows)] = _policy_actions(net, _frame2(o) if f2 else o, d, m, device)
 
         # Policy priors for pruning, both perspectives, one forward each.
         def topk_actions(obs_np, ids_np, mask_np):
+            if f2:
+                obs_np = _frame2(obs_np)
             with torch.no_grad():
                 logits, _ = net.forward(torch.as_tensor(obs_np, device=device),
                                         torch.as_tensor(mask_np, device=device),
@@ -147,7 +158,11 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
                             valid = np.asarray(valid)
                             live = valid & ~done if kind == 2 else (np.array([kind == 1]))
                             start = sum(len(x) for x in all_obs)
-                            all_obs.append(obs[live]); all_ids.append(ids[live])
+                            lv = obs[live]
+                            if f2:  # successor's previous frame IS the root state
+                                root = obs_by[s][e]
+                                lv = _frame2(lv, np.broadcast_to(root, lv.shape).copy()) if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32)
+                            all_obs.append(lv); all_ids.append(ids[live])
                             pending.append((i, pi, pj, kind, done, outc, valid, live,
                                             start, int(live.sum())))
             except ValueError:
@@ -157,7 +172,7 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
             o = np.stack([obs_by[envs[i][1]][envs[i][0]] for i in fallback_rows])
             d = np.stack([ids_by[envs[i][1]][envs[i][0]] for i in fallback_rows])
             m = np.stack([mask[i] for i in fallback_rows])
-            out[np.array(fallback_rows)] = _policy_actions(net, o, d, m, device)
+            out[np.array(fallback_rows)] = _policy_actions(net, _frame2(o) if f2 else o, d, m, device)
 
         values = _leaf_values(net, device,
                               np.concatenate(all_obs) if all_obs else np.zeros((0, 1)),
@@ -203,12 +218,14 @@ def make_value_search_agent(net, device, n_samples: int = 2, seed: int = 0,
 
     def fn(vec, envs, mask, rng):
         t0 = time.perf_counter()
+        f2 = getattr(net, "frames", 1) == 2
         out = np.zeros(len(envs), dtype=np.int64)
         acting = {s: np.asarray(vec.acting_all(s), dtype=bool) for s in (0, 1)}
         # A Turn request = both sides acting; only there is there a matrix game to solve.
         turn_rows = [i for i, (e, s) in enumerate(envs)
                      if acting[s][e] and acting[1 - s][e]]
         other_rows = [i for i in range(len(envs)) if i not in turn_rows]
+        root_by = {s: np.asarray(vec.observe_all(s), dtype=np.float32) for s in (0, 1)} if f2 else None
 
         if other_rows:  # single-sided requests: raw policy
             obs_by = {s: np.asarray(vec.observe_all(s), dtype=np.float32)
@@ -218,7 +235,7 @@ def make_value_search_agent(net, device, n_samples: int = 2, seed: int = 0,
             o = np.stack([obs_by[envs[i][1]][envs[i][0]] for i in other_rows])
             d = np.stack([ids_by[envs[i][1]][envs[i][0]] for i in other_rows])
             m = np.stack([mask[i] for i in other_rows])
-            out[np.array(other_rows)] = _policy_actions(net, o, d, m, device)
+            out[np.array(other_rows)] = _policy_actions(net, _frame2(o) if f2 else o, d, m, device)
 
         if turn_rows:
             # Gather every sample of every pair of every env, one big value forward.
