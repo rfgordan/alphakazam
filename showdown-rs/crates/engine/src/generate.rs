@@ -13165,6 +13165,8 @@ fn residual_rampage_confuses(state: &State, side: SideId) -> bool {
     let p = state.side(side).active();
     n <= 1
         && p.is_alive()
+        // A sleeping rampager's lock is DELETED rather than ended, so `onEnd` never confuses.
+        && p.status != Status::Sleep
         && p.ability != crate::ids::Ability::OwnTempo
         && !state.side(side).volatiles.contains(VolatileStatus::Confusion)
 }
@@ -13911,48 +13913,6 @@ fn apply_end_of_turn_inner(
         }
     }
 
-    // --- residual order `false` (duration-only handlers, sorted last) ---
-    // Rampage (lockedmove) `onResidual`: decrement `trueDuration` each end of turn. The move
-    // action stored the mid-turn (kernel) value {2,3 on start, s on continuation}; this ticks it
-    // to the terminal value {1,2, s-1}. The final locked turn (n==1) already ended and confused
-    // at move time, so a live Rampaging here always has n>=2 -> stays >=1.
-    for side in [SideId::One, SideId::Two] {
-        if battle_over(&b.state) { ended_early = true; break 'residual; }
-        if let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move {
-            if n >= 2 {
-                push(b, Instruction::SetPendingMove {
-                    side,
-                    previous: crate::state::PendingMove::Rampaging(m, n),
-                    new: crate::state::PendingMove::Rampaging(m, n - 1),
-                });
-            } else {
-                // n == 1 AND the lock is still armed: the mon did NOT use the move this turn (a
-                // use releases it at move time), so this is PS's `duration` reaching 0 with the
-                // volatile still up — `onEnd` fires here. See `residual_rampage_confuses`.
-                push(b, Instruction::SetPendingMove {
-                    side,
-                    previous: crate::state::PendingMove::Rampaging(m, n),
-                    new: crate::state::PendingMove::None,
-                });
-                if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
-                    push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
-                }
-                if let Some(t) = conf_dur[side.index()] {
-                    let prev = b.state.side(side).confusion_turns;
-                    draw(b, "random", &[2, 6], t as i64, "confusion");
-                    push(b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
-                    push(b, Instruction::SetActiveCounter {
-                        side,
-                        which: crate::instruction::ActiveCounter::Confusion,
-                        previous: prev,
-                        new: t,
-                    });
-                    consume_lum_if_statused(b, side);
-                }
-            }
-        }
-    }
-
     // Future Sight: tick; mark a strike when it lands (stochastic rolls -> branch below).
     fs_fired = [None, None];
     for side in [SideId::One, SideId::Two] {
@@ -14105,6 +14065,78 @@ fn apply_end_of_turn_inner(
     let out = branches_after_harvest;
 
     let mut out = out;
+    // --- residual order `false`: the duration-only handlers, which PS sorts LAST ---
+    //
+    // The rampage (`lockedmove`) expiry lives here, in the branching tail, for two reasons that
+    // are both PS facts rather than engine convenience: it sorts after every numbered handler
+    // (Yawn 23, Harvest 28), and it can CONFUSE, which forks.
+    let mut out = out
+        .into_iter()
+        .flat_map(|mut b| {
+            for side in [SideId::One, SideId::Two] {
+                let crate::state::PendingMove::Rampaging(m, n) = b.state.side(side).pending_move
+                else {
+                    continue;
+                };
+                // **A SLEEPING rampager drops the lock, and is not confused for it.**
+                // `lockedmove.onResidual` opens with
+                //     if (target.status === 'slp') { delete target.volatiles['lockedmove']; }
+                // — a `delete` on the volatile, not an `end()`, so `onEnd` never runs, and PS's
+                // own comment says why: "don't lock, and bypass confusion for calming".
+                //
+                // rb5160 d42 t35: an Outrage user is Yawned to sleep on the very turn it starts
+                // the rampage (`random[2,4]=3@lockedmove` and `random[2,5]=2@slp` in one unit).
+                // The sleep lands at Yawn's order 23; the lock expiry reads it at order-last. The
+                // engine used to run this whole block in the DETERMINISTIC core, ahead of the
+                // Yawn sleep that the tail applies — so it saw a statusless mon and ticked 3 -> 2.
+                if b.state.side(side).active().status == Status::Sleep {
+                    push(&mut b, Instruction::SetPendingMove {
+                        side,
+                        previous: crate::state::PendingMove::Rampaging(m, n),
+                        new: crate::state::PendingMove::None,
+                    });
+                    if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                        push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+                    }
+                    continue;
+                }
+                if n >= 2 {
+                    // The move action stored the mid-turn (kernel) value; this ticks it down.
+                    push(&mut b, Instruction::SetPendingMove {
+                        side,
+                        previous: crate::state::PendingMove::Rampaging(m, n),
+                        new: crate::state::PendingMove::Rampaging(m, n - 1),
+                    });
+                    continue;
+                }
+                // n == 1 AND the lock is still armed: the mon did NOT use the move this turn (a
+                // use releases it at move time), so this is PS's `duration` reaching 0 with the
+                // volatile still up — `onEnd` fires here. See `residual_rampage_confuses`.
+                push(&mut b, Instruction::SetPendingMove {
+                    side,
+                    previous: crate::state::PendingMove::Rampaging(m, n),
+                    new: crate::state::PendingMove::None,
+                });
+                if b.state.side(side).volatiles.contains(VolatileStatus::LockedMove) {
+                    push(&mut b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::LockedMove });
+                }
+                if let Some(t) = conf_dur[side.index()] {
+                    let prev = b.state.side(side).confusion_turns;
+                    draw(&mut b, "random", &[2, 6], t as i64, "confusion");
+                    push(&mut b, Instruction::ApplyVolatile { side, volatile: VolatileStatus::Confusion });
+                    push(&mut b, Instruction::SetActiveCounter {
+                        side,
+                        which: crate::instruction::ActiveCounter::Confusion,
+                        previous: prev,
+                        new: t,
+                    });
+                    consume_lum_if_statused(&mut b, side);
+                }
+            }
+            vec![b]
+        })
+        .collect::<Vec<_>>();
+
     // Future Sight strikes: 16 damage rolls, each its own branch.
     for (i, fired) in fs_fired.into_iter().enumerate() {
         let Some(caster_slot) = fired else { continue };
