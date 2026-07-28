@@ -6284,6 +6284,9 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     let (hits_min, hits_max) = multihit_bounds(&b, side, &md);
     let hits_min = hits_min.max(1);
     let hits_max = hits_max.max(hits_min);
+    // Beak Blast's `onHit` is PER HIT (`spreadMoveHit` step 3), so the realized multi-hit loops
+    // need the charging flag inside the loop, not just at the post-hit-loop site below.
+    let beak_blast_charging = foe_pending_move.is_some_and(|m| m.to_id() == "beakblast");
     // A fixed, small hit count keeps the exact per-hit product (preserves Substitute/Sturdy
     // interleaving). Variable hit counts ([2,5]) and large fixed counts (Population Bomb)
     // take the sumset-DP path, which also folds in the distribution over the hit count.
@@ -6298,7 +6301,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         None
     };
     let damaged: Vec<(Branch, bool)> = if let Some(cur) = realized {
-        apply_multihit_realized(&b, side, &md, hit_prob, cur)
+        apply_multihit_realized(&b, side, &md, hit_prob, cur, beak_blast_charging)
     } else if md.id.to_id() == "beatup" {
         // Beat Up: one hit per eligible party member with per-member base power. Realized single
         // path (seed gate / differ) draws each member's crit + damage off the source; Enumerate/
@@ -6306,7 +6309,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if let Some(cur) = realized_cursor(&b) {
             let mds = beatup_mds(&b, side, &md);
             let calcs: Vec<DamageCalc> = mds.iter().map(|m| compute_damage(&b, side, m)).collect();
-            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur)
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur, beak_blast_charging)
         } else {
             apply_beatup(&b, side, &md, hit_prob)
         }
@@ -6368,7 +6371,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // single branch off the source (per-hit accuracy + crit + damage, Loaded Dice count).
         let cur = realized_cursor(&b).unwrap();
         let calcs = vec![compute_damage(&b, side, &md)];
-        apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, std::slice::from_ref(&md), cur)
+        apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, std::slice::from_ref(&md), cur, beak_blast_charging)
     } else if matches!(md.id.to_id(), "tripleaxel" | "triplekick") {
         // Ascending power (20/40/60 or 10/20/30) with a fresh 90% accuracy check per hit;
         // a miss ends the move. hit_prob here is the single-hit accuracy.
@@ -6380,7 +6383,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         if let Some(cur) = realized_cursor_per_hit(&b) {
             // Realized single path (seed gate / differ / SAMPLE): per-hit accuracy + crit + damage
             // off the source, KO-truncated. The enumerated branch below serves Enumerate only.
-            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur)
+            apply_multihit_realized_ma(&b, side, &md, hit_prob, &calcs, &mds, cur, beak_blast_charging)
         } else {
             let crit_p = crit_chance(&b, side, &md);
             let acc = hit_prob;
@@ -6561,7 +6564,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             apply_spin_clear(&mut hb, side, &md);
             vec![hb]
         } else {
-            apply_beak_blast_burn(&mut hb, side, &md, foe_pending_move);
+            apply_beak_blast_burn(&mut hb, side, &md, beak_blast_charging);
             apply_burning_jealousy(&mut hb, side, &md);
             // A realized multi-hit branch already fired the `DamagingHit` ability rolls per hit
             // (PS runs the event inside `spreadMoveHit`, once per connecting hit) — don't fire them
@@ -7758,12 +7761,12 @@ enum HitRolls<'a> {
 }
 
 fn apply_damage_hit(b: &mut Branch, side: SideId, md: &crate::data::MoveData, hits: &[(u8, bool)], crit_den: i32, bp_roll: Option<bool>) -> bool {
-    apply_damage_hit_rolls(b, side, md, HitRolls::Fixed(hits), crit_den, bp_roll)
+    apply_damage_hit_rolls(b, side, md, HitRolls::Fixed(hits), crit_den, bp_roll, false)
 }
 
 /// `bp_roll`: the enumerated outcome of a random `onBasePower` handler (Fickle Beam), emitted
 /// between this hit's crit roll and its damage roll — PS's `runEvent('BasePower')` position.
-fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData, mut rolls: HitRolls, crit_den: i32, bp_roll: Option<bool>) -> bool {
+fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveData, mut rolls: HitRolls, crit_den: i32, bp_roll: Option<bool>, beak_blast: bool) -> bool {
     use crate::ids::Ability as Ab;
     let foe = side.other();
     let initial_calc = compute_damage(b, side, md);
@@ -7898,6 +7901,9 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         // fire its DRAWING handlers here so Cursed Body / Toxic Chain / the contact-status abilities
         // interleave into the stream between this hit and the next hit's crit roll.
         let pre_inputs = damage_inputs(b, side);
+        // Step 3 (`onHit`) precedes step 7: Beak Blast burns the attacker on THIS hit, and the
+        // re-derivation below hands the halved Attack to hit n+1.
+        apply_beak_blast_burn(b, side, md, beak_blast);
         if let HitRolls::Realized { cur, .. } = &mut rolls {
             realized_per_hit_damaging_hit(b, side, md, cur);
         }
@@ -9414,6 +9420,7 @@ fn apply_multihit_dp_sub(
 /// branch. Only ever reached with a realized source installed (seed gate / differ).
 fn apply_multihit_realized(
     b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32, mut cur: RealizedCursor,
+    beak_blast: bool,
 ) -> Vec<(Branch, bool)> {
     let mut hb = scaled(b, hit_prob);
     // Hit count. Variable [2,5]: `sample(20)` → count table; a Loaded Dice holder that sampled
@@ -9446,7 +9453,7 @@ fn apply_multihit_realized(
     // The loop also steps the cursor over the inter-hit `ModifyDamage` screen shuffle it emits.
     let crit_den = ps_crit_den(&hb, side, md);
     let hit_sub = apply_damage_hit_rolls(
-        &mut hb, side, md, HitRolls::Realized { count, cur: &mut cur }, crit_den, None,
+        &mut hb, side, md, HitRolls::Realized { count, cur: &mut cur }, crit_den, None, beak_blast,
     );
     // The per-hit hook already ran every DamagingHit ability roll for this move; suppress the
     // post-hit-loop once-per-move application in `execute_move_inner`.
@@ -9464,7 +9471,7 @@ fn apply_multihit_realized(
 /// faint never executes, so the draw stream truncates exactly where PS's `hitStepMoveHitLoop` breaks.
 fn apply_multihit_realized_ma(
     b: &Branch, side: SideId, md: &crate::data::MoveData, hit_prob: f32,
-    calcs: &[DamageCalc], mds: &[crate::data::MoveData], mut cur: RealizedCursor,
+    calcs: &[DamageCalc], mds: &[crate::data::MoveData], mut cur: RealizedCursor, beak_blast: bool,
 ) -> Vec<(Branch, bool)> {
     use crate::ids::Ability as Ab;
     let foe = side.other();
@@ -9593,6 +9600,9 @@ fn apply_multihit_realized_ma(
         // (rb1049) records `[crit, dmg, randomChance[3,10]@toxicchain] x 6`. The drawing handlers
         // stay here; the no-draw ones are deferred behind step 5's `secondaries()`.
         let pre_inputs = damage_inputs(&hb, side);
+        // Step 3 (`onHit`) precedes step 7: Beak Blast burns the attacker on THIS hit, so hits 2+
+        // of a Triple Axel / Population Bomb are computed against the halved Attack.
+        apply_beak_blast_burn(&mut hb, side, md, beak_blast);
         realized_per_hit_damaging_hit(&mut hb, side, md, &mut cur);
         // rb1198 d29: a Flame Body burn on hit 1 halves the attacker's Atk for hits 2-3.
         restat_dirty |= damage_inputs(&hb, side) != pre_inputs;
@@ -10174,18 +10184,20 @@ fn react_to_stat_drop(b: &mut Branch, target: SideId) {
 /// happens, it just finds the attacker already statused. A Substitute hit does NOT burn: PS nulls
 /// the target entry (`targets[i] = null`, battle-actions.ts:1085) before `runMoveEffects` runs.
 ///
+/// **`spreadMoveHit` is PER HIT, so on a multi-hit move the burn lands on hit 1 and hits 2+ are
+/// computed against the HALVED Attack.** rb5348 d1 t1: a L88 Hitmontop (Technician) Triple Axels a
+/// Toucannon that queued Beak Blast. PS's three hits are 48 / 48 / 81 = 177; the engine's were
+/// 48 / 96 / 162 = 306, which killed the Toucannon outright and left PS's `randomChance[100,100]
+/// @beakblast` unconsumed at decision ONE. The realized hit loops therefore call this per hit and
+/// feed the result into their `restat_dirty` re-derivation, exactly as they already do for a Flame
+/// Body burn (rb1198 d29). The enumerate/DP path keeps the once-per-move application below, which
+/// is exact for the single-hit moves it verifies.
+///
 /// rb1108 d4 t5: p2's Blissey queues Beak Blast, p1's Ceruledge lands a contact Shadow Sneak
 /// (+1 priority) first. PS burns the Ceruledge and it takes the 16-HP residual chip that turn; the
 /// engine left it unburned at 89 where PS has 73.
-fn apply_beak_blast_burn(
-    b: &mut Branch, side: SideId, md: &crate::data::MoveData,
-    foe_pending_move: Option<crate::ids::MoveId>,
-) {
-    if !md.flag_contact {
-        return;
-    }
-    let charging = foe_pending_move.is_some_and(|m| m.to_id() == "beakblast");
-    if !charging {
+fn apply_beak_blast_burn(b: &mut Branch, side: SideId, md: &crate::data::MoveData, charging: bool) {
+    if !md.flag_contact || !charging {
         return;
     }
     let atk = b.state.side(side).active();
