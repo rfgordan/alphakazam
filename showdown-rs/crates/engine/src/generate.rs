@@ -6183,7 +6183,14 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`. Placed here,
         // where the main path's `apply_post_damage` sits: after the damage step and ahead of the
         // self-drops / secondaries, so a secondary reading HP reads the post-orb HP as PS's does.
+        // The `source.hp` snapshot for step 8 is taken AHEAD of the orb, exactly as
+        // `apply_post_damage` takes it (PS runs `onAfterHit` before `onAfterMoveSecondarySelf`).
+        hb.after_hit_user_alive = hb.state.side(side).active().is_alive();
         apply_life_orb_recoil(&mut hb, side, &md);
+        // Step 8, `onAfterHit`, still runs on a nullified hit — see `apply_knock_off_take_item`.
+        if md.id.to_id() == "knockoff" {
+            apply_knock_off_take_item(&mut hb, side, def_ab);
+        }
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
         // battle-actions.ts:1127-1129) and still runs step 5, `secondaries()`. rb1038 t5: Throat
@@ -6261,7 +6268,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         emit_discarded_damage_rolls(&mut hb, crit_den);
         bust_disguise(&mut hb, foe);
         // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`.
+        hb.after_hit_user_alive = hb.state.side(side).active().is_alive();
         apply_life_orb_recoil(&mut hb, side, &md);
+        // Step 8, `onAfterHit`, still runs on a nullified hit — see `apply_knock_off_take_item`.
+        if md.id.to_id() == "knockoff" {
+            apply_knock_off_take_item(&mut hb, side, def_ab);
+        }
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
         // `move.self.boosts` payload with its `random(100)` — and it sits AHEAD of step 5's
@@ -8307,6 +8319,38 @@ fn damage_inputs(b: &Branch, side: SideId) -> DamageInputs {
 /// and Toxic Debris. Shared by the exact per-hit path and the multi-hit sumset-DP path so both
 /// stay in lockstep. `per_hit_done` suppresses the `runEvent('DamagingHit')` reactions when the
 /// caller already fired them inside its hit loop (the realized executors).
+/// Knock Off's `onAfterHit` (`data/moves.ts` knockoff) — **step 8** of `spreadMoveHit`:
+/// `if (source.hp) { const item = target.takeItem(); ... }`.
+///
+/// Factored out because step 8 has TWO callers, and the second one had nothing at all: a hit
+/// NULLIFIED by Disguise or Ice Face. `onDamage` returns the NUMBER 0, so the target stays in
+/// `targets` and PS runs the rest of `hitStepMoveHitLoop` — this file's own Disguise arm already
+/// records that for step 4 (`selfDrops`, rb1093) and for the two Updates (rb1191). Step 8 is the
+/// same fact one step further on.
+///
+/// * rb5453 d17 t14: a Deoxys-Speed Knock Offs an Eiscue with an intact ICE FACE holding a Sitrus
+///   Berry. PS ends the turn with the berry gone; the engine kept it.
+/// * rb5463 d27 t24: a Blaziken Knock Offs a Mimikyu with an intact DISGUISE holding a Life Orb.
+///   Same shape, other ability.
+///
+/// The `source.hp` guard is `after_hit_user_alive`, not `is_alive()` — see the caller's note.
+fn apply_knock_off_take_item(b: &mut Branch, side: SideId, def_ability: crate::ids::Ability) {
+    let foe = side.other();
+    let f = b.state.side(foe).active();
+    if f.species != crate::ids::Species::None
+        && b.after_hit_user_alive
+        && f.item != Item::None
+        && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
+        && def_ability != crate::ids::Ability::StickyHold
+    {
+        let (prev, fslot) = (f.item, b.state.side(foe).active_index);
+        push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
+        on_item_lost(b, foe);
+        // Knocking the item off reveals what it was.
+        reveal(b, foe, 0, crate::state::Reveal::ITEM);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_post_damage(
     b: &mut Branch,
@@ -8620,19 +8664,7 @@ fn apply_post_damage(
         // user). rb1314 d5 t5: p1's Knock Off takes a Light Clay off an Abomasnow and KOs it in
         // the same hit; the engine kept the item, and it stayed invisible for 40 turns until a
         // Revival Blessing at d45 put the corpse back on the field holding it.
-        let f = b.state.side(foe).active();
-        if f.species != crate::ids::Species::None
-            && b.after_hit_user_alive
-            && f.item != Item::None
-            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
-            && def_ability != Ab::StickyHold
-        {
-            let (prev, fslot) = (f.item, b.state.side(foe).active_index);
-            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
-            on_item_lost(b, foe);
-            // Knocking the item off reveals what it was.
-            reveal(b, foe, 0, crate::state::Reveal::ITEM);
-        }
+        apply_knock_off_take_item(b, side, def_ability);
     }
 
     // The defender's pinch/HP berry is an `onUpdate`, and PS's `eachEvent('Update')` sits at
