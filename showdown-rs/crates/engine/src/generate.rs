@@ -13094,6 +13094,9 @@ fn emit_after_move_shuffles(b: &mut Branch) {
 ///
 /// Witnesses: rb1315 d28 (PS 205, engine 189 = 205 − 258/16 — exactly one skipped status chip) and
 /// rb1380 d15.
+/// PS's `tox` residual stops advancing at stage 15 (`data/conditions.ts:156`).
+const TOXIC_MAX_STAGE: u8 = 15;
+
 pub(crate) fn apply_end_of_turn(branch: Branch, switched: [bool; 2]) -> Vec<Branch> {
     let mut holders: Vec<SideId> = Vec::new();
     for side in [SideId::One, SideId::Two] {
@@ -13512,10 +13515,13 @@ fn apply_end_of_turn_inner(
                 if heal > 0 && !heal_blocked(b, side) {
                     push(b, Instruction::Heal { side, slot, amount: heal });
                 }
-                // Toxic still advances its counter even under Poison Heal.
+                // Toxic still advances its counter even under Poison Heal — and still STOPS at
+                // 15 (`data/conditions.ts:156`, `if (this.effectState.stage < 15)`).
                 if pstatus == Status::Toxic {
                     let cur = b.state.side(side).active().status_counter;
-                    push(b, Instruction::ChangeStatusCounter { side, slot, previous: cur, new: cur + 1 });
+                    if cur < TOXIC_MAX_STAGE {
+                        push(b, Instruction::ChangeStatusCounter { side, slot, previous: cur, new: cur + 1 });
+                    }
                 }
             } else if !magic_guard {
                 match pstatus {
@@ -13528,10 +13534,18 @@ fn apply_end_of_turn_inner(
                         push(b, Instruction::Damage { side, slot, amount: dmg });
                     }
                     Status::Toxic => {
-                        let stage = (b.state.side(side).active().status_counter as i16 + 1).max(1);
+                        // **PS CAPS THE STAGE AT 15**: `onResidual` is
+                        // `if (this.effectState.stage < 15) this.effectState.stage++;` and only
+                        // THEN multiplies (`data/conditions.ts:155-160`). A 16th badly-poisoned
+                        // turn therefore deals 15/16, not 16/16, and the counter stops moving.
+                        // rb5133 d34 and rb5255 d49: `status_counter` engine 16 / PS 15.
+                        let cur = b.state.side(side).active().status_counter;
+                        let stage = (cur + 1).min(TOXIC_MAX_STAGE) as i16;
                         let dmg = ((maxhp / 16) * stage).max(1).min(b.state.side(side).active().hp);
                         push(b, Instruction::Damage { side, slot, amount: dmg });
-                        push(b, Instruction::ChangeStatusCounter { side, slot, previous: stage as u8 - 1, new: stage as u8 });
+                        if cur != stage as u8 {
+                            push(b, Instruction::ChangeStatusCounter { side, slot, previous: cur, new: stage as u8 });
+                        }
                     }
                     _ => {}
                 }
