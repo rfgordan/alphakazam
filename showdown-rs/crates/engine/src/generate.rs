@@ -4308,9 +4308,29 @@ pub(crate) fn execute_move(b: Branch, action: Action) -> Vec<Branch> {
         };
         let tick = if early { 2 } else { 1 };
         if counter > tick {
-            // Still asleep: `execute_move_inner` owns the tick and the `sleepUsable`
-            // (Sleep Talk / Snore) exception, and nothing below slp runs.
-            return dispatch_move_inner(b, action);
+            // Still asleep. slp's handler ends `if (move.sleepUsable) return; return false;`
+            // (`data/conditions.ts:77`) — so for Sleep Talk and Snore it returns UNDEFINED, and
+            // `runEvent` does NOT short-circuit: the mon acts while asleep and every handler below
+            // slp still runs. That includes confusion's `time--` at priority 3, which is what
+            // rb5386 d6 t7 turns on — a Snorlax with one confusion turn left Sleep Talks, PS
+            // decrements to 0, REMOVES the volatile, and rolls no `randomChance[33,100]` at all.
+            // The engine skipped the whole lower ladder for any sleeping mon and kept the turn.
+            //
+            // The tick moves up here with the routing, because a cancel branch below (confusion
+            // self-hit, Attract, full paralysis) never reaches `execute_move_inner` and PS ticked
+            // at priority 10 regardless. `execute_move_inner`'s own slp block is skipped for a
+            // `sleepUsable` move for exactly that reason.
+            let mid = {
+                let p = b.state.side(side).active();
+                action.external_move.unwrap_or(p.moves[action.move_idx as usize].id)
+            };
+            if !move_data(mid).sleep_usable {
+                // `execute_move_inner` owns the tick for the cancelling case.
+                return dispatch_move_inner(b, action);
+            }
+            let slot = b.state.side(side).active_index;
+            push(&mut b, Instruction::ChangeStatusCounter { side, slot, previous: counter, new: counter - tick });
+            return before_move_lower_ladder(b, action);
         }
         // WAKES. The handler returns `undefined`, so the ladder CONTINUES — Truant (9),
         // Disable/Taunt (7/6/5), confusion (3), Attract (2). `execute_move_inner`'s own wake
@@ -5304,7 +5324,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     // Sleep: can't move while the counter is > 1; on the expiry turn the mon wakes
     // (status cleared) and then moves normally. (gen9 sleep is a fixed countdown.)
     let (status, counter) = { let p = b.state.side(side).active(); (p.status, p.status_counter) };
-    if status == Status::Sleep && !called {
+    // `md.sleep_usable`: `execute_move` has already ticked the counter and run the rest of the
+    // ladder for Sleep Talk / Snore (slp's handler returns `undefined` for them), so re-entering
+    // here would tick a second time.
+    if status == Status::Sleep && !called && !md.sleep_usable {
         // Early Bird burns sleep turns twice as fast (PS slp onBeforeMove: an extra time--).
         let tick = if b.state.side(side).active().ability == crate::ids::Ability::EarlyBird { 2 } else { 1 };
         if counter > tick {
