@@ -7802,8 +7802,6 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         // So once the target has fainted, no further crit/damage draws are rolled. Emit the
         // per-hit draws here — after this KO check, before applying the hit — so a multi-hit move
         // that KOs early stops the draw stream exactly where PS does (fixes phantom-hit over-roll).
-        // A user faint mid-loop (recoil/contact item) is folded into `apply_post_damage`, so it
-        // never truncates the loop here; the corpus has no such multi-hit matchup.
         if b.state.side(foe).active().hp <= 0 {
             break;
         }
@@ -7812,6 +7810,17 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
             match &mut rolls {
                 HitRolls::Realized { cur, .. } => emit_prev_hit_update(b, Some(cur)),
                 HitRolls::Fixed(_) => emit_prev_hit_update(b, None),
+            }
+            // ...and PS's OWN last statement: `if (!pokemon.hp && targets.length === 1) { hit++;
+            // break; }` (`battle-actions.ts:971-974`). A USER that died to the previous hit's
+            // step-7 reaction — Rocky Helmet / Rough Skin / Iron Barbs — ends the multi-hit move.
+            // rb5280 d9 t7: a 40-HP Meowscarada (Choice Band) Triple Axels a Pecharunt holding a
+            // Rocky Helmet, dies to the hit-1 chip, and PS's stream stops after ONE crit+damage
+            // pair. The engine rolled all three and emitted a `rust extra`
+            // `randomChance[90,100]@accuracy` — an over-emission, which is the campaign's one
+            // hard invariant.
+            if b.state.side(side).active().hp <= 0 {
+                break;
             }
         }
         let (roll, crit) = match &mut rolls {
@@ -9516,6 +9525,12 @@ fn apply_multihit_realized_ma(
         // which is where PS puts it. See `emit_prev_hit_update`.
         if i >= 1 {
             emit_prev_hit_update(&mut hb, Some(&mut cur));
+            // PS's own last statement: a USER killed by the previous hit's step-7 reaction ends
+            // the move (`battle-actions.ts:971-974`) — same rule as in `apply_damage_hit_rolls`,
+            // and this is the arm rb5280's Triple Axel takes.
+            if hb.state.side(side).active().hp <= 0 {
+                break;
+            }
         }
         // Per-hit accuracy (hit>1) unless Loaded Dice removed multiaccuracy; a miss ends the move.
         if i >= 1 && multiacc {
