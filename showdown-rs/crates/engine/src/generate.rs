@@ -6245,7 +6245,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
         // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
-        emit_discarded_damage_rolls(&mut hb, crit_den);
+        // **A fixed-damage move never reaches either roll.** `getDamage`
+        // (`battle-actions.ts:1608-1615`) returns on `move.ohko` / `move.damageCallback` /
+        // `move.damage` BEFORE the crit `randomChance` and the `random(16)` — so a Seismic Toss
+        // into an intact Ice Face rolls its accuracy and nothing else. rb6463 d4 t4: p1 switches
+        // in an Eiscue, p2 Seismic Tosses it, and the engine's two draw-and-discards put it two
+        // draws ahead of PS for the rest of the game.
+        if fixed_damage_amount(&md, &hb.state, side).is_none() {
+            emit_discarded_damage_rolls(&mut hb, crit_den);
+        }
         break_ice_face(&mut hb, foe);
         // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`. Placed here,
         // where the main path's `apply_post_damage` sits: after the damage step and ahead of the
@@ -6333,7 +6341,15 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // 0 therefore kills the only live branch the moment the PRNG hands back anything else.
         // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
-        emit_discarded_damage_rolls(&mut hb, crit_den);
+        // **A fixed-damage move never reaches either roll.** `getDamage`
+        // (`battle-actions.ts:1608-1615`) returns on `move.ohko` / `move.damageCallback` /
+        // `move.damage` BEFORE the crit `randomChance` and the `random(16)` — so a Seismic Toss
+        // into an intact Ice Face rolls its accuracy and nothing else. rb6463 d4 t4: p1 switches
+        // in an Eiscue, p2 Seismic Tosses it, and the engine's two draw-and-discards put it two
+        // draws ahead of PS for the rest of the game.
+        if fixed_damage_amount(&md, &hb.state, side).is_none() {
+            emit_discarded_damage_rolls(&mut hb, crit_den);
+        }
         bust_disguise(&mut hb, foe);
         // A nullified hit is still a hit for Life Orb — see `apply_life_orb_recoil`.
         hb.after_hit_user_alive = hb.state.side(side).active().is_alive();
