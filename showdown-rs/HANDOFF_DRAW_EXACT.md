@@ -1,5 +1,77 @@
 # HANDOFF: Draw-Exact Campaign (branch `prng-exact`)
 
+**RANDBATS-1500 TRANCHE (2026-07-28): 1413 / 1500 randbats (94.2%) and 905 / 912 customgame
+(99.2%, UNMOVED).** One corpus commit and **six parity commits, 8 games**, newly-non-exact EMPTY on
+BOTH rails at every one, audited **111/111** at every one.
+
+**The randbats rail is now 1500 games.** Seeds 5501-6500 recorded and committed to
+`harness/seed-fixtures-rb-1000/`; `gate-rb.sh` runs all three dirs and COUNTS the total from the
+globs (add a dir, add a `run` line, the arithmetic follows). Determinism checked, not assumed:
+rebuilding 59 already-pinned fixtures from their sidecars reproduces the committed files
+BYTE-IDENTICALLY. The new 1000 opened at **93.3%** against the previous fresh 399's 94.5% and the
+pinned 101's 97.0% — the marginal return on corpus size has NOT fallen.
+
+**THE HEADLINE FINDING: four of the five roots are the DEFERRAL bill.** The engine runs
+`apply_post_damage` (drain / recoil / Life Orb / Knock Off / Magician / Pickpocket / the faint
+reverts) at the END of the hit loop and DEFERS `runEvent('DamagingHit')` past the caller's step-5
+secondary split. PS's order is the reverse on both counts, and this tranche found three separate
+consumers of that one displacement — a guard read too early (rb5164), an input read too late
+(rb5199), and a sibling left behind (rb5267 / rb5217 / rb5335).
+
+> **A deferred handler must be HANDED its inputs, not read them — and everything PS orders around
+> it has to move with it.** `apply_damaging_hit_reactions` has taken `def_item` / `def_ability` as
+> parameters since the beginning; Cursed Body was the copy that still read live state, and a
+> faint had already run `revert_transform` on the Imposter Ditto that copied it.
+
+There are now THREE engine answers to "is the attacker standing" and they are all different:
+`is_alive()` (post-orb), `after_hit_user_alive` (pre-step-7) and **`step8_user_alive`**
+(`hp + late_self_damage > 0`) — the composition, and the only one that is PS's `pokemon.hp` at
+`battle-actions.ts:1144`.
+
+**Four more rules this tranche cost a landing each** (full text in the scoreboard):
+
+1. **slp's `onBeforeMove` ends `if (move.sleepUsable) return;` BEFORE its `return false`**
+   (`data/conditions.ts:77`). Sleep Talk / Snore get `undefined`, `runEvent` does not
+   short-circuit, and everything below priority 10 still runs — including **confusion's `time--`
+   at priority 3**. rb5386 d6 t7.
+2. **`getDamage` returns on `ohko` / `damageCallback` / `damage` BEFORE the crit roll.** A
+   fixed-damage move into an intact Ice Face / Disguise has nothing for the two draw-and-discards
+   to discard. rb6463 d4 t4: a Seismic Toss is ONE draw in PS and was three in the engine.
+3. **A condition that clears ITSELF clears LATE, and `runEvent` SORTS before it runs.** PS's
+   `choicelock` removes itself from inside `onDisableMove` at `endTurn`, so the doomed handler is
+   still counted in the speed sort. `on_item_lost` removed it eagerly at the Knock Off. rb6454
+   d11 t12, plus rb5869 / rb5909 as pure stream offsets.
+4. **`Mold Breaker` nulls only `breakable` abilities**, and the `def_ab` the immunity checks use is
+   not a general-purpose capture. Passing it to Cursed Body cost rb1403 (Turboblaze Reshiram into
+   a Banette — PS rolls the chance all the same).
+
+**NAMED OPEN — the Roar phaze Updates, diagnosed and DELIBERATELY NOT LANDED.** rb5523 d31 and
+rb5933 d28 record `shuffle@roar`, `shuffle@roar`, `sample@roar`; the engine records only the
+sample. A landing phaze reaches the per-hit 970 and the post-loop 1024 before `dragIn`; a REFUSED
+one reaches neither (`forceSwitch` writes `damage[i] = false` for a Status move, the loop breaks at
+`battle-actions.ts:950`, and `if (hit === 1) return damage.fill(false)` skips the 1024). The
+guarded implementation restored rb1750 / rb1467 and advanced both witnesses several decisions —
+**and still lost rb6013 net, because the engine's POST-drag pair (`emit_drag_switchin_sort`'s
+`runSwitch` sort and the action's trailing 2882) fires where PS's does not, and rb6013 was passing
+only because two wrong shuffles after the sample equalled two right shuffles before it.** Fix the
+post-drag pair FIRST; the phaze half is written and in this tranche's history.
+
+**Gates at the certifying commit `be55929`:** audited 111/111; combined 905/912 (SET identical at
+every commit: rb1011 rb1012 rb1525 rb1572 rb1581 rb1681 rb1769); randbats 1413/1500 (pinned
+98/101, fresh 377/399, new-1000 938/1000), init-aligned 1500/1500; **sweep 3831/3831 EXACTNESS
+100.00%**; draw differ 3816/3831 = 99.61% with **zero `rust extra`** on the audited rail; engine +
+cosim 26 targets green.
+
+**The 87 randbats opens are triaged in the scoreboard.** 57 are `draws-match/state-diff` — the
+damage/HP asymptote, now 65% of the population. **Next tranche, in order: the post-drag shuffle
+pair then the phaze Updates (3 games, diagnosis done); the Imposter-Ditto switch-in Speed tie
+(rb5424, rb5936 — a SORT-time question, not a cache-refresh one, and the endgame tranche's
+eight-game regression is the warning); the Struggle class, now THREE (rb5142, rb5214, rb5927);
+rb6117 as a DAMAGE game (Tera-Steel Discharge, 272 vs ~267 pre-roll) rather than the `rust extra`
+its label claims; and `PRNG_TRACE` on the 13 `result random[16]` offsets before any state diff.**
+
+---
+
 **RANDBATS-500 TRANCHE (2026-07-28): 472 / 500 randbats (94.4%) and 905 / 912 customgame (99.2%,
 UNMOVED).** One corpus commit and **twelve parity commits, 15 games**, newly-non-exact EMPTY on
 BOTH rails at every one, audited **111/111** at every one. **Zero `rust extra` on both rails.**

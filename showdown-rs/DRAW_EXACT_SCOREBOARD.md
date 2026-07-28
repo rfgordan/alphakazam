@@ -3,20 +3,194 @@
 Reproduce: `bash harness/gate-912.sh [out-nonexact-set-file]` — the customgame rail in one
 command. **`bash harness/gate-rb.sh [out-set]`** — the real-format rail. PS pin: `b9dc987d`.
 
-**Current: 905 / 912 customgame (99.2%) and 472 / 500 randbats (94.4%). Read the RANDBATS-500
+**Current: 905 / 912 customgame (99.2%) and 1413 / 1500 randbats (94.2%). Read the RANDBATS-1500
 TRANCHE section immediately below before anything else.**
 
 **Two corpora now, and they are not interchangeable.**
 
-* **1412 games total.** The customgame rail is 912: 111 audited traces / 3831 move units
+* **2412 games total.** The customgame rail is 912: 111 audited traces / 3831 move units
   (`harness/cosim-traces/`), 401 seed fixtures (`harness/seed-fixtures/`, seeds 1000-1400) and 400
-  more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). The randbats rail is **500**:
-  `harness/seed-fixtures-rb/` (101, seeds 5001-5100 + 5139) and
-  `harness/seed-fixtures-rb-fresh/` (399, seeds 5101-5500 minus the already-pinned 5139).
+  more (`harness/seed-fixtures-fresh/`, seeds 1401-1800). The randbats rail is **1500**:
+  `harness/seed-fixtures-rb/` (101, seeds 5001-5100 + 5139),
+  `harness/seed-fixtures-rb-fresh/` (399, seeds 5101-5500 minus the already-pinned 5139) and
+  `harness/seed-fixtures-rb-1000/` (1000, seeds 5501-6500).
 * Every one of the 912 STAMPS `format: gen9randombattle` and was **played as `gen9customgame`**,
-  because `cosim.mjs` used to rewrite the formatid. Only the 500 are real random battles.
+  because `cosim.mjs` used to rewrite the formatid.
   `cosim::trace::ruleset_for` keys off a separate, explicit `ruleset` field for exactly this
-  reason; absent ⇒ customgame.
+  reason; absent ⇒ customgame. Only the 1500 are real random battles.
+
+---
+
+# ==== RANDBATS-1500 TRANCHE — the format rail TRIPLES, and the deferral bill comes due (2026-07-28) ====
+
+**HEADLINE: 1413 / 1500 randbats (94.2%) and 905 / 912 customgame (99.2%, UNMOVED for the
+SIXTEENTH consecutive parity commit).** One corpus commit, **six parity commits (8 games)** and one
+follow-up fix, newly-non-exact EMPTY on BOTH rails at every one, audited **111/111** at every one.
+
+## Final gate numbers (re-run at the certifying commit `be55929`)
+
+| gate | command | result |
+|------|---------|--------|
+| Seed gate, audited 111 | `SEED_GATE=1 cosim harness/cosim-traces/*.json.gz` | **111 / 111** (ABSOLUTE INVARIANT) |
+| **Seed gate, all 912 customgame** | `bash harness/gate-912.sh` | **905 / 912 = 99.2%** (SET identical at every commit) |
+| Seed gate, randbats pinned 101 | (inside `gate-rb.sh`) | **98 / 101 = 97.0%** |
+| Seed gate, randbats fresh 399 | (inside `gate-rb.sh`) | **377 / 399 = 94.5%** (was 374) |
+| Seed gate, randbats new 1000 | (inside `gate-rb.sh`) | **938 / 1000 = 93.8%** (opened at 933) |
+| **Seed gate, randbats 1500** | `bash harness/gate-rb.sh` | **1413 / 1500 = 94.2%**; init-aligned **1500 / 1500** |
+| State sweep (mechanics rail) | `cosim harness/cosim-traces/*.json.gz` | **3831 / 3831**, EXACTNESS **100.00%**, coverage 100.00% |
+| Draw differ, audited | `DRAW_DIFF=1 cosim harness/cosim-traces/*.json.gz` | **3816 / 3831 = 99.61%**; **zero `rust extra`** |
+| Engine + cosim tests | `cargo test --release -p engine -p cosim -j 2` | all 26 targets green |
+
+**The randbats rail is now 1500 games.** Seeds 5501-6500 were recorded and their fixtures
+committed to `harness/seed-fixtures-rb-1000/`. `gate-rb.sh` runs all THREE dirs and now COUNTS the
+total from the globs instead of hardcoding it. Determinism checked, not assumed: rebuilding 59 of
+the already-pinned fixtures from their sidecars reproduces the committed files BYTE-IDENTICALLY.
+
+| # | commit | what | rb | 912 |
+|---|--------|------|----|-----|
+| 1 | `0143dd8` | **Knock Off's step-8 guard is read AFTER the step-7 chip** — and Magician / Pickpocket ride with it | 473/500 | 905 |
+| 2 | `23f2381` | **Cursed Body reads the PRE-HIT ability** — a faint had already reverted the Imposter transform | 474/500 | 905 |
+| 3 | `17d5be1` | a **`sleepUsable` move does not short-circuit the BeforeMove ladder** | 475/500 | 905 |
+| 0 | `384cd88` | **corpus**: 1000 fresh randbats fixtures; first gate **1408 / 1500** | 1408 | 905 |
+| 4 | `feb67db` | a **FIXED-DAMAGE move into an intact Ice Face / Disguise** rolls neither crit nor damage | 1410 | 905 |
+| 5 | `c287c25` | **`choicelock` clears ITSELF at endTurn** — and it is still in the DisableMove sort when it does | 1413 | 905 |
+| 6 | `be55929` | fix: that step's STATE effect must run with annotation OFF (the sweep rail) | 1413 | 905 |
+
+## The finding: FOUR of the five roots are the DEFERRAL bill, and the campaign has now paid it twice
+
+The engine's move pipeline runs `apply_post_damage` (drain / recoil / Life Orb / Knock Off /
+Magician / Pickpocket / the faint reverts) at the END of the hit loop, and DEFERS
+`runEvent('DamagingHit')` — step 7 — past the caller's step-5 secondary split. PS's order is the
+reverse on both counts. Every deferred handler therefore stands one PS line out of place, and this
+tranche found three separate consumers of that one displacement:
+
+1. **A guard read too early** (rb5164). `after_hit_user_alive` is snapshotted before step 7 has
+   run, so a Knock Off user killed by a step-7 Rocky Helmet chip still looked alive at step 8.
+2. **An input read too late** (rb5199). `apply_cursed_body` read the holder's ability LIVE, and
+   `apply_post_damage`'s faint block had already run `revert_transform` on the Imposter Ditto that
+   copied Cursed Body — so the deferred handler saw a plain Ditto.
+3. **A sibling left behind** (rb5267 / rb5217 / rb5335). Moving Knock Off's `takeItem` to the
+   step-7/8 boundary and leaving Pickpocket in `apply_post_damage` split an ORDERED PS sequence:
+   Knock Off strips the target, and Pickpocket then finds an itemless holder and steals the
+   attacker's item in its place.
+
+> **A deferred handler must be HANDED its inputs, not read them — and everything PS orders around
+> it has to move with it.** `apply_damaging_hit_reactions` has taken `def_item` / `def_ability` as
+> parameters since the beginning, and the Gulp Missile hoist is a third witness. Cursed Body was
+> the copy that still read live state.
+
+Three engine-side answers now exist to "is the attacker standing", and they are all different:
+`is_alive()` (post-orb), `after_hit_user_alive` (pre-step-7) and `step8_user_alive`
+(`hp + late_self_damage > 0`) — the composition, and the only one that is PS's `pokemon.hp` at
+`battle-actions.ts:1144`.
+
+## Four more rules this tranche cost a landing each
+
+1. **`data/conditions.ts:77` — slp's `onBeforeMove` ends `if (move.sleepUsable) return;` before its
+   `return false`.** For Sleep Talk and Snore it returns UNDEFINED, so `runEvent` does not
+   short-circuit and everything below priority 10 still runs: Truant (9), Disable / Taunt (7/6/5),
+   **confusion (3) with its `time--`**, Attract (2), paralysis (1). rb5386 d6 t7: a Snorlax with
+   ONE confusion turn left Sleep Talks, PS decrements to 0, removes the volatile and rolls no
+   `randomChance[33,100]` at all. This is the third arm of the same routing rule
+   (`before_move_lower_ladder`) — slp and frz return `undefined` on a WAKE or a THAW too — and the
+   tick had to move UP into `execute_move`, because a confusion / Attract / paralysis cancel
+   branch never reaches `execute_move_inner` and PS ticked at priority 10 regardless.
+2. **`getDamage` returns on `ohko` / `damageCallback` / `damage` BEFORE the crit roll**
+   (`battle-actions.ts:1608-1615`). A fixed-damage move never reaches the crit `randomChance` or
+   the `random(16)` — so the two draw-and-discards the Ice Face / Disguise arms emit have nothing
+   to discard. rb6463 d4 t4: a Seismic Toss into a switching-in Eiscue is ONE draw in PS and was
+   three in the engine.
+3. **A condition that clears ITSELF clears LATE, and `runEvent` sorts before it runs.** PS's
+   `choicelock` has no `onEnd` and no item hook; it removes itself from inside `onDisableMove`
+   (`endTurn`, `battle.ts:1688`) and `onBeforeMove`. `runEvent` COLLECTS and speed-sorts the
+   handler list first, so the doomed handler is still in the sort. `on_item_lost` removed the
+   volatile eagerly at the Knock Off and deleted it from the count. rb6454 d11 t12 named it;
+   rb5869 and rb5909 came with it as pure stream offsets.
+4. **`Mold Breaker` nulls only `breakable` abilities, and the `def_ab` the immunity checks use is
+   not a general-purpose capture.** Passing it to Cursed Body cost rb1403 (a TURBOBLAZE Reshiram
+   Outrages a Banette and PS rolls the Cursed Body chance all the same) and had to be replaced
+   with the raw pre-hit ability.
+
+## The Roar phaze: DIAGNOSED, implemented, and REVERTED on the rails' verdict
+
+rb5523 d31 t27 and rb5933 d28 t26 both record `shuffle[2,0,2]@roar`, `shuffle[2,0,2]@roar`,
+`sample[n]@roar` on a Speed-tied board where the engine records only the sample. The mechanism is
+certain: a landing phaze reaches the per-hit 970 Update and the post-hit-loop 1024 before
+`dragIn`, and a REFUSED one reaches neither (`forceSwitch` writes `damage[i] = false` for a Status
+move, `hitStepMoveHitLoop` breaks at `:950`, and `if (hit === 1) return damage.fill(false)` skips
+the 1024). Emitting them, guarded on the drag actually landing, restored rb1750 / rb1467 and moved
+rb5523 from d31 to d32 and rb5933 from d28 to d32.
+
+**It still lost rb6013 net, so it is not in the tree.** rb6013 d9 exposes why: the engine's
+POST-drag shuffles (`emit_drag_switchin_sort`'s `runSwitch` sort and the action's trailing 2882)
+fire where PS's do not, and the game was passing only because two wrong shuffles after the sample
+happened to equal two right shuffles before it. **The phaze Update fix cannot land until the
+post-drag pair is right.** That is the named open for the next tranche, with its own witness.
+
+## The 87 remaining randbats opens + 7 customgame
+
+The seven customgame opens are UNCHANGED for the third tranche running: `rb1011 rb1012 rb1525
+rb1572 rb1581 rb1681 rb1769`.
+
+**57 of the 87 randbats opens are `draws-match/state-diff`** — the damage/HP asymptote, now 65% of
+the population. The 30 with a named draw label are:
+
+| bucket | n | games |
+|---|---|---|
+| `result random[16]@X` (stream OFFSET — `PRNG_TRACE` first) | 13 | rb5037 rb5146 rb5350 rb5400 rb5465 rb5605 rb5893 rb6098 rb6131 rb6246 rb6282 rb6292 rb6317 |
+| **Struggle** — a forced Struggle under Encore / Disable / Heal Block | **3** | rb5142 rb5214 rb5927 |
+| **Imposter Ditto switch-in Speed tie** (`PS shuffle@generic` ahead of the first accuracy; the recorded groups show Ditto at the foe's EXACT Speed) | **2** | rb5424 rb5936 |
+| **Roar phaze Updates** (diagnosed above; blocked on the post-drag pair) | **2** | rb5523 rb5933 |
+| `PS randomChance@<move>` where rust has `shuffle@update` | 2 | rb5940 rb5963 |
+| Bullet Seed | 2 | rb5301 rb6421 |
+| move-order tie (the LAST member) | 1 | rb5100 |
+| `args randomChance[1,4]@par` | 1 | rb5358 |
+| Shed Tail | 1 | rb5268 |
+| Scale Shot | 1 | rb5982 |
+| Future Sight | 1 | rb6260 |
+| **`rust-extra randomChance[1,4]@par`** | 1 | rb6117 |
+
+**rb6117 is the one `rust extra` on the rail and it is NOT an over-emission root.** d41 t32: a
+Tera-STEEL Kilowattrel's Discharge should deal 272 to a 244-HP Yanmega on a roll of 0 and KO it;
+the engine deals 240, the Yanmega survives on 4, gets paralysed, and its Bug Buzz rolls four draws
+PS never rolls. **The extra draw is a damage bug wearing an invariant violation** — the whole unit's
+recorded draws match up to and including the `random[16] = 0`, so the pre-roll damage is 272 in PS
+and 267-ish in the engine. Take it as a damage-formula game (Tera STAB on a move whose type matches
+the ORIGINAL type but not the Tera type), not as a draw-emission game.
+
+## Asymptote assessment
+
+**The kill criterion was not approached: six parity commits, six non-zero yields** (1, 1, 1, 2, 3
+and the corpus commit's own baseline). No commit flipped zero on the randbats rail. **All six
+flipped exactly zero on the customgame rail — sixteen consecutive parity commits now, across two
+tranches, with the 912 SET byte-identical at every single one.** The rails are not merely
+decoupled; the customgame corpus is inert.
+
+**The 1000 new games opened at 93.3%, against the previous fresh 399's 94.5% and the pinned 101's
+97.0%.** The marginal return on corpus size has NOT fallen — it is still the case that the newest
+games are where the bugs are, and 1000 games bought 67 opens where 400 bought 25.
+
+**Recommendation for the next tranche, in order:**
+
+1. **The post-drag shuffle pair (rb6013 d9), then land the phaze Updates (rb5523, rb5933).** The
+   phaze half is written, tested and reverted in this tranche's history; it needs only the
+   post-drag half to stop cancelling it. Three games, one mechanism, and the diagnosis is done.
+2. **The Imposter Ditto switch-in Speed tie (rb5424, rb5936).** Both recorded groups show the
+   Ditto at the foe's exact Speed in a `shuffle[2,0,2]` the engine does not emit. NOTE the
+   endgame-tranche warning: folding Imposter into the switch bracket's post-`SwitchIn` Speed
+   refresh once regressed EIGHT games, because `transformInto` calls `setSpecies` BEFORE it copies
+   `storedStats`. This is a SORT-time question, not a cache-refresh question.
+3. **The Struggle class is now THREE (rb5142, rb5214, rb5927)** — the largest structural bucket
+   left. rb5142's `midTurn: true` still wants the mid-turn request semantics pinned, and the same
+   answer applies to rb1681's Wish counter.
+4. **rb6117 as a DAMAGE game**, not an over-emission game: Tera-Steel Kilowattrel, Discharge,
+   272 vs ~267 pre-roll.
+5. **`PRNG_TRACE` the 13 `result random[16]` games before reading a single state diff.** Two of
+   this tranche's five roots (rb6463, rb6454) were found that way, and both turned out to be a
+   draw-COUNT bug several units upstream of the label.
+6. **Recording more seeds is STILL the highest-yield buy** and this is the third tranche in a row
+   to measure it. 6501-8500 would be the natural next block.
+
 
 ---
 
