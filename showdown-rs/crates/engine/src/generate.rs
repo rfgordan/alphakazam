@@ -874,6 +874,47 @@ pub fn replacement_bracket_tied(pre: &State, replacements: &[(SideId, u8)]) -> b
     alive && sp[0] == sp[1]
 }
 
+/// The replacement bracket's THIRD shuffle — `runSwitch`'s own `runAction` `eachEvent('Update')`
+/// (sim/battle.ts:2882) — is the only one that runs AFTER `runSwitch`'s
+/// `fieldEvent('SwitchIn')` (sim/battle-actions.ts:184). Everything the field event does to Speed
+/// is invisible to the sort, which reads the cached `pokemon.speed`, with ONE exception: a
+/// switch-in `onStart` that FORME-CHANGES goes through `Pokemon.setSpecies`, whose last line is
+/// `this.speed = this.storedStats.spe` (sim/pokemon.ts:1419). That rewrites the cache to the new
+/// forme's RAW Speed stat — no boost, item, ability, status or Trick Room adjustment, none of
+/// which `setSpecies` applies. Entry hazards and Sticky Web move BOOSTS, which the cache never
+/// sees, so they still change nothing (c3c2s82 d49).
+///
+/// So: same predicate as `replacement_bracket_tied`, except a side whose replacement forme-changed
+/// on the way in sorts on its post-change stored Speed instead of its entry cache.
+///
+/// Witness op-40001 d22 t18: a fainted Regice is replaced by a core-forme Minior (entry cache 202)
+/// against a Tyranitar at 140. Shields Down turns it into Minior-Meteor inside the field event and
+/// its raw Speed is 140, so PS's whole unit records exactly ONE `shuffle[2, 0, 2]` — this one —
+/// over `[{p1: Minior, speed: 140}, {p2: Tyranitar, speed: 140}]`. The engine held the entry cache
+/// for all three shuffles, consumed zero, and read every later damage roll one draw behind PS.
+pub fn replacement_bracket_tied_after_entry(pre: &State, replacements: &[(SideId, u8)]) -> bool {
+    let mut st = *pre;
+    let mut sp = [effective_speed(pre, SideId::One), effective_speed(pre, SideId::Two)];
+    for &(side, slot) in replacements {
+        let before = st.side(side).pokemon[slot as usize].species;
+        sp[side as usize] = switch_entry_speed(&st, side, slot);
+        let _ = switch_into(&mut st, side, slot);
+        let after = st.side(side).active();
+        // TRANSFORM is the one species change that does NOT leave the new forme's stored Speed in
+        // the cache. `transformInto` calls `setSpecies(species, effect, true)` first — which sets
+        // `.speed` from stats `spreadModify`d off the COPIER's own set — and only afterwards
+        // overwrites `storedStats` with the target's (sim/pokemon.ts:1290 vs 1301-1305), never
+        // touching `.speed` again. So an Imposter Ditto's cache is not its target's Speed, and the
+        // entry cache stays the better model of it: rb1119 d8 and rb1241 d21 both replace with a
+        // Choice Scarf Ditto whose copied Speed ties the foe's and PS still consumes nothing.
+        if after.species != before && !after.transformed {
+            sp[side as usize] = after.stat(crate::ids::StatIndex::Speed) as i32;
+        }
+    }
+    let alive = st.side(SideId::One).active().is_alive() && st.side(SideId::Two).active().is_alive();
+    alive && sp[0] == sp[1]
+}
+
 /// Whether `commitChoices`' `queue.sort()` over a SIMULTANEOUS both-sides forced replacement ties.
 ///
 /// A forced replacement is answered through the normal choice flow, so `commitChoices`
@@ -6068,6 +6109,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
         emit_discarded_damage_rolls(&mut hb, crit_den);
+        let knock_off = md.id.to_id() == "knockoff" && !substitute_absorbs(&hb, side, &md);
         break_ice_face(&mut hb, foe);
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
@@ -6087,6 +6129,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|sb| apply_cursed_body(sb, side, &md))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
             {
+                // `spreadMoveHit` step 8, `onAfterHit` — see the Disguise arm below for the
+                // witness and the `damagedTargets` reasoning; Ice Face's `onDamage` returns the
+                // same NUMBER 0, so Knock Off still takes an intact Eiscue's item.
+                if knock_off && sb.state.side(side).active().is_alive() {
+                    apply_knock_off_take(&mut sb, side, def_ab);
+                }
                 // A nullified hit is still a connecting hit, so the per-hit `eachEvent('Update')`
                 // (970) and the post-hit-loop one (1024) both fire.
                 emit_update_hit(&mut sb);
@@ -6143,6 +6191,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // rb1710 d18: U-turn into an intact Ice Face Eiscue, PS's roll is 13, the engine's branch
         // claimed 0, and the unit desynced on a draw whose value cannot matter.
         emit_discarded_damage_rolls(&mut hb, crit_den);
+        let knock_off = md.id.to_id() == "knockoff" && !substitute_absorbs(&hb, side, &md);
         bust_disguise(&mut hb, foe);
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
@@ -6162,6 +6211,16 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 .flat_map(|x| apply_cursed_body(x, side, &md))
                 .flat_map(|x| apply_contact_secondaries(x, side, &md))
             {
+                // `spreadMoveHit` step 8, `onAfterHit` (`sim/battle-actions.ts:1144`). Its gate is
+                // `damagedTargets` — built at :1131-1137 from `typeof damage[i] === 'number'` — and
+                // Disguise's `onDamage` returns the NUMBER 0, which `spreadDamage` passes straight
+                // through (`sim/battle.ts:2119` treats `0` as a real result, not a failure). So the
+                // busted Mimikyu IS a damaged target and Knock Off's `takeItem` still runs.
+                // op-40005 d6 t5: Hariyama's Knock Off busts an intact Mimikyu's Disguise and PS
+                // ends the turn with its Life Orb gone; the engine kept the item.
+                if knock_off && sb.state.side(side).active().is_alive() {
+                    apply_knock_off_take(&mut sb, side, def_ab);
+                }
                 // Same two Updates as the Ice Face arm: `onDamage` returned the NUMBER 0, so the
                 // target stayed in `targets` and PS ran the rest of `hitStepMoveHitLoop`.
                 // rb1191 d17: a Thunderbolt busts an intact Mimikyu on a Speed-TIED board and PS
@@ -7406,6 +7465,39 @@ fn disguise_is_intact(b: &Branch, foe: SideId, md: &crate::data::MoveData) -> bo
         && p.species == crate::ids::Species::from_id("mimikyu").unwrap_or(crate::ids::Species::None)
 }
 
+/// Knock Off's `onAfterHit` (`data/moves.ts:9977-9982`): `target.takeItem()` on the mon the move
+/// just connected with. Fails on a species-locked item (PS `onTakeItem` returning false) and on
+/// Sticky Hold (Mold Breaker suppression is already folded into `def_ability`).
+///
+/// Shared by the ordinary damage path (`apply_post_damage`) and by the nullifying-ability arms
+/// (Disguise / Ice Face), which return early and never reach it.
+fn apply_knock_off_take(b: &mut Branch, side: SideId, def_ability: crate::ids::Ability) {
+    let foe = side.other();
+    let f = b.state.side(foe).active();
+    if f.is_alive()
+        && f.item != Item::None
+        && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
+        && def_ability != crate::ids::Ability::StickyHold
+    {
+        let (prev, fslot) = (f.item, b.state.side(foe).active_index);
+        push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
+        on_item_lost(b, foe);
+        // Knocking the item off reveals what it was.
+        reveal(b, foe, 0, crate::state::Reveal::ITEM);
+    }
+}
+
+/// Would a Substitute on `foe` have absorbed this move — i.e. did PS never reach the mon itself?
+/// (`spreadMoveHit` rewrites a sub-absorbed entry to `targets[i] = null`, so the target never
+/// enters `damagedTargets` and no `onAfterHit` fires for it.)
+fn substitute_absorbs(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    let foe = side.other();
+    let bypass = md.flag_sound || b.state.side(side).active().ability == crate::ids::Ability::Infiltrator;
+    !bypass
+        && b.state.side(foe).substitute_hp > 0
+        && b.state.side(foe).volatiles.contains(VolatileStatus::Substitute)
+}
+
 /// Breaks an intact Ice Face and records the blocked hit. Transform instructions carry the
 /// complete previous forme data, so reversing a generated branch restores Eiscue exactly.
 /// Disguise busts: Mimikyu forme-changes to Mimikyu-Busted (identical stats/types/ability, so
@@ -8398,18 +8490,7 @@ fn apply_post_damage(
         // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
         // policy consumed, the engine at +0 / +0 with it merely knocked away.
         apply_weakness_policy(b, foe, &md);
-        let f = b.state.side(foe).active();
-        if f.is_alive()
-            && f.item != Item::None
-            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
-            && def_ability != Ab::StickyHold
-        {
-            let (prev, fslot) = (f.item, b.state.side(foe).active_index);
-            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: prev, new: Item::None });
-            on_item_lost(b, foe);
-            // Knocking the item off reveals what it was.
-            reveal(b, foe, 0, crate::state::Reveal::ITEM);
-        }
+        apply_knock_off_take(b, side, def_ability);
     }
 
     // The defender's pinch/HP berry is an `onUpdate`, and PS's `eachEvent('Update')` sits at
