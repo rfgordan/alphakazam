@@ -7333,10 +7333,29 @@ fn compute_damage(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Damag
     // Terastallization STAB floor: a terastallized mon's move matching its (post-Tera) type with
     // base power < 60 is raised to 60 — applied AFTER every onBasePower modifier. Excludes
     // priority moves, multi-hit moves, and variable-power moves whose dex base power is 0 or 150
-    // (Dragon Energy / Eruption / Water Spout, …). Stellar Tera uses a different rule (skipped).
+    // (Dragon Energy / Eruption / Water Spout, …).
+    //
+    // **A Stellar Tera gets the floor too, under a different predicate** (`battle-actions.ts:1664`):
+    //
+    // ```ts
+    // source.terastallized && (source.terastallized === 'Stellar'
+    //     ? !source.stellarBoostedTypes.includes(move.type)
+    //     : source.hasType(move.type)) && basePower < 60 && …
+    // ```
+    //
+    // The engine used to skip Stellar entirely. It is the SAME `stellarBoostedTypes` memory the
+    // Stellar STAB rule uses (`damage::stab_mod`), and for the same reason it is not modelled:
+    // `:1785` never pushes a type for **Terapagos-Stellar**, the only Stellar user the gen-9
+    // randbats generator produces, so the list is permanently empty and the floor applies to
+    // EVERY move of every type. Witness rb1795 d3 t4: Terapagos-Stellar's Rapid Spin (dex BP 50)
+    // — PS 17 damage off BP 60, the engine 14 off BP 50.
+    let tera_floor_type_ok = if attacker.tera_type == Type::Stellar {
+        true // `!stellarBoostedTypes.includes(move.type)` — always true for Terapagos-Stellar
+    } else {
+        attacker.types.contains(&md.typ) // `source.hasType(move.type)` — the post-Tera list
+    };
     if attacker.terastallized
-        && attacker.tera_type != Type::Stellar
-        && attacker.types.contains(&md.typ)
+        && tera_floor_type_ok
         && base_power < 60
         && md.priority <= 0
         && md.hits_max <= 1
