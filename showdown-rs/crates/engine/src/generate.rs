@@ -6156,6 +6156,12 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
     } else {
         defender.ability
     };
+    // The holder's ability as the DEFERRED step-7 handlers must see it: captured before the hit,
+    // and NOT the `def_ab` above. `def_ab` is nulled for any Mold Breaker / Teravolt / Turboblaze
+    // user because it answers the IMMUNITY question, and PS nulls only `breakable` abilities —
+    // Cursed Body is not one. rb1403 d10 t7: a TURBOBLAZE Reshiram Outrages a Banette and PS rolls
+    // `randomChance[3,10]@cursedbody` all the same.
+    let def_ab_raw = defender.ability;
     // Wind Rider: immunity to damaging wind moves (+1 Atk applied on the absorb branch).
     let wind_immune = def_ab == crate::ids::Ability::WindRider && is_wind_move(md.id);
     let flag_immune = (md.flag_sound && def_ab == crate::ids::Ability::Soundproof)
@@ -6245,7 +6251,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             for mut sb in apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|sb| apply_flinch_split(sb, side, &md))
-                .flat_map(|sb| apply_cursed_body(sb, side, &md))
+                .flat_map(|sb| apply_cursed_body(sb, side, &md, def_ab_raw))
                 .flat_map(|sb| apply_contact_secondaries(sb, side, &md))
                 .flat_map(|sb| apply_source_damaging_hit(sb, side, &md))
             {
@@ -6329,7 +6335,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             for mut sb in apply_target_secondary(hb, side, &md)
                 .into_iter()
                 .flat_map(|x| apply_flinch_split(x, side, &md))
-                .flat_map(|x| apply_cursed_body(x, side, &md))
+                .flat_map(|x| apply_cursed_body(x, side, &md, def_ab_raw))
                 .flat_map(|x| apply_contact_secondaries(x, side, &md))
                 .flat_map(|x| apply_source_damaging_hit(x, side, &md))
             {
@@ -6699,7 +6705,7 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                     apply_thaw_after_secondary(&mut sb, side, foe, &md);
                     sb
                 })
-                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md) })
+                .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_cursed_body(sb, side, &md, def_ab_raw) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_contact_secondaries(sb, side, &md) })
                 .flat_map(|sb| if per_hit_done { vec![sb] } else { apply_source_damaging_hit(sb, side, &md) })
                 .collect::<Vec<_>>()
@@ -10683,7 +10689,7 @@ fn realized_per_hit_damaging_hit(
     b: &mut Branch, side: SideId, md: &crate::data::MoveData, cur: &mut RealizedCursor,
 ) {
     let base = b.draws.len();
-    let cands: Vec<Branch> = apply_cursed_body(b.clone(), side, md)
+    let cands: Vec<Branch> = apply_cursed_body(b.clone(), side, md, b.state.side(side.other()).active().ability)
         .into_iter()
         .flat_map(|sb| apply_contact_secondaries(sb, side, md))
         .flat_map(|sb| apply_source_damaging_hit(sb, side, md))
@@ -10734,14 +10740,26 @@ fn realized_per_hit_damaging_hit(
 }
 
 /// Cursed Body (defender): 30% chance to Disable the move that just hit it.
-fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData) -> Vec<Branch> {
+/// `def_ability` is the ability the holder had when the move STARTED, not what it has now.
+///
+/// A holder the hit just KO'd has already been through `apply_post_damage`'s faint block, and
+/// `revert_transform` there rewrites `ability` back to `base_ability` — so an Imposter Ditto that
+/// copied Cursed Body is a plain Ditto again by the time this deferred step-7 handler runs, and
+/// the roll silently vanishes. PS reverts at `faintMessages`, well after `runEvent('DamagingHit')`.
+/// Same hazard, and the same fix, as the `def_item` / `def_ability` that `apply_damaging_hit_-
+/// reactions` has always taken as parameters, and as the Gulp Missile hoist in `apply_post_damage`.
+///
+/// rb5199 d6 t5: p2 switches in an Imposter Ditto that copies p1 Banette's CURSED BODY, and the
+/// Banette's Poltergeist KOs it. PS rolls `randomChance[3,10]@cursedbody`, it comes up TRUE, and
+/// the Banette ends the turn with Poltergeist disabled for 3.
+fn apply_cursed_body(b: Branch, side: SideId, md: &crate::data::MoveData, def_ability: crate::ids::Ability) -> Vec<Branch> {
     let foe = side.other();
     // PS Cursed Body `onDamagingHit` rolls `randomChance(3, 10)` whenever the holder (foe) is hit
     // by a non-Struggle damaging move and the SOURCE isn't already Disabled. The roll fires even
     // when the source can't actually be disabled — a source that fainted from the hit (its
     // `.fainted` flag isn't set until after the hit resolves, so it's still present at the
     // DamagingHit event). The engine had skipped the draw entirely in those cases.
-    let roll_fires = b.state.side(foe).active().ability == crate::ids::Ability::CursedBody
+    let roll_fires = def_ability == crate::ids::Ability::CursedBody
         && md.id != crate::ids::MoveId::None
         && md.id.to_id() != "struggle"
         && !b.state.side(side).volatiles.contains(VolatileStatus::Disable);
