@@ -6523,7 +6523,20 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         // `setType`, mapping Electric -> "???" typeless). A pure-Electric user becomes fully
         // typeless; Pawmot (Electric/Fighting) keeps only Fighting. Modeled as Type::None in the
         // stripped slot (the engine's typeless).
-        if md.id.to_id() == "doubleshock" && hb.state.side(side).active().is_alive() {
+        // **`setType` REFUSES a terastallized user** — `sim/pokemon.ts`: "Terastallized Pokemon
+        // cannot have their base type changed except via forme change", `if (this.terastallized)
+        // return false`. The move itself still runs: its `onTryMove` gate is
+        // `pokemon.hasType('Electric')`, and `hasType` goes through `getTypes()`, which
+        // short-circuits on `terastallized` — so a Pawmot that Teras to ELECTRIC passes the gate,
+        // deals its damage, and changes nothing. rb5189 d10 / rb5258 d19 are the same witness
+        // twice: the engine's tera writes `types = [Electric, None]`, Double Shock then stripped
+        // that to `[None, None]`, and because `types` reverts on switch-out only for a
+        // NON-terastallized mon (see the `clearVolatile` note), the typeless pair survived on the
+        // bench where PS had the species pair back.
+        if md.id.to_id() == "doubleshock"
+            && hb.state.side(side).active().is_alive()
+            && !hb.state.side(side).active().terastallized
+        {
             let p = hb.state.side(side).active();
             if p.types.contains(&Type::Electric) {
                 let prev = p.types;
@@ -6534,8 +6547,10 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
                 let slot = hb.state.side(side).active_index;
                 let prev_live = p.live_types;
                 // Double Shock's `onHit` is `pokemon.setType(...)` — a real type change, so
-                // PS's `types` array moves too. (The `hasType('Electric')` gate above already
-                // excludes a terastallized user, whom `setType` refuses.)
+                // PS's `types` array moves too. The terastallized case is excluded at the guard
+                // above, NOT by the `hasType('Electric')` test, which a mon terastallized to
+                // Electric passes.
+
                 push(&mut hb, Instruction::ChangeTypes { side, slot, previous: prev, new });
                 if prev_live != new {
                     push(&mut hb, Instruction::ChangeLiveTypes { side, slot, previous: prev_live, new });
