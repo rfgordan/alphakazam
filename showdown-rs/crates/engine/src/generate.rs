@@ -13989,6 +13989,47 @@ fn apply_end_of_turn_inner(
         }
         return out_h;
     }
+    // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
+    //
+    // **`onResidualOrder: 23` (`data/moves.ts` yawn `condition`), and Harvest is 28** — so the
+    // `random(2, 5)` sleep duration is drawn BEFORE Harvest's `randomChance(1, 2)`. This block
+    // used to sit in the branching tail after Harvest, five orders late; rb5162 d36 t30 is the
+    // witness (an Exeggutor with Harvest + Sitrus is Yawned to sleep: PS's pair is
+    // `random[2,5]=3@slp` then `randomChance[1,2]=False@harvest`, the engine's was the reverse).
+    // Same mistake, same tail, as the Shed Skin note directly below.
+    for (i, fired) in yawn_fired.into_iter().enumerate() {
+        if !fired {
+            continue;
+        }
+        let side = if i == 0 { SideId::One } else { SideId::Two };
+        out_h = out_h
+            .into_iter()
+            .flat_map(|mut x| {
+                let p = x.state.side(side).active();
+                let pre_clause = p.is_alive()
+                    && p.status == Status::None
+                    && status_applies(p, Status::Sleep)
+                    && !status_blocked_by_field(&x.state, side, Status::Sleep);
+                if pre_clause && sleep_clause_blocks(&x.state, side) {
+                    push(&mut x, Instruction::SleepClauseBlocked { side });
+                    return vec![x];
+                }
+                if pre_clause {
+                    let slot = x.state.side(side).active_index;
+                    push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
+                    mark_slept_by_foe(&mut x, side);
+                    consume_lum_if_statused(&mut x, side);
+                    if sleep_survived_or_discard_duration(&mut x, side, true) {
+                        branch_sleep_counter(x, side)
+                    } else {
+                        vec![x]
+                    }
+                } else {
+                    vec![x]
+                }
+            })
+            .collect();
+    }
     // Speed order, not side order: two Harvest holders make two consecutive, IDENTICALLY-SHAPED
     // `randomChance[1,2]` draws, so the differ cannot tell them apart but the SELECTOR must —
     // the seed gate hands the first recorded result to whichever holder the engine rolls first.
@@ -14063,41 +14104,7 @@ fn apply_end_of_turn_inner(
     // the deterministic core; `apply_end_of_turn`'s wrapper hoists the 33% split.
     let out = branches_after_harvest;
 
-    // Yawn expiry: the drowsy mon falls asleep now (stochastic 1-3 turn duration).
     let mut out = out;
-    for (i, fired) in yawn_fired.into_iter().enumerate() {
-        if !fired {
-            continue;
-        }
-        let side = if i == 0 { SideId::One } else { SideId::Two };
-        out = out
-            .into_iter()
-            .flat_map(|mut x| {
-                let p = x.state.side(side).active();
-                let pre_clause = p.is_alive()
-                    && p.status == Status::None
-                    && status_applies(p, Status::Sleep)
-                    && !status_blocked_by_field(&x.state, side, Status::Sleep);
-                if pre_clause && sleep_clause_blocks(&x.state, side) {
-                    push(&mut x, Instruction::SleepClauseBlocked { side });
-                    return vec![x];
-                }
-                if pre_clause {
-                    let slot = x.state.side(side).active_index;
-                    push(&mut x, Instruction::ChangeStatus { side, slot, previous: Status::None, new: Status::Sleep });
-                    mark_slept_by_foe(&mut x, side);
-                    consume_lum_if_statused(&mut x, side);
-                    if sleep_survived_or_discard_duration(&mut x, side, true) {
-                        branch_sleep_counter(x, side)
-                    } else {
-                        vec![x]
-                    }
-                } else {
-                    vec![x]
-                }
-            })
-            .collect();
-    }
     // Future Sight strikes: 16 damage rolls, each its own branch.
     for (i, fired) in fs_fired.into_iter().enumerate() {
         let Some(caster_slot) = fired else { continue };
