@@ -463,11 +463,6 @@ fn run_game(path: &str, g: &GateInput<'_>) -> GameResult {
             let mark = if eng == Some(ps_cum) { "" } else { "  <<< OFFSET" };
             eprintln!("[PRNG] {name} d{i} t{} engine={:?} ps={ps_cum}{mark}", dp.turn, eng);
         }
-        // Beat Up pairs each participant's base power with a distinct per-hit roll, so its realized
-        // total depends on PS's CURRENT side.pokemon array order (active-first, swap-tracked). The
-        // engine stores a fixed canonical slot order, so feed it PS's array order (the recorded
-        // pre-state's `rosterIndex` sequence) for this unit.
-        engine::generate::set_beatup_order(g.decisions[i - 1].roster_order.clone());
         let (chosen_draws, ambiguous) = match step_unit(&mut state, &unit, &canon, ruleset, &mut prng) {
             Ok(x) => x,
             Err(label) => {

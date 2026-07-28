@@ -154,25 +154,6 @@ pub fn set_realized_source(src: Option<RealizedSource>) {
     REALIZED_SOURCE.with(|c| *c.borrow_mut() = src);
 }
 
-thread_local! {
-    static BEATUP_ORDER: std::cell::RefCell<[Option<Vec<u8>>; 2]> =
-        const { std::cell::RefCell::new([None, None]) };
-}
-
-/// Install (or clear) the per-side Beat Up participant order: canonical party slots in PS's CURRENT
-/// `side.pokemon` array order (active-first, swap-tracked — `switchIn` swaps positions 0/j). Beat Up
-/// pairs each participant's base power with a distinct per-hit roll, so the array order changes the
-/// realized total. Only the seed gate installs this (from the recorded pre-state's `rosterIndex`
-/// order); Enumerate/Sample (sumset-DP) and the differ (draw kinds/args) are order-independent, so
-/// they leave it `None` and `beatup_calcs` falls back to canonical (teampreview) slot order.
-pub fn set_beatup_order(orders: [Option<Vec<u8>>; 2]) {
-    BEATUP_ORDER.with(|c| *c.borrow_mut() = orders);
-}
-
-fn beatup_order(side: SideId) -> Option<Vec<u8>> {
-    BEATUP_ORDER.with(|c| c.borrow()[side as usize].clone())
-}
-
 /// gen≥5 [2,5] hit-count table: `sample([2×7, 3×7, 4×3, 5×3])` (battle-actions.ts:864). Index → count.
 const MULTIHIT_COUNT_TABLE: [u8; 20] = [2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
 
@@ -9647,9 +9628,7 @@ fn beatup_mds(b: &Branch, side: SideId, md: &crate::data::MoveData) -> Vec<crate
     // base power is paired with a distinct per-hit roll, the order changes the realized total, so
     // the seed gate installs PS's array order; without it we fall back to canonical slot order (the
     // sumset-DP and differ don't observe the pairing).
-    let order: Vec<usize> = beatup_order(side)
-        .map(|o| o.into_iter().map(|x| x as usize).collect())
-        .unwrap_or_else(|| (0..6usize).collect());
+    let order: Vec<usize> = s.roster.iter().map(|&x| x as usize).collect();
     for i in order {
         let p = &s.pokemon[i];
         if p.species == crate::ids::Species::None {
@@ -12437,15 +12416,7 @@ fn apply_drag(b: Branch, dragged: SideId) -> Vec<Branch> {
     // live array order to sample over (d3: p1 switched Tornadus in, then Dragon Tail dragged — the
     // bench must be PS's post-switch array, not canonical). Without an intra-turn switch `j == 0`
     // and the swap is a no-op, so the common case is unchanged.
-    let bench: Vec<u8> = match beatup_order(dragged) {
-        Some(mut order) => {
-            if let Some(j) = order.iter().position(|&r| r == sd.active_index) {
-                order.swap(0, j);
-            }
-            order.into_iter().filter(|&i| (i as usize) < 6 && alive_benched(i)).collect()
-        }
-        None => (0..6u8).filter(|&i| alive_benched(i)).collect(),
-    };
+    let bench: Vec<u8> = sd.roster.iter().copied().filter(|&i| alive_benched(i)).collect();
     if bench.is_empty() {
         return vec![b];
     }

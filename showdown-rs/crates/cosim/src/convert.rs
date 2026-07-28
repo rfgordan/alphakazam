@@ -687,7 +687,7 @@ fn convert_side_conditions(v: &Value, side: &mut Side) -> Res<()> {
     Ok(())
 }
 
-fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, si: usize, canon: &Canonical, turn: u32) -> Res<()> {
+fn convert_slot_conditions(v: Option<&Value>, side: &mut Side, _si: usize, _canon: &Canonical, turn: u32) -> Res<()> {
     // Serialized as an array (one object per slot); accept the object form too.
     let entries: Vec<&Value> = match v {
         Some(Value::Array(a)) => a.iter().collect(),
