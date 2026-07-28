@@ -1183,14 +1183,17 @@ fn emit_modifydamage_shuffle(b: &mut Branch) {
 /// never tie with these and don't occur in the corpus.) Fired at the end of the turn, after the
 /// post-residual Update, since `getRequests` runs after the turn completes. Annotation-only.
 fn emit_trap_pokemon_shuffles(b: &mut Branch) {
-    if !annotating() {
-        return;
-    }
     // PS's `endTurn` per-active loop (battle.ts:1664) runs `runEvent('DisableMove', pokemon)`
     // (:1688) and then `runEvent('TrapPokemon', pokemon)` (:1724) for the SAME mon before moving
     // on to the next side's active — so the two shuffles interleave per side, not in two passes.
+    //
+    // NOT annotation-gated as a whole: `runEvent('DisableMove')` has a STATE effect too (the
+    // `choicelock` self-removal), and it has to happen whether or not draws are being recorded.
     for side in [SideId::One, SideId::Two] {
-        emit_disable_move_shuffle(b, side);
+        run_disable_move_step(b, side);
+        if !annotating() {
+            continue;
+        }
         let s = b.state.side(side);
         if !s.active().is_alive() {
             continue;
@@ -1203,6 +1206,25 @@ fn emit_trap_pokemon_shuffles(b: &mut Branch) {
         if n >= 2 {
             draw(b, "shuffle", &[n, 0, n], -1, "trappokemon");
         }
+    }
+}
+
+/// `runEvent('DisableMove', pokemon)` at `endTurn` (`battle.ts:1688`), in PS's order: COLLECT and
+/// speed-sort the handler list (the shuffle), THEN run the handlers — and `choicelock`'s handler
+/// is the one that removes its own volatile when the holder no longer has a Choice item. Doing
+/// the removal at the item loss instead (`on_item_lost` used to) is one handler short at the sort.
+fn run_disable_move_step(b: &mut Branch, side: SideId) {
+    emit_disable_move_shuffle(b, side);
+    if !b.state.side(side).active().is_alive() {
+        return;
+    }
+    // `choicelock.onDisableMove`: `if (!pokemon.getItem().isChoice || !this.effectState.move)
+    // { pokemon.removeVolatile('choicelock'); return; }`.
+    let item = b.state.side(side).active().item;
+    if b.state.side(side).volatiles.contains(VolatileStatus::ChoiceLock)
+        && !matches!(item, Item::ChoiceBand | Item::ChoiceScarf | Item::ChoiceSpecs)
+    {
+        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::ChoiceLock });
     }
 }
 
@@ -10135,9 +10157,16 @@ fn apply_crash_damage(b: &mut Branch, side: SideId, md: &crate::data::MoveData) 
 /// (modeled as a volatile read by `effective_speed`); Cheek Pouch heals 1/3 max HP when the
 /// loss was eating a berry (callers that consume berries call `on_berry_eaten` instead).
 fn on_item_lost(b: &mut Branch, side: SideId) {
-    if b.state.side(side).volatiles.contains(VolatileStatus::ChoiceLock) {
-        push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::ChoiceLock });
-    }
+    // **`choicelock` is NOT removed here.** PS's `choicelock` condition has no `onEnd` and no
+    // item hook: it clears ITSELF, lazily, from inside `onDisableMove` and `onBeforeMove`
+    // (`data/conditions.ts` choicelock — `if (!pokemon.getItem().isChoice ...) {
+    // pokemon.removeVolatile('choicelock'); return; }`). The `onDisableMove` copy runs at
+    // `endTurn` (`battle.ts:1688`) — and it runs AFTER `runEvent` has already collected and
+    // SPEED-SORTED the handler list, so the doomed handler is still counted in that sort.
+    // Removing the volatile at the item loss deletes it from the count. rb6454 d11 t12: a Choice
+    // Band Dugtrio carrying `choicelock` + `encore` is Knocked Off, and PS still records the
+    // `shuffle[2,0,2]` its two condition handlers tie on. `run_disable_move_step` owns the
+    // removal now.
     let p = b.state.side(side).active();
     if p.ability == crate::ids::Ability::Unburden
         && !b.state.side(side).volatiles.contains(VolatileStatus::Unburden)
