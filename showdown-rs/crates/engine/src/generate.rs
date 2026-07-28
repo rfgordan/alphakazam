@@ -11226,10 +11226,45 @@ fn status_try_immunity_fails(b: &Branch, side: SideId, md: &crate::data::MoveDat
     }
 }
 
+/// PS `hitStepTryHitEvent` is moveStep **2** — one step EARLIER than `hitStepTryImmunity` (4) and
+/// three earlier than `hitStepAccuracy` (5) (`battle-actions.ts:551-566`). A `runEvent('TryHit')`
+/// handler that returns `null` stops the move there, so it makes **no accuracy draw at all** —
+/// even a 100-accuracy move, which would otherwise still roll `randomChance(100, 100)`.
+///
+/// **Oblivious** (`data/abilities.ts:2979-2984`) is the gen9 randbats instance: its `onTryHit`
+/// returns `null` for `attract`, `captivate` and `taunt`. The engine had it only as an EFFECT gate
+/// at the volatile-application site — right for the state, wrong for the stream, exactly the
+/// mistake `status_try_immunity_fails`'s doc records for Attract's gender check and Leech Seed's
+/// Grass immunity.
+///
+/// rb5477 d11 t10: an Enamorus Taunts an Oblivious Whiscash. PS draws NOTHING for the whole turn;
+/// the engine drew `randomChance[100,100]@accuracy` and ran one draw ahead from turn 10 on, so
+/// d12's Zen Headbutt read the accuracy roll PS had already spent, HIT a move PS missed, and
+/// over-emitted a `randomChance[1,24]@crit`.
+///
+/// Oblivious carries `flags: { breakable: 1 }`, so Mold Breaker & co. suppress it.
+/// **Aroma Veil is deliberately NOT here**: it is `onAllyTryAddVolatile`, which runs inside
+/// `moveHit` — long after the accuracy roll — and the engine's late gate for it is correct.
+fn status_try_hit_event_fails(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
+    use crate::ids::Ability as Ab;
+    let a = b.state.side(side).active();
+    let t = b.state.side(side.other()).active();
+    if !t.is_alive() {
+        return false;
+    }
+    let mold_breaker = matches!(a.ability, Ab::MoldBreaker | Ab::Teravolt | Ab::Turboblaze);
+    !mold_breaker
+        && t.ability == Ab::Oblivious
+        && matches!(md.id.to_id(), "attract" | "captivate" | "taunt")
+}
+
 fn status_move_reaches_accuracy(b: &Branch, side: SideId, md: &crate::data::MoveData) -> bool {
     use crate::ids::Ability as Ab;
     let t = b.state.side(side.other()).active();
     if !t.is_alive() {
+        return false;
+    }
+    if status_try_hit_event_fails(b, side, md) {
         return false;
     }
     if md.flag_powder
@@ -11269,6 +11304,11 @@ fn execute_status_move(
     // are Giga Drain's accuracy/crit/roll and nothing else, the engine drew a fourth, and every
     // draw after it read the wrong PRNG value. Two engine copies of one PS predicate, again.
     if status_try_immunity_fails(&b, side, md) {
+        return vec![b];
+    }
+    // ...and moveStep **2**, one earlier still: an ability `onTryHit` that returns `null`
+    // (Oblivious vs Attract / Captivate / Taunt). See `status_try_hit_event_fails`.
+    if status_try_hit_event_fails(&b, side, md) {
         return vec![b];
     }
 
