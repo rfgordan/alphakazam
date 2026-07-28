@@ -789,8 +789,56 @@ fn emit_switch_bracket(b: &mut Branch, pre: &State, side: SideId, target: u8) {
         // ONE `shuffle[2,0,2]` for the landing — this one — and the engine recorded none, running
         // a draw behind PS for the rest of the game.
         emit_update_hit(b); // runSwitch getAllActive(true) speedSort (battle-actions.ts:182)
+    });
+    // **The THIRD shuffle sits on the far side of `fieldEvent('SwitchIn')`**, so the entrant's
+    // switch-in ability has already run — and an ability that calls `formeChange` REFRESHES the
+    // Speed cache the first two sorted on (`setSpecies` ends in `this.speed = this.storedStats.spe`,
+    // `sim/pokemon.ts:1419`). `runSwitch` (`battle-actions.ts:180-193`) does the `getAllActive(true)`
+    // speedSort, THEN `fieldEvent('SwitchIn')`, and only then returns to `runAction`'s trailing
+    // Update (`battle.ts:2882`).
+    //
+    // Only a species change moves it: a Sticky Web drop or an Intimidate is a BOOST, and boosts
+    // never touch `pokemon.speed` (rb1021 d58 is that case and still wants the cached entry Speed).
+    // rb1751 d24 t19: a Minior-Green (Speed 235) switches into a Scream Tail (235); the first two
+    // shuffles tie and fire, Shields Down then makes it Minior-Meteor at a RAW 140, and PS's third
+    // Update does not tie. PS records two shuffles for the unit; the engine recorded three and ran
+    // a draw ahead — the corpus's second `rust extra`.
+    with_switch_bracket_speeds_post(b, pre, side, target, |b| {
         emit_update(b); // runSwitch runAction Update (2882) — plain getAllActive()
     });
+}
+
+/// The bracket's post-`SwitchIn` speeds: as `with_switch_bracket_speeds`, except that a switch-in
+/// ability which `formeChange`d the entrant has overwritten its cached Speed with the new forme's
+/// RAW `storedStats.spe` (`setSpecies`, `sim/pokemon.ts:1419`).
+///
+/// **A TRANSFORM is excluded even though it is a species change**, because `transformInto`
+/// (`sim/pokemon.ts:1290-1305`) runs `setSpecies(species, effect, true)` FIRST — which caches the
+/// Speed `setSpecies` computed for the copied species out of the TRANSFORMER's own level / IVs /
+/// EVs / nature — and only then overwrites `storedStats` with the target's. The engine's post-state
+/// carries the copied stat, not that intermediate, so an Imposter Ditto's cached Speed is not
+/// derivable here; keeping the entry Speed is what the corpus was already exact on (rb1303 d6,
+/// rb1060, rb1241, rb1591 and four more all regressed on a Ditto when this case was folded in).
+/// NAMED GAP: an Imposter entrant whose `setSpecies` Speed differs from both its entry Speed and
+/// the copied one would still mis-gate this shuffle; no corpus witness.
+fn with_switch_bracket_speeds_post(
+    b: &mut Branch, pre: &State, entered: SideId, slot: u8, f: impl FnOnce(&mut Branch),
+) {
+    let entry_species = pre.side(entered).pokemon[slot as usize].species;
+    let now = b.state.side(entered).active();
+    if now.species == entry_species || now.transformed {
+        return with_switch_bracket_speeds(b, pre, entered, slot, f);
+    }
+    let prev = MOVE_TIE_SPEEDS.with(|c| c.get());
+    let sort_speed = |s: SideId| {
+        let p = b.state.side(s).active();
+        if p.is_alive() { effective_speed(&b.state, s) } else { p.stat(crate::ids::StatIndex::Speed) as i32 }
+    };
+    let mut sp = [sort_speed(SideId::One), sort_speed(SideId::Two)];
+    sp[entered as usize] = now.stat(crate::ids::StatIndex::Speed) as i32;
+    MOVE_TIE_SPEEDS.with(|c| c.set(Some(sp)));
+    f(b);
+    MOVE_TIE_SPEEDS.with(|c| c.set(prev));
 }
 
 fn with_switch_bracket_speeds(
