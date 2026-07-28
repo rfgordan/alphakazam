@@ -666,6 +666,11 @@ fn step_unit(
     let field_change_draws = engine::generate::replacement_field_change_draws(state, &repl_sides);
     // Same PRE-swap board: the incoming mon's cached Speed predates its own entry effects.
     let bracket_tied = engine::generate::replacement_bracket_tied(state, &repl_sides);
+    // ...except for the bracket's THIRD shuffle, which is the only one to run after `runSwitch`'s
+    // `fieldEvent('SwitchIn')` — and a switch-in forme change rewrites the Speed cache the sort
+    // reads. See `replacement_bracket_tied_after_entry`; identical to `bracket_tied` unless the
+    // replacement changed forme on the way in.
+    let bracket_tied_after = engine::generate::replacement_bracket_tied_after_entry(state, &repl_sides);
     // A SIMULTANEOUS both-sides replacement makes up to two draws BEFORE the bracket, on two
     // different Speed pairs. Both predicates are measured on the PRE-swap board.
     let both_sides_replace = replacements.len() == 2 && replacements[0].0 != replacements[1].0;
@@ -735,22 +740,33 @@ fn step_unit(
     if both_sides_replace && bracket_tied {
         let _ = consume(prng, "random", &[0, 2]);
     }
-    if !pre_end_turn && !replacements.is_empty() && bracket_tied {
+    if !pre_end_turn && !replacements.is_empty() && (bracket_tied || bracket_tied_after) {
         let brackets = if replacements.len() == 2 && replacements[0].0 != replacements[1].0 {
             1 // simultaneous both-sides double faint: only the second switch sees both actives alive
         } else {
             replacements.len()
         };
         for _ in 0..brackets {
-            for _ in 0..3 {
+            // Shuffles 1-2 (the switch action's runAction Update and `runSwitch`'s
+            // `getAllActive(true)` speedSort) both precede `fieldEvent('SwitchIn')`; shuffle 3
+            // (`runSwitch`'s own runAction Update) follows it. They read the same cached Speed
+            // unless the switch-in forme-changed, which is the whole of `bracket_tied_after`.
+            if bracket_tied {
+                for _ in 0..2 {
+                    let _ = consume(prng, "shuffle", &[2, 0, 2]);
+                }
+            }
+            if bracket_tied_after {
                 let _ = consume(prng, "shuffle", &[2, 0, 2]);
             }
         }
-        // ...plus the switch-in abilities' own field-change `eachEvent`s. Same tie predicate
-        // (`eachEvent` reads the cached `pokemon.speed` here too), same `shuffle[2,0,2]` shape, so
-        // only the COUNT matters to the stream.
-        for _ in 0..field_change_draws {
-            let _ = consume(prng, "shuffle", &[2, 0, 2]);
+        // ...plus the switch-in abilities' own field-change `eachEvent`s. They fire from inside
+        // `fieldEvent('SwitchIn')`, so they sort on the same cache shuffle 3 does; same
+        // `shuffle[2,0,2]` shape, so only the COUNT matters to the stream.
+        if bracket_tied_after {
+            for _ in 0..field_change_draws {
+                let _ = consume(prng, "shuffle", &[2, 0, 2]);
+            }
         }
     }
     // Trace's switch-in `sample(1)` for each tracing replacement (after the switch bracket, in the
