@@ -227,7 +227,7 @@ impl Flow {
 
         // Decomposed path (a pivot move is in play), mirroring generate_instructions_ctx:
         // custap -> switches -> tera -> ordered moves (pausing on PivotPending) -> EOT.
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
         let mut exec = Exec::Sample(self.rng);
         let custap = crate::generate::custap_stage(std::slice::from_mut(&mut b), &self.state, m1, m2);
 
@@ -367,14 +367,14 @@ impl Flow {
                 "[engine] PivotLanding with no live bench (side {:?}, turn {}) — staying in",
                 side, self.state.turn
             );
-            let b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+            let b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
             match second {
                 Some(a) => self.continue_after_first(b, a, switched),
                 None => self.finish_turn(b, switched),
             }
             return;
         };
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
         // Shed Tail passes its Substitute to the lander; every other pivot clears it.
         if pass_sub {
             crate::generate::apply_switch_pass_sub(&mut b, side, slot);
@@ -405,7 +405,7 @@ impl Flow {
             Some(slot) if valid(slot) => Some(slot),
             _ => fainted_bench(&self.state, side),
         };
-        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+        let mut b = Branch { prob: 100.0, state: self.state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
         match slot {
             Some(slot) => crate::generate::apply_revive(&mut b, side, slot),
             // Same defensive stance as the pivot fallback above: a Revive request with no

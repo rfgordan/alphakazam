@@ -312,7 +312,7 @@ fn is_multiaccuracy_move(md: &crate::data::MoveData) -> bool {
 /// to know when to consume PS's order-deciding shuffle bit.
 pub fn move_order_tie(state: &State, s1: MoveChoice, s2: MoveChoice) -> bool {
     let (MoveChoice::Move(i1), MoveChoice::Move(i2)) = (s1, s2) else { return false };
-    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true }];
+    let mut branches = vec![Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false }];
     let custap = custap_stage(&mut branches, state, s1, s2);
     let mk = |side: SideId, idx: u8, cu: bool| Action {
         side, move_idx: idx, pivot: Pivot::Stay, shell_phys: None,
@@ -398,7 +398,45 @@ pub(crate) struct Branch {
     /// (Ceaseless Edge's Spikes, Stone Axe's Stealth Rock, Glaive Rush's volatile). Testing
     /// `is_alive()` at those sites asks the question one self-KO too late, so `apply_post_damage`
     /// snapshots the answer here first. `true` when no damaging move has resolved.
+    ///
+    /// **The snapshot alone is one PS line too EARLY when the attacker dies at step 7.** The guard
+    /// has to be false for a user the `runEvent('DamagingHit')` chip killed (Rocky Helmet / Rough
+    /// Skin / Iron Barbs), because step 7 genuinely precedes step 8 — and true for a user its own
+    /// Life Orb killed, because that is `onAfterMoveSecondarySelf`, later. The engine applies the
+    /// LATE self-damage early and flushes step 7 LATE, so neither `is_alive()` nor the raw snapshot
+    /// answers both. `step8_user_alive` composes them: `hp + late_self_damage > 0`.
     pub(crate) after_hit_user_alive: bool,
+    /// Transient (NOT part of State): how much self-damage `apply_post_damage` has already dealt
+    /// the ATTACKER that PS deals only AFTER step 8 — `move.recoil`
+    /// (`battle-actions.ts:984`, after the whole hit loop) and Life Orb's
+    /// `onAfterMoveSecondarySelf` (`useMoveInner:533`). Reset at the top of every
+    /// `apply_post_damage`; read only by `step8_user_alive`.
+    pub(crate) late_self_damage: i16,
+    /// Transient (NOT part of State): did the move `apply_post_damage` just closed out deal damage
+    /// to the TARGET ITSELF (PS's `damage` entry being a number, not a Substitute's `true`)?
+    /// Written at the top of every `apply_post_damage`; read by the realized executors' caller,
+    /// which fires `apply_after_hit_item_moves` at the step-7/8 boundary and has no other way to
+    /// see the hit loop's `any_damage`.
+    pub(crate) move_any_damage: bool,
+}
+
+/// PS's step-8 guard `if (moveData.onAfterHit && pokemon.hp)` (`battle-actions.ts:1144`),
+/// evaluated where the ENGINE stands rather than where PS does.
+///
+/// The engine's move pipeline runs `apply_post_damage` (drain, `move.recoil`, Life Orb) at the end
+/// of the hit loop and DEFERS `runEvent('DamagingHit')` past the caller's step-5 secondary split
+/// (see `apply_damaging_hit_step7`). PS's order is the reverse on both counts: step 7 chips the
+/// attacker BEFORE step 8 reads its HP, and the recoil / orb land after. So at the step-7/8
+/// boundary the engine's `hp` is short by exactly the late self-damage it front-loaded, and
+/// crediting it back reproduces PS's `pokemon.hp` at that line.
+///
+/// * rb5164 d44 t35 — a 9-HP Assault Vest Okidogi Knock Offs a Rocky Helmet Amoonguss and dies to
+///   the 1/6 chip. `late_self_damage` is 0, so the guard is FALSE and PS keeps the helmet; the
+///   raw snapshot said the Okidogi was alive and the engine knocked it off.
+/// * rb1765 d6 t5 — a 16-HP Life Orb Samurott-Hisui lands Ceaseless Edge and dies to the ORB.
+///   `late_self_damage` is 16, so the guard stays TRUE and the Spikes are laid, as PS lays them.
+fn step8_user_alive(b: &Branch, side: SideId) -> bool {
+    b.state.side(side).active().hp as i32 + b.late_self_damage as i32 > 0
 }
 
 /// Integer divide with round-half-up (matches PS's `Math.round` for positive values).
@@ -2234,7 +2272,7 @@ pub fn generate_move_action(
     pivot: Option<u8>,
     foe_pending_move: Option<crate::ids::MoveId>,
 ) -> Vec<StateInstructions> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
     // In the full turn resolver the queue suppresses a flinched action before calling the move
     // executor. The factorized/request-model entry point must preserve that same boundary.
     if state.side(side).volatiles.contains(VolatileStatus::Flinch) {
@@ -2493,7 +2531,7 @@ pub fn generate_instructions_annotated(
 }
 
 fn generate_branches_ctx(state: &State, s1: MoveChoice, s2: MoveChoice, pivot: [Pivot; 2], tera: [bool; 2], exec: &mut Exec) -> Vec<Branch> {
-    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+    let start = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false , pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
     let mut branches = vec![start];
 
     let custap = custap_stage(&mut branches, state, s1, s2);
@@ -2707,7 +2745,7 @@ pub fn replacement_field_change_draws(state: &State, replacements: &[(SideId, u8
 /// resets — so a display layer (e.g. `protocol.rs`) can render the switch-in events. Callers that
 /// only want the state mutation may ignore the return value.
 pub fn switch_into(state: &mut State, side: SideId, target: u8) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
     apply_switch(&mut b, side, target);
     clear_stats_raised_markers(&mut b.state);
     *state = b.state;
@@ -3172,7 +3210,7 @@ fn retry_trace(b: &mut Branch, side: SideId) {
 /// Double faint-replacement: both mons enter, hazards, then switch-in abilities in speed order.
 /// Returns the applied reversible instruction list (see [`switch_into`]).
 pub fn switch_into_pair(state: &mut State, pairs: [(SideId, u8); 2]) -> Vec<Instruction> {
-    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true };
+    let mut b = Branch { prob: 100.0, state: *state, ins: Vec::new(), draws: Vec::new(), move_failed: false, pivot_update_done: false, per_hit_procs_done: false, pending_damaging_hit: None, drag_tie_speeds: None, after_hit_user_alive: true, late_self_damage: 0, move_any_damage: false };
     let mut order = pairs;
     if effective_speed(&b.state, order[1].0) > effective_speed(&b.state, order[0].0) {
         order.swap(0, 1);
@@ -3756,7 +3794,7 @@ fn resolve_moves_for_branch(b: Branch, actions: &[Action], exec: &mut Exec) -> V
 }
 
 fn scaled(b: &Branch, f: f32) -> Branch {
-    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds, after_hit_user_alive: b.after_hit_user_alive }
+    Branch { prob: b.prob * f, state: b.state, ins: b.ins.clone(), draws: b.draws.clone(), move_failed: b.move_failed , pivot_update_done: b.pivot_update_done, per_hit_procs_done: b.per_hit_procs_done, pending_damaging_hit: b.pending_damaging_hit, drag_tie_speeds: b.drag_tie_speeds, after_hit_user_alive: b.after_hit_user_alive, late_self_damage: b.late_self_damage, move_any_damage: b.move_any_damage }
 }
 
 /// Truant's BeforeMove toggle (PS abilities.ts): if the loaf marker is present the holder
@@ -6189,7 +6227,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_life_orb_recoil(&mut hb, side, &md);
         // Step 8, `onAfterHit`, still runs on a nullified hit — see `apply_knock_off_take_item`.
         if md.id.to_id() == "knockoff" {
-            apply_knock_off_take_item(&mut hb, side, def_ab);
+            let alive = hb.after_hit_user_alive;
+            apply_knock_off_take_item(&mut hb, side, def_ab, alive);
         }
         // PS's Ice Face is `onDamage` returning 0 — a NUMBER, not `false` — so `spreadMoveHit`
         // keeps the target live (`if (!damage[i] && damage[i] !== 0) targets[i] = false`,
@@ -6272,7 +6311,8 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
         apply_life_orb_recoil(&mut hb, side, &md);
         // Step 8, `onAfterHit`, still runs on a nullified hit — see `apply_knock_off_take_item`.
         if md.id.to_id() == "knockoff" {
-            apply_knock_off_take_item(&mut hb, side, def_ab);
+            let alive = hb.after_hit_user_alive;
+            apply_knock_off_take_item(&mut hb, side, def_ab, alive);
         }
         // `onDamage` returns 0, a NUMBER — the target stays live, so `spreadMoveHit` runs the
         // REST of its numbered steps, not just the secondaries. Step 4 is `selfDrops` — the
@@ -6671,6 +6711,22 @@ fn execute_move_inner(b: Branch, action: Action) -> Vec<Branch> {
             // (Alluring Voice, Burning Jealousy): rb1178 t11 — PS does NOT confuse the
             // Weakness-Policy Tyranitar that Alluring Voice just boosted.
             apply_weakness_policy(&mut sb, foe, &md);
+            // ---- step 7 ends, step 8 (`onAfterHit`) begins ----
+            // Knock Off's `takeItem` is step 8 and its guard is `pokemon.hp` — the ATTACKER's,
+            // read AFTER `runEvent('DamagingHit')` has already chipped it. The realized executors
+            // defer that event to the boundary just above, so this is the only line in the move
+            // pipeline where the guard can be asked at PS's position; `apply_post_damage` skips
+            // the take for them (`!per_hit_done`) and `step8_user_alive` credits back the Life Orb
+            // / recoil it front-loaded. rb5164 d44 t35: a 9-HP Okidogi Knock Offs a Rocky Helmet
+            // Amoonguss and the 1/6 chip kills it — PS's guard is false and the helmet stays.
+            //
+            // It sits AFTER `apply_weakness_policy` (step 7 consumes the policy before step 8 can
+            // knock it away — rb1544 t14 / rb1447 t25) and BEFORE `apply_pinch_berry` (step 8
+            // beats the 970 Update, so a Sitrus holder knocked below half loses the berry rather
+            // than eating it — rb1383 t15).
+            let alive = step8_user_alive(&sb, side);
+            let dealt = sb.move_any_damage;
+            apply_after_hit_item_moves(&mut sb, side, &md, def_ab, dealt, hit_sub, alive);
             // In-kernel Update shuffles for this connecting hit, in PS order (after `spreadMoveHit`
             // = self-drops + target secondaries + DamagingHit contact abilities have all rolled):
             //   970  per-hit `eachEvent('Update')` — fires on the PRE-faint board (a target
@@ -8348,12 +8404,14 @@ fn damage_inputs(b: &Branch, side: SideId) -> DamageInputs {
 /// * rb5463 d27 t24: a Blaziken Knock Offs a Mimikyu with an intact DISGUISE holding a Life Orb.
 ///   Same shape, other ability.
 ///
-/// The `source.hp` guard is `after_hit_user_alive`, not `is_alive()` — see the caller's note.
-fn apply_knock_off_take_item(b: &mut Branch, side: SideId, def_ability: crate::ids::Ability) {
+/// The `source.hp` guard is passed IN, not read off `is_alive()` — see `step8_user_alive` and
+/// `Branch::after_hit_user_alive` for why the engine has three different answers to "is the
+/// attacker standing" and which one belongs at which call site.
+fn apply_knock_off_take_item(b: &mut Branch, side: SideId, def_ability: crate::ids::Ability, user_alive: bool) {
     let foe = side.other();
     let f = b.state.side(foe).active();
     if f.species != crate::ids::Species::None
-        && b.after_hit_user_alive
+        && user_alive
         && f.item != Item::None
         && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
         && def_ability != crate::ids::Ability::StickyHold
@@ -8363,6 +8421,127 @@ fn apply_knock_off_take_item(b: &mut Branch, side: SideId, def_ability: crate::i
         on_item_lost(b, foe);
         // Knocking the item off reveals what it was.
         reveal(b, foe, 0, crate::state::Reveal::ITEM);
+    }
+}
+
+/// PS's step-8 `onAfterHit` item removal and the two `AfterMoveSecondary(Self)` item steals that
+/// follow it, as ONE ordered sequence — Knock Off's `takeItem`, then Magician, then Pickpocket.
+///
+/// **The order between them is load-bearing and it is not the order the engine used to run.**
+/// Knock Off strips the target at step 8; Pickpocket then finds an ITEMLESS holder and steals the
+/// attacker's item in its place. rb5267 d1 t2 is the witness: a Choice Band Pickpocket Weavile is
+/// Knocked Off by a Leftovers Wo-Chien, and PS ends with the Weavile holding the LEFTOVERS. Split
+/// the two across the step-5 secondary composition and the steal reads a Weavile that still has
+/// its Choice Band, so nothing moves at all (rb5217 d20, rb5335 d7 are the same shape).
+#[allow(clippy::too_many_arguments)]
+fn apply_after_hit_item_moves(
+    b: &mut Branch,
+    side: SideId,
+    md: &crate::data::MoveData,
+    def_ability: crate::ids::Ability,
+    any_damage: bool,
+    hit_sub: bool,
+    user_alive: bool,
+) {
+    use crate::ids::Ability as Ab;
+    let foe = side.other();
+    if md.id.to_id() == "knockoff" && !hit_sub {
+        // Knock Off's removal is `onAfterHit` — step 8 — and `runEvent('DamagingHit')` is step 7,
+        // so an `onDamagingHit` ITEM consumes itself before Knock Off can take it. The engine runs
+        // `apply_post_damage` ahead of the deferred `apply_damaging_hit_step7` (see the Gulp
+        // Missile note below for the same hazard), so the removal would erase the item first.
+        // Fire the policy here, ahead of the take; the caller's later call re-reads the item and
+        // finds nothing, exactly like the Gulp Missile precedent.
+        //
+        // Safe to hoist it above step 5 for THIS move only: Knock Off has no `secondaries`, so the
+        // reason the caller defers the policy — keeping the +2/+2 invisible to a secondary that
+        // reads `statsRaisedThisTurn` (rb1178: Alluring Voice) — has nothing to act on here.
+        //
+        // rb1544 t14 (Knock Off into a Weakness Policy Solgaleo) and rb1447 t25 (into a Necrozma-
+        // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
+        // policy consumed, the engine at +0 / +0 with it merely knocked away.
+        apply_weakness_policy(b, foe, md);
+        // **A target the Knock Off just KO'd still loses its item.** `onAfterHit` is step 8, and
+        // `faintMessages` has not run — `takeItem` (`sim/pokemon.ts:1851-1866`) checks only
+        // `this.item` and a `TakeItem` event; `pokemon.isActive` stays true until a replacement
+        // switches in and `pokemon.hp` is never consulted. Testing `is_alive()` here asked the
+        // question one faint too early, exactly as `after_hit_user_alive` does for the ATTACKER
+        // (which is where PS's real guard sits: `useMoveInner` never reaches step 8 with a dead
+        // user). rb1314 d5 t5: p1's Knock Off takes a Light Clay off an Abomasnow and KOs it in
+        // the same hit; the engine kept the item, and it stayed invisible for 40 turns until a
+        // Revival Blessing at d45 put the corpse back on the field holding it.
+        apply_knock_off_take_item(b, side, def_ability, user_alive);
+    }
+
+    // The defender's pinch/HP berry is an `onUpdate`, and PS's `eachEvent('Update')` sits at
+    // `battle-actions.ts:970` — at the BOTTOM of `hitStepMoveHitLoop`, after `spreadMoveHit`
+    // has already run `runEvent('DamagingHit')` (:1142) and the move's own `onAfterHit`
+    // (:1144). Knock Off's item removal is that `onAfterHit`, so it beats the berry: a Sitrus
+    // holder knocked below half by Knock Off loses the berry instead of eating it (rb1383 t15:
+    // Muk Knock Off into a switching-in Veluza — PS 116, engine 189 with `last_berry` set).
+    // It still precedes Magician / Pickpocket, which are `AfterMoveSecondary(Self)` events
+    // fired by `useMoveInner` after the whole hit loop.
+    //
+    // The EAT itself is NOT here: `battle-actions.ts:970` also sits after the move's
+    // SECONDARIES (`spreadMoveHit` order: damage -> onHit -> selfDrops -> secondaries ->
+    // DamagingHit -> onAfterHit -> :970), so the berry decision must read the post-secondary
+    // state. It is applied at the 970/1024 emission site in the hit path.
+
+    // Magician: after landing a damaging move, an itemless attacker steals the target's item
+    // (PS onAfterMoveSecondarySelf; excluded for pivot moves — source.switchFlag — and Fling).
+    if any_damage
+        && !hit_sub
+        && b.state.side(side).active().ability == Ab::Magician
+        && b.state.side(side).active().is_alive()
+        && b.state.side(side).active().item == Item::None
+        && !md.self_switch
+        && md.category != MoveCategory::Status
+    {
+        let f = b.state.side(foe).active();
+        if f.item != Item::None
+            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
+            && def_ability != Ab::StickyHold
+        {
+            let stolen = f.item;
+            let fslot = b.state.side(foe).active_index;
+            let aslot = b.state.side(side).active_index;
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: stolen, new: Item::None });
+            on_item_lost(b, foe);
+            push(b, Instruction::ChangeItem { side, slot: aslot, previous: Item::None, new: stolen });
+            // Gaining an item ends an active Unburden speed boost.
+            if b.state.side(side).volatiles.contains(VolatileStatus::Unburden) {
+                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Unburden });
+            }
+            reveal(b, foe, 0, crate::state::Reveal::ITEM);
+        }
+    }
+
+    // Pickpocket: when hit by a contact move, an itemless holder steals the attacker's item
+    // (PS onAfterMoveSecondary; not on pivot moves — source.switchFlag).
+    if any_damage
+        && !hit_sub
+        && md.flag_contact
+        && !md.self_switch
+        && def_ability == Ab::Pickpocket
+        && b.state.side(foe).active().is_alive()
+        && b.state.side(foe).active().item == Item::None
+    {
+        let a = b.state.side(side).active();
+        if a.item != Item::None
+            && item_removable_from(a.species, a.item, Some(b.state.side(foe).active().species))
+            && a.ability != Ab::StickyHold
+        {
+            let stolen = a.item;
+            let aslot = b.state.side(side).active_index;
+            let fslot = b.state.side(foe).active_index;
+            push(b, Instruction::ChangeItem { side, slot: aslot, previous: stolen, new: Item::None });
+            on_item_lost(b, side);
+            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: Item::None, new: stolen });
+            if b.state.side(foe).volatiles.contains(VolatileStatus::Unburden) {
+                push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Unburden });
+            }
+            reveal(b, side, 0, crate::state::Reveal::ITEM);
+        }
     }
 }
 
@@ -8385,6 +8564,10 @@ fn apply_post_damage(
     // PS's `onAfterHit` fired back inside `spreadMoveHit`, BEFORE any of the self-damage below.
     // Snapshot its `pokemon.hp` guard now — see `Branch::after_hit_user_alive`.
     b.after_hit_user_alive = b.state.side(side).active().is_alive();
+    // Everything PS defers past step 8 that this function applies now — `move.recoil` and Life
+    // Orb — is accumulated so `step8_user_alive` can credit it back at the step-7/8 boundary.
+    b.late_self_damage = 0;
+    b.move_any_damage = any_damage;
     if any_damage {
         let aslot = b.state.side(side).active_index;
         // Drain (Giga Drain, Drain Punch): heal a fraction of the damage dealt — unless the
@@ -8414,6 +8597,7 @@ fn apply_post_damage(
             if atk.is_alive() {
                 let rec = (round_div(total_dealt * md.recoil.0 as i32, md.recoil.1 as i32) as i16).max(1).min(atk.hp);
                 push(b, Instruction::Damage { side, slot: aslot, amount: rec });
+                b.late_self_damage += rec;
             }
         }
     }
@@ -8439,6 +8623,7 @@ fn apply_post_damage(
         if atk.is_alive() {
             let recoil = (atk.max_hp / 10).max(1).min(atk.hp);
             push(b, Instruction::Damage { side, slot: aslot, amount: recoil });
+            b.late_self_damage += recoil;
         }
     }
     // The `runEvent('DamagingHit')` reactions (contact punishers, Stamina, Gooey, …). PS fires
@@ -8654,103 +8839,13 @@ fn apply_post_damage(
     // Knock Off removes the target's held item (so it no longer triggers Leftovers heals
     // etc.) — unless the item is species-locked to the holder (PS onTakeItem false) or the
     // holder has Sticky Hold (suppressed by Mold Breaker, but def_ability reflects that).
-    if md.id.to_id() == "knockoff" && !hit_sub {
-        // Knock Off's removal is `onAfterHit` — step 8 — and `runEvent('DamagingHit')` is step 7,
-        // so an `onDamagingHit` ITEM consumes itself before Knock Off can take it. The engine runs
-        // `apply_post_damage` ahead of the deferred `apply_damaging_hit_step7` (see the Gulp
-        // Missile note below for the same hazard), so the removal would erase the item first.
-        // Fire the policy here, ahead of the take; the caller's later call re-reads the item and
-        // finds nothing, exactly like the Gulp Missile precedent.
-        //
-        // Safe to hoist it above step 5 for THIS move only: Knock Off has no `secondaries`, so the
-        // reason the caller defers the policy — keeping the +2/+2 invisible to a secondary that
-        // reads `statsRaisedThisTurn` (rb1178: Alluring Voice) — has nothing to act on here.
-        //
-        // rb1544 t14 (Knock Off into a Weakness Policy Solgaleo) and rb1447 t25 (into a Necrozma-
-        // Dusk-Mane): Dark is 2x on Psychic/Steel, PS ends the turn at +2 Atk / +2 SpA with the
-        // policy consumed, the engine at +0 / +0 with it merely knocked away.
-        apply_weakness_policy(b, foe, &md);
-        // **A target the Knock Off just KO'd still loses its item.** `onAfterHit` is step 8, and
-        // `faintMessages` has not run — `takeItem` (`sim/pokemon.ts:1851-1866`) checks only
-        // `this.item` and a `TakeItem` event; `pokemon.isActive` stays true until a replacement
-        // switches in and `pokemon.hp` is never consulted. Testing `is_alive()` here asked the
-        // question one faint too early, exactly as `after_hit_user_alive` does for the ATTACKER
-        // (which is where PS's real guard sits: `useMoveInner` never reaches step 8 with a dead
-        // user). rb1314 d5 t5: p1's Knock Off takes a Light Clay off an Abomasnow and KOs it in
-        // the same hit; the engine kept the item, and it stayed invisible for 40 turns until a
-        // Revival Blessing at d45 put the corpse back on the field holding it.
-        apply_knock_off_take_item(b, side, def_ability);
-    }
-
-    // The defender's pinch/HP berry is an `onUpdate`, and PS's `eachEvent('Update')` sits at
-    // `battle-actions.ts:970` — at the BOTTOM of `hitStepMoveHitLoop`, after `spreadMoveHit`
-    // has already run `runEvent('DamagingHit')` (:1142) and the move's own `onAfterHit`
-    // (:1144). Knock Off's item removal is that `onAfterHit`, so it beats the berry: a Sitrus
-    // holder knocked below half by Knock Off loses the berry instead of eating it (rb1383 t15:
-    // Muk Knock Off into a switching-in Veluza — PS 116, engine 189 with `last_berry` set).
-    // It still precedes Magician / Pickpocket, which are `AfterMoveSecondary(Self)` events
-    // fired by `useMoveInner` after the whole hit loop.
-    //
-    // The EAT itself is NOT here: `battle-actions.ts:970` also sits after the move's
-    // SECONDARIES (`spreadMoveHit` order: damage -> onHit -> selfDrops -> secondaries ->
-    // DamagingHit -> onAfterHit -> :970), so the berry decision must read the post-secondary
-    // state. It is applied at the 970/1024 emission site in the hit path.
-
-    // Magician: after landing a damaging move, an itemless attacker steals the target's item
-    // (PS onAfterMoveSecondarySelf; excluded for pivot moves — source.switchFlag — and Fling).
-    if any_damage
-        && !hit_sub
-        && b.state.side(side).active().ability == Ab::Magician
-        && b.state.side(side).active().is_alive()
-        && b.state.side(side).active().item == Item::None
-        && !md.self_switch
-        && md.category != MoveCategory::Status
-    {
-        let f = b.state.side(foe).active();
-        if f.item != Item::None
-            && item_removable_from(f.species, f.item, Some(b.state.side(side).active().species))
-            && def_ability != Ab::StickyHold
-        {
-            let stolen = f.item;
-            let fslot = b.state.side(foe).active_index;
-            let aslot = b.state.side(side).active_index;
-            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: stolen, new: Item::None });
-            on_item_lost(b, foe);
-            push(b, Instruction::ChangeItem { side, slot: aslot, previous: Item::None, new: stolen });
-            // Gaining an item ends an active Unburden speed boost.
-            if b.state.side(side).volatiles.contains(VolatileStatus::Unburden) {
-                push(b, Instruction::RemoveVolatile { side, volatile: VolatileStatus::Unburden });
-            }
-            reveal(b, foe, 0, crate::state::Reveal::ITEM);
-        }
-    }
-
-    // Pickpocket: when hit by a contact move, an itemless holder steals the attacker's item
-    // (PS onAfterMoveSecondary; not on pivot moves — source.switchFlag).
-    if any_damage
-        && !hit_sub
-        && md.flag_contact
-        && !md.self_switch
-        && def_ability == Ab::Pickpocket
-        && b.state.side(foe).active().is_alive()
-        && b.state.side(foe).active().item == Item::None
-    {
-        let a = b.state.side(side).active();
-        if a.item != Item::None
-            && item_removable_from(a.species, a.item, Some(b.state.side(foe).active().species))
-            && a.ability != Ab::StickyHold
-        {
-            let stolen = a.item;
-            let aslot = b.state.side(side).active_index;
-            let fslot = b.state.side(foe).active_index;
-            push(b, Instruction::ChangeItem { side, slot: aslot, previous: stolen, new: Item::None });
-            on_item_lost(b, side);
-            push(b, Instruction::ChangeItem { side: foe, slot: fslot, previous: Item::None, new: stolen });
-            if b.state.side(foe).volatiles.contains(VolatileStatus::Unburden) {
-                push(b, Instruction::RemoveVolatile { side: foe, volatile: VolatileStatus::Unburden });
-            }
-            reveal(b, side, 0, crate::state::Reveal::ITEM);
-        }
+    // Knock Off's `takeItem` (step 8) and the Magician / Pickpocket steals that follow it are
+    // ONE ordered sequence and they have been moved into `apply_after_hit_item_moves`. Only the
+    // paths that do NOT defer step 7 fire it here (`!per_hit_done`: fixed-damage and the
+    // enumeration DP paths); a deferring path cannot answer Knock Off's `pokemon.hp` guard at
+    // this line, so its caller fires the whole sequence at the step-7/8 boundary instead.
+    if !per_hit_done {
+        apply_after_hit_item_moves(b, side, md, def_ability, any_damage, hit_sub, b.after_hit_user_alive);
     }
 
     // A transformed mon that fainted this hit (the target, or the attacker via a contact
