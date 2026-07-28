@@ -1043,9 +1043,33 @@ fn emit_pivot_trailing_update(b: &mut Branch) {
 
 /// Emit the per-hit `eachEvent('Update')` shuffle (battle-actions.ts:970) — fires once per
 /// connecting hit, on the PRE-faint-message board (a target at 0 HP still counts as on-field).
-fn emit_update_hit(b: &mut Branch) {
+fn emit_update_hit(b: &mut Branch) -> bool {
     if annotating() && actives_update_tie(&b.state, true) {
         draw(b, "shuffle", &[2, 0, 2], -1, "update");
+        return true;
+    }
+    false
+}
+
+/// The 970 Update fires ONCE PER ITERATION of `hitStepMoveHitLoop`, not once per move — it is the
+/// last statement of the loop body (`battle-actions.ts:965`), so a five-hit Scale Shot fires FIVE.
+/// Every hit loop in the engine emits the previous iteration's Update at the TOP of the next one
+/// (after that iteration's KO break, which is PS's `targets.every(!hp)` — a hit that faints the
+/// target still fires its own Update, and the iteration that then breaks fires none), leaving the
+/// LAST executed hit's Update to `execute_move_inner`'s trailing `emit_update_hit`. That placement
+/// is also PS's for the one thing it interleaves with: hit n's Update precedes hit n+1's
+/// `multiaccuracy` accuracy roll (`:907`) and hit n+1's crit roll.
+///
+/// On a realized path the emitted `draw` advances the branch log and the real prng but NOT the peek
+/// clone, so the cursor has to be stepped over it exactly like the `ModifyDamage` screen shuffle.
+/// rb1661 d55 is the witness: Scale Shot + Loaded Dice into a Substitute, PS
+/// `crit, damage, shuffle[2,0,2]` five times over; the engine emitted the five crit/damage pairs
+/// back to back and read hit n+1's crit roll out of hit n's missing shuffle.
+fn emit_prev_hit_update(b: &mut Branch, cur: Option<&mut RealizedCursor>) {
+    if emit_update_hit(b) {
+        if let Some(c) = cur {
+            c.consume_shuffle(2);
+        }
     }
 }
 
@@ -6610,7 +6634,12 @@ fn annotate_hits(hb: &mut Branch, combo: &[(u8, bool)], crit_den: i32) {
     if !annotating() {
         return;
     }
-    for &(roll, crit) in combo {
+    for (i, &(roll, crit)) in combo.iter().enumerate() {
+        // The PREVIOUS hit's `eachEvent('Update')` (970) — one per loop iteration, and the last
+        // one is `execute_move_inner`'s trailing `emit_update_hit`. See `emit_prev_hit_update`.
+        if i >= 1 {
+            emit_prev_hit_update(hb, None);
+        }
         if crit_den > 0 {
             // PS rolls once per hit whenever `willCrit` is undefined (crit_den > 0), even against a
             // crit-immune target (the realized `crit` is already false on that branch — the roll is
@@ -7670,6 +7699,13 @@ fn apply_damage_hit_rolls(b: &mut Branch, side: SideId, md: &crate::data::MoveDa
         // never truncates the loop here; the corpus has no such multi-hit matchup.
         if b.state.side(foe).active().hp <= 0 {
             break;
+        }
+        // The PREVIOUS iteration's `eachEvent('Update')` (970) — see `emit_prev_hit_update`.
+        if hit_i >= 1 {
+            match &mut rolls {
+                HitRolls::Realized { cur, .. } => emit_prev_hit_update(b, Some(cur)),
+                HitRolls::Fixed(_) => emit_prev_hit_update(b, None),
+            }
         }
         let (roll, crit) = match &mut rolls {
             HitRolls::Fixed(h) => h[hit_i],
@@ -9337,6 +9373,11 @@ fn apply_multihit_realized_ma(
         // PS breaks the loop at the TOP once the target has fainted (before any hit draw).
         if hb.state.side(foe).active().hp <= 0 {
             break;
+        }
+        // The PREVIOUS iteration's `eachEvent('Update')` (970) — before this hit's accuracy roll,
+        // which is where PS puts it. See `emit_prev_hit_update`.
+        if i >= 1 {
+            emit_prev_hit_update(&mut hb, Some(&mut cur));
         }
         // Per-hit accuracy (hit>1) unless Loaded Dice removed multiaccuracy; a miss ends the move.
         if i >= 1 && multiacc {
