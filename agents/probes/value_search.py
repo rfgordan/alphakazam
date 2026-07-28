@@ -339,7 +339,8 @@ def main():
     t0 = time.perf_counter()
     r = evaluate_flow(agent, opp, device, n_games=args.games, num_envs=args.envs,
                       team_pool=POOL, seed=20_2607, fog_species=net.fog_species,
-                      obs_version=getattr(net, "obs_version", 1))
+                      obs_version=getattr(net, "obs_version", 1),
+                      frames=getattr(net, "frames", 1))
     print(json.dumps({
         "ckpt": args.ckpt, "step": step, "arm": f"value-search d{args.depth} x{args.samples}" + (f" topk{args.topk}" if args.depth == 2 else ""),
         "opponent": args.opponent,
