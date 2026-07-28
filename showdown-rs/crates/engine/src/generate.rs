@@ -14459,16 +14459,22 @@ fn apply_end_of_turn_inner(
     // already un-halved the Speed via the `activeTurns` bump above, tying the foe) and rb1310
     // d35 t28 (the exact mirror: PS records one extra shuffle after the residual sort, because its
     // cache still holds the HALVED Speed, which is the one that ties).
-    if annotating() {
-        for nb in &mut out {
+    for nb in &mut out {
+        if annotating() {
             let prev_tie = MOVE_TIE_SPEEDS.with(|c| c.replace(Some(pre_residual_speeds)));
             emit_update(nb);
             MOVE_TIE_SPEEDS.with(|c| c.set(prev_tie));
-            // getRequests' trap shuffle is a fresh sort outside the residual action — live Speed.
-            // Then PS builds the next move request (`getRequests` → per-active TrapPokemon), whose
-            // multi-trap tie shuffle is the turn's trailing draw.
-            emit_trap_pokemon_shuffles(nb);
         }
+        // getRequests' trap shuffle is a fresh sort outside the residual action — live Speed.
+        // Then PS builds the next move request (`getRequests` → per-active TrapPokemon), whose
+        // multi-trap tie shuffle is the turn's trailing draw.
+        //
+        // NOT under `annotating()`: `endTurn`'s `runEvent('DisableMove')` also has a STATE
+        // effect — `choicelock` removing itself once the holder no longer holds a Choice item —
+        // and the mechanics sweep runs with annotation OFF. c1f t20 / r20 / r8 are the witnesses
+        // (a Knock Off into a Choice holder left the volatile standing on the sweep rail while
+        // the seed rail, which annotates, was correct).
+        emit_trap_pokemon_shuffles(nb);
     }
     out
 }
