@@ -31,6 +31,7 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--outcome-head \
 	--team-pool ../showdown-rs/harness/team-pool/gen9randombattle-100k.jsonl.gz \
 	--ckpt-every 10 \
+	--keep-checkpoints 40 \
 	--snapshot-every 10 \
 	--pool-size 24 \
 	--opponent-slots 4 \
