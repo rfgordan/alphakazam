@@ -22,6 +22,6 @@ while true; do
   .venv/bin/python -m probes.value_search "$CK" --games 300 --envs 32 $SEARCH_ARGS \
       --opponent mcts --mcts-ms 100 >> "$LOG" 2>&1
   .venv/bin/python -m probes.eval_ckpt "$CK" --games 300 --baselines heuristic >> "$LOG" 2>&1
-  ./scripts/resume.sh "$RUN_DIR" >> "$LOG" 2>&1 || \
-      ./scripts/launch_train.sh "$RUN_DIR" >> "$LOG" 2>&1
+  NO_SIDECAR=1 ./scripts/resume.sh "$RUN_DIR" >> "$LOG" 2>&1 || \
+      NO_SIDECAR=1 ./scripts/launch_train.sh "$RUN_DIR" >> "$LOG" 2>&1
 done
