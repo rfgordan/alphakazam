@@ -29,7 +29,6 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--obs-version 2 \
 	--frames 2 \
 	--outcome-head \
-	--search-distill-envs 32 \
 	--team-pool ../showdown-rs/harness/team-pool/gen9randombattle-100k.jsonl.gz \
 	--ckpt-every 10 \
 	--snapshot-every 10 \
