@@ -1644,6 +1644,37 @@ impl FlowVec {
         Ok(state_json_of(&st.observe(sid(side))))
     }
 
+    /// Multi-turn-pattern potential features for PBRS shaping, from `side`'s perspective:
+    /// `[my positive boost stages, foe-side hazard layers, my screens/tailwind up, statused
+    /// foe mons]` — each a STATE function, so any weighted sum is a valid PBRS potential.
+    fn phi_features_all<'py>(&self, py: Python<'py>, side: u8) -> Bound<'py, PyArray2<f32>> {
+        let me = sid(side);
+        let n = self.flows.len();
+        let mut flat = vec![0f32; n * 4];
+        for (i, f) in self.flows.iter().enumerate() {
+            let sd = f.state.side(me);
+            let od = f.state.side(me.other());
+            let row = &mut flat[i * 4..(i + 1) * 4];
+            row[0] = sd.boosts.iter().take(5).map(|&b| b.max(0) as f32).sum();
+            let sc = &od.side_conditions;
+            row[1] = sc.stealth_rock as u8 as f32 + sc.spikes as f32 + sc.toxic_spikes as f32
+                + sc.sticky_web as u8 as f32;
+            let mc = &sd.side_conditions;
+            row[2] = (mc.reflect > 0) as u8 as f32 + (mc.light_screen > 0) as u8 as f32
+                + (mc.aurora_veil > 0) as u8 as f32 + (mc.tailwind > 0) as u8 as f32;
+            row[3] = od
+                .pokemon
+                .iter()
+                .filter(|p| {
+                    p.species != engine::ids::Species::None
+                        && p.is_alive()
+                        && p.status != engine::ids::Status::None
+                })
+                .count() as f32;
+        }
+        Array2::from_shape_vec((n, 4), flat).unwrap().into_pyarray_bound(py)
+    }
+
     /// Belief-head training targets (EXPLORATION_PLAN W9), from the TRUE state — free labels.
     /// Per env, about the FOE of `side`: `targets [N, 11]` = [species of party slot 0..5,
     /// active item, active move slot 0..3] as embedding ids; `mask [N, 11]` = 1 where the entry

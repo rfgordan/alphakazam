@@ -42,12 +42,15 @@ class FlowEnvVec:
     def __init__(self, num_envs: int, seed: int = 0, team_pool: str | None = None,
                  max_requests: int = 1000, shaping_coef: float = 0.0, gamma: float = 0.99,
                  fog_species: bool = False, obs_version: int = 1, frames: int = 1,
-                 capture_protocol: bool = False):
+                 capture_protocol: bool = False, phi_weights: dict | None = None):
         self.num_envs = num_envs
         self.shaping_coef = shaping_coef
         self.gamma = gamma
         self.fog_species = fog_species
         self.obs_version = obs_version
+        # Multi-turn-pattern potential weights (PBRS-safe to change at ANY time — each term is
+        # a state function): keys boost, hazard, screen, status. Live-tunable by the trainer.
+        self.phi_weights = dict(phi_weights or {})
         self.vec = se.FlowVec(num_envs, seed=seed, max_requests_per_episode=max_requests,
                               team_pool=team_pool, fog_species=fog_species,
                               obs_version=obs_version, capture_protocol=capture_protocol)
@@ -139,7 +142,7 @@ class FlowEnvVec:
     FAINT_W = 0.5
 
     def _potential(self, sides: np.ndarray) -> np.ndarray:
-        """Φ = learner-relative team-HP differential + faint differential (the PBRS potential)."""
+        """Φ = learner-relative HP + faints (+ optional multi-turn-pattern terms)."""
         red = sides == RED
         hp_r, hp_b = self.vec.team_hp_all(RED), self.vec.team_hp_all(BLUE)
         f_r = np.asarray(self.vec.faints_all(RED), dtype=np.float32)
@@ -148,7 +151,15 @@ class FlowEnvVec:
         theirs = np.where(red, hp_b, hp_r)
         f_mine = np.where(red, f_r, f_b)
         f_theirs = np.where(red, f_b, f_r)
-        return ((mine - theirs) + self.FAINT_W * (f_theirs - f_mine)).astype(np.float32)
+        phi = (mine - theirs) + self.FAINT_W * (f_theirs - f_mine)
+        if any(self.phi_weights.get(k, 0.0) for k in ("boost", "hazard", "screen", "status")):
+            ph_r = np.asarray(self.vec.phi_features_all(RED), dtype=np.float32)
+            ph_b = np.asarray(self.vec.phi_features_all(BLUE), dtype=np.float32)
+            ph = np.where(red[:, None], ph_r, ph_b)
+            w = self.phi_weights
+            phi = (phi + w.get("boost", 0.0) * ph[:, 0] + w.get("hazard", 0.0) * ph[:, 1]
+                   + w.get("screen", 0.0) * ph[:, 2] + w.get("status", 0.0) * ph[:, 3])
+        return phi.astype(np.float32)
 
     def _team_hp_pair(self, sides: np.ndarray):
         red = sides == RED

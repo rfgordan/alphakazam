@@ -102,10 +102,12 @@ def train(args):
     if pool and not os.path.exists(pool):
         raise SystemExit(f"team pool not found: {pool} (run harness/gen-team-pool.mjs, or pass --team-pool '')")
 
+    phi_weights = {"boost": args.phi_boost, "hazard": args.phi_hazard,
+                   "screen": args.phi_screen, "status": args.phi_status}
     env = FlowEnvVec(cfg.num_envs, seed=cfg.seed, team_pool=pool or None,
                      max_requests=args.max_requests, shaping_coef=cfg.shaping_coef, gamma=cfg.gamma,
                      fog_species=args.fog_species, obs_version=args.obs_version,
-                     frames=args.frames)
+                     frames=args.frames, phi_weights=phi_weights)
     if env.pool_size == 0:
         print("[train_flow] WARNING: no team pool loaded — every env replays the same fixed "
               "debug matchup. This is not a real training distribution.")
@@ -278,6 +280,19 @@ def train(args):
     opp_rng = np.random.default_rng(cfg.seed ^ 0xBEEF)
     while not _STOP and (indefinite or global_step < cfg.total_steps):
         update += 1
+        # Live phi overrides (behavior-conditioned incentive removal, user directive): edit
+        # <run_dir>/phi_overrides.json — e.g. {"boost": 0} — and the trainer picks it up within
+        # 25 updates. PBRS keeps any change policy-invariant-safe, no restart needed.
+        if update % 25 == 0:
+            ov_path = run_dir / "phi_overrides.json"
+            if ov_path.exists():
+                try:
+                    ov = json.loads(ov_path.read_text())
+                    if isinstance(ov, dict) and ov != env.phi_weights:
+                        env.phi_weights.update({k: float(v) for k, v in ov.items()})
+                        print(f"    [phi] weights now {env.phi_weights}", flush=True)
+                except Exception as e:
+                    print(f"    [phi] bad override file ignored ({e})", flush=True)
         if args.shaping_anneal_horizon > 0:
             # Shaping curriculum (user directive): the PBRS damage/faint bonuses guide early
             # exploration, then ramp to zero so the mature policy optimizes pure win/loss.
@@ -591,6 +606,14 @@ def main():
                    help="refresh the R-NaD reference to the current policy every N updates")
     p.add_argument("--setslot", action="store_true",
                    help="slot-shared move/switch scorers (night-era arch; needs obs v2)")
+    p.add_argument("--phi-boost", type=float, default=0.0,
+                   help="PBRS weight per positive boost stage held (multi-turn setup incentive)")
+    p.add_argument("--phi-hazard", type=float, default=0.0,
+                   help="PBRS weight per hazard layer on the foe's side")
+    p.add_argument("--phi-screen", type=float, default=0.0,
+                   help="PBRS weight per active screen/tailwind on my side")
+    p.add_argument("--phi-status", type=float, default=0.0,
+                   help="PBRS weight per statused living foe")
     p.add_argument("--shaping-anneal-horizon", type=int, default=0,
                    help=">0: linearly anneal the PBRS shaping coefficient to zero over this "
                         "many env steps (early exploration incentive, pure win/loss late)")
