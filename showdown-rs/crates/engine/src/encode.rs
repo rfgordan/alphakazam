@@ -159,7 +159,11 @@ fn encode_observed(observed: &State, viewer: SideId) -> Vec<f32> {
 /// it is computed from the OBSERVED state only (post-fog projection), so it is honest by
 /// construction — see `tests/obs_honesty.rs` scramble-invariance.
 pub const OBS_EXTRA_V2: usize = 2 * 4 * 2 + 6 + 6;
-pub const OBS_DIM_V2: usize = OBS_DIM + OBS_EXTRA_V2;
+/// E12 mechanics appendix (night-era: 2× faster learning): per active move, both sides:
+/// [priority/5, self_boost_total/6, heal_fraction, inflicts_status]. Appended AFTER the
+/// v2 block so every earlier offset stays stable.
+pub const OBS_MECH_V2: usize = 2 * 4 * 4;
+pub const OBS_DIM_V2: usize = OBS_DIM + OBS_EXTRA_V2 + OBS_MECH_V2;
 
 pub fn encode_v2(state: &State, viewer: SideId) -> Vec<f32> {
     let observed = state.observe(viewer);
@@ -204,6 +208,25 @@ pub fn encode_v2(state: &State, viewer: SideId) -> Vec<f32> {
             }
         }
         v.push((best / 2.0).min(1.0));
+    }
+
+    // E12 mechanics appendix (offsets after the v2 block; see OBS_MECH_V2).
+    for side_id in [viewer, viewer.other()] {
+        let p = observed.side(side_id).active();
+        for m in 0..4 {
+            let mv = p.moves[m];
+            if mv.id == MoveId::None {
+                v.extend_from_slice(&[0.0; 4]);
+                continue;
+            }
+            let md = move_data(mv.id);
+            v.push((md.priority as f32 / 5.0).clamp(-1.0, 1.0));
+            let sbt: i32 = md.self_boosts.iter().map(|&x| x as i32).sum();
+            v.push((sbt as f32 / 6.0).clamp(-1.0, 1.0));
+            v.push(if md.heal.1 > 0 { md.heal.0 as f32 / md.heal.1 as f32 } else { 0.0 });
+            v.push((md.status != crate::ids::Status::None
+                    || md.secondary_status != crate::ids::Status::None) as u8 as f32);
+        }
     }
 
     debug_assert_eq!(v.len(), OBS_DIM_V2, "encode_v2 produced {} feats, expected {}", v.len(), OBS_DIM_V2);

@@ -33,9 +33,10 @@ def load_ckpt(path: str, device):
     has_aux = any(k.startswith("aux_") for k in ck["model"])
     has_outcome = any(k.startswith("outcome_head.") for k in ck["model"])
     has_belief = any(k.startswith("belief_species.") for k in ck["model"])
+    has_setslot = any(k.startswith("move_scorer.") for k in ck["model"])
     net = ActorCritic(ck["obs_dim"], ck["n_actions"], ck.get("hidden_dim", 256),
                       ck.get("n_hidden_layers", 2), embed=embed, aux=has_aux,
-                      outcome=has_outcome, belief=has_belief).to(device)
+                      outcome=has_outcome, belief=has_belief, setslot=has_setslot).to(device)
     net.load_state_dict(ck["model"])
     net.eval()
     # Ride the fog setting along so evaluators construct MATCHING envs — a fog-trained net

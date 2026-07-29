@@ -41,7 +41,8 @@ class FlowEnvVec:
 
     def __init__(self, num_envs: int, seed: int = 0, team_pool: str | None = None,
                  max_requests: int = 1000, shaping_coef: float = 0.0, gamma: float = 0.99,
-                 fog_species: bool = False, obs_version: int = 1, frames: int = 1):
+                 fog_species: bool = False, obs_version: int = 1, frames: int = 1,
+                 capture_protocol: bool = False):
         self.num_envs = num_envs
         self.shaping_coef = shaping_coef
         self.gamma = gamma
@@ -49,7 +50,7 @@ class FlowEnvVec:
         self.obs_version = obs_version
         self.vec = se.FlowVec(num_envs, seed=seed, max_requests_per_episode=max_requests,
                               team_pool=team_pool, fog_species=fog_species,
-                              obs_version=obs_version)
+                              obs_version=obs_version, capture_protocol=capture_protocol)
         assert frames in (1, 2)
         self.frames = frames
         # frames=2: previous request's obs appended after the current one (night-era D3 lever —

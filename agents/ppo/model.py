@@ -19,11 +19,24 @@ from torch.distributions import Categorical
 # Finite stand-in for -inf when masking logits (keeps entropy finite for zeroed actions).
 MASK_FILL = -1e8
 
+# --- obs-v2 layout offsets (MUST mirror crates/engine/src/encode.rs; asserted in __init__) ----
+PER_MON = 35            # hp,faint,active,tera + status7 + types18 + stats5 + level
+MOVE_FEATS = 10         # present,pp,disabled,te,stab,bp,cat3,acc
+V2_BASE = 643           # v1 OBS_DIM
+V2_DIM = 703            # 643 + 28 dmg-calc + 32 mechanics appendix
+MON_BLOCK_OFF = 0       # viewer's 6 mons first
+ACTIVE_FLAG_IDX = 2     # within a mon block
+MY_MOVES_OFF = 560      # viewer's active-move block (4 x MOVE_FEATS)
+MY_MOVES_V2_OFF = 643   # per-move [est_dmg, ko] x4 (viewer)
+V2_INCOMING_OFF = 659   # per party slot: worst revealed incoming hit
+V2_BEST_OFF = 665       # per party slot: own best hit vs foe active
+MY_MOVES_MECH_OFF = 671  # per-move [priority, self_boost_total, heal, status] x4 (viewer)
+
 
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim, n_actions, hidden_dim=928, n_hidden_layers=2,
                  embed: dict | None = None, aux: bool = False, outcome: bool = False,
-                 belief: bool = False):
+                 belief: bool = False, setslot: bool = False):
         """`embed`, if given: {n_mons, cols: [table-name per ID column], vocab: {table: size}, dim}.
         `aux=True` adds prediction heads (opponent move + turn dynamics) that share the trunk but
         NOT the policy head — they enrich the representation without biasing the policy.
@@ -35,6 +48,7 @@ class ActorCritic(nn.Module):
         self.has_aux = aux
         self.has_outcome = outcome
         self.has_belief = belief
+        self.has_setslot = setslot
         self.n_actions = n_actions
         embed_total = 0
         if embed is not None:
@@ -59,6 +73,21 @@ class ActorCritic(nn.Module):
 
         self.policy_head = nn.Linear(hidden_dim, n_actions)
         self.value_head = nn.Linear(hidden_dim, 1)
+
+        if setslot:
+            # Slot-shared action scorers (the night-era `setslot` arch, ported): one shared MLP
+            # scores each MOVE from [trunk, that move's feature slice, tera?], one scores each
+            # SWITCH from [trunk, that bench mon's block, its matchup scalars]. Positional bias
+            # is unrepresentable by construction — the flat head's documented failure mode.
+            assert obs_dim in (V2_DIM, 2 * V2_DIM), \
+                f"setslot expects obs v2 (671 or 1342 with frames), got {obs_dim}"
+            assert n_actions == 13
+            move_in = hidden_dim + MOVE_FEATS + 2 + 4 + 1  # slice + [dmg,ko] + mechanics + tera
+            switch_in = hidden_dim + PER_MON + 2        # mon block + [incoming, best]
+            self.move_scorer = nn.Sequential(
+                nn.Linear(move_in, 256), nn.Tanh(), nn.Linear(256, 1))
+            self.switch_scorer = nn.Sequential(
+                nn.Linear(switch_in, 256), nn.Tanh(), nn.Linear(256, 1))
 
         if aux:
             # Auxiliary *prediction* heads (training-time only). Off the trunk, never the policy
@@ -106,6 +135,37 @@ class ActorCritic(nn.Module):
     def _trunk_features(self, obs, obs_ids):
         return self.trunk(self._features(obs, obs_ids))
 
+    def _setslot_logits(self, obs, h):
+        """Slot-shared scorers over the CURRENT frame's feature slices (first V2_DIM cols)."""
+        b = obs.shape[0]
+        cur = obs[:, :V2_DIM]
+        # Moves: [B, 4, MOVE_FEATS] + v2 [est_dmg, ko] pairs.
+        mf = cur[:, MY_MOVES_OFF:MY_MOVES_OFF + 4 * MOVE_FEATS].view(b, 4, MOVE_FEATS)
+        dk = cur[:, MY_MOVES_V2_OFF:MY_MOVES_V2_OFF + 8].view(b, 4, 2)
+        mech = cur[:, MY_MOVES_MECH_OFF:MY_MOVES_MECH_OFF + 16].view(b, 4, 4)
+        moves = torch.cat([mf, dk, mech], dim=2)                 # [B, 4, 16]
+        h4 = h.unsqueeze(1).expand(-1, 4, -1)
+        zeros = torch.zeros(b, 4, 1, device=obs.device)
+        ones = torch.ones(b, 4, 1, device=obs.device)
+        move_logits = self.move_scorer(torch.cat([h4, moves, zeros], 2)).squeeze(-1)   # a0..3
+        tera_logits = self.move_scorer(torch.cat([h4, moves, ones], 2)).squeeze(-1)    # a9..12
+        # Switches: bench = the 5 non-active party slots in order (stable argsort on the
+        # active flag reproduces engine bench ordering).
+        mons = cur[:, MON_BLOCK_OFF:MON_BLOCK_OFF + 6 * PER_MON].view(b, 6, PER_MON)
+        active_flag = mons[:, :, ACTIVE_FLAG_IDX]
+        order = torch.argsort(active_flag, dim=1, stable=True)   # non-active first, party order
+        bench_idx = order[:, :5]
+        bench = torch.gather(mons, 1, bench_idx.unsqueeze(-1).expand(-1, -1, PER_MON))
+        inc = torch.gather(cur[:, V2_INCOMING_OFF:V2_INCOMING_OFF + 6], 1, bench_idx)
+        bst = torch.gather(cur[:, V2_BEST_OFF:V2_BEST_OFF + 6], 1, bench_idx)
+        h5 = h.unsqueeze(1).expand(-1, 5, -1)
+        sw = torch.cat([h5, bench, inc.unsqueeze(-1), bst.unsqueeze(-1)], 2)
+        switch_logits = self.switch_scorer(sw).squeeze(-1)                              # a4..8
+        return torch.cat([move_logits, switch_logits, tera_logits], dim=1)
+
+    def _logits(self, obs, h):
+        return self._setslot_logits(obs, h) if self.has_setslot else self.policy_head(h)
+
     def forward(self, obs, action_mask=None, obs_ids=None):
         """Return (logits, value). `action_mask` [..., n_actions] bool (True = legal).
 
@@ -113,7 +173,7 @@ class ActorCritic(nn.Module):
         stash pattern as `teacher_log_prob`) — callers that want it read it after the call.
         """
         h = self._trunk_features(obs, obs_ids)
-        logits = self.policy_head(h)
+        logits = self._logits(obs, h)
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, MASK_FILL)
         value = self.value_head(h).squeeze(-1)
@@ -129,7 +189,7 @@ class ActorCritic(nn.Module):
         must be masked out by the caller (they carry no gradient there anyway once masked).
         """
         h = self._trunk_features(obs, obs_ids)
-        logits = self.policy_head(h)
+        logits = self._logits(obs, h)
         if action_mask is not None:
             logits = logits.masked_fill(~action_mask, MASK_FILL)
         value = self.value_head(h).squeeze(-1)

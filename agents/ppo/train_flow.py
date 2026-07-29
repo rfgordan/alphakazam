@@ -71,7 +71,8 @@ def build_model(cfg, env, device, aux: bool):
     return ActorCritic(env.obs_dim, env.n_actions, cfg.hidden_dim, cfg.n_hidden_layers,
                        embed=embed, aux=aux,
                        outcome=getattr(cfg, "outcome_head", False),
-                       belief=getattr(cfg, "belief_head", False)).to(device)
+                       belief=getattr(cfg, "belief_head", False),
+                       setslot=getattr(cfg, "setslot", False)).to(device)
 
 
 def train(args):
@@ -84,6 +85,7 @@ def train(args):
         embed_dim=args.embed_dim, seed=args.seed, device=args.device or "auto",
         shaping_coef=args.shaping_coef, aux=args.aux, target_kl=args.target_kl,
         outcome_head=args.outcome_head, belief_head=args.belief_head,
+        setslot=args.setslot,
     )
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -276,6 +278,13 @@ def train(args):
     opp_rng = np.random.default_rng(cfg.seed ^ 0xBEEF)
     while not _STOP and (indefinite or global_step < cfg.total_steps):
         update += 1
+        if args.lr_anneal_horizon > 0:
+            # Wang 2024's schedule, the single biggest lever in that work (+25pts vs constant):
+            # lr(x) = lr0 / (8x + 1)^1.5, x = progress in [0, 1] over the anneal horizon.
+            x = min(1.0, global_step / args.lr_anneal_horizon)
+            lr_now = cfg.lr / (8.0 * x + 1.0) ** 1.5
+            for pg in opt.param_groups:
+                pg["lr"] = lr_now
         if rnad_ref is not None and update % args.rnad_ref_every == 0:
             rnad_ref.load_state_dict(model.state_dict())
         # Fresh draw from the reservoir each rollout, so an update sees several past selves.
@@ -573,6 +582,11 @@ def main():
                         "r' = r − η(log π − log π_ref) on acting steps (E4)")
     p.add_argument("--rnad-ref-every", type=int, default=50,
                    help="refresh the R-NaD reference to the current policy every N updates")
+    p.add_argument("--setslot", action="store_true",
+                   help="slot-shared move/switch scorers (night-era arch; needs obs v2)")
+    p.add_argument("--lr-anneal-horizon", type=int, default=0,
+                   help=">0: anneal lr by Wang-2024's power law over this many env steps "
+                        "(lr0/(8x+1)^1.5; reaches lr0/27 at the horizon)")
     p.add_argument("--search-distill-envs", type=int, default=0,
                    help=">0: run the budget subgame search on this many Turn-state envs at "
                         "rollout step 0 and distill its mixed strategy into the policy")

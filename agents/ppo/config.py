@@ -46,6 +46,9 @@ class PPOConfig:
     # --- outcome head (search evaluator: unshaped terminal-outcome lambda-returns) ---
     outcome_head: bool = False
 
+    # --- slot-shared action scorers (night-era setslot; needs obs v2) ---
+    setslot: bool = False
+
     # --- belief heads (predict hidden foe identity from public obs; W9) ---
     belief_head: bool = False
     belief_coef: float = 0.5
