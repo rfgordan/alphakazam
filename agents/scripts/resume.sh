@@ -36,6 +36,10 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--embed-dim 48 \
 	--lr-anneal-horizon 1500000000 \
 	--shaping-anneal-horizon 500000000 \
+	--phi-boost 0.10 \
+	--phi-hazard 0.10 \
+	--phi-screen 0.03 \
+	--phi-status 0.03 \
 	--team-pool ../showdown-rs/harness/team-pool/gen9randombattle-100k.jsonl.gz \
 	--ckpt-every 10 \
 	--keep-checkpoints 40 \
