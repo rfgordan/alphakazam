@@ -278,6 +278,13 @@ def train(args):
     opp_rng = np.random.default_rng(cfg.seed ^ 0xBEEF)
     while not _STOP and (indefinite or global_step < cfg.total_steps):
         update += 1
+        if args.shaping_anneal_horizon > 0:
+            # Shaping curriculum (user directive): the PBRS damage/faint bonuses guide early
+            # exploration, then ramp to zero so the mature policy optimizes pure win/loss.
+            # PBRS keeps every intermediate coefficient policy-invariant, so the ramp changes
+            # learning emphasis, never the optimum.
+            frac = max(0.0, 1.0 - global_step / args.shaping_anneal_horizon)
+            env.shaping_coef = cfg.shaping_coef * frac
         if args.lr_anneal_horizon > 0:
             # Wang 2024's schedule, the single biggest lever in that work (+25pts vs constant):
             # lr(x) = lr0 / (8x + 1)^1.5, x = progress in [0, 1] over the anneal horizon.
@@ -584,6 +591,9 @@ def main():
                    help="refresh the R-NaD reference to the current policy every N updates")
     p.add_argument("--setslot", action="store_true",
                    help="slot-shared move/switch scorers (night-era arch; needs obs v2)")
+    p.add_argument("--shaping-anneal-horizon", type=int, default=0,
+                   help=">0: linearly anneal the PBRS shaping coefficient to zero over this "
+                        "many env steps (early exploration incentive, pure win/loss late)")
     p.add_argument("--lr-anneal-horizon", type=int, default=0,
                    help=">0: anneal lr by Wang-2024's power law over this many env steps "
                         "(lr0/(8x+1)^1.5; reaches lr0/27 at the horizon)")
