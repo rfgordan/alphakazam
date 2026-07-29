@@ -196,6 +196,23 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                     hit = (sp_l.argmax(-1) == bt[:, :6]).float() * bm[:, :6]
                     belief_acc_v = (hit.sum() / bm[:, :6].sum().clamp(min=1.0)).item()
 
+            # Search distillation (goal lever): CE of the policy against the search's mixed
+            # strategy, on the step-0 rows that carry targets. -sum(p_search * log pi).
+            sdist_v = 0.0
+            if "distill_probs" in data:
+                n0 = data["distill_n"]
+                in_t0 = mb < n0
+                if in_t0.any():
+                    rows = mb[in_t0]
+                    dm = data["distill_mask"][rows]
+                    if dm.any():
+                        tgt_p = data["distill_probs"][rows]
+                        logp = model.log_probs_full[in_t0]
+                        ce = -(tgt_p * logp).sum(-1)
+                        sdist_loss = (ce * dm).sum() / dm.sum().clamp(min=1.0)
+                        loss = loss + float(data.get("distill_coef", 1.0)) * sdist_loss
+                        sdist_v = sdist_loss.item()
+
             # Kickstart distillation: -log pi(teacher_action) on steps where the teacher had an
             # opinion AND the learner was acting; the coefficient anneals to 0 (train_flow owns
             # the schedule). Weak supervision that shapes early exploration, then gets out of
@@ -244,6 +261,7 @@ def ppo_update(model, optimizer, data, cfg: PPOConfig, batch_size: int) -> dict:
                 kick_loss=kick_v,         # kickstart distillation CE (0 when off/annealed out)
                 outcome_loss=outcome_loss_v,  # win-prob head MSE (0 when head absent)
                 belief_loss=belief_loss_v,    # hidden-identity CE (0 when head absent)
+                sdist_loss=sdist_v,           # search-distillation CE (0 when off)
                 belief_acc=belief_acc_v,      # unrevealed-species top-1 accuracy
             )
     return last

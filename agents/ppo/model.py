@@ -141,6 +141,7 @@ class ActorCritic(nn.Module):
             self.teacher_log_prob = dist.log_prob(teacher_action.clamp(min=0))
         self.outcome_pred = self.outcome_head(h).squeeze(-1) if self.has_outcome else None
         self.trunk_h = h if self.has_belief else None
+        self.log_probs_full = torch.log_softmax(logits, dim=-1)  # soft-target distillation reads this
         out = (action, dist.log_prob(action), dist.entropy(), value)
         if return_aux:
             # Return the trunk features so the dynamics head can be conditioned on the actions

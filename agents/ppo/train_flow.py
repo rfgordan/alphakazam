@@ -120,6 +120,11 @@ def train(args):
                 setattr(cfg, k, ck[k])
 
     model = build_model(cfg, env, device, aux=cfg.aux)
+    # Evaluators and the search core read these off the net (load_ckpt sets them for loaded
+    # checkpoints; the live training model needs them too, e.g. for search distillation).
+    model.frames = args.frames
+    model.obs_version = args.obs_version
+    model.fog_species = args.fog_species
     # fused=True: the per-minibatch Adam step was 23% of trainer wall time (py-spy, post-TF32) —
     # 32 unfused step() calls per update over 10M params is kernel-launch soup. The fused CUDA
     # kernel shares the same state-dict format, so resume is unaffected.
@@ -276,9 +281,37 @@ def train(args):
         # Fresh draw from the reservoir each rollout, so an update sees several past selves.
         if exploit_net is None:
             slots.assign(league, model.state_dict())
+        distill_probs_t = distill_mask_t = None
         for t in range(cfg.rollout_steps):
             obs_l, ids_l, mask_l, _ = env.learner_view()
             obs_o, ids_o, mask_o, _ = env.opponent_view()
+
+            # Search distillation (goal lever): on step 0 only, run the budget subgame search on
+            # a small subset of Turn-state envs and keep its mixed strategy as a soft policy
+            # target. AlphaZero's improvement operator at ~a few percent of wall clock.
+            if t == 0 and args.search_distill_envs > 0 and update > 10:
+                from probes.value_search import root_strategies
+                act0 = np.asarray(env.vec.acting_all(0), dtype=bool)
+                act1 = np.asarray(env.vec.acting_all(1), dtype=bool)
+                turn_envs = np.flatnonzero(act0 & act1)
+                pick = opp_rng.choice(turn_envs, size=min(args.search_distill_envs,
+                                                          turn_envs.size), replace=False)
+                rows_es = [(int(e), int(env.learner_side[e])) for e in pick]
+                model.eval()
+                try:
+                    strats = root_strategies(model, device, env.vec, rows_es,
+                                             topk=4, n_samples=1, det=True,
+                                             counter=[int(global_step) + update])
+                finally:
+                    model.train()
+                dp = np.zeros((cfg.num_envs, env.n_actions), dtype=np.float32)
+                dmsk = np.zeros(cfg.num_envs, dtype=np.float32)
+                for i, (acts, strat) in strats.items():
+                    e = rows_es[i][0]
+                    dp[e][acts] = strat
+                    dmsk[e] = 1.0
+                distill_probs_t = torch.as_tensor(dp, device=device)
+                distill_mask_t = torch.as_tensor(dmsk, device=device)
 
             obs_t = torch.as_tensor(obs_l, device=device)
             ids_t = torch.as_tensor(ids_l, device=device)
@@ -376,10 +409,16 @@ def train(args):
                 torch.as_tensor(obs_l, device=device),
                 torch.as_tensor(mask_l, device=device),
                 obs_ids=torch.as_tensor(ids_l, device=device))
+        if distill_probs_t is not None:
+            buffer.set_distill(distill_probs_t, distill_mask_t)
+        else:
+            buffer.set_distill(None, None)
         buffer.compute_gae(last_value, cfg.gamma, cfg.gae_lambda)
         if buffer.outcome:
             buffer.compute_gae_outcome(model.outcome_pred, cfg.gamma, cfg.gae_lambda)
         data = buffer.flat_view()
+        if "distill_probs" in data:
+            data["distill_coef"] = args.search_distill_coef
         if args.kickstart_coef > 0:
             frac = max(0.0, 1.0 - global_step / max(1, args.kickstart_anneal_steps))
             data["kick_coef"] = args.kickstart_coef * frac
@@ -534,6 +573,10 @@ def main():
                         "r' = r − η(log π − log π_ref) on acting steps (E4)")
     p.add_argument("--rnad-ref-every", type=int, default=50,
                    help="refresh the R-NaD reference to the current policy every N updates")
+    p.add_argument("--search-distill-envs", type=int, default=0,
+                   help=">0: run the budget subgame search on this many Turn-state envs at "
+                        "rollout step 0 and distill its mixed strategy into the policy")
+    p.add_argument("--search-distill-coef", type=float, default=1.0)
     p.add_argument("--kickstart-coef", type=float, default=0.0,
                    help=">0: distill toward the Rust heuristic's action with this coefficient, "
                         "annealed linearly to 0 over --kickstart-anneal-steps (E1 arm c)")

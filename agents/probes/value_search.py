@@ -88,6 +88,92 @@ def _solve_child(q_flat: np.ndarray, cnt_flat: np.ndarray) -> float:
     return float((strat @ A).min())
 
 
+def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, counter=None):
+    """Depth-2 subgame search root strategies for `rows_es` = [(env, side), ...] (must be Turn
+    states). Returns {row_index: (my_actions ndarray, mixed strategy ndarray)} — the reusable
+    core of the search agent, also consumed by the trainer's search-distillation (goal lever).
+    """
+    if counter is None:
+        counter = [0]
+    f2 = getattr(net, "frames", 1) == 2
+    obs_by = {s: np.asarray(vec.observe_all(s), dtype=np.float32) for s in (0, 1)}
+    ids_by = {s: np.asarray(vec.observe_ids_all(s), dtype=np.int64) for s in (0, 1)}
+    mask_by = {s: np.asarray(vec.legal_all(s), dtype=bool) for s in (0, 1)}
+
+    def topk_actions(obs_np, ids_np, mask_np):
+        if f2:
+            obs_np = _frame2(obs_np)
+        with torch.no_grad():
+            logits, _ = net.forward(torch.as_tensor(obs_np, device=device),
+                                    torch.as_tensor(mask_np, device=device),
+                                    obs_ids=torch.as_tensor(ids_np, device=device))
+        lg = logits.cpu().numpy()
+        picks = []
+        for r in range(len(lg)):
+            legal = np.flatnonzero(mask_np[r])
+            order = legal[np.argsort(-lg[r][legal])]
+            picks.append(order[:topk])
+        return picks
+
+    pending, all_obs, all_ids = [], [], []
+    my_acts, opp_acts = {}, {}
+    ok_rows = []
+    for i, (e, s) in enumerate(rows_es):
+        try:
+            my = topk_actions(obs_by[s][e:e + 1], ids_by[s][e:e + 1], mask_by[s][e:e + 1])[0]
+            op = topk_actions(obs_by[1 - s][e:e + 1], ids_by[1 - s][e:e + 1],
+                              mask_by[1 - s][e:e + 1])[0]
+            my_acts[i], opp_acts[i] = my, op
+            for pi, a1 in enumerate(my):
+                for pj, a2 in enumerate(op):
+                    for _k in range(n_samples):
+                        counter[0] += 1
+                        kind, obs, ids, done, outc, valid = vec.lookahead_pair_obs(
+                            e, s, counter[0], int(a1), int(a2),
+                            counter[0] * 37 + 11 if det else None)
+                        obs = np.asarray(obs); ids = np.asarray(ids)
+                        done = np.asarray(done); outc = np.asarray(outc)
+                        valid = np.asarray(valid)
+                        live = valid & ~done if kind == 2 else (np.array([kind == 1]))
+                        start = sum(len(x) for x in all_obs)
+                        lv = obs[live]
+                        if f2:
+                            lv = (_frame2(lv, np.broadcast_to(obs_by[s][e], lv.shape).copy())
+                                  if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32))
+                        all_obs.append(lv); all_ids.append(ids[live])
+                        pending.append((i, pi, pj, kind, done, outc, valid, live,
+                                        start, int(live.sum())))
+            ok_rows.append(i)
+        except ValueError:
+            continue
+    values = _leaf_values(net, device,
+                          np.concatenate(all_obs) if all_obs else np.zeros((0, 1)),
+                          np.concatenate(all_ids) if all_ids else np.zeros((0, 1)))
+    acc = {}
+    for (i, pi, pj, kind, done, outc, valid, live, start, nlive) in pending:
+        if kind == 0:
+            v = float(outc[0])
+        elif kind == 1:
+            v = float(values[start]) if nlive else 0.0
+        else:
+            q = np.where(done, outc, 0.0).astype(np.float64)
+            q[live] = values[start:start + nlive]
+            v = _solve_child(np.where(valid, q, 0.0), valid.astype(np.float64))
+        tot, n = acc.get((i, pi, pj), (0.0, 0))
+        acc[(i, pi, pj)] = (tot + v, n + 1)
+    out = {}
+    for i in ok_rows:
+        my, op = my_acts[i], opp_acts[i]
+        Q = np.zeros((len(my), len(op)))
+        for pi in range(len(my)):
+            for pj in range(len(op)):
+                tot, n = acc.get((i, pi, pj), (0.0, 0))
+                Q[pi, pj] = tot / max(1, n)
+        strat = solve_matrix_game(Q, np.arange(len(my)), np.arange(len(op)))
+        out[i] = (my, strat)
+    return out
+
+
 def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, seed: int = 0,
                               timing: dict | None = None, det: bool = False):
     """Depth-2 search with equilibrium backups (EXPLORATION_PLAN W7, the ReBeL concept scoped).

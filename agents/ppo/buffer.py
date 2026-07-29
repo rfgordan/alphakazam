@@ -41,6 +41,10 @@ class RolloutBuffer:
         # Kickstart distillation target (long, -1 = no teacher opinion at this step). Allocated
         # lazily on the first add() that supplies one.
         self.teacher_actions = None
+        # Search-distillation soft targets: computed on rollout step 0 only for a small env
+        # subset (the AlphaZero policy-improvement operator at a wall-clock budget).
+        self.distill_probs = None   # [num_envs, n_actions]
+        self.distill_mask = None    # [num_envs]
 
         # Belief-head labels: 11 hidden-identity targets + their is-hidden mask (see
         # pybridge belief_targets_all).
@@ -115,6 +119,10 @@ class RolloutBuffer:
             last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
             self.outcome_returns[t] = last_gae + self.outcome_values[t]
 
+    def set_distill(self, probs, mask):
+        self.distill_probs = probs
+        self.distill_mask = mask
+
     def flat_view(self):
         """Flatten [steps, num_envs, ...] -> [steps*num_envs, ...] for minibatching."""
         d = dict(
@@ -139,4 +147,9 @@ class RolloutBuffer:
         if self.belief:
             d["belief_target"] = self.belief_targets.reshape(-1, 11)
             d["belief_mask"] = self.belief_masks.reshape(-1, 11)
+        if self.distill_probs is not None:
+            # Step-0 rows occupy flat indices 0..num_envs-1 (flatten order is [steps, envs]).
+            d["distill_probs"] = self.distill_probs
+            d["distill_mask"] = self.distill_mask
+            d["distill_n"] = self.num_envs
         return d
