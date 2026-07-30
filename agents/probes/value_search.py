@@ -120,11 +120,20 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
     my_acts, opp_acts = {}, {}
     ok_rows = []
     P = N * N
+    # Priors for ALL rows in two stacked forwards — per-env batch-1 GPU calls were ~half the
+    # search wall clock (launch latency), dwarfing the engine expansion they were pruning.
+    if rows_es:
+        my_stack = topk_actions(
+            np.stack([obs_by[s][e] for e, s in rows_es]),
+            np.stack([ids_by[s][e] for e, s in rows_es]),
+            np.stack([mask_by[s][e] for e, s in rows_es]))
+        op_stack = topk_actions(
+            np.stack([obs_by[1 - s][e] for e, s in rows_es]),
+            np.stack([ids_by[1 - s][e] for e, s in rows_es]),
+            np.stack([mask_by[1 - s][e] for e, s in rows_es]))
     for i, (e, s) in enumerate(rows_es):
         try:
-            my = topk_actions(obs_by[s][e:e + 1], ids_by[s][e:e + 1], mask_by[s][e:e + 1])[0]
-            op = topk_actions(obs_by[1 - s][e:e + 1], ids_by[1 - s][e:e + 1],
-                              mask_by[1 - s][e:e + 1])[0]
+            my, op = my_stack[i], op_stack[i]
             my_acts[i], opp_acts[i] = my, op
             pair_a1 = [int(a1) for a1 in my for _ in op]
             pair_a2 = [int(a2) for _ in my for a2 in op]
