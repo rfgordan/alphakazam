@@ -1644,6 +1644,150 @@ impl FlowVec {
         Ok(state_json_of(&st.observe(sid(side))))
     }
 
+    /// Batched depth-2 expansion: ALL root joint pairs of one env in a single call (16 bridge
+    /// crossings become 1), under ONE shared determinization — matrix entries must be scored in
+    /// the same sampled world, which the per-pair API couldn't guarantee. Returns per pair p:
+    /// `kinds[p]` (0 terminal / 1 leaf / 2 expanded), and P=169 rows each of obs/ids/done/
+    /// outcome/valid stacked at `p*169` (kind 0/1 use row 0 only, like `lookahead_pair_obs`).
+    #[allow(clippy::type_complexity)]
+    #[pyo3(signature = (env, side, seed, a_selfs, a_opps, det_seed = None))]
+    fn lookahead_pairs_env<'py>(
+        &self,
+        py: Python<'py>,
+        env: usize,
+        side: u8,
+        seed: u64,
+        a_selfs: Vec<u8>,
+        a_opps: Vec<u8>,
+        det_seed: Option<u64>,
+    ) -> PyResult<(
+        Bound<'py, PyArray1<u8>>,
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<i64>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+    )> {
+        let f = self
+            .flows
+            .get(env)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("env out of range"))?;
+        if !matches!(f.request(), Request::Turn) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lookahead_pairs_env is only valid at a Turn request",
+            ));
+        }
+        if a_selfs.len() != a_opps.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err("pair arrays must match"));
+        }
+        let me = sid(side);
+        let mut world = f.clone();
+        if let Some(ds) = det_seed {
+            let mut dz = ds;
+            world.state =
+                determinize_foe(&f.state, me, &self.donors_all, &self.donors_by_species, &mut dz);
+        }
+        let ver = self.obs_version;
+        let obs_dim = obs_dim_v(ver);
+        let id_dim = engine::encode::ID_DIM;
+        const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
+        let m = a_selfs.len();
+        let mut kinds = vec![0u8; m];
+        let mut obs = vec![0f32; m * P * obs_dim];
+        let mut ids = vec![0i64; m * P * id_dim];
+        let mut done = vec![false; m * P];
+        let mut outcome = vec![0f32; m * P];
+        let mut valid = vec![false; m * P];
+        py.allow_threads(|| {
+            kinds
+                .par_iter_mut()
+                .zip(obs.par_chunks_mut(P * obs_dim))
+                .zip(ids.par_chunks_mut(P * id_dim))
+                .zip(done.par_chunks_mut(P))
+                .zip(outcome.par_chunks_mut(P))
+                .zip(valid.par_chunks_mut(P))
+                .enumerate()
+                .for_each(|(pi, (((((kind, o_c), i_c), d_c), out_c), v_c))| {
+                    let mut root = world.clone();
+                    let mut z = seed
+                        ^ (0xD1B5_4A32_D192_ED03u64.wrapping_mul(pi as u64 + 1));
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    root.rng = z ^ (z >> 27);
+                    let c_me = flow_choice(&root.state, me, a_selfs[pi]);
+                    let c_op = flow_choice(&root.state, me.other(), a_opps[pi]);
+                    let (c0, c1) = if me == SideId::One { (c_me, c_op) } else { (c_op, c_me) };
+                    let next = root.submit([Some(c0), Some(c1)]);
+                    match next {
+                        Request::Terminal { winner } => {
+                            *kind = 0;
+                            d_c[0] = true;
+                            out_c[0] = if winner < 0 {
+                                0.0
+                            } else if winner == me.index() as i64 {
+                                1.0
+                            } else {
+                                -1.0
+                            };
+                            v_c[0] = true;
+                        }
+                        Request::Turn => {
+                            *kind = 2;
+                            let my_mask = flow_legal_mask(&root.state, Request::Turn, me);
+                            let op_mask =
+                                flow_legal_mask(&root.state, Request::Turn, me.other());
+                            for p in 0..P {
+                                let (ai, aj) = (p / N_ACTIONS_FLOW, p % N_ACTIONS_FLOW);
+                                if !my_mask[ai] || !op_mask[aj] {
+                                    continue;
+                                }
+                                let mut sim = root.clone();
+                                let mut z2 = seed
+                                    ^ (0x9E37_79B9_7F4A_7C15u64
+                                        .wrapping_mul((pi * P + p) as u64 + 7));
+                                z2 = (z2 ^ (z2 >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                                sim.rng = z2 ^ (z2 >> 27);
+                                let mm = flow_choice(&sim.state, me, ai as u8);
+                                let oo = flow_choice(&sim.state, me.other(), aj as u8);
+                                let (cc0, cc1) =
+                                    if me == SideId::One { (mm, oo) } else { (oo, mm) };
+                                let nn = sim.submit([Some(cc0), Some(cc1)]);
+                                o_c[p * obs_dim..(p + 1) * obs_dim]
+                                    .copy_from_slice(&enc_v(ver, &sim.state, me));
+                                i_c[p * id_dim..(p + 1) * id_dim]
+                                    .copy_from_slice(&engine::encode::encode_ids(&sim.state, me));
+                                if let Request::Terminal { winner } = nn {
+                                    d_c[p] = true;
+                                    out_c[p] = if winner < 0 {
+                                        0.0
+                                    } else if winner == me.index() as i64 {
+                                        1.0
+                                    } else {
+                                        -1.0
+                                    };
+                                }
+                                v_c[p] = true;
+                            }
+                        }
+                        _ => {
+                            *kind = 1;
+                            o_c[..obs_dim].copy_from_slice(&enc_v(ver, &root.state, me));
+                            i_c[..id_dim]
+                                .copy_from_slice(&engine::encode::encode_ids(&root.state, me));
+                            v_c[0] = true;
+                        }
+                    }
+                });
+        });
+        Ok((
+            Array1::from_vec(kinds).into_pyarray_bound(py),
+            Array2::from_shape_vec((m * P, obs_dim), obs).unwrap().into_pyarray_bound(py),
+            Array2::from_shape_vec((m * P, id_dim), ids).unwrap().into_pyarray_bound(py),
+            Array1::from_vec(done).into_pyarray_bound(py),
+            Array1::from_vec(outcome).into_pyarray_bound(py),
+            Array1::from_vec(valid).into_pyarray_bound(py),
+        ))
+    }
+
     /// Multi-turn-pattern potential features for PBRS shaping, from `side`'s perspective:
     /// `[my positive boost stages, foe-side hazard layers, my screens/tailwind up, statused
     /// foe mons]` — each a STATE function, so any weighted sum is a valid PBRS potential.

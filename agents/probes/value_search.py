@@ -118,31 +118,40 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
     pending, all_obs, all_ids = [], [], []
     my_acts, opp_acts = {}, {}
     ok_rows = []
+    P = N * N
     for i, (e, s) in enumerate(rows_es):
         try:
             my = topk_actions(obs_by[s][e:e + 1], ids_by[s][e:e + 1], mask_by[s][e:e + 1])[0]
             op = topk_actions(obs_by[1 - s][e:e + 1], ids_by[1 - s][e:e + 1],
                               mask_by[1 - s][e:e + 1])[0]
             my_acts[i], opp_acts[i] = my, op
-            for pi, a1 in enumerate(my):
-                for pj, a2 in enumerate(op):
-                    for _k in range(n_samples):
-                        counter[0] += 1
-                        kind, obs, ids, done, outc, valid = vec.lookahead_pair_obs(
-                            e, s, counter[0], int(a1), int(a2),
-                            counter[0] * 37 + 11 if det else None)
-                        obs = np.asarray(obs); ids = np.asarray(ids)
-                        done = np.asarray(done); outc = np.asarray(outc)
-                        valid = np.asarray(valid)
-                        live = valid & ~done if kind == 2 else (np.array([kind == 1]))
-                        start = sum(len(x) for x in all_obs)
-                        lv = obs[live]
-                        if f2:
-                            lv = (_frame2(lv, np.broadcast_to(obs_by[s][e], lv.shape).copy())
-                                  if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32))
-                        all_obs.append(lv); all_ids.append(ids[live])
-                        pending.append((i, pi, pj, kind, done, outc, valid, live,
-                                        start, int(live.sum())))
+            pair_a1 = [int(a1) for a1 in my for _ in op]
+            pair_a2 = [int(a2) for _ in my for a2 in op]
+            n_op = len(op)
+            for _k in range(n_samples):
+                counter[0] += 1
+                # ONE bridge call for every pair, sharing one determinized world per sample.
+                kinds, obs, ids, done, outc, valid = vec.lookahead_pairs_env(
+                    e, s, counter[0], pair_a1, pair_a2,
+                    counter[0] * 37 + 11 if det else None)
+                kinds = np.asarray(kinds)
+                obs = np.asarray(obs); ids = np.asarray(ids)
+                done = np.asarray(done); outc = np.asarray(outc)
+                valid = np.asarray(valid)
+                for pidx in range(len(pair_a1)):
+                    pi, pj = pidx // n_op, pidx % n_op
+                    kind = int(kinds[pidx])
+                    sl = slice(pidx * P, (pidx + 1) * P)
+                    dn, oc, vl = done[sl], outc[sl], valid[sl]
+                    live = (vl & ~dn) if kind == 2 else np.array([kind == 1] + [False] * (P - 1))
+                    start = sum(len(x) for x in all_obs)
+                    lv = obs[sl][live]
+                    if f2:
+                        lv = (_frame2(lv, np.broadcast_to(obs_by[s][e], lv.shape).copy())
+                              if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32))
+                    all_obs.append(lv); all_ids.append(ids[sl][live])
+                    pending.append((i, pi, pj, kind, dn, oc, vl, live,
+                                    start, int(live.sum())))
             ok_rows.append(i)
         except ValueError:
             continue
@@ -176,15 +185,7 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
 
 def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, seed: int = 0,
                               timing: dict | None = None, det: bool = False):
-    """Depth-2 search with equilibrium backups (EXPLORATION_PLAN W7, the ReBeL concept scoped).
-
-    Root Turn state: prune both sides' actions to the policy's top-`topk` legal choices, advance
-    every joint pair, and where the successor is itself a Turn state, build ITS 13×13 matrix
-    from leaf values and back up the SOLVED game value — so every simultaneous node in the
-    2-ply tree is resolved by (approximate) Nash, not by assuming the opponent plays π. Play
-    the root matrix's mixed strategy. Terminals use true outcomes; single-sided successors are
-    leaf-evaluated.
-    """
+    """Depth-2 search with equilibrium backups — thin wrapper over `root_strategies` (batched)."""
     counter = [seed]
 
     def fn(vec, envs, mask, rng):
@@ -195,99 +196,26 @@ def make_subgame_search_agent(net, device, topk: int = 4, n_samples: int = 1, se
         turn_rows = [i for i, (e, s) in enumerate(envs) if acting[s][e] and acting[1 - s][e]]
         other_rows = [i for i in range(len(envs)) if i not in turn_rows]
 
-        obs_by = {s: np.asarray(vec.observe_all(s), dtype=np.float32) for s in (0, 1)}
-        ids_by = {s: np.asarray(vec.observe_ids_all(s), dtype=np.int64) for s in (0, 1)}
-        mask_by = {s: np.asarray(vec.legal_all(s), dtype=bool) for s in (0, 1)}
-
         if other_rows:
+            obs_by = {s: np.asarray(vec.observe_all(s), dtype=np.float32)
+                      for s in {envs[i][1] for i in other_rows}}
+            ids_by = {s: np.asarray(vec.observe_ids_all(s), dtype=np.int64) for s in obs_by}
             o = np.stack([obs_by[envs[i][1]][envs[i][0]] for i in other_rows])
             d = np.stack([ids_by[envs[i][1]][envs[i][0]] for i in other_rows])
             m = np.stack([mask[i] for i in other_rows])
             out[np.array(other_rows)] = _policy_actions(net, _frame2(o) if f2 else o, d, m, device)
 
-        # Policy priors for pruning, both perspectives, one forward each.
-        def topk_actions(obs_np, ids_np, mask_np):
-            if f2:
-                obs_np = _frame2(obs_np)
-            with torch.no_grad():
-                logits, _ = net.forward(torch.as_tensor(obs_np, device=device),
-                                        torch.as_tensor(mask_np, device=device),
-                                        obs_ids=torch.as_tensor(ids_np, device=device))
-            lg = logits.cpu().numpy()
-            picks = []
-            for r in range(len(lg)):
-                legal = np.flatnonzero(mask_np[r])
-                order = legal[np.argsort(-lg[r][legal])]
-                picks.append(order[:topk])
-            return picks
-
-        pending = []  # (row, pair_idx, sample, kind, done, outc, valid, live_slice)
-        all_obs, all_ids = [], []
-        my_acts, opp_acts = {}, {}
-        fallback_rows = []
-        for i in list(turn_rows):
-            e, s = envs[i]
-            try:
-                my = topk_actions(obs_by[s][e:e + 1], ids_by[s][e:e + 1], mask_by[s][e:e + 1])[0]
-                op = topk_actions(obs_by[1 - s][e:e + 1], ids_by[1 - s][e:e + 1],
-                                  mask_by[1 - s][e:e + 1])[0]
-                my_acts[i], opp_acts[i] = my, op
-                for pi, a1 in enumerate(my):
-                    for pj, a2 in enumerate(op):
-                        for k in range(n_samples):
-                            counter[0] += 1
-                            kind, obs, ids, done, outc, valid = vec.lookahead_pair_obs(
-                                e, s, counter[0], int(a1), int(a2),
-                                counter[0] * 37 + 11 if det else None)
-                            obs = np.asarray(obs); ids = np.asarray(ids)
-                            done = np.asarray(done); outc = np.asarray(outc)
-                            valid = np.asarray(valid)
-                            live = valid & ~done if kind == 2 else (np.array([kind == 1]))
-                            start = sum(len(x) for x in all_obs)
-                            lv = obs[live]
-                            if f2:  # successor's previous frame IS the root state
-                                root = obs_by[s][e]
-                                lv = _frame2(lv, np.broadcast_to(root, lv.shape).copy()) if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32)
-                            all_obs.append(lv); all_ids.append(ids[live])
-                            pending.append((i, pi, pj, kind, done, outc, valid, live,
-                                            start, int(live.sum())))
-            except ValueError:
-                turn_rows.remove(i)
-                fallback_rows.append(i)
-        if fallback_rows:
-            o = np.stack([obs_by[envs[i][1]][envs[i][0]] for i in fallback_rows])
-            d = np.stack([ids_by[envs[i][1]][envs[i][0]] for i in fallback_rows])
-            m = np.stack([mask[i] for i in fallback_rows])
-            out[np.array(fallback_rows)] = _policy_actions(net, _frame2(o) if f2 else o, d, m, device)
-
-        values = _leaf_values(net, device,
-                              np.concatenate(all_obs) if all_obs else np.zeros((0, 1)),
-                              np.concatenate(all_ids) if all_ids else np.zeros((0, 1)))
-
-        # Back up: per (env, root pair) accumulate the pair's value over samples.
-        acc = {}
-        for (i, pi, pj, kind, done, outc, valid, live, start, nlive) in pending:
-            if kind == 0:
-                v = float(outc[0])
-            elif kind == 1:
-                v = float(values[start]) if nlive else 0.0
-            else:
-                q = np.where(done, outc, 0.0).astype(np.float64)
-                q[live] = values[start:start + nlive]
-                v = _solve_child(np.where(valid, q, 0.0), valid.astype(np.float64))
-            key = (i, pi, pj)
-            tot, n = acc.get(key, (0.0, 0))
-            acc[key] = (tot + v, n + 1)
-
-        for i in turn_rows:
-            my, op = my_acts[i], opp_acts[i]
-            Q = np.zeros((len(my), len(op)))
-            for pi in range(len(my)):
-                for pj in range(len(op)):
-                    tot, n = acc.get((i, pi, pj), (0.0, 0))
-                    Q[pi, pj] = tot / max(1, n)
-            strat = solve_matrix_game(Q, np.arange(len(my)), np.arange(len(op)))
-            out[i] = int(my[int(rng.choice(len(my), p=strat))])
+        if turn_rows:
+            rows_es = [(int(envs[i][0]), int(envs[i][1])) for i in turn_rows]
+            strats = root_strategies(net, device, vec, rows_es, topk=topk,
+                                     n_samples=n_samples, det=det, counter=counter)
+            for j, i in enumerate(turn_rows):
+                if j in strats:
+                    acts, strat = strats[j]
+                    out[i] = int(acts[int(rng.choice(len(acts), p=strat))])
+                else:
+                    legal = np.flatnonzero(mask[i])
+                    out[i] = int(legal[0]) if legal.size else 0
         if timing is not None:
             timing["s"] = timing.get("s", 0.0) + (time.perf_counter() - t0)
             timing["n"] = timing.get("n", 0) + len(envs)
