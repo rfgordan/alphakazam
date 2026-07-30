@@ -1650,7 +1650,7 @@ impl FlowVec {
     /// `kinds[p]` (0 terminal / 1 leaf / 2 expanded), and P=169 rows each of obs/ids/done/
     /// outcome/valid stacked at `p*169` (kind 0/1 use row 0 only, like `lookahead_pair_obs`).
     #[allow(clippy::type_complexity)]
-    #[pyo3(signature = (env, side, seed, a_selfs, a_opps, det_seed = None))]
+    #[pyo3(signature = (env, side, seed, a_selfs, a_opps, det_seed = None, child_whitelist = None))]
     fn lookahead_pairs_env<'py>(
         &self,
         py: Python<'py>,
@@ -1660,6 +1660,7 @@ impl FlowVec {
         a_selfs: Vec<u8>,
         a_opps: Vec<u8>,
         det_seed: Option<u64>,
+        child_whitelist: Option<Vec<u8>>,
     ) -> PyResult<(
         Bound<'py, PyArray1<u8>>,
         Bound<'py, PyArray2<f32>>,
@@ -1732,9 +1733,27 @@ impl FlowVec {
                         }
                         Request::Turn => {
                             *kind = 2;
-                            let my_mask = flow_legal_mask(&root.state, Request::Turn, me);
-                            let op_mask =
+                            let mut my_mask = flow_legal_mask(&root.state, Request::Turn, me);
+                            let mut op_mask =
                                 flow_legal_mask(&root.state, Request::Turn, me.other());
+                            // Second-ply pruning: restrict the child grid to whitelisted action
+                            // ids (the root's top-k) — ~7× less engine work per pair. If the
+                            // filter empties a side, fall back to its full legal mask.
+                            if let Some(wl) = &child_whitelist {
+                                let keep = |m: &mut [bool; N_ACTIONS_FLOW]| {
+                                    let mut f = [false; N_ACTIONS_FLOW];
+                                    for &a in wl {
+                                        if (a as usize) < N_ACTIONS_FLOW && m[a as usize] {
+                                            f[a as usize] = true;
+                                        }
+                                    }
+                                    if f.iter().any(|&b| b) {
+                                        *m = f;
+                                    }
+                                };
+                                keep(&mut my_mask);
+                                keep(&mut op_mask);
+                            }
                             for p in 0..P {
                                 let (ai, aj) = (p / N_ACTIONS_FLOW, p % N_ACTIONS_FLOW);
                                 if !my_mask[ai] || !op_mask[aj] {

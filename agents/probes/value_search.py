@@ -88,7 +88,8 @@ def _solve_child(q_flat: np.ndarray, cnt_flat: np.ndarray) -> float:
     return float((strat @ A).min())
 
 
-def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, counter=None):
+def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, counter=None,
+                    prune_children=True):
     """Depth-2 subgame search root strategies for `rows_es` = [(env, side), ...] (must be Turn
     states). Returns {row_index: (my_actions ndarray, mixed strategy ndarray)} — the reusable
     core of the search agent, also consumed by the trainer's search-distillation (goal lever).
@@ -128,12 +129,13 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
             pair_a1 = [int(a1) for a1 in my for _ in op]
             pair_a2 = [int(a2) for _ in my for a2 in op]
             n_op = len(op)
+            wl = sorted({int(a) for a in my} | {int(a) for a in op}) if prune_children else None
             for _k in range(n_samples):
                 counter[0] += 1
                 # ONE bridge call for every pair, sharing one determinized world per sample.
                 kinds, obs, ids, done, outc, valid = vec.lookahead_pairs_env(
                     e, s, counter[0], pair_a1, pair_a2,
-                    counter[0] * 37 + 11 if det else None)
+                    counter[0] * 37 + 11 if det else None, wl)
                 kinds = np.asarray(kinds)
                 obs = np.asarray(obs); ids = np.asarray(ids)
                 done = np.asarray(done); outc = np.asarray(outc)
