@@ -75,11 +75,11 @@ def _leaf_values(net, device, obs_np, ids_np) -> np.ndarray:
     return w.float().cpu().numpy()
 
 
-def _solve_child(q_flat: np.ndarray, cnt_flat: np.ndarray) -> float:
-    """Value (to the row player) of a successor Turn state's 13×13 matrix game."""
-    q = np.where(cnt_flat > 0, q_flat / np.maximum(cnt_flat, 1), 0.0).reshape(N, N)
-    rows = np.flatnonzero((cnt_flat.reshape(N, N) > 0).any(axis=1))
-    cols = np.flatnonzero((cnt_flat.reshape(N, N) > 0).any(axis=0))
+def _solve_child(q_flat: np.ndarray, cnt_flat: np.ndarray, n_ax: int = N) -> float:
+    """Value (to the row player) of a successor Turn state's n_ax×n_ax matrix game."""
+    q = np.where(cnt_flat > 0, q_flat / np.maximum(cnt_flat, 1), 0.0).reshape(n_ax, n_ax)
+    rows = np.flatnonzero((cnt_flat.reshape(n_ax, n_ax) > 0).any(axis=1))
+    cols = np.flatnonzero((cnt_flat.reshape(n_ax, n_ax) > 0).any(axis=0))
     if rows.size == 0 or cols.size == 0:
         return 0.0
     strat = solve_matrix_game(q, rows, cols)
@@ -130,6 +130,8 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
             pair_a2 = [int(a2) for _ in my for a2 in op]
             n_op = len(op)
             wl = sorted({int(a) for a in my} | {int(a) for a in op}) if prune_children else None
+            n_ax = len(wl) if wl is not None else N
+            stride = n_ax * n_ax
             for _k in range(n_samples):
                 counter[0] += 1
                 # ONE bridge call for every pair, sharing one determinized world per sample.
@@ -143,9 +145,9 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
                 for pidx in range(len(pair_a1)):
                     pi, pj = pidx // n_op, pidx % n_op
                     kind = int(kinds[pidx])
-                    sl = slice(pidx * P, (pidx + 1) * P)
+                    sl = slice(pidx * stride, (pidx + 1) * stride)
                     dn, oc, vl = done[sl], outc[sl], valid[sl]
-                    live = (vl & ~dn) if kind == 2 else np.array([kind == 1] + [False] * (P - 1))
+                    live = (vl & ~dn) if kind == 2 else np.array([kind == 1] + [False] * (stride - 1))
                     start = sum(len(x) for x in all_obs)
                     lv = obs[sl][live]
                     if f2:
@@ -153,7 +155,7 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
                               if len(lv) else np.zeros((0, obs.shape[1] * 2), dtype=np.float32))
                     all_obs.append(lv); all_ids.append(ids[sl][live])
                     pending.append((i, pi, pj, kind, dn, oc, vl, live,
-                                    start, int(live.sum())))
+                                    start, int(live.sum()), n_ax))
             ok_rows.append(i)
         except ValueError:
             continue
@@ -161,7 +163,7 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
                           np.concatenate(all_obs) if all_obs else np.zeros((0, 1)),
                           np.concatenate(all_ids) if all_ids else np.zeros((0, 1)))
     acc = {}
-    for (i, pi, pj, kind, done, outc, valid, live, start, nlive) in pending:
+    for (i, pi, pj, kind, done, outc, valid, live, start, nlive, n_ax) in pending:
         if kind == 0:
             v = float(outc[0])
         elif kind == 1:
@@ -169,7 +171,7 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
         else:
             q = np.where(done, outc, 0.0).astype(np.float64)
             q[live] = values[start:start + nlive]
-            v = _solve_child(np.where(valid, q, 0.0), valid.astype(np.float64))
+            v = _solve_child(np.where(valid, q, 0.0), valid.astype(np.float64), n_ax)
         tot, n = acc.get((i, pi, pj), (0.0, 0))
         acc[(i, pi, pj)] = (tot + v, n + 1)
     out = {}

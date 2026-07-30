@@ -1691,22 +1691,28 @@ impl FlowVec {
         let ver = self.obs_version;
         let obs_dim = obs_dim_v(ver);
         let id_dim = engine::encode::ID_DIM;
-        const P: usize = N_ACTIONS_FLOW * N_ACTIONS_FLOW;
+        // Row stride per pair: the full 13x13 grid, or |whitelist|^2 in compact (pruned) mode —
+        // the fixed-stride zero-fill was ~1/3 of wall time at 169 rows per pair.
+        let wl: Option<Vec<u8>> = child_whitelist;
+        let stride: usize = match &wl {
+            Some(w) => (w.len() * w.len()).max(1),
+            None => N_ACTIONS_FLOW * N_ACTIONS_FLOW,
+        };
         let m = a_selfs.len();
         let mut kinds = vec![0u8; m];
-        let mut obs = vec![0f32; m * P * obs_dim];
-        let mut ids = vec![0i64; m * P * id_dim];
-        let mut done = vec![false; m * P];
-        let mut outcome = vec![0f32; m * P];
-        let mut valid = vec![false; m * P];
+        let mut obs = vec![0f32; m * stride * obs_dim];
+        let mut ids = vec![0i64; m * stride * id_dim];
+        let mut done = vec![false; m * stride];
+        let mut outcome = vec![0f32; m * stride];
+        let mut valid = vec![false; m * stride];
         py.allow_threads(|| {
             kinds
                 .par_iter_mut()
-                .zip(obs.par_chunks_mut(P * obs_dim))
-                .zip(ids.par_chunks_mut(P * id_dim))
-                .zip(done.par_chunks_mut(P))
-                .zip(outcome.par_chunks_mut(P))
-                .zip(valid.par_chunks_mut(P))
+                .zip(obs.par_chunks_mut(stride * obs_dim))
+                .zip(ids.par_chunks_mut(stride * id_dim))
+                .zip(done.par_chunks_mut(stride))
+                .zip(outcome.par_chunks_mut(stride))
+                .zip(valid.par_chunks_mut(stride))
                 .enumerate()
                 .for_each(|(pi, (((((kind, o_c), i_c), d_c), out_c), v_c))| {
                     let mut root = world.clone();
@@ -1733,36 +1739,26 @@ impl FlowVec {
                         }
                         Request::Turn => {
                             *kind = 2;
-                            let mut my_mask = flow_legal_mask(&root.state, Request::Turn, me);
-                            let mut op_mask =
+                            let my_mask = flow_legal_mask(&root.state, Request::Turn, me);
+                            let op_mask =
                                 flow_legal_mask(&root.state, Request::Turn, me.other());
-                            // Second-ply pruning: restrict the child grid to whitelisted action
-                            // ids (the root's top-k) — ~7× less engine work per pair. If the
-                            // filter empties a side, fall back to its full legal mask.
-                            if let Some(wl) = &child_whitelist {
-                                let keep = |m: &mut [bool; N_ACTIONS_FLOW]| {
-                                    let mut f = [false; N_ACTIONS_FLOW];
-                                    for &a in wl {
-                                        if (a as usize) < N_ACTIONS_FLOW && m[a as usize] {
-                                            f[a as usize] = true;
-                                        }
-                                    }
-                                    if f.iter().any(|&b| b) {
-                                        *m = f;
-                                    }
-                                };
-                                keep(&mut my_mask);
-                                keep(&mut op_mask);
-                            }
-                            for p in 0..P {
-                                let (ai, aj) = (p / N_ACTIONS_FLOW, p % N_ACTIONS_FLOW);
+                            // Child grid: compact wl x wl in pruned mode, full 13x13 otherwise.
+                            let full: Vec<u8> = (0..N_ACTIONS_FLOW as u8).collect();
+                            let axis: &[u8] = match &wl {
+                                Some(w) => w.as_slice(),
+                                None => full.as_slice(),
+                            };
+                            let n_ax = axis.len();
+                            for p in 0..stride.min(n_ax * n_ax) {
+                                let ai = axis[p / n_ax] as usize;
+                                let aj = axis[p % n_ax] as usize;
                                 if !my_mask[ai] || !op_mask[aj] {
                                     continue;
                                 }
                                 let mut sim = root.clone();
                                 let mut z2 = seed
                                     ^ (0x9E37_79B9_7F4A_7C15u64
-                                        .wrapping_mul((pi * P + p) as u64 + 7));
+                                        .wrapping_mul((pi * 4096 + p) as u64 + 7));
                                 z2 = (z2 ^ (z2 >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
                                 sim.rng = z2 ^ (z2 >> 27);
                                 let mm = flow_choice(&sim.state, me, ai as u8);
@@ -1799,8 +1795,8 @@ impl FlowVec {
         });
         Ok((
             Array1::from_vec(kinds).into_pyarray_bound(py),
-            Array2::from_shape_vec((m * P, obs_dim), obs).unwrap().into_pyarray_bound(py),
-            Array2::from_shape_vec((m * P, id_dim), ids).unwrap().into_pyarray_bound(py),
+            Array2::from_shape_vec((m * stride, obs_dim), obs).unwrap().into_pyarray_bound(py),
+            Array2::from_shape_vec((m * stride, id_dim), ids).unwrap().into_pyarray_bound(py),
             Array1::from_vec(done).into_pyarray_bound(py),
             Array1::from_vec(outcome).into_pyarray_bound(py),
             Array1::from_vec(valid).into_pyarray_bound(py),
