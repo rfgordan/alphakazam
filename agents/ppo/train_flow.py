@@ -229,6 +229,12 @@ def train(args):
                    "pool_size": env.pool_size, "params": model.num_params(),
                    "device": str(device), "env": "FlowEnvVec", "run_dir": str(run_dir)})
 
+    if args.expect_min_params and model.num_params() < args.expect_min_params:
+        raise SystemExit(
+            f"[train_flow] REFUSING TO TRAIN: model has {model.num_params():,} params, expected "
+            f">= {args.expect_min_params:,}. A fresh launch probably lost its arch flags — the "
+            f"exact bug that silently ran hero1 on the 1.6M default net for 709M steps.")
+
     batch = cfg.num_envs * cfg.rollout_steps
     indefinite = cfg.total_steps <= 0
     print(f"device={device}  params={model.num_params():,}  obs_dim={env.obs_dim}  "
@@ -604,6 +610,9 @@ def main():
                         "r' = r − η(log π − log π_ref) on acting steps (E4)")
     p.add_argument("--rnad-ref-every", type=int, default=50,
                    help="refresh the R-NaD reference to the current policy every N updates")
+    p.add_argument("--expect-min-params", type=int, default=0,
+                   help="refuse to train if the built model has fewer params (guards against "
+                        "fresh launches silently falling back to default architecture)")
     p.add_argument("--setslot", action="store_true",
                    help="slot-shared move/switch scorers (night-era arch; needs obs v2)")
     p.add_argument("--phi-boost", type=float, default=0.0,

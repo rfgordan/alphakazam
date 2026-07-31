@@ -31,6 +31,7 @@ exec ./scripts/launch_train.sh "$RUN_DIR" \
 	--frames 2 \
 	--outcome-head \
 	--setslot \
+	--expect-min-params 10000000 \
 	--hidden-dim 1024 \
 	--n-hidden-layers 3 \
 	--embed-dim 48 \
