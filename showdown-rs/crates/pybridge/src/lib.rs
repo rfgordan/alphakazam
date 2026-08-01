@@ -2161,12 +2161,116 @@ fn encode_ps_state(
     ))
 }
 
+/// Batched zero-sum matrix-game values by regret matching (the search's child solves — ~1.5k
+/// tiny numpy solves per decision-step were the residual Python wall). For each of M games:
+/// average q over samples (cnt), run `iters` of RM+ on the valid rows/cols, and return the row
+/// player's value against a best-responding column player — exactly `_solve_child` in Rust.
+#[pyfunction]
+fn solve_matrix_games<'py>(
+    py: Python<'py>,
+    q_flat: PyReadonlyArray1<'py, f64>,
+    cnt_flat: PyReadonlyArray1<'py, f64>,
+    n_ax: usize,
+    iters: usize,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let q = q_flat.as_slice()?.to_vec();
+    let c = cnt_flat.as_slice()?.to_vec();
+    let cells = n_ax * n_ax;
+    if q.len() != c.len() || q.len() % cells != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err("bad shapes"));
+    }
+    let m = q.len() / cells;
+    let mut out = vec![0f64; m];
+    py.allow_threads(|| {
+        out.par_iter_mut().enumerate().for_each(|(g, val)| {
+            let qs = &q[g * cells..(g + 1) * cells];
+            let cs = &c[g * cells..(g + 1) * cells];
+            let mut a = vec![0f64; cells];
+            for i in 0..cells {
+                a[i] = if cs[i] > 0.0 { qs[i] / cs[i] } else { 0.0 };
+            }
+            let rows: Vec<usize> = (0..n_ax)
+                .filter(|&r| (0..n_ax).any(|cc| cs[r * n_ax + cc] > 0.0))
+                .collect();
+            let cols: Vec<usize> = (0..n_ax)
+                .filter(|&cc| (0..n_ax).any(|r| cs[r * n_ax + cc] > 0.0))
+                .collect();
+            if rows.is_empty() || cols.is_empty() {
+                *val = 0.0;
+                return;
+            }
+            let (nr, nc) = (rows.len(), cols.len());
+            let sub: Vec<f64> = rows
+                .iter()
+                .flat_map(|&r| cols.iter().map(move |&cc| (r, cc)))
+                .map(|(r, cc)| a[r * n_ax + cc])
+                .collect();
+            let mut r_reg = vec![0f64; nr];
+            let mut c_reg = vec![0f64; nc];
+            let mut r_avg = vec![0f64; nr];
+            let mut r_s = vec![1.0 / nr as f64; nr];
+            let mut c_s = vec![1.0 / nc as f64; nc];
+            for _ in 0..iters {
+                for i in 0..nr {
+                    r_avg[i] += r_s[i];
+                }
+                let mut u_r = vec![0f64; nr];
+                for i in 0..nr {
+                    for j in 0..nc {
+                        u_r[i] += sub[i * nc + j] * c_s[j];
+                    }
+                }
+                let ev_r: f64 = (0..nr).map(|i| r_s[i] * u_r[i]).sum();
+                let mut u_c = vec![0f64; nc];
+                for j in 0..nc {
+                    for i in 0..nr {
+                        u_c[j] -= sub[i * nc + j] * r_s[i];
+                    }
+                }
+                let ev_c: f64 = (0..nc).map(|j| c_s[j] * u_c[j]).sum();
+                for i in 0..nr {
+                    r_reg[i] += u_r[i] - ev_r;
+                }
+                for j in 0..nc {
+                    c_reg[j] += u_c[j] - ev_c;
+                }
+                let rp: f64 = r_reg.iter().map(|&x| x.max(0.0)).sum();
+                if rp > 0.0 {
+                    for i in 0..nr {
+                        r_s[i] = r_reg[i].max(0.0) / rp;
+                    }
+                } else {
+                    r_s.iter_mut().for_each(|x| *x = 1.0 / nr as f64);
+                }
+                let cp: f64 = c_reg.iter().map(|&x| x.max(0.0)).sum();
+                if cp > 0.0 {
+                    for j in 0..nc {
+                        c_s[j] = c_reg[j].max(0.0) / cp;
+                    }
+                } else {
+                    c_s.iter_mut().for_each(|x| *x = 1.0 / nc as f64);
+                }
+            }
+            let tot: f64 = r_avg.iter().sum();
+            for i in 0..nr {
+                r_avg[i] /= tot;
+            }
+            // value vs best-responding column player
+            *val = (0..nc)
+                .map(|j| (0..nr).map(|i| r_avg[i] * sub[i * nc + j]).sum::<f64>())
+                .fold(f64::INFINITY, f64::min);
+        });
+    });
+    Ok(Array1::from_vec(out).into_pyarray_bound(py))
+}
+
 #[pymodule]
 fn showdown_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Battle>()?;
     m.add_class::<BattleVec>()?;
     m.add_class::<FlowVec>()?;
     m.add_function(wrap_pyfunction!(encode_ps_state, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_matrix_games, m)?)?;
     Ok(())
 }
 

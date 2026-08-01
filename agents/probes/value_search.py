@@ -20,6 +20,8 @@ import time
 import numpy as np
 import torch
 
+import showdown_engine as se
+
 from ppo.flow_eval import (_policy_actions, evaluate_flow, make_mcts_opponent,
                            make_scripted_heuristic)
 from probes.mcts_calib import POOL, load_ckpt
@@ -171,16 +173,31 @@ def root_strategies(net, device, vec, rows_es, topk=4, n_samples=1, det=True, co
     values = _leaf_values(net, device,
                           np.concatenate(all_obs) if all_obs else np.zeros((0, 1)),
                           np.concatenate(all_ids) if all_ids else np.zeros((0, 1)))
+    # Child matrix games batch-solved in Rust (grouped by axis size) — the ~1.5k tiny numpy
+    # solves per decision-step were the residual search wall.
+    solved = {}
+    groups: dict = {}
+    for pidx_, (i, pi, pj, kind, done, outc, valid, live, start, nlive, n_ax) in enumerate(pending):
+        if kind != 2:
+            continue
+        q = np.where(done, outc, 0.0).astype(np.float64)
+        q[live] = values[start:start + nlive]
+        groups.setdefault(n_ax, []).append((pidx_, np.where(valid, q, 0.0),
+                                            valid.astype(np.float64)))
+    for n_ax_g, items in groups.items():
+        qf = np.concatenate([q for _, q, _ in items])
+        cf = np.concatenate([c for _, _, c in items])
+        vals = np.asarray(se.solve_matrix_games(qf, cf, n_ax_g, 200))
+        for (pidx_, _, _), v in zip(items, vals):
+            solved[pidx_] = float(v)
     acc = {}
-    for (i, pi, pj, kind, done, outc, valid, live, start, nlive, n_ax) in pending:
+    for pidx_, (i, pi, pj, kind, done, outc, valid, live, start, nlive, n_ax) in enumerate(pending):
         if kind == 0:
             v = float(outc[0])
         elif kind == 1:
             v = float(values[start]) if nlive else 0.0
         else:
-            q = np.where(done, outc, 0.0).astype(np.float64)
-            q[live] = values[start:start + nlive]
-            v = _solve_child(np.where(valid, q, 0.0), valid.astype(np.float64), n_ax)
+            v = solved[pidx_]
         tot, n = acc.get((i, pi, pj), (0.0, 0))
         acc[(i, pi, pj)] = (tot + v, n + 1)
     out = {}
